@@ -1,0 +1,273 @@
+# SendBox Default Security Policy
+# This policy provides a secure baseline for running AI agents.
+# Commands and network access are denied by default, with explicit allowlists.
+#
+# Usage:
+#   Reference this file from your sandbox configuration:
+#     policy:
+#       file: ./config/default-policy.yaml
+#
+#   Or use it as a starting point and override specific sections inline.
+#
+# Design Philosophy:
+#   - Deny by default: anything not explicitly allowed is blocked
+#   - Defense in depth: even allowed commands are subject to filesystem and network restrictions
+#   - Least privilege: only grant access needed for common development workflows
+#   - Auditability: blocked commands are logged for review
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command Execution Policy
+# ─────────────────────────────────────────────────────────────────────────────
+# Controls which shell commands the agent is allowed to execute.
+# The denylist takes priority over the allowlist — if a command matches both,
+# it is denied.
+commands:
+  # What to do when a command doesn't match any rule.
+  # "deny" is the only safe default for untrusted agents.
+  default_action: deny
+
+  # When true, every blocked command is written to the sandbox audit log.
+  # Useful for debugging policy issues and reviewing agent behavior.
+  log_blocked: true
+
+  # ── Allowlist ──────────────────────────────────────────────────────────────
+  # Commands the agent is permitted to run. Patterns use simple glob matching:
+  #   "git *"   → allows "git status", "git commit -m '…'", etc.
+  #   "env"     → allows only the bare "env" command (no arguments)
+  #
+  # NOTE: Network-capable commands (curl, wget) are allowed here because
+  # actual network access is controlled separately by the firewall rules
+  # in the `network` section below.
+  allowlist:
+    # ── Version control ────────────────────────────────────────────────────
+    - "git *"
+    - "gh *"
+
+    # ── Node.js ecosystem ──────────────────────────────────────────────────
+    - "node *"
+    - "npm *"
+    - "npx *"
+    - "yarn *"
+    - "pnpm *"
+    - "tsx *"
+    - "tsc *"
+
+    # ── Python ecosystem ───────────────────────────────────────────────────
+    - "python *"
+    - "python3 *"
+    - "pip *"
+    - "pip3 *"
+    - "pipenv *"
+    - "poetry *"
+    - "uv *"
+
+    # ── Rust ecosystem ─────────────────────────────────────────────────────
+    - "cargo *"
+    - "rustc *"
+    - "rustup *"
+
+    # ── Go ecosystem ───────────────────────────────────────────────────────
+    - "go *"
+
+    # ── Build tools ────────────────────────────────────────────────────────
+    - "make *"
+    - "cmake *"
+    - "gradle *"
+    - "mvn *"
+
+    # ── Common utilities (safe) ────────────────────────────────────────────
+    # These are standard POSIX/coreutils commands that operate on files
+    # within the sandboxed filesystem. They cannot escape the sandbox.
+    - "cat *"
+    - "ls *"
+    - "find *"
+    - "grep *"
+    - "sed *"
+    - "awk *"
+    - "head *"
+    - "tail *"
+    - "wc *"
+    - "sort *"
+    - "uniq *"
+    - "cut *"
+    - "tr *"
+    - "echo *"
+    - "printf *"
+    - "env"
+    - "which *"
+    - "whoami"
+    - "pwd"
+    - "date"
+    - "mkdir *"
+    - "cp *"
+    - "mv *"
+    - "touch *"
+    - "rm *"       # Within sandbox, this is safe — filesystem is isolated
+    - "chmod *"
+    - "test *"
+    - "diff *"
+    - "patch *"
+    - "tar *"
+    - "gzip *"
+    - "gunzip *"
+    - "unzip *"
+    - "curl *"     # Network access controlled by firewall rules below
+    - "wget *"     # Network access controlled by firewall rules below
+    - "jq *"
+    - "yq *"
+
+    # ── Editor / pager ─────────────────────────────────────────────────────
+    - "less *"
+    - "more *"
+    - "vi *"
+    - "vim *"
+    - "nano *"
+
+    # ── Container / devcontainer tools ─────────────────────────────────────
+    - "code *"     # VS Code server operations
+    - "devcontainer *"
+
+  # ── Denylist ───────────────────────────────────────────────────────────────
+  # Commands that are ALWAYS blocked, even if they match an allowlist pattern.
+  # The denylist is evaluated first and takes absolute priority.
+  denylist:
+    # ── System administration ──────────────────────────────────────────────
+    # These commands can modify the host system, escalate privileges,
+    # or disrupt the sandbox runtime.
+    - "sudo *"
+    - "su *"
+    - "mount *"
+    - "umount *"
+    - "fdisk *"
+    - "mkfs *"
+    - "dd *"
+    - "shutdown *"
+    - "reboot *"
+    - "halt *"
+    - "poweroff *"
+    - "init *"
+    - "systemctl *"
+    - "service *"
+    - "iptables *"     # Firewall rules are managed by sendbox, not the agent
+    - "ip6tables *"
+    - "nftables *"
+
+    # ── User management ───────────────────────────────────────────────────
+    # Prevent the agent from creating users or changing ownership,
+    # which could be used for privilege escalation.
+    - "passwd *"
+    - "useradd *"
+    - "userdel *"
+    - "usermod *"
+    - "groupadd *"
+    - "groupdel *"
+    - "chown *"        # Prevent privilege escalation via ownership changes
+
+    # ── Network tools that could bypass the firewall ───────────────────────
+    # Raw socket tools and tunneling utilities can circumvent the
+    # domain-based firewall, so they must be blocked.
+    - "nc *"
+    - "ncat *"
+    - "netcat *"
+    - "socat *"
+    - "ssh *"          # Use `gh auth` for GitHub authentication instead
+    - "scp *"
+    - "sftp *"
+    - "telnet *"
+
+    # ── System package managers ────────────────────────────────────────────
+    # System-level package installation can modify the base image and
+    # introduce unvetted software. Use language-specific package managers
+    # (npm, pip, cargo, etc.) instead.
+    - "apt *"
+    - "apt-get *"
+    - "yum *"
+    - "dnf *"
+    - "pacman *"
+    - "apk *"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Network / Firewall Policy
+# ─────────────────────────────────────────────────────────────────────────────
+# Controls outbound network access from the sandbox.
+# Inbound connections are always blocked — the sandbox is not a server.
+#
+# How it works:
+#   1. DNS queries are intercepted by the sandbox DNS resolver.
+#   2. If the resolved domain matches `allowed_domains`, the connection proceeds.
+#   3. If it matches `blocked_domains`, the connection is refused (blocked_domains wins).
+#   4. Otherwise, `default_action` applies.
+network:
+  # What to do when a domain doesn't match any rule.
+  # "deny" ensures the agent can only reach explicitly allowed destinations.
+  default_action: deny
+
+  # Allow DNS resolution even when network is otherwise denied.
+  # Required for domain-based filtering to work. Set to false only if
+  # you want to block ALL network access including DNS.
+  allow_dns: true
+
+  # Maximum number of concurrent outbound connections.
+  # Prevents resource exhaustion from runaway network activity.
+  max_connections: 100
+
+  # ── Allowed Domains ────────────────────────────────────────────────────
+  # Domains the agent can connect to. Supports wildcard subdomains:
+  #   "*.github.com" matches "api.github.com", "raw.github.com", etc.
+  #   "github.com"   matches only the apex domain.
+  allowed_domains:
+    # ── GitHub ─────────────────────────────────────────────────────────────
+    - "github.com"
+    - "*.github.com"
+    - "*.githubusercontent.com"
+    - "*.githubassets.com"
+    - "ghcr.io"
+    - "*.ghcr.io"
+
+    # ── Package registries ─────────────────────────────────────────────────
+    # These are the official registries for major language ecosystems.
+    # Add private registries (e.g., Artifactory, Nexus) as needed.
+    - "registry.npmjs.org"
+    - "*.npmjs.org"
+    - "pypi.org"
+    - "*.pypi.org"
+    - "files.pythonhosted.org"
+    - "crates.io"
+    - "*.crates.io"
+    - "proxy.golang.org"
+    - "sum.golang.org"
+    - "rubygems.org"
+    - "*.rubygems.org"
+    - "repo1.maven.org"
+    - "plugins.gradle.org"
+    - "registry.yarnpkg.com"
+
+    # ── Container registries ───────────────────────────────────────────────
+    - "*.docker.io"
+    - "*.docker.com"
+    - "mcr.microsoft.com"
+    - "*.azurecr.io"
+
+    # ── VS Code / Copilot ──────────────────────────────────────────────────
+    - "*.vscode-cdn.net"
+    - "*.vscode-unpkg.net"
+    - "marketplace.visualstudio.com"
+    - "*.gallerycdn.vsassets.io"
+    - "api.copilot.github.com"
+    - "copilot-proxy.githubusercontent.com"
+
+    # ── CDNs commonly needed by packages ───────────────────────────────────
+    - "*.cloudflare.com"
+    - "*.fastly.net"
+    - "*.akamaized.net"
+
+  # ── Blocked Domains ────────────────────────────────────────────────────
+  # Domains that are ALWAYS blocked, even if they match `allowed_domains`.
+  # Use this to carve out exceptions — for example, blocking a specific
+  # subdomain while allowing the rest of a wildcard.
+  #
+  # Example:
+  #   allowed_domains: ["*.example.com"]
+  #   blocked_domains: ["evil.example.com"]
+  #   → all subdomains allowed except evil.example.com
+  blocked_domains: []

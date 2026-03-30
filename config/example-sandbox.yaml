@@ -1,0 +1,185 @@
+# SendBox Configuration Example
+# ─────────────────────────────────────────────────────────────────────────────
+# This file configures a sandbox for running an AI agent on a project.
+# Copy this file and customize it for your project:
+#
+#   cp config/example-sandbox.yaml my-sandbox.yaml
+#   sendbox run --config my-sandbox.yaml
+#
+# All paths are relative to where `sendbox` is invoked unless absolute.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# A human-readable name for this sandbox instance.
+# Used in logs, the dashboard, and container labels.
+# Must be unique across running sandboxes on the same host.
+name: my-project-sandbox
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project
+# ─────────────────────────────────────────────────────────────────────────────
+# Absolute or relative path to the project root.
+# This directory is mounted read/write into the sandbox container.
+# The agent can read, modify, and create files within this tree.
+project_path: /Users/developer/my-project
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Container Resources
+# ─────────────────────────────────────────────────────────────────────────────
+# Resource limits for the sandbox container. These are hard caps — the
+# container cannot exceed them. Set them based on your project's needs:
+#
+#   Small project (linting, tests):     cpus: 2, memory_mb: 2048
+#   Medium project (builds, bundling):  cpus: 4, memory_mb: 4096
+#   Large project (compilation, ML):    cpus: 8, memory_mb: 8192
+resources:
+  # Number of CPU cores allocated to the container.
+  # Fractional values are supported (e.g., 1.5).
+  # Default: 2
+  cpus: 4
+
+  # Memory limit in megabytes.
+  # The container is killed (OOM) if it exceeds this limit.
+  # Default: 2048
+  memory_mb: 4096
+
+  # Disk space limit in megabytes for the container's writable layer.
+  # Does not include the project mount (which uses the host filesystem).
+  # Default: 5120
+  disk_size_mb: 10240
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Security Policy
+# ─────────────────────────────────────────────────────────────────────────────
+# Controls what the agent can do inside the sandbox.
+# You can define the policy inline (as shown below) or reference an
+# external policy file for reuse across multiple sandboxes.
+#
+# To use an external policy file instead of inline rules:
+#   policy:
+#     file: ./config/default-policy.yaml
+#
+# When both `file` and inline rules are present, inline rules are merged
+# on top of the file — allowing you to extend or override specific parts.
+policy:
+  # ── Command execution ──────────────────────────────────────────────────
+  commands:
+    # "deny" blocks any command not in the allowlist.
+    # "allow" permits all commands except those in the denylist.
+    # Recommended: "deny" for untrusted agents, "allow" for trusted local use.
+    default_action: deny
+
+    # Log every blocked command to the sandbox audit log.
+    # Helpful for building your allowlist iteratively.
+    log_blocked: true
+
+    # Commands the agent may execute (glob patterns).
+    allowlist:
+      - "git *"
+      - "npm *"
+      - "node *"
+      - "python3 *"
+      - "make *"
+      - "cat *"
+      - "ls *"
+      - "grep *"
+      - "curl *"
+
+    # Commands that are always blocked, even if they match the allowlist.
+    # Use specific patterns to block dangerous invocations of otherwise
+    # safe commands (e.g., "rm -rf /*" but not "rm -rf ./build").
+    denylist:
+      - "sudo *"
+      - "rm -rf /*"
+
+  # ── Network / Firewall ─────────────────────────────────────────────────
+  network:
+    # "deny" blocks all outbound connections except to allowed_domains.
+    # "allow" permits all outbound connections except to blocked_domains.
+    default_action: deny
+
+    # Allow DNS resolution. Required for domain-based filtering.
+    # Only set to false if you need a fully air-gapped sandbox.
+    allow_dns: true
+
+    # Maximum concurrent outbound connections from the container.
+    # Prevents runaway HTTP clients from exhausting resources.
+    max_connections: 50
+
+    # Domains the agent can reach. Supports wildcard subdomains.
+    allowed_domains:
+      - "github.com"
+      - "*.github.com"
+      - "registry.npmjs.org"
+      - "pypi.org"
+
+    # Domains that are always blocked (takes priority over allowed_domains).
+    blocked_domains: []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets
+# ─────────────────────────────────────────────────────────────────────────────
+# Names of secrets to inject as environment variables into the sandbox.
+# Secrets are stored in the sendbox vault (not in this file).
+#
+# To add a secret to the vault:
+#   sendbox secret set GITHUB_TOKEN
+#
+# Secrets are injected at container start and are available as standard
+# environment variables (e.g., $GITHUB_TOKEN). They are never written
+# to disk inside the container.
+secrets:
+  - GITHUB_TOKEN
+  - NPM_TOKEN
+  - DATABASE_URL
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DevContainer Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Controls how the sandbox container is built and configured.
+# SendBox uses the Dev Containers specification (https://containers.dev)
+# to create reproducible development environments.
+devcontainer:
+  # Path to an existing devcontainer.json in your project.
+  # If set, sendbox uses this instead of auto-generating one.
+  # Relative to project_path.
+  # Default: not set (auto-generate is used)
+  # config_path: .devcontainer/devcontainer.json
+
+  # When true, sendbox analyzes your project (package.json, Cargo.toml,
+  # requirements.txt, etc.) and generates a devcontainer.json automatically.
+  # Ignored if config_path is set.
+  # Default: true
+  auto_generate: true
+
+  # Additional VS Code extensions to install in the container.
+  # These are merged with any extensions from the devcontainer.json.
+  # Use the fully qualified extension ID: publisher.extension-name
+  extensions:
+    - github.copilot
+    - github.copilot-chat
+    - ms-python.python
+    - dbaeumer.vscode-eslint
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub Authentication
+# ─────────────────────────────────────────────────────────────────────────────
+# Controls how the sandbox authenticates with GitHub.
+# By default, sendbox forwards your local `gh` CLI credentials so the
+# agent can push commits, open PRs, and interact with the GitHub API
+# without storing long-lived tokens.
+github:
+  # Forward the host's `gh auth` token into the container.
+  # The agent can use `gh` commands and the GitHub API as you.
+  # Default: true
+  forward_auth: true
+
+  # Forward Copilot CLI authentication into the container.
+  # Required if the agent uses GitHub Copilot features.
+  # Default: true
+  forward_copilot_auth: true
+
+  # Path to an SSH private key to mount (read-only) into the container.
+  # Use this if your project requires SSH-based git operations.
+  # The key is mounted at ~/.ssh/ inside the container.
+  # Default: not set (SSH auth disabled; use HTTPS via `gh auth`)
+  # ssh_key_path: ~/.ssh/id_ed25519
