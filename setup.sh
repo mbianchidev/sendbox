@@ -23,6 +23,64 @@ warn()  { echo -e "${YELLOW}⚠${NC}  $*"; }
 err()   { echo -e "${RED}✘${NC}  $*" >&2; }
 header(){ echo -e "\n${BOLD}${CYAN}═══ $* ═══${NC}\n"; }
 
+CONTAINER_RELEASES_API="https://api.github.com/repos/apple/container/releases/latest"
+
+# ── Install Apple Container CLI ──────────────────────────────
+install_container_cli() {
+    info "Fetching latest release from apple/container..."
+
+    local release_json
+    release_json="$(curl -fsSL "$CONTAINER_RELEASES_API")" || {
+        err "Failed to fetch release info. Check your network connection."
+        return 1
+    }
+
+    # Find the signed .pkg asset URL and name
+    local pkg_url pkg_name
+    pkg_url="$(echo "$release_json" | grep -o '"browser_download_url":\s*"[^"]*installer-signed\.pkg"' | head -1 | sed 's/.*"browser_download_url":\s*"\(.*\)"/\1/')"
+    pkg_name="$(echo "$release_json" | grep -o '"name":\s*"[^"]*installer-signed\.pkg"' | head -1 | sed 's/.*"name":\s*"\(.*\)"/\1/')"
+
+    if [[ -z "$pkg_url" ]]; then
+        err "Could not find a signed .pkg installer in the latest release."
+        err "Install manually from: https://github.com/apple/container/releases"
+        return 1
+    fi
+
+    local tag_name
+    tag_name="$(echo "$release_json" | grep -o '"tag_name":\s*"[^"]*"' | head -1 | sed 's/.*"tag_name":\s*"\(.*\)"/\1/')"
+    info "Latest version: ${tag_name:-unknown}"
+    info "Downloading ${pkg_name}..."
+
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    local pkg_path="${tmp_dir}/${pkg_name}"
+
+    curl -fSL --progress-bar -o "$pkg_path" "$pkg_url" || {
+        err "Download failed."
+        rm -rf "$tmp_dir"
+        return 1
+    }
+    ok "Downloaded $(du -h "$pkg_path" | cut -f1 | xargs) — ${pkg_name}"
+
+    info "Installing (requires administrator password)..."
+    sudo installer -pkg "$pkg_path" -target / || {
+        err "Installation failed. Try installing manually:"
+        err "  open ${pkg_path}"
+        return 1
+    }
+
+    rm -rf "$tmp_dir"
+    ok "Apple Container CLI installed"
+
+    # Start the system service
+    info "Starting container system service..."
+    if container system start 2>/dev/null; then
+        ok "Container system service started"
+    else
+        warn "Could not start system service — you may need to run: container system start"
+    fi
+}
+
 # ── Preflight checks ────────────────────────────────────────
 preflight() {
     header "Preflight Checks"
@@ -56,12 +114,18 @@ preflight() {
         warn "Install Node.js 20+ for full functionality."
     fi
 
-    # Apple Container runtime (optional but recommended)
+    # Apple Container runtime — auto-install if missing
     if command -v container &>/dev/null; then
         ok "Apple Container CLI found"
     else
         warn "Apple Container CLI not installed."
-        warn "Get it from: https://github.com/apple/container/releases"
+        read -rp "$(echo -e "${YELLOW}?${NC}  Download and install it now? [Y/n]: ")" install_container
+        install_container="${install_container:-y}"
+        if [[ "$install_container" =~ ^[Yy]$ ]]; then
+            install_container_cli
+        else
+            warn "Skipping — container runtime will not be available."
+        fi
     fi
 
     # GitHub CLI (for auth forwarding)
