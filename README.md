@@ -28,11 +28,48 @@ SendBox provides hardware-isolated execution environments for AI agents using Ap
 
 ### Install
 
+**From releases (prebuilt):**
+
+Download the latest `.pkg`, `.dmg`, or tarball from [Releases](https://github.com/mbianchidev/sendbox/releases).
+
+```bash
+# .pkg — double-click or:
+sudo installer -pkg sendbox-*-macos-arm64.pkg -target /
+
+# Tarball:
+tar xzf sendbox-*-macos-arm64.tar.gz
+sudo cp sendbox-*/sendbox /usr/local/bin/
+```
+
+**From source:**
+
 ```bash
 git clone https://github.com/mbianchidev/sendbox.git
 cd sendbox
 make install
 ```
+
+### Running Unsigned Releases
+
+Releases are **not code-signed**. macOS Gatekeeper will block the binary on first run.
+Use one of these methods to allow it:
+
+```bash
+# Option 1 (recommended) — Remove the quarantine attribute
+xattr -dr com.apple.quarantine /usr/local/bin/sendbox
+
+# Option 2 — Right-click the binary in Finder → Open (one-time approval)
+
+# Option 3 — Allow in System Settings
+#   System Settings → Privacy & Security → scroll to "sendbox was blocked" → Allow Anyway
+
+# Option 4 (not recommended) — Disable Gatekeeper globally
+sudo spctl --master-disable
+# Re-enable after:  sudo spctl --master-enable
+```
+
+> **Note:** The `.pkg` installer runs `xattr -dr` automatically during post-install, so
+> the quarantine attribute is removed for you.
 
 ### Configure
 
