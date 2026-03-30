@@ -435,6 +435,17 @@ main() {
     echo -e "${BOLD}${CYAN}╚═══════════════════════════════════════╝${NC}"
     echo ""
 
+    # No arguments → run the default flow
+    if [[ $# -eq 0 ]]; then
+        preflight
+        build_sendbox
+        setup_bridge
+        init_dirs
+        configure
+        run_sandbox
+        return
+    fi
+
     PS3=$'\n'"$(echo -e "${CYAN}?${NC}  Select an action: ")"
     options=(
         "Full setup (preflight → build → configure → run)"
@@ -454,7 +465,6 @@ main() {
                 setup_bridge
                 init_dirs
                 configure
-                add_secrets
                 run_sandbox
                 break
                 ;;
