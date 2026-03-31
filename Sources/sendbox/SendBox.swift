@@ -8,7 +8,7 @@ struct SendBox: AsyncParsableCommand {
         commandName: "sendbox",
         abstract: "Secure sandbox for AI agents using Apple Virtualization",
         version: "0.1.0",
-        subcommands: [Run.self, Init.self, Analyze.self, Secrets.self, Policy.self]
+        subcommands: [Run.self, Init.self, Analyze.self, Secrets.self, Policy.self, Completions.self]
     )
 }
 
@@ -448,4 +448,130 @@ private func loadConfiguration(
     }
 
     return SandboxConfiguration.default(projectPath: projectDir)
+}
+
+// MARK: - Completions
+
+extension SendBox {
+    struct Completions: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Install shell completions for sendbox",
+            subcommands: [Install.self, Print.self],
+            defaultSubcommand: Install.self
+        )
+
+        struct Install: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Install completions for your current shell"
+            )
+
+            @Option(name: .long, help: "Shell to install for (bash, zsh, fish). Auto-detected if omitted.")
+            var shell: String?
+
+            func run() throws {
+                let detected = shell ?? detectShell()
+                switch detected {
+                case "bash":
+                    try installBash()
+                case "zsh":
+                    try installZsh()
+                case "fish":
+                    try installFish()
+                default:
+                    printError("Unknown shell: \(detected). Use --shell bash|zsh|fish")
+                    throw ExitCode.failure
+                }
+            }
+
+            private func detectShell() -> String {
+                let shellPath = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+                if shellPath.hasSuffix("zsh") { return "zsh" }
+                if shellPath.hasSuffix("bash") { return "bash" }
+                if shellPath.hasSuffix("fish") { return "fish" }
+                return "zsh"
+            }
+
+            private func generateScript(_ shell: String) throws -> String {
+                let process = Process()
+                let pipe = Pipe()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                process.arguments = [CommandLine.arguments[0], "--generate-completion-script", shell]
+                process.standardOutput = pipe
+                process.standardError = FileHandle.nullDevice
+                try process.run()
+                process.waitUntilExit()
+                guard let data = try pipe.fileHandleForReading.readToEnd(),
+                      let script = String(data: data, encoding: .utf8) else {
+                    throw ExitCode.failure
+                }
+                return script
+            }
+
+            private func installBash() throws {
+                let script = try generateScript("bash")
+                let dir = NSHomeDirectory() + "/.local/share/bash-completion/completions"
+                try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                let path = dir + "/sendbox"
+                try script.write(toFile: path, atomically: true, encoding: .utf8)
+                print("✅ Bash completions installed to \(path)")
+                print("")
+                print("To activate now:")
+                print("  source \(path)")
+                print("")
+                print("It will load automatically in new terminals if bash-completion is set up.")
+                print("If not, add this to your ~/.bashrc:")
+                print("  source \(path)")
+            }
+
+            private func installZsh() throws {
+                let script = try generateScript("zsh")
+                let dir = NSHomeDirectory() + "/.zsh/completions"
+                try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                let path = dir + "/_sendbox"
+                try script.write(toFile: path, atomically: true, encoding: .utf8)
+                print("✅ Zsh completions installed to \(path)")
+                print("")
+                print("To activate, add this to your ~/.zshrc (if not already present):")
+                print("  fpath=(~/.zsh/completions $fpath)")
+                print("  autoload -Uz compinit && compinit")
+                print("")
+                print("Then reload:")
+                print("  exec zsh")
+            }
+
+            private func installFish() throws {
+                let script = try generateScript("fish")
+                let dir = NSHomeDirectory() + "/.config/fish/completions"
+                try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                let path = dir + "/sendbox.fish"
+                try script.write(toFile: path, atomically: true, encoding: .utf8)
+                print("✅ Fish completions installed to \(path)")
+                print("They will load automatically in new fish sessions.")
+            }
+        }
+
+        struct Print: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Print completions to stdout (for manual setup)"
+            )
+
+            @Option(name: .long, help: "Shell (bash, zsh, fish)")
+            var shell: String = "bash"
+
+            func run() throws {
+                let process = Process()
+                let pipe = Pipe()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                process.arguments = [CommandLine.arguments[0], "--generate-completion-script", shell]
+                process.standardOutput = pipe
+                process.standardError = FileHandle.nullDevice
+                try process.run()
+                process.waitUntilExit()
+                if let data = try pipe.fileHandleForReading.readToEnd(),
+                   let script = String(data: data, encoding: .utf8) {
+                    Swift.print(script, terminator: "")
+                }
+            }
+        }
+    }
 }
