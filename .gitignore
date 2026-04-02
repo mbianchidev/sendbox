@@ -2,3 +2,4 @@
 node_modules/
 copilot-bridge/dist/
 .DS_Store
+.sendbox.yaml
