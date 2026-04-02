@@ -11,7 +11,12 @@ SendBox provides hardware-isolated execution environments for AI agents using Ap
 - **File Isolation** — Mount only the directories an agent needs. Everything else is invisible.
 - **Command Filtering** — Allowlist or denylist which binaries an agent may execute inside the sandbox.
 - **Network Firewall** — Restrict outbound traffic to specific hosts, ports, or protocols.
-- **Secrets Management** — Inject credentials at runtime without persisting them to disk.
+- **Credential Injection** — Secrets loaded from macOS Keychain injected via reverse proxy (`--proxy-credential`, agent never sees raw tokens) or environment variables (`--env-credential`). Predefined rules for OpenAI, Anthropic, GitHub, Google AI, and npm.
+- **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
+- **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
+- **Supply Chain Provenance** — Ed25519 signing for config and policy files ensures they were authored by trusted identities. Multi-signer support with a configurable trust store.
+- **Runtime Supervisor** — Dynamic permission expansion with approval workflows. Agents start restricted and earn broader permissions through supervised interaction (one-time, session-wide, or pattern-based grants).
+- **VM Hardening** — Defense-in-depth sysctl lockdown, capability dropping, and seccomp profiles covering all 18 [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) scenarios.
 - **Devcontainer Generation** — Export sandbox configurations as [devcontainer](https://containers.dev/) specs for reproducible environments.
 
 ## Requirements
