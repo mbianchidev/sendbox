@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XCODE_PATH" ]; then
+            echo "No Xcode found, using default"
+          else
+            echo "Using $XCODE_PATH"
+            sudo xcode-select -s "${XCODE_PATH}/Contents/Developer"
+          fi
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Resolve dependencies
+        run: swift package resolve
+
+      - name: Build (debug)
+        run: swift build
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Verify binary runs
+        run: .build/release/sendbox --help
+
+  lint:
+    name: Lint
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XCODE_PATH" ]; then
+            sudo xcode-select -s "${XCODE_PATH}/Contents/Developer"
+          fi
+
+      - name: Check formatting
+        run: |
+          if command -v swift-format &>/dev/null; then
+            swift-format lint --recursive Sources/ Tests/ || true
+          else
+            echo "swift-format not available, skipping"
+          fi
+
+  copilot-bridge:
+    name: Copilot Bridge
+    runs-on: ubuntu-latest
+    # Non-blocking — @github/copilot-sdk may not be published yet
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: copilot-bridge
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts || echo "⚠ npm install failed (copilot-sdk may not be published yet)"
+
+      - name: Type check
+        run: npx tsc --noEmit || echo "⚠ Type check skipped"
+
+      - name: Build
+        run: npm run build || echo "⚠ Build skipped"

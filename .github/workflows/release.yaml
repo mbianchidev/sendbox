@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-package:
+    name: Build & Package
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XCODE_PATH" ]; then
+            echo "Using $XCODE_PATH"
+            sudo xcode-select -s "${XCODE_PATH}/Contents/Developer"
+          fi
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build release binary
+        run: swift build -c release
+
+      - name: Verify binary
+        run: |
+          .build/release/sendbox --help
+          .build/release/sendbox --version
+
+      # ── Standalone tarball ──────────────────────────────────
+      - name: Create tarball
+        run: |
+          STAGING="sendbox-${{ steps.version.outputs.version }}-macos-arm64"
+          mkdir -p "$STAGING"
+          cp .build/release/sendbox "$STAGING/"
+          cp README.md LICENSE ROADMAP.md "$STAGING/"
+          cp -r config "$STAGING/"
+          cp setup.sh "$STAGING/"
+
+          tar czf "${STAGING}.tar.gz" "$STAGING"
+          shasum -a 256 "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
+
+      # ── macOS .pkg installer ────────────────────────────────
+      - name: Build .pkg installer
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_ROOT="$(mktemp -d)"
+          SCRIPTS_DIR="$(mktemp -d)"
+
+          # Layout: /usr/local/bin/sendbox
+          mkdir -p "${PKG_ROOT}/usr/local/bin"
+          cp .build/release/sendbox "${PKG_ROOT}/usr/local/bin/"
+
+          # Layout: /usr/local/share/sendbox/config
+          mkdir -p "${PKG_ROOT}/usr/local/share/sendbox"
+          cp -r config "${PKG_ROOT}/usr/local/share/sendbox/"
+          cp setup.sh "${PKG_ROOT}/usr/local/share/sendbox/"
+
+          # Post-install script — remove quarantine so unsigned binary runs
+          cat > "${SCRIPTS_DIR}/postinstall" << 'POSTINSTALL'
+          #!/bin/bash
+          xattr -dr com.apple.quarantine /usr/local/bin/sendbox 2>/dev/null || true
+          echo "SendBox installed to /usr/local/bin/sendbox"
+          echo "Run 'sendbox --help' to get started."
+          POSTINSTALL
+          chmod +x "${SCRIPTS_DIR}/postinstall"
+
+          # Build the flat package (unsigned)
+          pkgbuild \
+            --root "${PKG_ROOT}" \
+            --scripts "${SCRIPTS_DIR}" \
+            --identifier "dev.sendbox.cli" \
+            --version "${VERSION}" \
+            --install-location "/" \
+            "sendbox-${VERSION}-macos-arm64.pkg"
+
+          shasum -a 256 "sendbox-${VERSION}-macos-arm64.pkg" > "sendbox-${VERSION}-macos-arm64.pkg.sha256"
+
+      # ── macOS .dmg ──────────────────────────────────────────
+      - name: Build .dmg image
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DMG_STAGING="$(mktemp -d)"
+          DMG_NAME="sendbox-${VERSION}-macos-arm64"
+
+          # Copy binary and support files
+          mkdir -p "${DMG_STAGING}/SendBox"
+          cp .build/release/sendbox "${DMG_STAGING}/SendBox/"
+          cp README.md LICENSE "${DMG_STAGING}/SendBox/"
+          cp -r config "${DMG_STAGING}/SendBox/"
+          cp setup.sh "${DMG_STAGING}/SendBox/"
+
+          # Create install script inside DMG
+          cat > "${DMG_STAGING}/SendBox/install.sh" << 'INSTALL'
+          #!/bin/bash
+          set -euo pipefail
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          echo "Installing SendBox to /usr/local/bin..."
+          cp "${SCRIPT_DIR}/sendbox" /usr/local/bin/sendbox
+          chmod +x /usr/local/bin/sendbox
+          xattr -dr com.apple.quarantine /usr/local/bin/sendbox 2>/dev/null || true
+          mkdir -p /usr/local/share/sendbox
+          cp -r "${SCRIPT_DIR}/config" /usr/local/share/sendbox/
+          echo "✔ SendBox installed. Run 'sendbox --help' to get started."
+          INSTALL
+          chmod +x "${DMG_STAGING}/SendBox/install.sh"
+
+          # Create the DMG
+          hdiutil create \
+            -volname "SendBox ${VERSION}" \
+            -srcfolder "${DMG_STAGING}/SendBox" \
+            -ov -format UDZO \
+            "${DMG_NAME}.dmg"
+
+          shasum -a 256 "${DMG_NAME}.dmg" > "${DMG_NAME}.dmg.sha256"
+
+      # ── Upload artifacts ────────────────────────────────────
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sendbox-${{ steps.version.outputs.version }}-macos-arm64
+          path: |
+            sendbox-*.tar.gz
+            sendbox-*.pkg
+            sendbox-*.dmg
+            sendbox-*.sha256
+
+  release:
+    name: Create GitHub Release
+    needs: build-package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sendbox-${{ steps.version.outputs.version }}-macos-arm64
+          path: dist/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "SendBox ${{ steps.version.outputs.version }}"
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ### Option 1 — Package installer (.pkg)
+            Download `sendbox-${{ steps.version.outputs.version }}-macos-arm64.pkg` and double-click to install.
+
+            ### Option 2 — DMG
+            Download `sendbox-${{ steps.version.outputs.version }}-macos-arm64.dmg`, open it, and run the included `install.sh`.
+
+            ### Option 3 — Tarball
+            ```bash
+            tar xzf sendbox-${{ steps.version.outputs.version }}-macos-arm64.tar.gz
+            sudo cp sendbox-${{ steps.version.outputs.version }}-macos-arm64/sendbox /usr/local/bin/
+            ```
+
+            ### Running unsigned binaries on macOS
+            These releases are **unsigned**. macOS Gatekeeper may block execution. To allow it:
+            ```bash
+            # Remove quarantine attribute (recommended)
+            xattr -dr com.apple.quarantine /usr/local/bin/sendbox
+
+            # Or, if you get "not allowed to execute", also run:
+            sudo spctl --master-disable   # disables Gatekeeper (re-enable with --master-enable)
+            ```
+
+            See the [README](https://github.com/mbianchidev/sendbox#running-unsigned-releases) for more details.
+
+            ### Verify checksums
+            ```bash
+            shasum -a 256 -c sendbox-${{ steps.version.outputs.version }}-macos-arm64.tar.gz.sha256
+            ```
+          files: |
+            dist/sendbox-*.tar.gz
+            dist/sendbox-*.tar.gz.sha256
+            dist/sendbox-*.pkg
+            dist/sendbox-*.pkg.sha256
+            dist/sendbox-*.dmg
+            dist/sendbox-*.dmg.sha256

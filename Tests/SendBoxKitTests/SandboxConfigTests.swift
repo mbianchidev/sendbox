@@ -1,0 +1,128 @@
+import Foundation
+import Testing
+import Yams
+@testable import SendBoxKit
+
+struct SandboxConfigTests {
+
+    private typealias Action = PolicyConfiguration.CommandPolicyConfig.Action
+
+    // MARK: - Default configuration
+
+    @Test func testDefaultConfig() {
+        let config = SandboxConfiguration.default(projectPath: "/home/user/my-project")
+        #expect(config.name == "my-project")
+        #expect(config.projectPath == "/home/user/my-project")
+        #expect(config.secrets.isEmpty)
+        #expect(config.github.forwardAuth == true)
+        #expect(config.github.forwardCopilotAuth == true)
+        #expect(config.devcontainer?.autoGenerate == true)
+    }
+
+    // MARK: - YAML serialization round-trip
+
+    @Test func testSerializationRoundTrip() throws {
+        let original = SandboxConfiguration.default(projectPath: "/projects/test")
+
+        let encoder = YAMLEncoder()
+        let yamlString = try encoder.encode(original)
+
+        let decoder = YAMLDecoder()
+        let decoded = try decoder.decode(SandboxConfiguration.self, from: yamlString)
+
+        #expect(decoded.name == original.name)
+        #expect(decoded.projectPath == original.projectPath)
+        #expect(decoded.resources.cpus == original.resources.cpus)
+        #expect(decoded.resources.memoryMB == original.resources.memoryMB)
+        #expect(decoded.resources.diskSizeMB == original.resources.diskSizeMB)
+        #expect(decoded.policy.commands.defaultAction == original.policy.commands.defaultAction)
+        #expect(decoded.policy.network.defaultAction == original.policy.network.defaultAction)
+        #expect(decoded.github.forwardAuth == original.github.forwardAuth)
+        #expect(decoded.secrets == original.secrets)
+    }
+
+    // MARK: - Loading from YAML string
+
+    @Test func testLoadFromYAML() throws {
+        let yaml = """
+        name: test-sandbox
+        project_path: /home/user/project
+        resources:
+          cpus: 2
+          memory_mb: 2048
+          disk_size_mb: 5120
+        policy:
+          commands:
+            default_action: allow
+            allowlist: []
+            denylist:
+              - sudo
+            log_blocked: true
+          network:
+            default_action: deny
+            allowed_domains:
+              - github.com
+            blocked_domains: []
+            allow_dns: true
+        secrets: []
+        github:
+          forward_auth: false
+          forward_copilot_auth: true
+        """
+
+        let data = Data(yaml.utf8)
+        let config = try SandboxConfiguration.load(from: data)
+
+        #expect(config.name == "test-sandbox")
+        #expect(config.projectPath == "/home/user/project")
+        #expect(config.resources.cpus == 2)
+        #expect(config.resources.memoryMB == 2048)
+        #expect(config.resources.diskSizeMB == 5120)
+        #expect(config.policy.commands.defaultAction == Action.allow)
+        #expect(config.policy.commands.denylist == ["sudo"])
+        #expect(config.policy.network.allowedDomains == ["github.com"])
+        #expect(config.github.forwardAuth == false)
+        #expect(config.github.forwardCopilotAuth == true)
+    }
+
+    // MARK: - Policy presets
+
+    @Test func testDefaultPolicyPreset() {
+        let policy = PolicyConfiguration.default
+        #expect(policy.commands.defaultAction == Action.deny)
+        #expect(policy.commands.allowlist.contains("git"))
+        #expect(policy.commands.allowlist.contains("npm"))
+        #expect(policy.network.defaultAction == Action.deny)
+        #expect(policy.network.allowedDomains.contains("github.com"))
+        #expect(policy.network.allowDNS == true)
+    }
+
+    @Test func testPermissivePolicyPreset() {
+        let policy = PolicyConfiguration.permissive
+        #expect(policy.commands.defaultAction == Action.allow)
+        #expect(policy.commands.denylist.contains("sudo"))
+        #expect(policy.commands.denylist.contains("su"))
+        #expect(policy.network.defaultAction == Action.allow)
+        #expect(policy.network.blockedDomains.isEmpty)
+    }
+
+    @Test func testStrictPolicyPreset() {
+        let policy = PolicyConfiguration.strict
+        #expect(policy.commands.defaultAction == Action.deny)
+        #expect(policy.commands.allowlist.contains("cat"))
+        #expect(policy.commands.allowlist.contains("ls"))
+        #expect(!policy.commands.allowlist.contains("curl"))
+        #expect(!policy.commands.allowlist.contains("npm"))
+        #expect(policy.network.maxConnections == 10)
+        #expect(policy.network.allowedDomains.contains("github.com"))
+    }
+
+    // MARK: - Resource defaults
+
+    @Test func testResourceDefaults() {
+        let resources = SandboxConfiguration.ResourceConfig.default
+        #expect(resources.cpus == 4)
+        #expect(resources.memoryMB == 4096)
+        #expect(resources.diskSizeMB == 10240)
+    }
+}

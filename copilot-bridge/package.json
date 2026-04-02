@@ -1,0 +1,22 @@
+{
+  "name": "@sendbox/copilot-bridge",
+  "version": "0.1.0",
+  "description": "Copilot SDK bridge for SendBox - analyzes projects and generates devcontainers",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "analyze": "tsx src/index.ts analyze",
+    "generate": "tsx src/index.ts generate"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
+  }
+}
