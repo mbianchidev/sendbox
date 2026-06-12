@@ -8,7 +8,7 @@ struct SendBox: AsyncParsableCommand {
         commandName: "sendbox",
         abstract: "Secure sandbox for AI agents using Apple Virtualization",
         version: "0.1.0",
-        subcommands: [Run.self, Init.self, Analyze.self, Secrets.self, Policy.self, Completions.self]
+        subcommands: [Run.self, Init.self, Analyze.self, Secrets.self, Policy.self, Mcp.self, Completions.self]
     )
 }
 
@@ -400,6 +400,195 @@ extension SendBox {
                 }
             }
         }
+    }
+}
+
+// MARK: - MCP Inspection
+
+extension SendBox {
+    struct Mcp: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Inspect Model Context Protocol (MCP) calls via eBPF",
+            subcommands: [Script.self, Parse.self, Report.self]
+        )
+
+        /// Build an inspection config from CLI flags, optionally seeded from a config file.
+        static func makeConfig(
+            configPath: String?,
+            noStdio: Bool,
+            noHttp: Bool,
+            redact: Bool
+        ) throws -> ObservabilityConfig.MCPInspectionConfig {
+            var base = ObservabilityConfig.MCPInspectionConfig.default
+            if let configPath {
+                let sandbox = try SandboxConfiguration.load(from: configPath)
+                if let mcp = sandbox.observability?.mcpInspection {
+                    base = mcp
+                }
+            }
+            var transports: [ObservabilityConfig.MCPInspectionConfig.Transport] = []
+            if !noStdio { transports.append(.stdio) }
+            if !noHttp { transports.append(.http) }
+            if transports.isEmpty { transports = [.stdio] }
+            return ObservabilityConfig.MCPInspectionConfig(
+                enabled: true,
+                transports: transports,
+                capturePayloads: redact ? false : base.capturePayloads,
+                maxPayloadBytes: base.maxPayloadBytes,
+                logPath: base.logPath,
+                serverCommandPatterns: base.serverCommandPatterns
+            )
+        }
+
+        // MARK: script
+
+        struct Script: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Print the bpftrace program (or guest startup script) for MCP inspection"
+            )
+
+            @Option(name: .long, help: "Path to sendbox config file")
+            var config: String?
+
+            @Flag(name: .long, help: "Print the guest startup bash script instead of the raw bpftrace program")
+            var startup = false
+
+            @Flag(name: .long, help: "Disable stdio (pipe) transport tracing")
+            var noStdio = false
+
+            @Flag(name: .long, help: "Disable HTTP/SSE (TLS) transport tracing")
+            var noHttp = false
+
+            func run() throws {
+                let mcpConfig = try Mcp.makeConfig(
+                    configPath: config, noStdio: noStdio, noHttp: noHttp, redact: false
+                )
+                let inspector = MCPInspector(config: mcpConfig)
+                print(startup
+                    ? inspector.generateStartupScript()
+                    : inspector.generateBpftraceProgram())
+            }
+        }
+
+        // MARK: parse
+
+        struct Parse: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Parse a captured MCP trace log into structured calls"
+            )
+
+            @Argument(help: "Path to the trace log file written by the inspector")
+            var logfile: String
+
+            @Flag(name: .long, help: "Emit parsed calls as JSON")
+            var json = false
+
+            @Flag(name: .long, help: "Redact payloads, keeping only method/id/tool metadata")
+            var redact = false
+
+            func run() throws {
+                guard FileManager.default.fileExists(atPath: logfile) else {
+                    printError("Trace log not found: \(logfile)")
+                    throw ExitCode.failure
+                }
+                let contents = try String(contentsOfFile: logfile, encoding: .utf8)
+                let inspector = MCPInspector(config: try Mcp.makeConfig(
+                    configPath: nil, noStdio: false, noHttp: false, redact: redact
+                ))
+                let calls = inspector.parseEvents(from: contents)
+
+                if json {
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                    let data = try encoder.encode(calls)
+                    print(String(data: data, encoding: .utf8) ?? "[]")
+                    return
+                }
+
+                if calls.isEmpty {
+                    printStatus("No MCP calls found in \(logfile)")
+                    return
+                }
+                for call in calls {
+                    let method = call.method ?? (call.kind == .spawn ? "<spawn>" : "<response>")
+                    let subject = call.subject.map { " (\($0))" } ?? ""
+                    let id = call.id.map { " id=\($0)" } ?? ""
+                    printStatus("[\(call.transport.rawValue)] \(call.kind.rawValue) "
+                        + "\(call.category.rawValue)/\(method)\(subject)\(id)")
+                }
+            }
+        }
+
+        // MARK: report
+
+        struct Report: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Summarise MCP activity from a captured trace log"
+            )
+
+            @Argument(help: "Path to the trace log file written by the inspector")
+            var logfile: String
+
+            func run() throws {
+                guard FileManager.default.fileExists(atPath: logfile) else {
+                    printError("Trace log not found: \(logfile)")
+                    throw ExitCode.failure
+                }
+                let contents = try String(contentsOfFile: logfile, encoding: .utf8)
+                let inspector = MCPInspector()
+                let calls = inspector.parseEvents(from: contents)
+                let summary = inspector.summarize(calls)
+
+                printStatus("MCP Inspection Report — \(logfile)")
+                printStatus("")
+                printStatus("Total calls:    \(summary.totalCalls)")
+                printStatus("Tool calls:     \(summary.toolCallCount)")
+                printStatus("Errors:         \(summary.errorCount)")
+
+                if !summary.servers.isEmpty {
+                    printStatus("")
+                    printStatus("MCP servers:")
+                    for server in summary.servers {
+                        printStatus("  • \(server)")
+                    }
+                }
+
+                if !summary.byCategory.isEmpty {
+                    printStatus("")
+                    printStatus("By category:")
+                    for (category, count) in summary.byCategory.sorted(by: { $0.value > $1.value }) {
+                        printStatus("  \(category.rawValue.padded(to: 14)) \(count)")
+                    }
+                }
+
+                if !summary.byTransport.isEmpty {
+                    printStatus("")
+                    printStatus("By transport:")
+                    for (transport, count) in summary.byTransport.sorted(by: { $0.value > $1.value }) {
+                        printStatus("  \(transport.rawValue.padded(to: 14)) \(count)")
+                    }
+                }
+
+                if !summary.toolInvocations.isEmpty {
+                    printStatus("")
+                    printStatus("Tool invocations:")
+                    for (tool, count) in summary.toolInvocations.sorted(by: { $0.value > $1.value }) {
+                        printStatus("  \(tool.padded(to: 24)) \(count)")
+                    }
+                }
+
+                if !summary.distinctMethods.isEmpty {
+                    printStatus("")
+                    printStatus("Distinct methods: \(summary.distinctMethods.joined(separator: ", "))")
+                }
+            }
+        }
+    }
+}
+
+private extension String {
+    func padded(to width: Int) -> String {
+        count >= width ? self : self + String(repeating: " ", count: width - count)
     }
 }
 

@@ -10,6 +10,7 @@ public actor AgentRunner {
     private let firewall: NetworkFirewall
     private let secrets: SecretsVault
     private let devcontainerBuilder: DevContainerBuilder
+    private let mcpInspector: MCPInspector?
     private let logger: Logger
 
     public enum RunnerState: String, Sendable {
@@ -75,6 +76,11 @@ public actor AgentRunner {
         self.firewall = NetworkFirewall(config: config.policy.network, logger: logger)
         self.secrets = SecretsVault(logger: logger)
         self.devcontainerBuilder = DevContainerBuilder(logger: logger)
+        if let mcpConfig = config.observability?.mcpInspection, mcpConfig.enabled {
+            self.mcpInspector = MCPInspector(config: mcpConfig, logger: logger)
+        } else {
+            self.mcpInspector = nil
+        }
         self.logger = logger
     }
 
@@ -231,8 +237,13 @@ public actor AgentRunner {
         var containerConfig = ContainerConfig.from(
             sandbox: config,
             imageReference: spec.image,
-            firewall: firewall
+            firewall: firewall,
+            mcpInspector: mcpInspector
         )
+
+        if mcpInspector != nil {
+            logger.info("eBPF MCP inspection enabled")
+        }
 
         // Merge authentication environment.
         for (key, value) in authEnv {

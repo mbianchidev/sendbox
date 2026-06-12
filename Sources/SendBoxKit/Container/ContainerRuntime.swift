@@ -212,16 +212,25 @@ public actor ContainerRuntime {
             // Inject firewall rules after container starts, if configured.
             if let firewallScript = config.firewallScript, !firewallScript.isEmpty {
                 logger.info("Injecting firewall rules into container \(config.id)")
-                let scriptPath = URL(fileURLWithPath: "/run/sendbox-firewall.sh")
-                let scriptData = Data(firewallScript.utf8)
-                try await container.copyIn(
-                    from: URL(fileURLWithPath: NSTemporaryDirectory())
-                        .appendingPathComponent("firewall-\(config.id).sh"),
-                    to: scriptPath,
-                    mode: 0o755
+                await injectBootScript(
+                    firewallScript,
+                    name: "firewall",
+                    guestPath: "/run/sendbox-firewall.sh",
+                    container: container,
+                    containerId: config.id
                 )
-                // TODO: Execute the firewall script inside the container after copyIn.
-                // The script needs to be written to a host-side temp location first.
+            }
+
+            // Inject and launch the eBPF MCP inspector, if configured.
+            if let mcpScript = config.mcpInspectionScript, !mcpScript.isEmpty {
+                logger.info("Injecting eBPF MCP inspector into container \(config.id)")
+                await injectBootScript(
+                    mcpScript,
+                    name: "mcp-inspector",
+                    guestPath: "/run/sendbox-mcp-setup.sh",
+                    container: container,
+                    containerId: config.id
+                )
             }
 
             activeContainers[config.id] = ContainerHandle(
@@ -342,6 +351,47 @@ public actor ContainerRuntime {
         } catch {
             throw RuntimeError.execFailed(error.localizedDescription)
         }
+    }
+
+    // MARK: - Boot Script Injection
+
+    /// Write a boot script to a host temp file, copy it into the guest, and run it.
+    ///
+    /// Best-effort: failures are logged but never abort container startup, so a
+    /// tracing or firewall hiccup cannot block the agent from running.
+    private func injectBootScript(
+        _ content: String,
+        name: String,
+        guestPath: String,
+        container: LinuxContainer,
+        containerId: String
+    ) async {
+        let hostURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("\(name)-\(containerId).sh")
+        do {
+            try Data(content.utf8).write(to: hostURL)
+            try await container.copyIn(
+                from: hostURL,
+                to: URL(fileURLWithPath: guestPath),
+                mode: 0o755
+            )
+            let execId = "\(name)-\(UUID().uuidString.prefix(8))"
+            let process = try await container.exec(execId) { processConfig in
+                processConfig.arguments = ["/bin/bash", guestPath]
+                processConfig.workingDirectory = "/"
+                processConfig.terminal = false
+            }
+            try await process.start()
+            let status = try await process.wait(timeoutInSeconds: 60)
+            if status.exitCode != 0 {
+                logger.warning("Boot script \(name) exited with code \(status.exitCode) in \(containerId)")
+            } else {
+                logger.debug("Boot script \(name) applied in \(containerId)")
+            }
+        } catch {
+            logger.warning("Failed to inject \(name) script into \(containerId): \(error)")
+        }
+        try? FileManager.default.removeItem(at: hostURL)
     }
 
     // MARK: - Output Streaming

@@ -29,6 +29,8 @@ public struct ContainerConfig: Sendable {
     public var firewallScript: String?
     /// DNS configuration content
     public var dnsConfig: String?
+    /// eBPF MCP inspector startup script content
+    public var mcpInspectionScript: String?
 
     public struct MountPoint: Sendable {
         public let source: String
@@ -66,7 +68,8 @@ public struct ContainerConfig: Sendable {
     public static func from(
         sandbox: SandboxConfiguration,
         imageReference: String,
-        firewall: NetworkFirewall
+        firewall: NetworkFirewall,
+        mcpInspector: MCPInspector? = nil
     ) -> ContainerConfig {
         let containerId = UUID().uuidString.lowercased()
 
@@ -111,6 +114,7 @@ public struct ContainerConfig: Sendable {
 
         let firewallScript = firewall.generateStartupScript()
         let dnsConfig = firewall.generateDNSConfig()
+        let mcpScript = mcpInspector?.generateStartupScript()
 
         return ContainerConfig(
             id: containerId,
@@ -125,7 +129,8 @@ public struct ContainerConfig: Sendable {
             mounts: mountPoints,
             network: networkConfig,
             firewallScript: firewallScript.isEmpty ? nil : firewallScript,
-            dnsConfig: dnsConfig.isEmpty ? nil : dnsConfig
+            dnsConfig: dnsConfig.isEmpty ? nil : dnsConfig,
+            mcpInspectionScript: (mcpScript?.isEmpty ?? true) ? nil : mcpScript
         )
     }
 }

@@ -24,6 +24,9 @@ public struct SandboxConfiguration: Codable, Sendable {
     /// GitHub authentication configuration
     public var github: GitHubConfig
 
+    /// Observability configuration (eBPF MCP inspection, etc.)
+    public var observability: ObservabilityConfig?
+
     // MARK: - CodingKeys
 
     private enum CodingKeys: String, CodingKey {
@@ -34,6 +37,7 @@ public struct SandboxConfiguration: Codable, Sendable {
         case secrets
         case devcontainer
         case github
+        case observability
     }
 
     // MARK: - Nested Types
@@ -125,7 +129,8 @@ extension SandboxConfiguration {
                 forwardAuth: true,
                 forwardCopilotAuth: true,
                 sshKeyPath: nil
-            )
+            ),
+            observability: .default
         )
     }
 }

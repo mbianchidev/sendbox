@@ -42,6 +42,7 @@ public actor AuditTrail {
             case secret
             case lifecycle
             case policy
+            case mcp
         }
 
         public enum Outcome: String, Codable, Sendable {
