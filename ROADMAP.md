@@ -256,6 +256,7 @@ Features planned after core platform and agent support is solid.
 
 ### Observability & Audit
 - [ ] Full audit log of all commands executed, network connections made, files modified
+- [x] eBPF inspection of MCP (Model Context Protocol) calls the agent performs
 - [ ] Real-time dashboard (TUI) showing agent activity
 - [ ] Export audit logs as JSON/CSV for compliance
 - [ ] Cost tracking (API calls made by agent, token usage if available)

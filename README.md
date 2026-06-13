@@ -14,6 +14,7 @@ SendBox provides hardware-isolated execution environments for AI agents using Ap
 - **Credential Injection** — Secrets loaded from macOS Keychain injected via reverse proxy (`--proxy-credential`, agent never sees raw tokens) or environment variables (`--env-credential`). Predefined rules for OpenAI, Anthropic, GitHub, Google AI, and npm.
 - **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
 - **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
+- **MCP Inspection (eBPF)** — Observe Model Context Protocol JSON-RPC traffic between the agent and its MCP servers at the kernel boundary. Captures both stdio and HTTP/SSE transports, classifies tool calls, and feeds the audit trail. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
 - **Supply Chain Provenance** — Ed25519 signing for config and policy files ensures they were authored by trusted identities. Multi-signer support with a configurable trust store.
 - **Runtime Supervisor** — Dynamic permission expansion with approval workflows. Agents start restricted and earn broader permissions through supervised interaction (one-time, session-wide, or pattern-based grants).
 - **VM Hardening** — Defense-in-depth sysctl lockdown, capability dropping, and seccomp profiles covering all 18 [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) scenarios.
@@ -148,6 +149,16 @@ devcontainer:
   features:
     - ghcr.io/devcontainers/features/git:1
     - ghcr.io/devcontainers/features/node:1
+
+observability:
+  mcp_inspection:
+    enabled: true              # opt-in; disabled by default
+    transports:                # stdio | http
+      - stdio
+      - http
+    capture_payloads: true     # false → metadata only (method/id/tool name)
+    max_payload_bytes: 16384
+    log_path: /var/log/sendbox/mcp-trace.log
 ```
 
 ### Configuration Reference
@@ -164,6 +175,9 @@ devcontainer:
 | `security.network.outbound` | object | Outbound network rules |
 | `security.secrets` | list | Secrets injected at runtime |
 | `devcontainer.generate` | bool | Whether to generate a devcontainer spec |
+| `observability.mcp_inspection.enabled` | bool | Enable eBPF MCP call inspection (opt-in) |
+| `observability.mcp_inspection.transports` | list | Transports to trace: `stdio`, `http` |
+| `observability.mcp_inspection.capture_payloads` | bool | Capture full payloads, or metadata only when `false` |
 
 ## Architecture
 
@@ -232,6 +246,7 @@ SUBCOMMANDS:
   status        Show status of active sandboxes
   config        Validate or display resolved configuration
   devcontainer  Generate a devcontainer.json from the current config
+  mcp           Inspect Model Context Protocol calls via eBPF
   help          Show help for any subcommand
 ```
 
@@ -258,6 +273,13 @@ sendbox status
 
 # Generate devcontainer spec
 sendbox devcontainer --config sendbox.yaml --output .devcontainer/
+
+# Print the eBPF program SendBox uses to inspect MCP calls
+sendbox mcp script
+
+# Parse a captured trace log and summarise MCP activity
+sendbox mcp parse /var/log/sendbox/mcp-trace.log
+sendbox mcp report /var/log/sendbox/mcp-trace.log
 ```
 
 ## Contributing
