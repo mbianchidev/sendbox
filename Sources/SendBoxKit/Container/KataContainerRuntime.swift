@@ -52,7 +52,13 @@ public actor KataContainerRuntime: RuntimeProvider {
     ) {
         self.configuration = configuration
         self.logger = logger
-        self.commandRunner = HostCommand.run
+        self.commandRunner = { executable, arguments, environment in
+            try await HostCommand.run(
+                executable: executable,
+                arguments: arguments,
+                environment: environment
+            )
+        }
     }
 
     init(

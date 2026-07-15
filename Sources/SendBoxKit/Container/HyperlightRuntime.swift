@@ -235,7 +235,11 @@ public actor HyperlightRuntime: RuntimeProvider {
 
         let result: HostCommandResult
         do {
-            result = try await task.value
+            result = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
         } catch {
             throw RuntimeError.commandFailed(exitCode: -1, stderr: error.localizedDescription)
         }
@@ -247,7 +251,7 @@ public actor HyperlightRuntime: RuntimeProvider {
         )
     }
 
-    /// Start a bidirectional stdio MCP server in a fresh Hyperlight micro-VM.
+    /// Start a network-transport MCP server in a fresh Hyperlight micro-VM.
     public func mcpExec(
         containerId: String,
         command: [String],
@@ -452,6 +456,11 @@ public actor HyperlightRuntime: RuntimeProvider {
                 "network access with DNS disabled because Hyperlight permits resolver traffic"
             )
         }
+        if networkingEnabled && config.network.maxConnections != nil {
+            throw RuntimeError.unsupported(
+                "network connection limits because Hyperlight cannot enforce them"
+            )
+        }
     }
 
     private static let hostEnvironment = [
@@ -542,25 +551,19 @@ public actor HyperlightRuntime: RuntimeProvider {
     }
 }
 
-/// A bidirectional stdio connection to an MCP server running in Hyperlight.
+/// A managed network-transport MCP server process running in Hyperlight.
 public final class HyperlightMCPSession: @unchecked Sendable {
     private let process: Process
-    private let input: FileHandle
-    private let output: FileHandle
-    private let errorOutput: FileHandle
     private let lock = NSLock()
 
     fileprivate init(executable: String, arguments: [String]) throws {
         let process = Process()
-        let inputPipe = Pipe()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [executable] + arguments
-        process.standardInput = inputPipe
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.standardError
         process.environment = [
             "LANG": "C",
             "PATH": "/usr/bin:/bin",
@@ -568,43 +571,14 @@ public final class HyperlightMCPSession: @unchecked Sendable {
         try process.run()
 
         self.process = process
-        self.input = inputPipe.fileHandleForWriting
-        self.output = outputPipe.fileHandleForReading
-        self.errorOutput = errorPipe.fileHandleForReading
     }
 
     public var isRunning: Bool {
         process.isRunning
     }
 
-    /// Write one newline-delimited JSON-RPC message to the MCP server.
-    public func send(_ message: Data) throws {
-        var payload = message
-        if payload.last != 0x0A {
-            payload.append(0x0A)
-        }
-        lock.lock()
-        defer { lock.unlock() }
-        try input.write(contentsOf: payload)
-    }
-
-    /// Read the next available response bytes from the MCP server.
-    public func receive(maxBytes: Int = 65_536) async throws -> Data {
-        try await Task.detached {
-            try self.output.read(upToCount: maxBytes) ?? Data()
-        }.value
-    }
-
-    /// Read diagnostic bytes emitted on stderr.
-    public func receiveError(maxBytes: Int = 65_536) async throws -> Data {
-        try await Task.detached {
-            try self.errorOutput.read(upToCount: maxBytes) ?? Data()
-        }.value
-    }
-
     public func stop() {
         lock.lock()
-        try? input.close()
         if process.isRunning {
             process.terminate()
             process.waitUntilExit()
@@ -614,8 +588,6 @@ public final class HyperlightMCPSession: @unchecked Sendable {
 
     deinit {
         stop()
-        try? output.close()
-        try? errorOutput.close()
     }
 }
 

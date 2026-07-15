@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import SendBoxKit
@@ -16,7 +17,7 @@ struct HyperlightRuntimeTests {
             for: makeContainerConfig(
                 allowedHosts: ["api.github.com", "registry.npmjs.org"]
             ),
-            command: ["node", "/workspaces/project/server.js", "--stdio"]
+            command: ["node", "/workspaces/project/server.js", "--http"]
         )
 
         #expect(arguments[0] == "/opt/hyperlight/shell-kernel")
@@ -38,7 +39,7 @@ struct HyperlightRuntimeTests {
             arguments.suffix(2)
                 == [
                     "--exec",
-                    "'node' '/workspaces/project/server.js' '--stdio'",
+                    "'node' '/workspaces/project/server.js' '--http'",
                 ]
         )
     }

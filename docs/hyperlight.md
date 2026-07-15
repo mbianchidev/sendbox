@@ -42,12 +42,12 @@ blocklist is mapped to Hyperlight's network options. Read-only mounts are
 staged in private temporary directories so the guest cannot modify their host
 sources.
 
-MCP servers use `HyperlightRuntime.mcpExec`, which returns a
-`HyperlightMCPSession` with `send`, `receive`, and `receiveError` methods for
-stdio JSON-RPC. The server is stopped with its parent runtime. Include the
-server and its runtime (for example, Node.js or Python) in the CPIO rootfs.
-HTTP MCP servers additionally need their destinations in
-`policy.network.allowed_domains`.
+Network-transport MCP servers use `HyperlightRuntime.mcpExec`, which returns a
+`HyperlightMCPSession` process handle. The server is stopped with its parent
+runtime. Include the server and its runtime (for example, Node.js or Python) in
+the CPIO rootfs and configure its destinations in
+`policy.network.allowed_domains`. Stdio MCP is not supported because
+`hyperlight-unikraft` does not forward host stdin into the guest.
 
 ## Limitations
 
@@ -57,5 +57,7 @@ HTTP MCP servers additionally need their destinations in
 - Hyperlight always permits resolver traffic when networking is enabled, so
   SendBox fails closed when a policy combines network access with
   `allow_dns: false`.
+- Hyperlight cannot enforce a maximum connection count, so SendBox fails closed
+  when networking is enabled and `max_connections` is configured.
 - Hyperlight is selected explicitly; `runtime.provider: auto` continues to use
   Apple Containerization on macOS and Kata Containers on Linux.
