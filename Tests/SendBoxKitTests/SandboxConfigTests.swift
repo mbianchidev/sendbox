@@ -19,6 +19,7 @@ struct SandboxConfigTests {
         #expect(config.devcontainer?.autoGenerate == true)
         #expect(config.runtime?.provider == .automatic)
         #expect(config.runtime?.kata.runtimeHandler == "io.containerd.kata.v2")
+        #expect(config.runtime?.hyperlight.executable == "hyperlight-unikraft")
     }
 
     // MARK: - YAML serialization round-trip
@@ -169,6 +170,51 @@ struct SandboxConfigTests {
         let runtime = try #require(config.runtime)
 
         #expect(runtime.kata == .default)
+    }
+
+    @Test func testLoadHyperlightRuntimeFromYAML() throws {
+        let yaml = """
+            name: hyperlight-sandbox
+            project_path: /home/user/project
+            runtime:
+              provider: hyperlight
+              hyperlight:
+                executable: /usr/local/bin/hyperlight-unikraft
+                kernel_path: /opt/hyperlight/shell-kernel
+                initrd_path: /opt/hyperlight/shell.cpio
+                stack_mb: 16
+                allowed_hosts:
+                  - api.github.com
+            resources:
+              cpus: 2
+              memory_mb: 256
+              disk_size_mb: 5120
+            policy:
+              commands:
+                default_action: allow
+                allowlist: []
+                denylist: []
+                log_blocked: true
+              network:
+                default_action: deny
+                allowed_domains: []
+                blocked_domains: []
+                allow_dns: true
+            secrets: []
+            github:
+              forward_auth: false
+              forward_copilot_auth: false
+            """
+
+        let config = try SandboxConfiguration.load(from: Data(yaml.utf8))
+        let runtime = try #require(config.runtime)
+
+        #expect(runtime.provider == .hyperlight)
+        #expect(runtime.hyperlight.executable == "/usr/local/bin/hyperlight-unikraft")
+        #expect(runtime.hyperlight.kernelPath == "/opt/hyperlight/shell-kernel")
+        #expect(runtime.hyperlight.initrdPath == "/opt/hyperlight/shell.cpio")
+        #expect(runtime.hyperlight.stackMB == 16)
+        #expect(runtime.hyperlight.allowedHosts == ["api.github.com"])
     }
 
     // MARK: - Policy presets
