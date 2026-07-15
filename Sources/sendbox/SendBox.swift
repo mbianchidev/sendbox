@@ -2,11 +2,31 @@ import ArgumentParser
 import Foundation
 import SendBoxKit
 
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
+
+enum RuntimeOption: String, ExpressibleByArgument, CaseIterable {
+    case automatic = "auto"
+    case apple
+    case kata
+
+    var provider: RuntimeConfiguration.Provider {
+        switch self {
+        case .automatic: return .automatic
+        case .apple: return .apple
+        case .kata: return .kata
+        }
+    }
+}
+
 @main
 struct SendBox: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "sendbox",
-        abstract: "Secure sandbox for AI agents using Apple Virtualization",
+        abstract: "Secure hardware-isolated sandbox for AI agents",
         version: "0.1.0",
         subcommands: [Run.self, Init.self, Analyze.self, Secrets.self, Policy.self, Mcp.self, Completions.self]
     )
@@ -28,6 +48,9 @@ extension SendBox {
 
         @Option(name: .long, help: "Security policy preset (default, permissive, strict)")
         var policy: PolicyPreset?
+
+        @Option(name: .long, help: "Runtime provider (auto, apple, kata)")
+        var runtime: RuntimeOption?
 
         enum PolicyPreset: String, ExpressibleByArgument, CaseIterable {
             case `default`
@@ -58,6 +81,13 @@ extension SendBox {
             if let preset = policy {
                 sandboxConfig.policy = preset.policyConfiguration
                 printStatus("Using \(preset.rawValue) policy preset")
+            }
+
+            if let runtime {
+                var runtimeConfiguration = sandboxConfig.runtime ?? .default
+                runtimeConfiguration.provider = runtime.provider
+                sandboxConfig.runtime = runtimeConfiguration
+                printStatus("Using \(runtime.rawValue) runtime provider")
             }
 
             let runner = AgentRunner(config: sandboxConfig)
@@ -97,6 +127,9 @@ extension SendBox {
         @Option(name: .long, help: "Security policy preset (default, permissive, strict)")
         var policy: Run.PolicyPreset?
 
+        @Option(name: .long, help: "Runtime provider (auto, apple, kata)")
+        var runtime: RuntimeOption?
+
         func run() throws {
             let projectPath = project ?? FileManager.default.currentDirectoryPath
             let configFilePath = (projectPath as NSString)
@@ -114,6 +147,12 @@ extension SendBox {
 
             if let preset = policy {
                 config.policy = preset.policyConfiguration
+            }
+
+            if let runtime {
+                var runtimeConfiguration = config.runtime ?? .default
+                runtimeConfiguration.provider = runtime.provider
+                config.runtime = runtimeConfiguration
             }
 
             try config.save(to: configFilePath)
@@ -196,8 +235,7 @@ extension SendBox {
             var key: String
 
             func run() throws {
-                print("Enter value for '\(key)': ", terminator: "")
-                fflush(stdout)
+                FileHandle.standardOutput.write(Data("Enter value for '\(key)': ".utf8))
 
                 // Disable terminal echo for secure input.
                 var oldTermios = termios()

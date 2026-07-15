@@ -1,8 +1,8 @@
 # SendBox
 
-**Secure, lightweight agent sandboxing on Apple Silicon.**
+**Secure, hardware-isolated agent sandboxing on macOS and Linux.**
 
-SendBox provides hardware-isolated execution environments for AI agents using Apple's [Virtualization framework](https://developer.apple.com/documentation/virtualization) and [Containerization](https://github.com/apple/containerization). Every agent runs inside a minimal Linux VM with fine-grained controls over filesystem access, network connectivity, command execution, and secret management.
+SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's [Containerization](https://github.com/apple/containerization) framework on Apple silicon and [Kata Containers](https://katacontainers.io/) through nerdctl/containerd on Linux.
 
 ---
 
@@ -11,7 +11,8 @@ SendBox provides hardware-isolated execution environments for AI agents using Ap
 - **File Isolation** — Mount only the directories an agent needs. Everything else is invisible.
 - **Command Filtering** — Allowlist or denylist which binaries an agent may execute inside the sandbox.
 - **Network Firewall** — Restrict outbound traffic to specific hosts, ports, or protocols.
-- **Credential Injection** — Secrets loaded from macOS Keychain injected via reverse proxy (`--proxy-credential`, agent never sees raw tokens) or environment variables (`--env-credential`). Predefined rules for OpenAI, Anthropic, GitHub, Google AI, and npm.
+- **Runtime Providers** — Select Apple Containerization or Kata Containers through one lifecycle API and `--runtime`.
+- **Credential Injection** — Secrets load from macOS Keychain or the protected Linux secret store and are injected without persisting them in the guest filesystem.
 - **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
 - **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
 - **MCP Inspection (eBPF)** — Observe Model Context Protocol JSON-RPC traffic between the agent and its MCP servers at the kernel boundary. Captures both stdio and HTTP/SSE transports, classifies tool calls, and feeds the audit trail. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
@@ -22,19 +23,23 @@ SendBox provides hardware-isolated execution environments for AI agents using Ap
 
 ## Requirements
 
-| Dependency | Minimum Version |
-|---|---|
-| macOS | 26 (Tahoe) |
-| Hardware | Apple Silicon (M1 or later) |
-| Xcode | 26 |
-| Swift | 6.1 |
-| Node.js | 20+ (for copilot-bridge) |
+| Scope | Dependency | Minimum |
+|---|---|---|
+| Common | Swift | 6.2 |
+| Common | Node.js | 20+ for `copilot-bridge` |
+| Apple runtime | macOS | 26 (Tahoe) |
+| Apple runtime | Hardware | Apple Silicon |
+| Apple runtime | Xcode | 26 |
+| Kata runtime | Linux | Bare metal or nested virtualization |
+| Kata runtime | Kata Containers | 3.28 |
+| Kata runtime | containerd | 1.7 |
+| Kata runtime | nerdctl and CNI plugins | Current compatible releases |
 
 ## Quick Start
 
 ### Install
 
-**From releases (prebuilt):**
+**From releases (prebuilt macOS artifacts):**
 
 Download the latest `.pkg`, `.dmg`, or tarball from [Releases](https://github.com/mbianchidev/sendbox/releases).
 
@@ -55,7 +60,15 @@ cd sendbox
 make install
 ```
 
-### Running Unsigned Releases
+For an interactive runtime preflight and configuration flow:
+
+```bash
+./setup.sh
+```
+
+Kata installation and containerd configuration are documented in [docs/kata-containers.md](docs/kata-containers.md).
+
+### Running Unsigned macOS Releases
 
 Releases are **not code-signed**. macOS Gatekeeper will block the binary on first run.
 Use one of these methods to allow it:
@@ -83,6 +96,7 @@ Create a `sendbox.yaml` in your project root (see [Configuration](#configuration
 
 ```bash
 sendbox init
+sendbox init --runtime kata
 ```
 
 ### Run
@@ -90,73 +104,56 @@ sendbox init
 ```bash
 # Launch an agent inside the sandbox
 sendbox run --config sendbox.yaml
-
-# One-shot command execution
-sendbox exec --config sendbox.yaml -- echo "hello from the sandbox"
+sendbox run --config sendbox.yaml --runtime kata
 ```
 
 ## Configuration
 
-SendBox is configured through a YAML file. Below is a complete example showing all available options:
+SendBox is configured through YAML. See [config/example-sandbox.yaml](config/example-sandbox.yaml) for the fully annotated reference.
 
 ```yaml
-# sendbox.yaml
-sandbox:
-  name: my-agent-sandbox
-  image: ghcr.io/mbianchidev/sendbox-base:latest
+name: my-agent-sandbox
+project_path: /home/developer/my-project
+
+runtime:
+  provider: auto # auto | apple | kata
+  kata:
+    executable: nerdctl
+    runtime_handler: io.containerd.kata.v2
+    namespace: sendbox
 
 resources:
   cpus: 2
-  memory: 2048  # MB
+  memory_mb: 2048
+  disk_size_mb: 5120
 
-filesystem:
-  mounts:
-    - host: ./workspace
-      guest: /home/agent/workspace
-      readonly: false
-    - host: ~/.ssh/id_ed25519.pub
-      guest: /home/agent/.ssh/authorized_keys
-      readonly: true
-
-security:
+policy:
   commands:
-    mode: allowlist          # allowlist | denylist
-    list:
-      - /usr/bin/git
-      - /usr/bin/curl
-      - /usr/local/bin/node
-
+    default_action: deny
+    allowlist: ["git *", "npm *", "swift *"]
+    denylist: ["sudo *"]
+    log_blocked: true
   network:
-    outbound:
-      allow:
-        - host: api.github.com
-          port: 443
-        - host: registry.npmjs.org
-          port: 443
-      deny:
-        - host: "*"          # deny everything else
+    default_action: deny
+    allowed_domains: ["github.com", "*.github.com"]
+    blocked_domains: []
+    allow_dns: true
 
-  secrets:
-    - name: GITHUB_TOKEN
-      source: env            # env | file | keychain
-    - name: NPM_TOKEN
-      source: file
-      path: ~/.secrets/npm
+secrets: [GITHUB_TOKEN]
 
 devcontainer:
-  generate: true
-  output: .devcontainer/devcontainer.json
-  features:
-    - ghcr.io/devcontainers/features/git:1
-    - ghcr.io/devcontainers/features/node:1
+  auto_generate: true
+  extensions: [github.copilot]
+
+github:
+  forward_auth: true
+  forward_copilot_auth: true
 
 observability:
   mcp_inspection:
-    enabled: true              # opt-in; disabled by default
-    transports:                # stdio | http
-      - stdio
-      - http
-    capture_payloads: true     # false → metadata only (method/id/tool name)
+    enabled: false
+    transports: [stdio, http]
+    capture_payloads: false
     max_payload_bytes: 16384
     log_path: /var/log/sendbox/mcp-trace.log
 ```
@@ -165,51 +162,35 @@ observability:
 
 | Section | Key | Description |
 |---|---|---|
-| `sandbox.name` | string | Human-readable name for the sandbox instance |
-| `sandbox.image` | string | Base container image to use |
+| `name` | string | Human-readable sandbox name |
+| `project_path` | string | Host project directory mounted into the guest |
+| `runtime.provider` | enum | `auto`, `apple`, or `kata` |
+| `runtime.kata.runtime_handler` | string | Kata containerd runtime v2 handler |
+| `runtime.kata.namespace` | string | containerd namespace |
+| `runtime.kata.configuration_path` | string | Absolute Kata config path on the containerd host |
 | `resources.cpus` | int | Number of virtual CPUs |
-| `resources.memory` | int | Memory allocation in MB |
-| `filesystem.mounts` | list | Host-to-guest filesystem mounts |
-| `security.commands.mode` | string | `allowlist` or `denylist` |
-| `security.commands.list` | list | Paths to allowed/denied binaries |
-| `security.network.outbound` | object | Outbound network rules |
-| `security.secrets` | list | Secrets injected at runtime |
-| `devcontainer.generate` | bool | Whether to generate a devcontainer spec |
+| `resources.memory_mb` | int | Memory allocation in MB |
+| `resources.disk_size_mb` | int | Requested writable-layer size |
+| `policy.commands` | object | Command allowlist/denylist policy |
+| `policy.network` | object | Outbound network policy |
+| `secrets` | list | Secret names injected at runtime |
+| `devcontainer.auto_generate` | bool | Generate a devcontainer spec |
 | `observability.mcp_inspection.enabled` | bool | Enable eBPF MCP call inspection (opt-in) |
-| `observability.mcp_inspection.transports` | list | Transports to trace: `stdio`, `http` |
-| `observability.mcp_inspection.capture_payloads` | bool | Capture full payloads, or metadata only when `false` |
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│  Host (macOS)                                    │
-│                                                  │
-│  ┌─────────┐   ┌──────────────┐                  │
-│  │ sendbox  │──▶│ SendBoxKit   │                  │
-│  │   CLI    │   │              │                  │
-│  └─────────┘   │ ┌──────────┐ │  ┌─────────────┐ │
-│                │ │ Config   │ │  │  Copilot     │ │
-│                │ ├──────────┤ │  │  Bridge      │ │
-│                │ │ Security │ │──│  (Node.js)   │ │
-│                │ ├──────────┤ │  └─────────────┘ │
-│                │ │Container │ │                   │
-│                │ ├──────────┤ │                   │
-│                │ │ Agent    │ │                   │
-│                │ └──────────┘ │                   │
-│                └──────┬───────┘                   │
-│                       │ Virtualization.framework  │
-│  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ │
-│                       ▼                           │
-│            ┌────────────────────┐                 │
-│            │  Lightweight VM    │                 │
-│            │  (Linux guest)     │                 │
-│            │                    │                 │
-│            │  ┌──────────────┐  │                 │
-│            │  │ Agent Process│  │                 │
-│            │  └──────────────┘  │                 │
-│            └────────────────────┘                 │
-└──────────────────────────────────────────────────┘
+┌─────────────┐     ┌─────────────────┐
+│ sendbox CLI │────▶│ RuntimeProvider │
+└─────────────┘     └────────┬────────┘
+                    ┌────────┴─────────┐
+                    ▼                  ▼
+          Apple Containerization   nerdctl/containerd
+             (macOS arm64)          + Kata shim (Linux)
+                    │                  │
+                    └────────┬─────────┘
+                             ▼
+                  Dedicated Linux guest VM
 ```
 
 **SendBoxKit** is the core library organized into four modules:
@@ -218,7 +199,7 @@ observability:
 |---|---|
 | `Config` | Parse and validate YAML configuration |
 | `Security` | Enforce command filtering, network rules, and secret injection |
-| `Container` | Manage VM lifecycle via Apple Containerization / Virtualization |
+| `Container` | Select and manage Apple or Kata VM runtimes |
 | `Agent` | Coordinate agent process execution and I/O |
 
 The **copilot-bridge** is an optional Node.js sidecar that exposes a JSON-RPC interface for IDE integrations.
@@ -230,7 +211,7 @@ SendBox follows a **deny-by-default** security posture:
 1. **Filesystem** — Only explicitly mounted paths are visible inside the VM. The host filesystem is never exposed wholesale.
 2. **Commands** — By default no binaries are available. Use `allowlist` mode to grant access to specific tools, or `denylist` mode to start permissive and lock down selectively.
 3. **Network** — Outbound connections are blocked unless a matching `allow` rule exists. DNS resolution is restricted to permitted hosts.
-4. **Secrets** — Credentials are injected as environment variables at VM boot and are never written to the guest filesystem. Sources include host environment variables, files, and the macOS Keychain.
+4. **Secrets** — Credentials are injected at container creation and never persisted in the guest filesystem. Host storage uses Keychain on macOS and mode-restricted files on Linux.
 5. **Isolation** — Each sandbox runs in its own lightweight VM. A compromised agent cannot affect the host or other sandboxes.
 
 ## CLI Reference
@@ -241,12 +222,11 @@ USAGE: sendbox <subcommand> [options]
 SUBCOMMANDS:
   init          Initialize a new sendbox.yaml in the current directory
   run           Start the sandbox and launch the agent
-  exec          Execute a single command inside the sandbox
-  stop          Stop a running sandbox
-  status        Show status of active sandboxes
-  config        Validate or display resolved configuration
-  devcontainer  Generate a devcontainer.json from the current config
+  analyze       Analyze a project and generate a devcontainer spec
+  secrets       Add, remove, or list stored secrets
+  policy        Show or validate policies
   mcp           Inspect Model Context Protocol calls via eBPF
+  completions   Install or print shell completions
   help          Show help for any subcommand
 ```
 
@@ -256,23 +236,14 @@ SUBCOMMANDS:
 # Initialize a new project
 sendbox init
 
-# Validate configuration
-sendbox config --validate sendbox.yaml
-
-# Run with verbose logging
-sendbox run --config sendbox.yaml --log-level debug
-
-# Execute a command and capture output
-sendbox exec --config sendbox.yaml -- python3 script.py
-
-# Stop a sandbox by name
-sendbox stop my-agent-sandbox
-
-# List running sandboxes
-sendbox status
+# Run with the Kata backend
+sendbox run --config sendbox.yaml --runtime kata
 
 # Generate devcontainer spec
-sendbox devcontainer --config sendbox.yaml --output .devcontainer/
+sendbox analyze --project . --output .devcontainer/
+
+# Validate a sandbox configuration's policy
+sendbox policy validate --config sendbox.yaml
 
 # Print the eBPF program SendBox uses to inspect MCP calls
 sendbox mcp script

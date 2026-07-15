@@ -1,4 +1,4 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.2
 
 import PackageDescription
 
@@ -30,7 +30,11 @@ let package = Package(
         .target(
             name: "SendBoxKit",
             dependencies: [
-                .product(name: "Containerization", package: "containerization"),
+                .product(
+                    name: "Containerization",
+                    package: "containerization",
+                    condition: .when(platforms: [.macOS])
+                ),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Yams", package: "Yams"),
                 .product(name: "Logging", package: "swift-log"),

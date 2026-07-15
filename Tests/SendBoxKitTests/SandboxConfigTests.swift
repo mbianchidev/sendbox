@@ -17,6 +17,8 @@ struct SandboxConfigTests {
         #expect(config.github.forwardAuth == true)
         #expect(config.github.forwardCopilotAuth == true)
         #expect(config.devcontainer?.autoGenerate == true)
+        #expect(config.runtime?.provider == .automatic)
+        #expect(config.runtime?.kata.runtimeHandler == "io.containerd.kata.v2")
     }
 
     // MARK: - YAML serialization round-trip
@@ -39,6 +41,7 @@ struct SandboxConfigTests {
         #expect(decoded.policy.network.defaultAction == original.policy.network.defaultAction)
         #expect(decoded.github.forwardAuth == original.github.forwardAuth)
         #expect(decoded.secrets == original.secrets)
+        #expect(decoded.runtime == original.runtime)
     }
 
     // MARK: - Loading from YAML string
@@ -83,6 +86,89 @@ struct SandboxConfigTests {
         #expect(config.policy.network.allowedDomains == ["github.com"])
         #expect(config.github.forwardAuth == false)
         #expect(config.github.forwardCopilotAuth == true)
+        #expect(config.runtime == nil)
+    }
+
+    @Test func testLoadKataRuntimeFromYAML() throws {
+        let yaml = """
+            name: kata-sandbox
+            project_path: /home/user/project
+            runtime:
+              provider: kata
+              kata:
+                executable: /usr/local/bin/nerdctl
+                runtime_handler: io.containerd.kata-qemu.v2
+                namespace: sendbox-ci
+                address: /run/containerd/containerd.sock
+                snapshotter: overlayfs
+                configuration_path: /etc/kata-containers/configuration-qemu.toml
+            resources:
+              cpus: 2
+              memory_mb: 2048
+              disk_size_mb: 5120
+            policy:
+              commands:
+                default_action: allow
+                allowlist: []
+                denylist: []
+                log_blocked: true
+              network:
+                default_action: allow
+                allowed_domains: []
+                blocked_domains: []
+                allow_dns: true
+            secrets: []
+            github:
+              forward_auth: false
+              forward_copilot_auth: false
+            """
+
+        let config = try SandboxConfiguration.load(from: Data(yaml.utf8))
+        let runtime = try #require(config.runtime)
+
+        #expect(runtime.provider == .kata)
+        #expect(runtime.kata.executable == "/usr/local/bin/nerdctl")
+        #expect(runtime.kata.runtimeHandler == "io.containerd.kata-qemu.v2")
+        #expect(runtime.kata.namespace == "sendbox-ci")
+        #expect(runtime.kata.address == "/run/containerd/containerd.sock")
+        #expect(runtime.kata.snapshotter == "overlayfs")
+        #expect(
+            runtime.kata.configurationPath
+                == "/etc/kata-containers/configuration-qemu.toml"
+        )
+    }
+
+    @Test func testKataRuntimeDefaultsWhenSectionIsPartial() throws {
+        let yaml = """
+            name: kata-sandbox
+            project_path: /home/user/project
+            runtime:
+              provider: kata
+            resources:
+              cpus: 2
+              memory_mb: 2048
+              disk_size_mb: 5120
+            policy:
+              commands:
+                default_action: allow
+                allowlist: []
+                denylist: []
+                log_blocked: true
+              network:
+                default_action: allow
+                allowed_domains: []
+                blocked_domains: []
+                allow_dns: true
+            secrets: []
+            github:
+              forward_auth: false
+              forward_copilot_auth: false
+            """
+
+        let config = try SandboxConfiguration.load(from: Data(yaml.utf8))
+        let runtime = try #require(config.runtime)
+
+        #expect(runtime.kata == .default)
     }
 
     // MARK: - Policy presets

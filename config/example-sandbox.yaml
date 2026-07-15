@@ -23,6 +23,23 @@ name: my-project-sandbox
 project_path: /Users/developer/my-project
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Runtime Provider
+# ─────────────────────────────────────────────────────────────────────────────
+# "auto" selects Apple Containerization on supported macOS hosts and Kata
+# Containers on Linux. Override it with `sendbox run --runtime apple|kata`.
+runtime:
+  provider: auto
+
+  # Used only when provider is "kata".
+  kata:
+    executable: nerdctl
+    runtime_handler: io.containerd.kata.v2
+    namespace: sendbox
+    # address: /run/containerd/containerd.sock
+    # snapshotter: overlayfs
+    # configuration_path: /etc/kata-containers/configuration.toml
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Container Resources
 # ─────────────────────────────────────────────────────────────────────────────
 # Resource limits for the sandbox container. These are hard caps — the
