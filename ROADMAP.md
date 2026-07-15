@@ -4,16 +4,18 @@
 
 ---
 
-## Phase 1 — Foundation ✅ (Current)
+## Phase 1 — Foundation and Direct VM Runtimes ✅ (Current)
 
-The initial release targets macOS on Apple silicon using Apple's [Containerization](https://github.com/apple/containerization) framework and the [GitHub Copilot SDK](https://github.com/github/copilot-sdk).
+SendBox supports direct hardware-isolated runtimes on macOS and Linux: Apple's [Containerization](https://github.com/apple/containerization) framework on Apple silicon, and [Kata Containers](https://katacontainers.io/) through nerdctl/containerd on Linux.
 
 | Feature | Status |
 |---------|--------|
 | Lightweight Linux VMs via Virtualization.framework | ✅ Done |
+| Kata Containers runtime via nerdctl/containerd | ✅ Done |
+| RuntimeProvider abstraction and `--runtime` selection | ✅ Done |
 | Command allowlist / denylist engine | ✅ Done |
 | Domain-level network firewall (iptables) | ✅ Done |
-| macOS Keychain secrets management | ✅ Done |
+| macOS Keychain and Linux file-backed secrets management | ✅ Done |
 | DevContainer generation via Copilot SDK | ✅ Done |
 | YAML-based configuration with presets | ✅ Done |
 | CLI (`run`, `init`, `analyze`, `secrets`, `policy`) | ✅ Done |
@@ -21,11 +23,11 @@ The initial release targets macOS on Apple silicon using Apple's [Containerizati
 
 ---
 
-## Phase 2 — Cross-Platform via Kubernetes (KinD)
+## Phase 2 — Kubernetes Orchestration (KinD)
 
 ### Goal
 
-Remove the macOS-only requirement by supporting **Kubernetes in Docker (KinD)** as an alternative container runtime. This enables SendBox to run on **Linux, Windows (WSL2), and macOS (Intel + Apple silicon)**.
+Add **Kubernetes in Docker (KinD)** as an orchestrated runtime for Windows, Intel macOS, remote clusters, and multi-sandbox deployments. Linux already has direct Kata Containers support.
 
 ### Architecture
 
@@ -35,16 +37,16 @@ Remove the macOS-only requirement by supporting **Kubernetes in Docker (KinD)** 
 ├──────────────────┬──────────────────────────────────┤
 │  RuntimeProvider │  (protocol / trait / interface)   │
 ├──────────────────┼──────────────────────────────────┤
-│  AppleVMRuntime  │  KubernetesRuntime               │
-│  (macOS arm64)   │  (Linux, Windows, macOS x86)     │
-│  Virtualization  │  KinD + containerd               │
-│  .framework      │                                  │
+│ AppleVMRuntime   │ KataRuntime      │ Kubernetes     │
+│ (macOS arm64)    │ (Linux)          │ Runtime        │
+│ Virtualization   │ nerdctl +        │ KinD +         │
+│ .framework       │ containerd       │ containerd     │
 └──────────────────┴──────────────────────────────────┘
 ```
 
 ### Approach
 
-1. **Abstract the container runtime** behind a `RuntimeProvider` protocol so the sandbox logic (policies, firewall, secrets) is runtime-agnostic.
+1. **Extend the existing `RuntimeProvider` abstraction** with a Kubernetes implementation while keeping sandbox logic runtime-agnostic.
 
 2. **KinD backend** (`KubernetesRuntime`):
    - Requires Docker and [KinD](https://kind.sigs.k8s.io/) installed on the host.
@@ -67,7 +69,8 @@ Remove the macOS-only requirement by supporting **Kubernetes in Docker (KinD)** 
 3. **Runtime selection** — auto-detected or user-specified:
    ```yaml
    # .sendbox.yaml
-   runtime: auto          # auto | apple-vm | kubernetes
+   runtime:
+     provider: auto       # auto | apple | kata | kubernetes
    kubernetes:
      provider: kind       # kind | minikube | k3d | remote
      cluster_name: sendbox-cluster
@@ -85,15 +88,15 @@ Remove the macOS-only requirement by supporting **Kubernetes in Docker (KinD)** 
 
 ### Tasks
 
-- [ ] Define `RuntimeProvider` protocol with create/start/stop/exec/cleanup
+- [x] Define `RuntimeProvider` protocol with create/start/stop/exec/cleanup
 - [ ] Implement `KubernetesRuntime` using client-go or kubectl subprocess
 - [ ] Generate Kubernetes manifests (Pod, NetworkPolicy, Secret) from SendBox config
 - [ ] Implement FQDN-aware NetworkPolicy (Cilium CiliumNetworkPolicy or DNS-to-CIDR resolver)
 - [ ] Map command policy to OPA/Gatekeeper constraints or shell wrapper
 - [ ] KinD cluster lifecycle management (create, reuse, destroy)
-- [ ] Add `--runtime` flag to CLI
-- [ ] Cross-platform CI (GitHub Actions: macOS, Ubuntu, Windows)
-- [ ] Integration tests on Linux (no Apple Virtualization)
+- [x] Add `--runtime` flag to CLI
+- [ ] Cross-platform CI (macOS and Linux complete; Windows pending)
+- [x] Runtime unit tests on Linux (live Kata tests require nested virtualization)
 - [ ] Helm chart for remote Kubernetes clusters (EKS, GKE, AKS)
 
 ### Platform Support Matrix
@@ -101,6 +104,8 @@ Remove the macOS-only requirement by supporting **Kubernetes in Docker (KinD)** 
 | Platform | Runtime | Status |
 |----------|---------|--------|
 | macOS arm64 | Apple Virtualization | ✅ Supported |
+| Linux x86_64 | Kata Containers | ✅ Supported |
+| Linux arm64 | Kata Containers | ✅ Supported |
 | macOS arm64 | KinD | 🔲 Planned |
 | macOS x86_64 | KinD | 🔲 Planned |
 | Linux x86_64 | KinD | 🔲 Planned |

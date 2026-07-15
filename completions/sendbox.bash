@@ -173,13 +173,13 @@ _sendbox() {
     unset 'unparsed_words[0]'
     unparsed_words=("${unparsed_words[@]}")
     case "${subcommand}" in
-    run|init|analyze|secrets|policy|help)
+    run|init|analyze|secrets|policy|mcp|completions|help)
         # Offer subcommand argument completions
         "_sendbox_${subcommand}"
         ;;
     *)
         # Offer subcommand completions
-        COMPREPLY+=($(compgen -W 'run init analyze secrets policy help' -- "${cur}"))
+        COMPREPLY+=($(compgen -W 'run init analyze secrets policy mcp completions help' -- "${cur}"))
         ;;
     esac
 }
@@ -188,7 +188,7 @@ _sendbox_run() {
     repeating_flags=()
     non_repeating_flags=(--version -h --help)
     repeating_options=()
-    non_repeating_options=(--config --project --policy)
+    non_repeating_options=(--config --project --policy --runtime)
     __sendbox_offer_flags_options 0
 
     # Offer option value completions
@@ -203,6 +203,10 @@ _sendbox_run() {
         __sendbox_add_completions -W 'default'$'\n''permissive'$'\n''strict'
         return
         ;;
+    '--runtime')
+        __sendbox_add_completions -W 'auto'$'\n''apple'$'\n''kata'
+        return
+        ;;
     esac
 }
 
@@ -210,7 +214,7 @@ _sendbox_init() {
     repeating_flags=()
     non_repeating_flags=(--version -h --help)
     repeating_options=()
-    non_repeating_options=(--project --policy)
+    non_repeating_options=(--project --policy --runtime)
     __sendbox_offer_flags_options 0
 
     # Offer option value completions
@@ -220,6 +224,10 @@ _sendbox_init() {
         ;;
     '--policy')
         __sendbox_add_completions -W 'default'$'\n''permissive'$'\n''strict'
+        return
+        ;;
+    '--runtime')
+        __sendbox_add_completions -W 'auto'$'\n''apple'$'\n''kata'
         return
         ;;
     esac
@@ -338,6 +346,113 @@ _sendbox_policy_validate() {
     # Offer option value completions
     case "${prev}" in
     '--config')
+        return
+        ;;
+    esac
+}
+
+_sendbox_mcp() {
+    repeating_flags=()
+    non_repeating_flags=(--version -h --help)
+    repeating_options=()
+    non_repeating_options=()
+    __sendbox_offer_flags_options 0
+
+    # Offer subcommand / subcommand argument completions
+    local -r subcommand="${unparsed_words[0]}"
+    unset 'unparsed_words[0]'
+    unparsed_words=("${unparsed_words[@]}")
+    case "${subcommand}" in
+    script|parse|report)
+        # Offer subcommand argument completions
+        "_sendbox_mcp_${subcommand}"
+        ;;
+    *)
+        # Offer subcommand completions
+        COMPREPLY+=($(compgen -W 'script parse report' -- "${cur}"))
+        ;;
+    esac
+}
+
+_sendbox_mcp_script() {
+    repeating_flags=()
+    non_repeating_flags=(--startup --no-stdio --no-http --version -h --help)
+    repeating_options=()
+    non_repeating_options=(--config)
+    __sendbox_offer_flags_options 0
+
+    # Offer option value completions
+    case "${prev}" in
+    '--config')
+        return
+        ;;
+    esac
+}
+
+_sendbox_mcp_parse() {
+    repeating_flags=()
+    non_repeating_flags=(--json --redact --version -h --help)
+    repeating_options=()
+    non_repeating_options=()
+    __sendbox_offer_flags_options 1
+}
+
+_sendbox_mcp_report() {
+    repeating_flags=()
+    non_repeating_flags=(--version -h --help)
+    repeating_options=()
+    non_repeating_options=()
+    __sendbox_offer_flags_options 1
+}
+
+_sendbox_completions() {
+    repeating_flags=()
+    non_repeating_flags=(--version -h --help)
+    repeating_options=()
+    non_repeating_options=()
+    __sendbox_offer_flags_options 0
+
+    # Offer subcommand / subcommand argument completions
+    local -r subcommand="${unparsed_words[0]}"
+    unset 'unparsed_words[0]'
+    unparsed_words=("${unparsed_words[@]}")
+    case "${subcommand}" in
+    install|print)
+        # Offer subcommand argument completions
+        "_sendbox_completions_${subcommand}"
+        ;;
+    *)
+        # Offer subcommand completions
+        COMPREPLY+=($(compgen -W 'install print' -- "${cur}"))
+        ;;
+    esac
+}
+
+_sendbox_completions_install() {
+    repeating_flags=()
+    non_repeating_flags=(--version -h --help)
+    repeating_options=()
+    non_repeating_options=(--shell)
+    __sendbox_offer_flags_options 0
+
+    # Offer option value completions
+    case "${prev}" in
+    '--shell')
+        return
+        ;;
+    esac
+}
+
+_sendbox_completions_print() {
+    repeating_flags=()
+    non_repeating_flags=(--version -h --help)
+    repeating_options=()
+    non_repeating_options=(--shell)
+    __sendbox_offer_flags_options 0
+
+    # Offer option value completions
+    case "${prev}" in
+    '--shell')
         return
         ;;
     esac

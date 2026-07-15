@@ -1,6 +1,13 @@
 import Foundation
 import Logging
+
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
+#if canImport(Network)
 @preconcurrency import Network
+#endif
 
 /// Credential injection via reverse proxy or environment variables.
 ///
@@ -10,7 +17,7 @@ import Logging
 ///    on the host. The agent's requests to API endpoints are routed through this proxy,
 ///    which injects Authorization headers transparently. The agent never sees raw tokens.
 ///
-/// 2. **Env mode** (`--env-credential`): Secrets are loaded from the system keystore
+/// 2. **Env mode** (`--env-credential`): Secrets are loaded from the host secret store
 ///    and injected as environment variables into the container. Simpler but the agent
 ///    can read the values.
 ///
@@ -22,8 +29,11 @@ public actor CredentialProxy {
     private let logger: Logger
     private let proxyConfig: ProxyConfig
     private var proxyRules: [ProxyRule]
+    #if canImport(Network)
     private var listener: NWListener?
     private var activeConnections: [ObjectIdentifier: NWConnection] = [:]
+    #endif
+    private var listenerRunning = false
     private var proxyPort: Int?
     private var requestsProxied: Int = 0
     private var requestsFailed: Int = 0
@@ -198,7 +208,7 @@ public actor CredentialProxy {
 
     /// Start the credential proxy. Returns the port it's listening on.
     public func start() async throws -> Int {
-        guard listener == nil else {
+        guard !listenerRunning else {
             throw ProxyError.alreadyRunning
         }
 
@@ -209,22 +219,32 @@ public actor CredentialProxy {
             }
         }
 
+        #if canImport(Network)
         let port = try await startHTTPListener(port: proxyConfig.port)
+        listenerRunning = true
         self.proxyPort = port
         self.startTime = Date()
         logger.info("Credential proxy started", metadata: ["port": "\(port)"])
         return port
+        #else
+        throw ProxyError.configurationError(
+            "proxy mode requires Apple's Network framework; use env credential mode on Linux"
+        )
+        #endif
     }
 
     /// Stop the credential proxy and close all connections.
     public func stop() async {
+        #if canImport(Network)
         listener?.cancel()
         listener = nil
         for (_, connection) in activeConnections {
             connection.cancel()
         }
         activeConnections.removeAll()
+        #endif
         let uptime = startTime.map { Date().timeIntervalSince($0) }
+        listenerRunning = false
         proxyPort = nil
         startTime = nil
         logger.info("Credential proxy stopped", metadata: [
@@ -237,7 +257,7 @@ public actor CredentialProxy {
     /// Get current proxy status.
     public func status() -> ProxyStatus {
         ProxyStatus(
-            isRunning: listener != nil,
+            isRunning: listenerRunning,
             port: proxyPort,
             rulesCount: proxyRules.count,
             requestsProxied: requestsProxied,
@@ -553,11 +573,13 @@ public actor CredentialProxy {
 
     // MARK: - Internal — HTTP Server (Network.framework)
 
+    #if canImport(Network)
     /// Guards against double-resuming a checked continuation from NWListener / NWConnection
     /// state callbacks (which run on a serial dispatch queue).
     private final class OnceFlag: @unchecked Sendable {
         var fired = false
     }
+    #endif
 
     /// Parsed HTTP request components.
     private struct ParsedRequest: Sendable {
@@ -576,6 +598,7 @@ public actor CredentialProxy {
 
     /// Create an `NWListener` on localhost, wait for it to become ready,
     /// and return the actual port it bound to.
+    #if canImport(Network)
     private func startHTTPListener(port requestedPort: Int) async throws -> Int {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
@@ -657,6 +680,7 @@ public actor CredentialProxy {
     private func cleanUpListener() {
         listener?.cancel()
         listener = nil
+        listenerRunning = false
     }
 
     /// Accept and process a single connection.
@@ -769,6 +793,7 @@ public actor CredentialProxy {
             )
         }
     }
+    #endif
 
     // MARK: - Internal — HTTP Parsing
 

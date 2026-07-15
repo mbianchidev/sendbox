@@ -498,8 +498,7 @@ export class ProjectAnalyzer {
   ): Promise<ProjectAnalysis> {
     const client = new CopilotClient();
 
-    const readProjectFile = defineTool({
-      name: "readProjectFile",
+    const readProjectFile = defineTool<{ filePath: string }>("readProjectFile", {
       description:
         "Read a file from the project being analyzed. " +
         "Use this to inspect configuration files, source code, or any file " +
@@ -562,17 +561,19 @@ export class ProjectAnalyzer {
 
     log("Requesting Copilot analysis...");
 
-    const response = await client.chat({
-      messages: [{ role: "user", content: prompt }],
+    const session = await client.createSession({
       tools: [readProjectFile],
     });
+    let text = "";
+    try {
+      const response = await session.sendAndWait({ prompt });
+      text = response?.data.content ?? "";
+    } finally {
+      await session.disconnect();
+      await client.stop();
+    }
 
     // Parse Copilot's refinement suggestions
-    const text =
-      typeof response === "string"
-        ? response
-        : response?.message?.content ?? "";
-
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       try {
@@ -649,14 +650,15 @@ export class DevContainerGenerator {
         `Package manager: ${this.analysis.packageManager ?? "unknown"}`,
       ].join("\n");
 
-      const response = await client.chat({
-        messages: [{ role: "user", content: prompt }],
-      });
-
-      const text =
-        typeof response === "string"
-          ? response
-          : response?.message?.content ?? "";
+      const session = await client.createSession({});
+      let text = "";
+      try {
+        const response = await session.sendAndWait({ prompt });
+        text = response?.data.content ?? "";
+      } finally {
+        await session.disconnect();
+        await client.stop();
+      }
 
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (jsonMatch) {

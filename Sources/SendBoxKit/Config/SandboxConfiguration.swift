@@ -1,6 +1,94 @@
 import Foundation
 import Yams
 
+/// Host runtime selection for a sandbox.
+public struct RuntimeConfiguration: Codable, Sendable, Equatable {
+    public enum Provider: String, Codable, Sendable, CaseIterable {
+        case automatic = "auto"
+        case apple
+        case kata
+    }
+
+    public var provider: Provider
+    public var kata: KataRuntimeConfiguration
+
+    public static let `default` = RuntimeConfiguration()
+
+    public init(
+        provider: Provider = .automatic,
+        kata: KataRuntimeConfiguration = .default
+    ) {
+        self.provider = provider
+        self.kata = kata
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case provider
+        case kata
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.provider =
+            try container.decodeIfPresent(Provider.self, forKey: .provider) ?? .automatic
+        self.kata =
+            try container.decodeIfPresent(KataRuntimeConfiguration.self, forKey: .kata) ?? .default
+    }
+}
+
+/// nerdctl/containerd settings for the Kata Containers runtime provider.
+public struct KataRuntimeConfiguration: Codable, Sendable, Equatable {
+    public var executable: String
+    public var runtimeHandler: String
+    public var namespace: String
+    public var address: String?
+    public var snapshotter: String?
+    public var configurationPath: String?
+
+    public static let `default` = KataRuntimeConfiguration()
+
+    public init(
+        executable: String = "nerdctl",
+        runtimeHandler: String = "io.containerd.kata.v2",
+        namespace: String = "sendbox",
+        address: String? = nil,
+        snapshotter: String? = nil,
+        configurationPath: String? = nil
+    ) {
+        self.executable = executable
+        self.runtimeHandler = runtimeHandler
+        self.namespace = namespace
+        self.address = address
+        self.snapshotter = snapshotter
+        self.configurationPath = configurationPath
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case executable
+        case runtimeHandler = "runtime_handler"
+        case namespace
+        case address
+        case snapshotter
+        case configurationPath = "configuration_path"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.executable =
+            try container.decodeIfPresent(String.self, forKey: .executable) ?? "nerdctl"
+        self.runtimeHandler =
+            try container.decodeIfPresent(String.self, forKey: .runtimeHandler)
+            ?? "io.containerd.kata.v2"
+        self.namespace = try container.decodeIfPresent(String.self, forKey: .namespace) ?? "sendbox"
+        self.address = try container.decodeIfPresent(String.self, forKey: .address)
+        self.snapshotter = try container.decodeIfPresent(String.self, forKey: .snapshotter)
+        self.configurationPath = try container.decodeIfPresent(
+            String.self,
+            forKey: .configurationPath
+        )
+    }
+}
+
 /// Main configuration for a SendBox sandbox instance.
 public struct SandboxConfiguration: Codable, Sendable {
     /// Name identifier for this sandbox
@@ -8,6 +96,9 @@ public struct SandboxConfiguration: Codable, Sendable {
 
     /// Path to the project to sandbox
     public var projectPath: String
+
+    /// Host runtime provider and provider-specific settings
+    public var runtime: RuntimeConfiguration?
 
     /// Container resource configuration
     public var resources: ResourceConfig
@@ -32,6 +123,7 @@ public struct SandboxConfiguration: Codable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case name
         case projectPath = "project_path"
+        case runtime
         case resources
         case policy
         case secrets
@@ -117,6 +209,7 @@ extension SandboxConfiguration {
         return SandboxConfiguration(
             name: projectName,
             projectPath: projectPath,
+            runtime: .default,
             resources: .default,
             policy: .default,
             secrets: [],

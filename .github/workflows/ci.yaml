@@ -45,6 +45,31 @@ jobs:
       - name: Verify binary runs
         run: .build/release/sendbox --help
 
+  linux-build-and-test:
+    name: Linux Build & Test
+    runs-on: ubuntu-latest
+    container: swift:6.2@sha256:dd349c6dfc3cd3040910a84ab3e5bd5d08efdd547e5fb9f77b765abed16fe5ff
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Resolve dependencies
+        run: swift package resolve
+
+      - name: Build (debug)
+        run: swift build
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Verify binary runs
+        run: .build/release/sendbox --help
+
   lint:
     name: Lint
     runs-on: macos-15
@@ -69,7 +94,6 @@ jobs:
   copilot-bridge:
     name: Copilot Bridge
     runs-on: ubuntu-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: copilot-bridge
@@ -81,10 +105,10 @@ jobs:
           node-version: "22"
 
       - name: Install dependencies
-        run: npm install --ignore-scripts || echo "⚠ npm install failed (copilot-sdk may not be published yet)"
+        run: npm ci --ignore-scripts
 
-      - name: Type check
-        run: npx tsc --noEmit || echo "⚠ Type check skipped"
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
 
       - name: Build
-        run: npm run build || echo "⚠ Build skipped"
+        run: npm run build

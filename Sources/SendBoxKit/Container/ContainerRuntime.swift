@@ -1,16 +1,20 @@
 import Foundation
-import Containerization
 import Logging
+
+#if canImport(Containerization)
+import Containerization
 
 /// Manages the lifecycle of sandboxed Linux containers using Apple's Containerization framework.
 ///
 /// This actor wraps the `ContainerManager` from `apple/containerization` to provide
 /// a higher-level API for creating, running, and managing sandbox containers with
 /// integrated command-policy enforcement.
-public actor ContainerRuntime {
+public actor ContainerRuntime: RuntimeProvider {
     private let logger: Logger
     private var manager: ContainerManager?
     private var activeContainers: [String: ContainerHandle]
+
+    public typealias ContainerStatus = RuntimeContainerStatus
 
     public struct ContainerHandle: Sendable {
         public let id: String
@@ -23,14 +27,6 @@ public actor ContainerRuntime {
             self.status = status
             self.container = container
         }
-    }
-
-    public enum ContainerStatus: String, Sendable {
-        case creating
-        case running
-        case stopped
-        case failed
-        case unknown
     }
 
     public enum RuntimeError: Error, LocalizedError {
@@ -76,7 +72,11 @@ public actor ContainerRuntime {
     ///
     /// Locates a Linux kernel binary (or uses the provided path), then creates
     /// a `ContainerManager` backed by macOS Virtualization.framework.
-    public func initialize(kernelPath: String? = nil) async throws {
+    public func initialize() async throws {
+        try await initialize(kernelPath: nil)
+    }
+
+    public func initialize(kernelPath: String?) async throws {
         let resolvedPath: String
         if let kernelPath {
             resolvedPath = kernelPath
@@ -280,7 +280,7 @@ public actor ContainerRuntime {
     }
 
     /// Get the current status of a container.
-    public func containerStatus(id: String) -> ContainerStatus {
+    public func containerStatus(id: String) async -> RuntimeContainerStatus {
         activeContainers[id]?.status ?? .unknown
     }
 
@@ -458,7 +458,6 @@ public actor ContainerRuntime {
     private func findKernelPath() -> String? {
         let candidates = [
             "\(FileManager.default.homeDirectoryForCurrentUser.path)/.sendbox/kernel/vmlinux",
-            "/opt/kata/share/kata-containers/vmlinux.container",
             "\(FileManager.default.homeDirectoryForCurrentUser.path)/.local/share/containerization/kernel/vmlinux",
             "/usr/local/share/containerization/kernel/vmlinux",
         ]
@@ -474,18 +473,4 @@ public actor ContainerRuntime {
         return nil
     }
 }
-
-// MARK: - ExecResult
-
-/// The result of executing a command inside a container.
-public struct ExecResult: Sendable {
-    public let exitCode: Int32
-    public let stdout: String
-    public let stderr: String
-
-    public init(exitCode: Int32, stdout: String, stderr: String) {
-        self.exitCode = exitCode
-        self.stdout = stdout
-        self.stderr = stderr
-    }
-}
+#endif

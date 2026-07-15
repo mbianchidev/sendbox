@@ -7,6 +7,7 @@ set -euo pipefail
 SENDBOX_DIR="${HOME}/.sendbox"
 CONFIG_DIR="${SENDBOX_DIR}/config"
 SECRETS_DIR="${SENDBOX_DIR}/secrets"
+RUNTIME_PROVIDER="auto"
 
 # ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -24,6 +25,25 @@ err()   { echo -e "${RED}✘${NC}  $*" >&2; }
 header(){ echo -e "\n${BOLD}${CYAN}═══ $* ═══${NC}\n"; }
 
 CONTAINER_RELEASES_API="https://api.github.com/repos/apple/container/releases/latest"
+
+detect_runtime() {
+    case "$(uname)" in
+        Darwin)
+            if [[ "$(uname -m)" != "arm64" ]]; then
+                err "Apple silicon (arm64) required for the Apple runtime (detected: $(uname -m))."
+                exit 1
+            fi
+            RUNTIME_PROVIDER="apple"
+            ;;
+        Linux)
+            RUNTIME_PROVIDER="kata"
+            ;;
+        *)
+            err "Unsupported host operating system: $(uname)"
+            exit 1
+            ;;
+    esac
+}
 
 # ── Install Apple Container CLI ──────────────────────────────
 install_container_cli() {
@@ -85,18 +105,8 @@ install_container_cli() {
 preflight() {
     header "Preflight Checks"
 
-    # macOS + Apple silicon
-    if [[ "$(uname)" != "Darwin" ]]; then
-        err "SendBox currently requires macOS (detected: $(uname))."
-        err "See ROADMAP.md for Kubernetes/Linux/Windows support."
-        exit 1
-    fi
-
-    if [[ "$(uname -m)" != "arm64" ]]; then
-        err "Apple silicon (arm64) required (detected: $(uname -m))."
-        exit 1
-    fi
-    ok "macOS on Apple silicon"
+    detect_runtime
+    ok "Runtime provider: ${RUNTIME_PROVIDER}"
 
     # Swift
     if command -v swift &>/dev/null; then
@@ -114,17 +124,49 @@ preflight() {
         warn "Install Node.js 20+ for full functionality."
     fi
 
-    # Apple Container runtime — auto-install if missing
-    if command -v container &>/dev/null; then
-        ok "Apple Container CLI found"
-    else
-        warn "Apple Container CLI not installed."
-        read -rp "$(echo -e "${YELLOW}?${NC}  Download and install it now? [Y/n]: ")" install_container
-        install_container="${install_container:-y}"
-        if [[ "$install_container" =~ ^[Yy]$ ]]; then
-            install_container_cli
+    if [[ "$RUNTIME_PROVIDER" == "apple" ]]; then
+        # Apple Container runtime — auto-install if missing
+        if command -v container &>/dev/null; then
+            ok "Apple Container CLI found"
         else
-            warn "Skipping — container runtime will not be available."
+            warn "Apple Container CLI not installed."
+            read -rp "$(echo -e "${YELLOW}?${NC}  Download and install it now? [Y/n]: ")" install_container
+            install_container="${install_container:-y}"
+            if [[ "$install_container" =~ ^[Yy]$ ]]; then
+                install_container_cli
+            else
+                warn "Skipping — container runtime will not be available."
+            fi
+        fi
+    else
+        local kata_missing=0
+        for binary in nerdctl containerd-shim-kata-v2; do
+            if command -v "$binary" &>/dev/null; then
+                ok "$binary found"
+            else
+                err "$binary not found"
+                kata_missing=1
+            fi
+        done
+
+        if [[ "$kata_missing" -ne 0 ]]; then
+            err "Install Kata Containers, containerd, CNI plugins, and nerdctl before continuing."
+            err "See docs/kata-containers.md."
+            exit 1
+        fi
+
+        if nerdctl info &>/dev/null; then
+            ok "containerd is reachable through nerdctl"
+        else
+            err "Cannot connect to containerd with nerdctl."
+            err "Configure socket permissions or a rootless containerd service."
+            exit 1
+        fi
+
+        if command -v kata-runtime &>/dev/null; then
+            kata-runtime check >/dev/null 2>&1 \
+                && ok "Kata host compatibility check passed" \
+                || warn "kata-runtime check reported a host compatibility issue"
         fi
     fi
 
@@ -181,8 +223,10 @@ setup_bridge() {
     if [[ -d "$BRIDGE_DIR" ]]; then
         info "Installing copilot-bridge dependencies..."
         cd "$BRIDGE_DIR"
-        npm install --silent 2>/dev/null || warn "npm install had warnings (may be OK)"
-        npm run build 2>/dev/null && ok "copilot-bridge built" || warn "copilot-bridge build had issues (SDK may not be published yet)"
+        npm ci --ignore-scripts --no-fund --silent
+        npm audit --audit-level=high --silent
+        npm run build --silent
+        ok "copilot-bridge built"
         cd "$SCRIPT_DIR"
     else
         warn "copilot-bridge directory not found"
@@ -206,6 +250,9 @@ init_dirs() {
 # ── Interactive configuration ────────────────────────────────
 configure() {
     header "Configure Sandbox"
+    if [[ "$RUNTIME_PROVIDER" == "auto" ]]; then
+        detect_runtime
+    fi
 
     # Project path
     read -rp "$(echo -e "${CYAN}?${NC}  Project path to sandbox: ")" project_path
@@ -283,7 +330,7 @@ configure() {
 
     # Secrets
     echo ""
-    info "Secrets to inject (keys stored in macOS Keychain via 'sendbox secrets add'):"
+    info "Secrets to inject (stored in the host secret store via 'sendbox secrets add'):"
     read -rp "$(echo -e "${CYAN}?${NC}  Secret keys (comma-separated, or Enter to skip): ")" secret_keys
 
     # VS Code extensions
@@ -301,6 +348,21 @@ configure() {
 
 name: ${sandbox_name}
 project_path: ${project_path}
+
+runtime:
+  provider: ${RUNTIME_PROVIDER}
+YAML
+
+    if [[ "$RUNTIME_PROVIDER" == "kata" ]]; then
+        cat >> "$config_path" <<YAML
+  kata:
+    executable: nerdctl
+    runtime_handler: io.containerd.kata.v2
+    namespace: sendbox
+YAML
+    fi
+
+    cat >> "$config_path" <<YAML
 
 resources:
   cpus: ${cpus}
@@ -448,7 +510,7 @@ add_secrets() {
     fi
 
     echo ""
-    info "Add secrets that your agent needs (stored in macOS Keychain)."
+    info "Add secrets that your agent needs (stored in the host secret store)."
     info "Type 'done' when finished."
     echo ""
 
@@ -495,7 +557,7 @@ main() {
     echo ""
     echo -e "${BOLD}${CYAN}╔═══════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${CYAN}║         SendBox Setup & Run           ║${NC}"
-    echo -e "${BOLD}${CYAN}║   Secure Agent Sandbox on Apple Si    ║${NC}"
+    echo -e "${BOLD}${CYAN}║      Secure Agent Sandbox Runtime      ║${NC}"
     echo -e "${BOLD}${CYAN}╚═══════════════════════════════════════╝${NC}"
     echo ""
 
