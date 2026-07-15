@@ -139,7 +139,7 @@ policy:
     blocked_domains: []
     allow_dns: true
 
-secrets: [GITHUB_TOKEN]
+secrets: [NPM_TOKEN]
 
 devcontainer:
   auto_generate: true
@@ -148,6 +148,7 @@ devcontainer:
 github:
   forward_auth: true
   forward_copilot_auth: true
+  allow_private_repository_access: false
 
 observability:
   mcp_inspection:

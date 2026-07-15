@@ -139,13 +139,13 @@ policy:
 # Secrets are stored in the sendbox vault (not in this file).
 #
 # To add a secret to the vault:
-#   sendbox secret set GITHUB_TOKEN
+#   sendbox secret set NPM_TOKEN
 #
 # Secrets are injected at container start and are available as standard
-# environment variables (e.g., $GITHUB_TOKEN). They are never written
+# environment variables (e.g., $NPM_TOKEN). GitHub tokens are handled by
+# the guarded GitHub auth forwarding configuration below. Secrets are never written
 # to disk inside the container.
 secrets:
-  - GITHUB_TOKEN
   - NPM_TOKEN
   - DATABASE_URL
 
@@ -181,9 +181,8 @@ devcontainer:
 # GitHub Authentication
 # ─────────────────────────────────────────────────────────────────────────────
 # Controls how the sandbox authenticates with GitHub.
-# By default, sendbox forwards your local `gh` CLI credentials so the
-# agent can push commits, open PRs, and interact with the GitHub API
-# without storing long-lived tokens.
+# Sendbox forwards local `gh` CLI credentials only for verified private
+# organization repositories with the explicit override below.
 github:
   # Forward the host's `gh auth` token into the container.
   # The agent can use `gh` commands and the GitHub API as you.
@@ -194,6 +193,13 @@ github:
   # Required if the agent uses GitHub Copilot features.
   # Default: true
   forward_copilot_auth: true
+
+  # Allow GitHub credentials in a private repository sandbox.
+  # Only enable this when accessing private repositories in the same
+  # organization, and use credentials scoped to that organization.
+  # GitHub credentials are never exposed to public repository sandboxes.
+  # Default: false
+  allow_private_repository_access: false
 
   # Path to an SSH private key to mount (read-only) into the container.
   # Use this if your project requires SSH-based git operations.

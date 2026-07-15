@@ -16,6 +16,7 @@ struct SandboxConfigTests {
         #expect(config.secrets.isEmpty)
         #expect(config.github.forwardAuth == true)
         #expect(config.github.forwardCopilotAuth == true)
+        #expect(config.github.allowPrivateRepositoryAccess == false)
         #expect(config.devcontainer?.autoGenerate == true)
         #expect(config.runtime?.provider == .automatic)
         #expect(config.runtime?.kata.runtimeHandler == "io.containerd.kata.v2")
@@ -86,6 +87,7 @@ struct SandboxConfigTests {
         #expect(config.policy.network.allowedDomains == ["github.com"])
         #expect(config.github.forwardAuth == false)
         #expect(config.github.forwardCopilotAuth == true)
+        #expect(config.github.allowPrivateRepositoryAccess == false)
         #expect(config.runtime == nil)
     }
 
@@ -136,6 +138,20 @@ struct SandboxConfigTests {
             runtime.kata.configurationPath
                 == "/etc/kata-containers/configuration-qemu.toml"
         )
+    }
+
+    @Test func testLoadPrivateRepositoryAccessOverride() throws {
+        let original = SandboxConfiguration.default(projectPath: "/projects/private")
+        var github = original.github
+        github.allowPrivateRepositoryAccess = true
+
+        let encoded = try YAMLEncoder().encode(github)
+        let decoded = try YAMLDecoder().decode(
+            SandboxConfiguration.GitHubConfig.self,
+            from: encoded
+        )
+
+        #expect(decoded.allowPrivateRepositoryAccess)
     }
 
     @Test func testKataRuntimeDefaultsWhenSectionIsPartial() throws {

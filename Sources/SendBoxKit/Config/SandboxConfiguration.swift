@@ -168,13 +168,38 @@ public struct SandboxConfiguration: Codable, Sendable {
         public var forwardAuth: Bool
         /// Whether to forward Copilot CLI auth
         public var forwardCopilotAuth: Bool
+        /// Explicitly allow GitHub credentials in a private repository sandbox.
+        public var allowPrivateRepositoryAccess: Bool
         /// SSH key path to mount (optional)
         public var sshKeyPath: String?
 
         private enum CodingKeys: String, CodingKey {
             case forwardAuth = "forward_auth"
             case forwardCopilotAuth = "forward_copilot_auth"
+            case allowPrivateRepositoryAccess = "allow_private_repository_access"
             case sshKeyPath = "ssh_key_path"
+        }
+
+        public init(
+            forwardAuth: Bool,
+            forwardCopilotAuth: Bool,
+            allowPrivateRepositoryAccess: Bool = false,
+            sshKeyPath: String? = nil
+        ) {
+            self.forwardAuth = forwardAuth
+            self.forwardCopilotAuth = forwardCopilotAuth
+            self.allowPrivateRepositoryAccess = allowPrivateRepositoryAccess
+            self.sshKeyPath = sshKeyPath
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.forwardAuth = try container.decode(Bool.self, forKey: .forwardAuth)
+            self.forwardCopilotAuth = try container.decode(Bool.self, forKey: .forwardCopilotAuth)
+            self.allowPrivateRepositoryAccess =
+                try container.decodeIfPresent(Bool.self, forKey: .allowPrivateRepositoryAccess)
+                ?? false
+            self.sshKeyPath = try container.decodeIfPresent(String.self, forKey: .sshKeyPath)
         }
     }
 }
@@ -221,6 +246,7 @@ extension SandboxConfiguration {
             github: GitHubConfig(
                 forwardAuth: true,
                 forwardCopilotAuth: true,
+                allowPrivateRepositoryAccess: false,
                 sshKeyPath: nil
             ),
             observability: .default
