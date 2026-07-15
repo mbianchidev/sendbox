@@ -171,7 +171,9 @@ public struct ContainerConfig: Sendable {
                 .filter { !$0.isEmpty }
             command = [
                 "/bin/bash",
-                "-lc",
+                "--noprofile",
+                "--norc",
+                "-c",
                 boundaryEnforcer.generateBootstrapScript(
                     command: baseCommand,
                     preflightScripts: preflightScripts

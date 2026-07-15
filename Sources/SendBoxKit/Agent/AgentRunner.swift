@@ -1,12 +1,17 @@
-import Darwin
 import Foundation
 import Logging
+
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 /// Orchestrates the full agent sandbox lifecycle:
 /// analyze project → generate devcontainer → build container → apply policies → inject secrets → run agent
 public actor AgentRunner {
     private let config: SandboxConfiguration
-    private let runtime: ContainerRuntime
+    private let runtime: any RuntimeProvider
     private let commandPolicy: CommandPolicy
     private let firewall: NetworkFirewall
     private let secrets: SecretsVault
@@ -76,7 +81,10 @@ public actor AgentRunner {
         logger: Logger = Logger(label: "sendbox.runner")
     ) {
         self.config = config
-        self.runtime = ContainerRuntime(logger: logger)
+        self.runtime = RuntimeProviderFactory.make(
+            configuration: config.runtime ?? .default,
+            logger: logger
+        )
         self.commandPolicy = CommandPolicy(config: config.policy.commands, logger: logger)
         self.firewall = NetworkFirewall(config: config.policy.network, logger: logger)
         self.secrets = SecretsVault(logger: logger)
@@ -154,7 +162,11 @@ public actor AgentRunner {
             // Step 3: Build and start container
             state = .buildingContainer
             logger.info("Step 3/6: Building container...")
-            try await runtime.initialize()
+            do {
+                try await runtime.initialize()
+            } catch {
+                throw RunnerError.runtimeInitializationFailed(error.localizedDescription)
+            }
             let id = try await buildContainer(spec: spec)
             containerId = id
 

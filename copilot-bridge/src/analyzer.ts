@@ -590,6 +590,7 @@ export class ProjectAnalyzer {
 
     const text = await chatWithCopilot(prompt, [readProjectFile]);
 
+    // Parse Copilot's refinement suggestions
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       try {

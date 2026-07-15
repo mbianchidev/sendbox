@@ -188,7 +188,7 @@ _sendbox_run() {
     repeating_flags=()
     non_repeating_flags=(--version -h --help)
     repeating_options=()
-    non_repeating_options=(--config --project --policy)
+    non_repeating_options=(--config --project --policy --runtime)
     __sendbox_offer_flags_options 0
 
     # Offer option value completions
@@ -203,6 +203,10 @@ _sendbox_run() {
         __sendbox_add_completions -W 'default'$'\n''permissive'$'\n''strict'
         return
         ;;
+    '--runtime')
+        __sendbox_add_completions -W 'auto'$'\n''apple'$'\n''kata'
+        return
+        ;;
     esac
 }
 
@@ -210,7 +214,7 @@ _sendbox_init() {
     repeating_flags=()
     non_repeating_flags=(--version -h --help)
     repeating_options=()
-    non_repeating_options=(--project --policy)
+    non_repeating_options=(--project --policy --runtime)
     __sendbox_offer_flags_options 0
 
     # Offer option value completions
@@ -220,6 +224,10 @@ _sendbox_init() {
         ;;
     '--policy')
         __sendbox_add_completions -W 'default'$'\n''permissive'$'\n''strict'
+        return
+        ;;
+    '--runtime')
+        __sendbox_add_completions -W 'auto'$'\n''apple'$'\n''kata'
         return
         ;;
     esac

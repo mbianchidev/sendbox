@@ -77,10 +77,12 @@ _sendbox() {
 _sendbox_run() {
     local -i ret=1
     local -ar ___policy=('default' 'permissive' 'strict')
+    local -ar ___runtime=('auto' 'apple' 'kata')
     local -ar arg_specs=(
         '--config[Path to sendbox config file]:config:'
         '--project[Path to the project directory]:project:'
         '--policy[Security policy preset (default, permissive, strict)]:policy:{__sendbox_complete "${___policy[@]}"}'
+        '--runtime[Runtime provider (auto, apple, kata)]:runtime:{__sendbox_complete "${___runtime[@]}"}'
         '--version[Show the version.]'
         '(-h --help)'{-h,--help}'[Show help information.]'
     )
@@ -92,9 +94,11 @@ _sendbox_run() {
 _sendbox_init() {
     local -i ret=1
     local -ar ___policy=('default' 'permissive' 'strict')
+    local -ar ___runtime=('auto' 'apple' 'kata')
     local -ar arg_specs=(
         '--project[Path to the project directory]:project:'
         '--policy[Security policy preset (default, permissive, strict)]:policy:{__sendbox_complete "${___policy[@]}"}'
+        '--runtime[Runtime provider (auto, apple, kata)]:runtime:{__sendbox_complete "${___runtime[@]}"}'
         '--version[Show the version.]'
         '(-h --help)'{-h,--help}'[Show help information.]'
     )

@@ -23,6 +23,23 @@ name: my-project-sandbox
 project_path: /Users/developer/my-project
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Runtime Provider
+# ─────────────────────────────────────────────────────────────────────────────
+# "auto" selects Apple Containerization on supported macOS hosts and Kata
+# Containers on Linux. Override it with `sendbox run --runtime apple|kata`.
+runtime:
+  provider: auto
+
+  # Used only when provider is "kata".
+  kata:
+    executable: nerdctl
+    runtime_handler: io.containerd.kata.v2
+    namespace: sendbox
+    # address: /run/containerd/containerd.sock
+    # snapshotter: overlayfs
+    # configuration_path: /etc/kata-containers/configuration.toml
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Container Resources
 # ─────────────────────────────────────────────────────────────────────────────
 # Resource limits for the sandbox container. These are hard caps — the
@@ -34,17 +51,17 @@ project_path: /Users/developer/my-project
 resources:
   # Number of CPU cores allocated to the container.
   # Fractional values are supported (e.g., 1.5).
-  # Default: 2
+  # Default: 4
   cpus: 4
 
   # Memory limit in megabytes.
   # The container is killed (OOM) if it exceeds this limit.
-  # Default: 2048
+  # Default: 4096
   memory_mb: 4096
 
   # Disk space limit in megabytes for the container's writable layer.
   # Does not include the project mount (which uses the host filesystem).
-  # Default: 5120
+  # Default: 10240
   disk_size_mb: 10240
 
 # ─────────────────────────────────────────────────────────────────────────────

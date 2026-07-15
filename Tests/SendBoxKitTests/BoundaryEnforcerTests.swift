@@ -220,7 +220,10 @@ struct BoundaryEnforcerTests {
             boundaryEnforcer: enforcer
         )
 
-        #expect(config.command.prefix(2) == ["/bin/bash", "-lc"])
+        #expect(
+            config.command.prefix(4)
+                == ["/bin/bash", "--noprofile", "--norc", "-c"]
+        )
         #expect(config.command.last?.contains("SENDBOX_PREFLIGHT_0") == true)
         #expect(config.firewallScript == nil)
         #expect(config.boundaryExecPrefix == enforcer.execPrefix)

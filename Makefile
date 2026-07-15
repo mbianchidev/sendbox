@@ -1,5 +1,9 @@
 .PHONY: all build release test clean install install-completions setup-bridge lint help
 
+PREFIX ?= /usr/local
+DESTDIR ?=
+BINDIR := $(DESTDIR)$(PREFIX)/bin
+
 all: release
 
 build:
@@ -14,16 +18,21 @@ test:
 clean:
 	swift package clean
 
-install: release install-completions
-	install -d /usr/local/bin
-	install .build/release/sendbox /usr/local/bin/sendbox
-	@echo "✔ sendbox installed to /usr/local/bin/sendbox"
+install: release
+	install -d "$(BINDIR)"
+	install .build/release/sendbox "$(BINDIR)/sendbox"
+	@if [ -z "$(DESTDIR)" ]; then \
+		.build/release/sendbox completions install 2>/dev/null || echo "⚠ Shell completions not installed (run 'sendbox completions install' manually)"; \
+	else \
+		echo "Skipping shell completions for staged install"; \
+	fi
+	@echo "✔ sendbox installed to $(BINDIR)/sendbox"
 
 install-completions: release
 	@.build/release/sendbox completions install 2>/dev/null || echo "⚠ Shell completions not installed (run 'sendbox completions install' manually)"
 
 setup-bridge:
-	cd copilot-bridge && npm install
+	cd copilot-bridge && npm ci
 
 lint:
 	swift format lint --recursive Sources Tests

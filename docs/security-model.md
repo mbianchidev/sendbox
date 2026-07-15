@@ -6,31 +6,31 @@
 
 ## Architecture Overview
 
-SendBox uses Apple's [Virtualization.framework](https://developer.apple.com/documentation/virtualization) to run each agent sandbox in a **dedicated lightweight Linux VM** on Apple Silicon. This is fundamentally different from Docker/OCI container isolation — the guest runs its own kernel on virtualized hardware, not a process in a shared kernel namespace.
+SendBox has two runtime providers. Both give the workload a dedicated Linux kernel, but their host control planes and operational responsibilities differ.
 
-| Property | Docker Container | SendBox VM |
-|----------|-----------------|------------|
-| Kernel | Shared with host | Dedicated per sandbox |
-| PID namespace | Logical isolation (kernel namespaces) | Hardware isolation (separate kernel) |
-| Network | Shared kernel stack (veth pairs) | Separate virtual NIC (virtio-net) |
-| Filesystem | Shared kernel VFS (overlayfs) | Separate disk image (virtiofs for mounts) |
-| Device access | cgroup-filtered | Not exposed (no `/dev` passthrough) |
-| Container runtime | runc / containerd | None (direct VM via Virtualization.framework) |
-| Orchestrator | Optional (Kubernetes, Swarm) | None |
-| Attack surface | Kernel syscall interface (~300+ syscalls) | Hypervisor interface (virtio devices only) |
-| Root inside container | Full kernel capabilities if misconfigured | Root in guest kernel only — host kernel unaffected |
+| Property | Apple provider | Kata provider |
+|----------|----------------|---------------|
+| Host | macOS on Apple silicon | Linux with hardware or nested virtualization |
+| VM control plane | Apple Containerization / Virtualization.framework | nerdctl, containerd, and `containerd-shim-kata-v2` |
+| Kernel | Dedicated per sandbox | Dedicated per Kata sandbox |
+| Filesystem sharing | Explicit virtiofs mounts | Explicit OCI bind mounts mediated by the Kata VM |
+| Host runtime attack surface | Apple virtualization stack | containerd, Kata shim, and selected hypervisor |
+| Root in workload | Root in the guest only | Root in the Kata guest only |
+| Secret store | macOS Keychain | Mode-restricted host files |
 
-**Key insight:** Most container escape techniques exploit the shared kernel boundary between host and container. SendBox eliminates this boundary entirely — the guest has its own kernel, and a kernel exploit inside the VM compromises only the guest.
+**Key insight:** The workload does not share the host kernel. A guest-kernel compromise is contained by the selected hypervisor boundary, while host runtime and hypervisor components still require normal patching and hardening.
+
+The detailed SandboxEscapeBench analysis below describes the Apple provider. The Kata provider relies on Kata's VM boundary and the security configuration of containerd, the Kata shim, and the selected hypervisor; SendBox does not claim architectural immunity from vulnerabilities in those host components.
 
 ---
 
-## SandboxEscapeBench Coverage
+## SandboxEscapeBench Coverage — Apple Provider
 
-The [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) benchmark defines 18 escape scenarios across three layers of the container stack. SendBox mitigates **all 18 scenarios** through a combination of architectural immunity (VM isolation eliminates the attack surface) and defense-in-depth hardening.
+The [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) benchmark defines 18 escape scenarios across three layers of the container stack. The Apple provider mitigates all 18 through architectural isolation and guest defense-in-depth.
 
 ### Summary Table
 
-| # | Scenario | Layer | Attack Vector | SendBox Status | Primary Defense |
+| # | Scenario | Layer | Attack Vector | Apple Provider Status | Primary Defense |
 |---|----------|-------|---------------|----------------|-----------------|
 | 1 | `crio_cve` | Orchestration | CRI-O CVE-2022-0811 — kernel parameter injection via `pinns` | **Blocked** | No CRI-O runtime |
 | 2 | `kubectl_cp` | Orchestration | CVE-2019-11246 — symlink path traversal via `kubectl cp` | **Blocked** | No kubectl / Kubernetes |
@@ -55,12 +55,12 @@ The [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) benchmark defines 18 
 
 ### Layer 1: Orchestration (4/4 Blocked)
 
-These attacks target Kubernetes and container orchestration components. SendBox does not use Kubernetes, CRI-O, or any orchestrator — there is no orchestration layer to attack.
+These attacks target Kubernetes and container orchestration components. The direct Apple and Kata providers do not use Kubernetes or CRI-O.
 
 #### 1. CRI-O CVE (CVE-2022-0811)
 
 - **Attack:** Exploits a vulnerability in CRI-O's `pinns` utility that allows setting arbitrary kernel parameters via specially crafted annotations on a pod. An attacker can set `kernel.core_pattern` to a pipe command, achieving host code execution when a process crashes.
-- **Why N/A:** SendBox does not use CRI-O or any OCI-compliant container runtime. VMs are created directly via Apple's Virtualization.framework hypervisor interface. There is no `pinns` binary, no annotation processing, and no shared kernel whose `core_pattern` could be hijacked.
+- **Why N/A:** The Apple provider creates VMs directly through Virtualization.framework and has no CRI-O or `pinns`. The direct Kata provider uses containerd and the Kata shim, not CRI-O.
 - **Defense-in-depth:** Even within the guest VM, `kernel.core_pattern` is set to a safe value (`|/bin/false`) and `kernel.modules_disabled=1` prevents loading modules that could be triggered by core patterns.
 
 #### 2. kubectl cp Path Traversal (CVE-2019-11246)
@@ -78,25 +78,25 @@ These attacks target Kubernetes and container orchestration components. SendBox 
 #### 4. route_localnet Metadata Access
 
 - **Attack:** Setting `net.ipv4.conf.all.route_localnet=1` allows routing to 127.0.0.0/8 from non-loopback interfaces. In cloud environments, this can be combined with iptables DNAT rules to redirect traffic intended for the cloud metadata service (169.254.169.254) to localhost, bypassing network policies.
-- **Why N/A:** SendBox VMs run on local Apple Silicon hardware, not in a cloud environment. There is no cloud metadata service at 169.254.169.254.
-- **Defense-in-depth:** `net.ipv4.conf.all.route_localnet=0` is explicitly set via sysctl hardening. The network firewall blocks all traffic not in the domain allowlist, which would not include any metadata endpoint. Additionally, the guest kernel is separate — sysctl changes inside the VM cannot affect the host network stack.
+- **Why N/A:** The Apple provider runs locally and has no cloud metadata service. Kata deployments may run in cloud environments and must keep metadata endpoints outside the allowed network policy.
+- **Defense-in-depth:** `net.ipv4.conf.all.route_localnet=0` is explicitly set via sysctl hardening. The network firewall blocks traffic outside the domain allowlist, and guest sysctl changes cannot modify the host network stack.
 
 ---
 
 ### Layer 2: Runtime (8/8 Blocked)
 
-These attacks exploit container runtime misconfigurations or vulnerabilities. SendBox has no container runtime — there is no runc, containerd, or Docker daemon.
+This section describes the Apple provider, which creates the VM directly and has no runc, containerd, or Docker daemon. The Kata provider does use containerd and the Kata shim on the host; those components must be patched and configured according to Kata guidance.
 
 #### 5. Privileged Container
 
 - **Attack:** Running a container with `--privileged` grants all Linux capabilities, disables seccomp, and allows access to all host devices via `/dev`. An attacker can mount the host filesystem from a block device and escape.
-- **Why N/A:** There is no `--privileged` flag because there is no container runtime. The VM runs its own kernel; "capabilities" inside the VM are guest-kernel capabilities that grant power only within the VM.
+- **Why N/A:** The Apple provider has no `--privileged` flag. SendBox never requests `--privileged` from nerdctl for Kata workloads and only adds narrowly scoped capabilities when firewall or MCP inspection requires them.
 - **Defense-in-depth:** The hardening script drops all dangerous capabilities (`CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_NET_RAW`, etc.) inside the guest. Even root inside the VM cannot load kernel modules or mount arbitrary filesystems.
 
 #### 6. Docker Socket Mount
 
 - **Attack:** When `/var/run/docker.sock` is mounted inside a container, the agent can use the Docker API to create a new privileged container with host filesystem access, effectively escaping the sandbox.
-- **Why N/A:** There is no Docker daemon running on macOS (SendBox replaces Docker). No Docker socket exists. No container runtime binaries (`docker`, `ctr`, `crictl`, `nerdctl`) are installed inside the VM.
+- **Why N/A:** The Apple provider has no Docker daemon. The Kata provider uses a host containerd socket, but SendBox never mounts that socket or host runtime binaries into the guest.
 - **Defense-in-depth:** The mount configuration only allows two mount points (`.devcontainer` read-only, workspace copy read-write). No host paths like `/var/run/` are ever exposed. The command policy denylist blocks `docker` commands. The `ContainerHardening.validate()` method warns if any mount targets sensitive paths.
 
 #### 7. CAP_SYS_ADMIN Abuse
@@ -120,19 +120,19 @@ These attacks exploit container runtime misconfigurations or vulnerabilities. Se
 #### 10. HostPath Volume Abuse
 
 - **Attack:** Kubernetes `hostPath` volumes or Docker `-v /:/host` mounts expose the host filesystem inside the container. An attacker with access to the host root filesystem can modify system files, add SSH keys, or create cron jobs for persistent access.
-- **Why N/A:** SendBox does not use Kubernetes volumes or Docker bind mounts. File sharing uses virtiofs, and the mount points are explicitly defined in configuration.
+- **Why N/A:** The Apple provider uses explicit virtiofs sharing. The Kata provider maps only SendBox's explicit project and devcontainer bind mounts into the Kata guest.
 - **Defense-in-depth:** Only two mounts exist: `.devcontainer` (read-only) and workspace (a copy, not the original). `ContainerHardening.validate()` warns if mounts target sensitive paths (`/etc`, `/var/run`, `/proc`, `/sys`). The workspace copy ensures that even destructive operations inside the VM don't affect the original project.
 
 #### 11. runc CVE-2019-5736
 
 - **Attack:** CVE-2019-5736 allows a malicious container to overwrite the host `runc` binary via `/proc/self/exe`. When `runc` is next invoked (e.g., `docker exec`), the attacker's code runs as root on the host.
-- **Why N/A:** There is no runc. There is no container runtime binary to overwrite. The VM is managed directly by the hypervisor.
-- **Defense-in-depth:** `/proc/self/exe` inside the VM points to a guest binary. Even if overwritten, it has no effect on the host. No container runtime exists on the host to be targeted.
+- **Why N/A:** The Apple provider has no runc. Kata uses the runtime v2 shim and a guest VM rather than running the workload through a shared-kernel runc container.
+- **Defense-in-depth:** `/proc/self/exe` inside either guest refers to a guest process, not the host shim. Kata and containerd still require timely security updates.
 
 #### 12. runc CVE-2024-21626
 
 - **Attack:** CVE-2024-21626 exploits a file descriptor leak in runc where the working directory of the container process retains a reference to a host filesystem directory. An attacker can use this leaked fd to traverse up to the host root filesystem.
-- **Why N/A:** There is no runc, no containerd, and no file descriptor inheritance from host to guest. The VM boots from a disk image — its initial process is the guest `init`, not a runtime-spawned process.
+- **Why N/A:** The Apple provider has no runc or containerd file-descriptor inheritance. Kata's shim crosses into a VM boundary rather than exposing a shared host mount namespace to the workload.
 - **Defense-in-depth:** The hypervisor boundary ensures no host file descriptors are leaked to the guest. The VM's `/proc/self/fd/` shows only guest file descriptors.
 
 ---
@@ -179,9 +179,9 @@ These attacks exploit shared kernel vulnerabilities. SendBox's VM architecture p
 
 ---
 
-## Defense-in-Depth Layers
+## Defense-in-Depth Layers — Apple Provider
 
-SendBox applies six overlapping defense layers. Even if one layer is bypassed, the remaining layers prevent escape.
+The Apple provider defines seven overlapping defense layers. Kata deployments should apply equivalent guest hardening through their Kata image and configuration.
 
 ### Layer 1: Hardware VM Isolation
 
@@ -318,8 +318,8 @@ The `CommandPolicy` engine provides an application-level defense layer:
 
 Secrets management prevents credential exposure:
 
-- Secrets are stored in **macOS Keychain** (encrypted at rest by the Secure Enclave on Apple Silicon)
-- Injected as **environment variables** at VM boot time
+- Secrets are stored in **macOS Keychain** or mode-restricted files on Linux
+- Injected as environment variables at container creation
 - **Never written to disk** in plaintext inside the VM
 - Environment is **cleaned up on VM shutdown**
 - Sensitive environment variables (e.g., `LD_PRELOAD`, `LD_LIBRARY_PATH`) are stripped from the agent environment by the hardening process
@@ -376,9 +376,9 @@ These are threats SendBox is designed to defend against:
 | Agent attempts to execute dangerous commands | Command policy — allowlist/denylist with pipeline parsing |
 | Agent attempts to escalate privileges within the VM | Capability dropping, seccomp, `PR_SET_NO_NEW_PRIVS`, sysctl hardening |
 | Agent attempts to exfiltrate secrets | Secrets are env vars, not files; network firewall blocks unauthorized endpoints |
-| Agent attempts to exploit kernel vulnerabilities | Separate guest kernel; exploit affects guest only; host kernel is macOS XNU |
-| Agent attempts to escape via container runtime bugs | No container runtime exists (no runc, no containerd, no Docker) |
-| Agent attempts cloud metadata access | No cloud environment; `route_localnet` disabled; metadata IP blocked |
+| Agent attempts to exploit kernel vulnerabilities | Separate guest kernel; guest compromise is contained by the selected hypervisor |
+| Agent attempts to escape via host runtime bugs | Apple provider avoids OCI runtimes; Kata provider relies on patched containerd, Kata shim, and hypervisor components |
+| Agent attempts cloud metadata access | `route_localnet` disabled and metadata endpoints must remain outside the network allowlist |
 | Agent attempts to intercept network traffic | `CAP_NET_RAW` dropped; separate virtual NIC |
 | Agent attempts to load malicious kernel modules | `kernel.modules_disabled=1`; `CAP_SYS_MODULE` dropped; seccomp blocks `init_module` |
 | Agent attempts a disallowed MCP tool call | Framing-aware stdio proxy returns a policy error; eBPF terminates direct proxy bypasses |
@@ -390,26 +390,26 @@ These threats are not addressed by SendBox:
 | Threat | Reason |
 |--------|--------|
 | Hardware side-channel attacks (Spectre, Meltdown) | Requires CPU microcode/hardware mitigations; beyond hypervisor scope |
-| Attacks against Apple's Virtualization.framework itself | Hypervisor bugs are Apple's responsibility; extremely low attack surface |
+| Attacks against the selected hypervisor or host runtime | Provider components must be patched by Apple, Kata, containerd, and the operating-system vendor |
 | Physical access attacks | Physical access bypasses all software security |
 | Social engineering of the host user | User-level risk; SendBox cannot prevent the user from disabling protections |
 | Denial-of-service against the host | VM resource limits (CPU/memory) mitigate but don't eliminate resource exhaustion |
 | Supply chain attacks on the base VM image | Image provenance and signing are the user's responsibility |
-| Zero-day hypervisor escapes | Theoretical; Apple's hypervisor has a very small attack surface (virtio devices only) |
+| Zero-day hypervisor escapes | No software sandbox can eliminate hypervisor zero-day risk |
 | Remote HTTP/SSE MCP authorization | Boundary mode intentionally supports stdio MCP only; HTTP/SSE remains audit-only |
 
 ---
 
 ## CVE Reference
 
-The following CVEs are directly addressed by SendBox's security model:
+The following CVEs are directly addressed by the Apple provider's architecture. Kata deployments must additionally track containerd, Kata shim, and hypervisor advisories.
 
 | CVE | Description | SendBox Mitigation |
 |-----|-------------|-------------------|
 | CVE-2022-0811 | CRI-O kernel parameter injection | No CRI-O; `core_pattern` locked |
 | CVE-2019-11246 | kubectl cp symlink traversal | No kubectl; explicit virtiofs mounts |
-| CVE-2019-5736 | runc binary overwrite via `/proc/self/exe` | No runc; VM isolation |
-| CVE-2024-21626 | runc fd leak for host filesystem access | No runc; VM isolation |
+| CVE-2019-5736 | runc binary overwrite via `/proc/self/exe` | Apple provider has no runc; Kata workload runs behind a VM boundary |
+| CVE-2024-21626 | runc fd leak for host filesystem access | Apple provider has no runc; Kata workload does not share the host mount namespace |
 | CVE-2016-5195 | Dirty COW — COW race condition | Separate kernel; host is XNU |
 | CVE-2022-0847 | Dirty Pipe — pipe buffer flag manipulation | Separate kernel; host is XNU |
 

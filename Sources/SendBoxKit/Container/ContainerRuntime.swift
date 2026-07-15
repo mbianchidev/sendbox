@@ -1,16 +1,20 @@
 import Foundation
-import Containerization
 import Logging
+
+#if canImport(Containerization)
+import Containerization
 
 /// Manages the lifecycle of sandboxed Linux containers using Apple's Containerization framework.
 ///
 /// This actor wraps the `ContainerManager` from `apple/containerization` to provide
 /// a higher-level API for creating, running, and managing sandbox containers with
 /// integrated command-policy enforcement.
-public actor ContainerRuntime {
+public actor ContainerRuntime: RuntimeProvider {
     private let logger: Logger
     private var manager: ContainerManager?
     private var activeContainers: [String: ContainerHandle]
+
+    public typealias ContainerStatus = RuntimeContainerStatus
 
     public struct ContainerHandle: Sendable {
         public let id: String
@@ -31,14 +35,6 @@ public actor ContainerRuntime {
             self.execPrefix = execPrefix
             self.container = container
         }
-    }
-
-    public enum ContainerStatus: String, Sendable {
-        case creating
-        case running
-        case stopped
-        case failed
-        case unknown
     }
 
     public enum RuntimeError: Error, LocalizedError {
@@ -84,7 +80,11 @@ public actor ContainerRuntime {
     ///
     /// Locates a Linux kernel binary (or uses the provided path), then creates
     /// a `ContainerManager` backed by macOS Virtualization.framework.
-    public func initialize(kernelPath: String? = nil) async throws {
+    public func initialize() async throws {
+        try await initialize(kernelPath: nil)
+    }
+
+    public func initialize(kernelPath: String?) async throws {
         let resolvedPath: String
         if let kernelPath {
             resolvedPath = kernelPath
@@ -174,6 +174,7 @@ public actor ContainerRuntime {
             execPrefix: config.boundaryExecPrefix
         )
 
+        var createdContainer: LinuxContainer?
         do {
             // Build environment in KEY=VALUE format expected by the runtime.
             let environment =
@@ -212,12 +213,12 @@ public actor ContainerRuntime {
                         )
                     )
                 }
-
                 // DNS configuration
                 containerConfig.dns = DNS(
                     nameservers: config.network.nameservers
                 )
             }
+            createdContainer = container
 
             // Persist the manager state back (ContainerManager is a value type).
             self.manager = mgr
@@ -268,6 +269,22 @@ public actor ContainerRuntime {
             return config.id
 
         } catch {
+            if let createdContainer {
+                do {
+                    try await createdContainer.stop()
+                } catch {
+                    logger.warning(
+                        "Failed to stop container \(config.id) after startup error: \(error.localizedDescription)"
+                    )
+                }
+            }
+            do {
+                try mgr.delete(config.id)
+            } catch {
+                logger.warning(
+                    "Failed to delete container \(config.id) after startup error: \(error.localizedDescription)"
+                )
+            }
             activeContainers[config.id] = ContainerHandle(
                 id: config.id,
                 status: .failed,
@@ -307,7 +324,7 @@ public actor ContainerRuntime {
     }
 
     /// Get the current status of a container.
-    public func containerStatus(id: String) -> ContainerStatus {
+    public func containerStatus(id: String) async -> RuntimeContainerStatus {
         activeContainers[id]?.status ?? .unknown
     }
 
@@ -519,7 +536,6 @@ public actor ContainerRuntime {
     private func findKernelPath() -> String? {
         let candidates = [
             "\(FileManager.default.homeDirectoryForCurrentUser.path)/.sendbox/kernel/vmlinux",
-            "/opt/kata/share/kata-containers/vmlinux.container",
             "\(FileManager.default.homeDirectoryForCurrentUser.path)/.local/share/containerization/kernel/vmlinux",
             "/usr/local/share/containerization/kernel/vmlinux",
         ]
@@ -535,18 +551,4 @@ public actor ContainerRuntime {
         return nil
     }
 }
-
-// MARK: - ExecResult
-
-/// The result of executing a command inside a container.
-public struct ExecResult: Sendable {
-    public let exitCode: Int32
-    public let stdout: String
-    public let stderr: String
-
-    public init(exitCode: Int32, stdout: String, stderr: String) {
-        self.exitCode = exitCode
-        self.stdout = stdout
-        self.stderr = stderr
-    }
-}
+#endif
