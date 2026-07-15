@@ -91,6 +91,40 @@ policy:
       - "sudo *"
       - "rm -rf /*"
 
+  # ── Kernel and MCP boundaries ─────────────────────────────────────────────
+  boundaries:
+    # Fail closed if eBPF, Python, the compiler, or libseccomp is unavailable.
+    enabled: true
+
+    tool_calls:
+      # Secure enforcement currently supports newline-framed stdio MCP only.
+      # Prefix each configured server command with:
+      #   /run/sendbox-boundary/mcp-proxy --
+      transport: stdio
+      default_action: deny
+      allowlist:
+        - read_file
+        - list_directory
+        - search_code
+      denylist:
+        - "*delete*"
+        - "*shell*"
+      max_frame_bytes: 1048576
+      server_command_patterns:
+        - mcp-server
+        - "@modelcontextprotocol"
+      allowed_server_commands:
+        - ["/usr/local/bin/node", "/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspaces/my-project"]
+
+    syscalls:
+      # These extend the built-in ContainerHardening seccomp denylist.
+      additional_denylist:
+        - io_uring_setup
+        - io_uring_register
+      log_blocked: true
+
+    log_path: /var/log/sendbox/boundary.log
+
   # ── Network / Firewall ─────────────────────────────────────────────────
   network:
     # "deny" blocks all outbound connections except to allowed_domains.

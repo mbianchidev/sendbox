@@ -55,13 +55,16 @@ _sendbox() {
             'analyze:Analyze a project and suggest sandbox configuration'
             'secrets:Manage secrets for sandbox injection'
             'policy:View and validate security policies'
+            'mcp:Inspect Model Context Protocol (MCP) calls via eBPF'
+            'boundary:Inspect fail-closed syscall and MCP boundary artifacts'
+            'completions:Install shell completions for sendbox'
             'help:Show subcommand help information.'
         )
         _describe -V subcommand subcommands && ret=0
         ;;
     arg)
         case "${words[1]}" in
-        run|init|analyze|secrets|policy|help)
+        run|init|analyze|secrets|policy|mcp|boundary|completions|help)
             "_sendbox_${words[1]}" && ret=0
             ;;
         esac
@@ -223,6 +226,172 @@ _sendbox_policy_validate() {
     local -i ret=1
     local -ar arg_specs=(
         '--config[Path to sendbox config file]:config:'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_sendbox_mcp() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+        '(-): :->command'
+        '(-)*:: :->arg'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+    case "${state}" in
+    command)
+        local -ar subcommands=(
+            'script:Print the bpftrace program (or guest startup script) for MCP inspection'
+            'parse:Parse a captured MCP trace log into structured calls'
+            'report:Summarise MCP activity from a captured trace log'
+        )
+        _describe -V subcommand subcommands && ret=0
+        ;;
+    arg)
+        case "${words[1]}" in
+        script|parse|report)
+            "_sendbox_mcp_${words[1]}" && ret=0
+            ;;
+        esac
+        ;;
+    esac
+
+    return "${ret}"
+}
+
+_sendbox_mcp_script() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--config[Path to sendbox config file]:config:'
+        '--startup[Print the guest startup bash script instead of the raw bpftrace program]'
+        '--no-stdio[Disable stdio (pipe) transport tracing]'
+        '--no-http[Disable HTTP/SSE (TLS) transport tracing]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_sendbox_mcp_parse() {
+    local -i ret=1
+    local -ar arg_specs=(
+        ':logfile:'
+        '--json[Emit parsed calls as JSON]'
+        '--redact[Redact payloads, keeping only method/id/tool metadata]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_sendbox_mcp_report() {
+    local -i ret=1
+    local -ar arg_specs=(
+        ':logfile:'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_sendbox_boundary() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+        '(-): :->command'
+        '(-)*:: :->arg'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+    case "${state}" in
+    command)
+        local -ar subcommands=(
+            'script:Print a generated boundary component'
+        )
+        _describe -V subcommand subcommands && ret=0
+        ;;
+    arg)
+        case "${words[1]}" in
+        script)
+            "_sendbox_boundary_${words[1]}" && ret=0
+            ;;
+        esac
+        ;;
+    esac
+
+    return "${ret}"
+}
+
+_sendbox_boundary_script() {
+    local -i ret=1
+    local -ar ___component=('bootstrap' 'bpftrace' 'proxy' 'proxy-client' 'seccomp')
+    local -ar arg_specs=(
+        '--config[Path to sendbox config file]:config:'
+        '--component[Component\: bootstrap, bpftrace, proxy, proxy-client, or seccomp]:component:{__sendbox_complete "${___component[@]}"}'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_sendbox_completions() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+        '(-): :->command'
+        '(-)*:: :->arg'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+    case "${state}" in
+    command)
+        local -ar subcommands=(
+            'install:Install completions for your current shell'
+            'print:Print completions to stdout (for manual setup)'
+        )
+        _describe -V subcommand subcommands && ret=0
+        ;;
+    arg)
+        case "${words[1]}" in
+        install|print)
+            "_sendbox_completions_${words[1]}" && ret=0
+            ;;
+        esac
+        ;;
+    esac
+
+    return "${ret}"
+}
+
+_sendbox_completions_install() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--shell[Shell to install for (bash, zsh, fish). Auto-detected if omitted.]:shell:'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_sendbox_completions_print() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--shell[Shell (bash, zsh, fish)]:shell:'
         '--version[Show the version.]'
         '(-h --help)'{-h,--help}'[Show help information.]'
     )

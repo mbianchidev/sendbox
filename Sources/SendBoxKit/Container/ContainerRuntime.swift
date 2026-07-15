@@ -15,12 +15,20 @@ public actor ContainerRuntime {
     public struct ContainerHandle: Sendable {
         public let id: String
         public let status: ContainerStatus
+        /// Prefix applied to every exec process inside the container.
+        public let execPrefix: [String]
         /// Reference to the underlying container (held internally)
         let container: LinuxContainer?
 
-        public init(id: String, status: ContainerStatus, container: LinuxContainer? = nil) {
+        public init(
+            id: String,
+            status: ContainerStatus,
+            execPrefix: [String] = [],
+            container: LinuxContainer? = nil
+        ) {
             self.id = id
             self.status = status
+            self.execPrefix = execPrefix
             self.container = container
         }
     }
@@ -162,12 +170,20 @@ public actor ContainerRuntime {
 
         activeContainers[config.id] = ContainerHandle(
             id: config.id,
-            status: .creating
+            status: .creating,
+            execPrefix: config.boundaryExecPrefix
         )
 
         do {
             // Build environment in KEY=VALUE format expected by the runtime.
-            let envVars = config.environment.map { "\($0.key)=\($0.value)" }
+            let environment =
+                config.boundaryReadyPath == nil
+                ? config.environment
+                : BoundaryEnforcer.bootstrapEnvironment(
+                    agentEnvironment: config.environment,
+                    workingDirectory: config.workingDirectory
+                )
+            let envVars = environment.map { "\($0.key)=\($0.value)" }
 
             let container = try await mgr.create(
                 config.id,
@@ -209,6 +225,14 @@ public actor ContainerRuntime {
             try await container.create()
             try await container.start()
 
+            if let readyPath = config.boundaryReadyPath {
+                try await waitForBoundaryReady(
+                    at: readyPath,
+                    container: container,
+                    containerId: config.id
+                )
+            }
+
             // Inject firewall rules after container starts, if configured.
             if let firewallScript = config.firewallScript, !firewallScript.isEmpty {
                 logger.info("Injecting firewall rules into container \(config.id)")
@@ -236,6 +260,7 @@ public actor ContainerRuntime {
             activeContainers[config.id] = ContainerHandle(
                 id: config.id,
                 status: .running,
+                execPrefix: config.boundaryExecPrefix,
                 container: container
             )
 
@@ -245,7 +270,8 @@ public actor ContainerRuntime {
         } catch {
             activeContainers[config.id] = ContainerHandle(
                 id: config.id,
-                status: .failed
+                status: .failed,
+                execPrefix: config.boundaryExecPrefix
             )
             self.manager = mgr
             logger.error("Failed to create container \(config.id): \(error)")
@@ -273,7 +299,8 @@ public actor ContainerRuntime {
 
         activeContainers[id] = ContainerHandle(
             id: id,
-            status: .stopped
+            status: .stopped,
+            execPrefix: handle.execPrefix
         )
 
         logger.info("Container \(id) stopped")
@@ -326,7 +353,7 @@ public actor ContainerRuntime {
             let stderrPipe = Pipe()
 
             let process = try await container.exec(execId) { processConfig in
-                processConfig.arguments = command
+                processConfig.arguments = handle.execPrefix + command
                 processConfig.workingDirectory = "/workspaces"
                 processConfig.terminal = false
             }
@@ -354,6 +381,40 @@ public actor ContainerRuntime {
     }
 
     // MARK: - Boot Script Injection
+
+    private func waitForBoundaryReady(
+        at path: String,
+        container: LinuxContainer,
+        containerId: String
+    ) async throws {
+        var lastError: Error?
+
+        for attempt in 0..<240 {
+            do {
+                let process = try await container.exec("boundary-ready-\(attempt)") {
+                    processConfig in
+                    processConfig.arguments = ["/bin/test", "-f", path]
+                    processConfig.workingDirectory = "/"
+                    processConfig.terminal = false
+                }
+                try await process.start()
+                let status = try await process.wait(timeoutInSeconds: 2)
+                if status.exitCode == 0 {
+                    logger.info("Boundary enforcement ready in \(containerId)")
+                    return
+                }
+            } catch {
+                lastError = error
+            }
+
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+
+        let suffix = lastError.map { ": \($0.localizedDescription)" } ?? ""
+        throw RuntimeError.startFailed(
+            "Boundary enforcement did not become ready in \(containerId)\(suffix)"
+        )
+    }
 
     /// Write a boot script to a host temp file, copy it into the guest, and run it.
     ///

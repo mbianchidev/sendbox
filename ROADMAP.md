@@ -18,6 +18,7 @@ The initial release targets macOS on Apple silicon using Apple's [Containerizati
 | YAML-based configuration with presets | ✅ Done |
 | CLI (`run`, `init`, `analyze`, `secrets`, `policy`) | ✅ Done |
 | Interactive setup script | ✅ Done |
+| Fail-closed seccomp syscall and stdio MCP tool boundaries | ✅ Done |
 
 ---
 

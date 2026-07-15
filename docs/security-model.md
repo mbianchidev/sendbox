@@ -235,9 +235,20 @@ Linux capabilities are dropped to a minimal set before the agent runs. The follo
 | `CAP_FOWNER` | Bypass permission checks on file operations |
 | `CAP_SETUID` / `CAP_SETGID` | Change process UID/GID — privilege escalation |
 
-### Layer 4: Seccomp Profile
+### Layer 4: Seccomp-BPF Syscall Boundary
 
-A seccomp-BPF profile blocks dangerous syscalls at the kernel level, providing a last line of defense even if capabilities are somehow regained:
+Before the agent starts, SendBox compiles a root-owned libseccomp launcher from
+the same typed rules used by `ContainerHardening.seccompProfile()`. The initial
+agent process and every later `container.exec` are prefixed with that launcher,
+so the filter is inherited across all agent forks and execs. Setup is
+fail-closed, `PR_SET_NO_NEW_PRIVS` is set, and the process drops to the invoking
+non-root host UID before executing agent code.
+
+Project-provided environment variables never reach the root bootstrap under
+their original names. SendBox serializes the complete agent environment into one
+base64 value, starts root setup with a strict minimal environment, writes a
+root-only NUL-delimited environment file, and restores it only inside the
+launcher immediately before privilege drop and exec.
 
 | Blocked Syscall | Attack Prevented |
 |----------------|------------------|
@@ -256,8 +267,33 @@ A seccomp-BPF profile blocks dangerous syscalls at the kernel level, providing a
 | `userfaultfd` | Used in exploitation of race conditions |
 | `perf_event_open` | Kernel-level performance monitoring (information leak) |
 | `move_mount` / `open_tree` / `fsopen` / `fspick` | New mount API — filesystem manipulation |
+| `process_vm_readv` / `process_vm_writev` / `pidfd_getfd` / `kcmp` | Cross-process memory and descriptor takeover |
 
-### Layer 5: Network Firewall
+Denied syscall attempts are also recorded by a root-owned eBPF tracepoint
+program and, when supported by the kernel, the seccomp audit log.
+
+### Layer 5: MCP Tool Boundary
+
+Application-semantic tool decisions are enforced by a framing-aware stdio
+proxy, not by matching truncated payloads in kernel probes:
+
+- Complete newline-framed JSON-RPC messages are parsed before forwarding.
+- `tools/call` names use denylist-first glob matching, then allowlist/default action.
+- Denied requests receive JSON-RPC error `-32001`; denied notifications are dropped.
+- A root-owned policy daemon launches only exact absolute commands listed in
+  `allowed_server_commands`; the untrusted client cannot create a trusted subtree.
+- Forking package/shell wrappers are rejected; policies identify the final
+  interpreter or native server process directly.
+- The daemon double-forks away from the agent, Yama `ptrace_scope=2` is required,
+  and cross-process memory/descriptor syscalls are denied.
+- eBPF trusts only the daemon's direct launcher child and terminates configured
+  MCP server commands launched directly outside it.
+- Proxy, policy, logs, and eBPF processes remain root-owned while the agent runs
+  as a non-root UID.
+- Remote HTTP/SSE MCP is unsupported in boundary mode because generic TLS
+  uprobes cannot enforce policy across TLS implementations or fragmented records.
+
+### Layer 6: Network Firewall
 
 Network access is controlled by a domain-level firewall implemented via iptables rules generated per-VM:
 
@@ -268,7 +304,7 @@ Network access is controlled by a domain-level firewall implemented via iptables
 - **Logging:** Dropped packets are logged with `[SENDBOX DROP]` prefix for audit
 - **No host access:** The VM cannot reach host services by default — the NAT network only routes to the internet through allowed domains
 
-### Layer 6: Command Filtering
+### Layer 7: Command Filtering
 
 The `CommandPolicy` engine provides an application-level defense layer:
 
@@ -278,7 +314,7 @@ The `CommandPolicy` engine provides an application-level defense layer:
 - **System admin commands blocked:** `sudo`, `su`, `mount`, `iptables`, `systemctl`, and other administrative commands are blocked in default and strict presets
 - **Logging:** Blocked commands are logged for audit
 
-### Layer 7: Secrets Protection
+### Layer 8: Secrets Protection
 
 Secrets management prevents credential exposure:
 
@@ -345,6 +381,7 @@ These are threats SendBox is designed to defend against:
 | Agent attempts cloud metadata access | No cloud environment; `route_localnet` disabled; metadata IP blocked |
 | Agent attempts to intercept network traffic | `CAP_NET_RAW` dropped; separate virtual NIC |
 | Agent attempts to load malicious kernel modules | `kernel.modules_disabled=1`; `CAP_SYS_MODULE` dropped; seccomp blocks `init_module` |
+| Agent attempts a disallowed MCP tool call | Framing-aware stdio proxy returns a policy error; eBPF terminates direct proxy bypasses |
 
 ### Out of Scope
 
@@ -359,6 +396,7 @@ These threats are not addressed by SendBox:
 | Denial-of-service against the host | VM resource limits (CPU/memory) mitigate but don't eliminate resource exhaustion |
 | Supply chain attacks on the base VM image | Image provenance and signing are the user's responsibility |
 | Zero-day hypervisor escapes | Theoretical; Apple's hypervisor has a very small attack surface (virtio devices only) |
+| Remote HTTP/SSE MCP authorization | Boundary mode intentionally supports stdio MCP only; HTTP/SSE remains audit-only |
 
 ---
 

@@ -1,4 +1,9 @@
-import { CopilotClient, defineTool } from "@github/copilot-sdk";
+import {
+  approveAll,
+  CopilotClient,
+  defineTool,
+  type Tool,
+} from "@github/copilot-sdk";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -152,6 +157,30 @@ const INSTALL_COMMANDS: Record<string, string> = {
 
 function log(message: string): void {
   process.stderr.write(`[sendbox] ${message}\n`);
+}
+
+async function chatWithCopilot<T = never>(
+  prompt: string,
+  tools: Tool<T>[] = [],
+): Promise<string> {
+  const client = new CopilotClient();
+  try {
+    const session = await client.createSession({
+      tools,
+      onPermissionRequest: approveAll,
+    });
+    try {
+      const response = await session.sendAndWait({ prompt });
+      return response?.data.content ?? "";
+    } finally {
+      await session.disconnect();
+    }
+  } finally {
+    const errors = await client.stop();
+    for (const error of errors) {
+      log(`Copilot cleanup error: ${error.message}`);
+    }
+  }
 }
 
 // ── ProjectAnalyzer ─────────────────────────────────────────────────────────
@@ -496,10 +525,7 @@ export class ProjectAnalyzer {
     analysis: ProjectAnalysis,
     detectedFiles: Record<string, boolean>,
   ): Promise<ProjectAnalysis> {
-    const client = new CopilotClient();
-
-    const readProjectFile = defineTool({
-      name: "readProjectFile",
+    const readProjectFile = defineTool<{ filePath: string }>("readProjectFile", {
       description:
         "Read a file from the project being analyzed. " +
         "Use this to inspect configuration files, source code, or any file " +
@@ -562,16 +588,7 @@ export class ProjectAnalyzer {
 
     log("Requesting Copilot analysis...");
 
-    const response = await client.chat({
-      messages: [{ role: "user", content: prompt }],
-      tools: [readProjectFile],
-    });
-
-    // Parse Copilot's refinement suggestions
-    const text =
-      typeof response === "string"
-        ? response
-        : response?.message?.content ?? "";
+    const text = await chatWithCopilot(prompt, [readProjectFile]);
 
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
@@ -634,8 +651,6 @@ export class DevContainerGenerator {
     const base = this.generate();
 
     try {
-      const client = new CopilotClient();
-
       const prompt = [
         "Review this devcontainer.json configuration and suggest improvements.",
         "Respond with the complete, improved JSON configuration only.",
@@ -649,14 +664,7 @@ export class DevContainerGenerator {
         `Package manager: ${this.analysis.packageManager ?? "unknown"}`,
       ].join("\n");
 
-      const response = await client.chat({
-        messages: [{ role: "user", content: prompt }],
-      });
-
-      const text =
-        typeof response === "string"
-          ? response
-          : response?.message?.content ?? "";
+      const text = await chatWithCopilot(prompt);
 
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (jsonMatch) {

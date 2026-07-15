@@ -15,6 +15,7 @@ SendBox provides hardware-isolated execution environments for AI agents using Ap
 - **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
 - **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
 - **MCP Inspection (eBPF)** — Observe Model Context Protocol JSON-RPC traffic between the agent and its MCP servers at the kernel boundary. Captures both stdio and HTTP/SSE transports, classifies tool calls, and feeds the audit trail. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
+- **Boundary Enforcement** — Run every agent process under a seccomp-BPF syscall denylist and route stdio MCP servers through a framing-aware tool proxy. eBPF detects direct proxy bypass attempts and records denied syscalls. Enforcement is fail-closed.
 - **Supply Chain Provenance** — Ed25519 signing for config and policy files ensures they were authored by trusted identities. Multi-signer support with a configurable trust store.
 - **Runtime Supervisor** — Dynamic permission expansion with approval workflows. Agents start restricted and earn broader permissions through supervised interaction (one-time, session-wide, or pattern-based grants).
 - **VM Hardening** — Defense-in-depth sysctl lockdown, capability dropping, and seccomp profiles covering all 18 [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) scenarios.
@@ -29,6 +30,11 @@ SendBox provides hardware-isolated execution environments for AI agents using Ap
 | Xcode | 26 |
 | Swift | 6.1 |
 | Node.js | 20+ (for copilot-bridge) |
+
+Boundary-enabled guest images must include `python3`, `bpftrace`, a C compiler,
+libseccomp development headers, and the Yama LSM with writable
+`kernel.yama.ptrace_scope`. SendBox refuses to launch the agent when any required
+enforcement component is unavailable.
 
 ## Quick Start
 
@@ -101,54 +107,69 @@ SendBox is configured through a YAML file. Below is a complete example showing a
 
 ```yaml
 # sendbox.yaml
-sandbox:
-  name: my-agent-sandbox
-  image: ghcr.io/mbianchidev/sendbox-base:latest
+name: my-agent-sandbox
+project_path: ./workspace
 
 resources:
   cpus: 2
-  memory: 2048  # MB
+  memory_mb: 2048
+  disk_size_mb: 10240
 
-filesystem:
-  mounts:
-    - host: ./workspace
-      guest: /home/agent/workspace
-      readonly: false
-    - host: ~/.ssh/id_ed25519.pub
-      guest: /home/agent/.ssh/authorized_keys
-      readonly: true
-
-security:
+policy:
   commands:
-    mode: allowlist          # allowlist | denylist
-    list:
-      - /usr/bin/git
-      - /usr/bin/curl
-      - /usr/local/bin/node
+    default_action: deny
+    allowlist:
+      - "git *"
+      - "npm *"
+      - "python3 *"
+    denylist:
+      - "sudo *"
+    log_blocked: true
 
   network:
-    outbound:
-      allow:
-        - host: api.github.com
-          port: 443
-        - host: registry.npmjs.org
-          port: 443
-      deny:
-        - host: "*"          # deny everything else
+    default_action: deny
+    allow_dns: true
+    allowed_domains:
+      - github.com
+      - "*.github.com"
+      - registry.npmjs.org
+    blocked_domains: []
 
-  secrets:
-    - name: GITHUB_TOKEN
-      source: env            # env | file | keychain
-    - name: NPM_TOKEN
-      source: file
-      path: ~/.secrets/npm
+  boundaries:
+    enabled: true
+    tool_calls:
+      transport: stdio       # HTTP/SSE MCP is rejected in boundary mode
+      default_action: deny
+      allowlist:
+        - read_file
+        - list_directory
+        - search_code
+      denylist:
+        - "*delete*"
+      max_frame_bytes: 1048576
+      server_command_patterns:
+        - mcp-server
+        - "@modelcontextprotocol"
+      allowed_server_commands:
+        - ["/usr/local/bin/node", "/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspaces/my-project"]
+    syscalls:
+      additional_denylist:
+        - io_uring_setup
+      log_blocked: true
+    log_path: /var/log/sendbox/boundary.log
+
+secrets:
+  - GITHUB_TOKEN
+  - NPM_TOKEN
 
 devcontainer:
-  generate: true
-  output: .devcontainer/devcontainer.json
-  features:
-    - ghcr.io/devcontainers/features/git:1
-    - ghcr.io/devcontainers/features/node:1
+  auto_generate: true
+  extensions:
+    - github.copilot
+
+github:
+  forward_auth: true
+  forward_copilot_auth: true
 
 observability:
   mcp_inspection:
@@ -165,16 +186,17 @@ observability:
 
 | Section | Key | Description |
 |---|---|---|
-| `sandbox.name` | string | Human-readable name for the sandbox instance |
-| `sandbox.image` | string | Base container image to use |
+| `name` | string | Human-readable name for the sandbox instance |
+| `project_path` | string | Project directory mounted into the VM |
 | `resources.cpus` | int | Number of virtual CPUs |
-| `resources.memory` | int | Memory allocation in MB |
-| `filesystem.mounts` | list | Host-to-guest filesystem mounts |
-| `security.commands.mode` | string | `allowlist` or `denylist` |
-| `security.commands.list` | list | Paths to allowed/denied binaries |
-| `security.network.outbound` | object | Outbound network rules |
-| `security.secrets` | list | Secrets injected at runtime |
-| `devcontainer.generate` | bool | Whether to generate a devcontainer spec |
+| `resources.memory_mb` | int | Memory allocation in MB |
+| `policy.commands` | object | Command allowlist/denylist rules |
+| `policy.network` | object | Domain firewall rules |
+| `policy.boundaries.enabled` | bool | Install fail-closed MCP and syscall boundaries |
+| `policy.boundaries.tool_calls` | object | Framed stdio MCP tool allow/deny rules |
+| `policy.boundaries.syscalls.additional_denylist` | list | Extra syscall names blocked by seccomp |
+| `secrets` | list | Vault keys injected at runtime |
+| `devcontainer.auto_generate` | bool | Whether to generate a devcontainer spec |
 | `observability.mcp_inspection.enabled` | bool | Enable eBPF MCP call inspection (opt-in) |
 | `observability.mcp_inspection.transports` | list | Transports to trace: `stdio`, `http` |
 | `observability.mcp_inspection.capture_payloads` | bool | Capture full payloads, or metadata only when `false` |
@@ -232,6 +254,7 @@ SendBox follows a **deny-by-default** security posture:
 3. **Network** — Outbound connections are blocked unless a matching `allow` rule exists. DNS resolution is restricted to permitted hosts.
 4. **Secrets** — Credentials are injected as environment variables at VM boot and are never written to the guest filesystem. Sources include host environment variables, files, and the macOS Keychain.
 5. **Isolation** — Each sandbox runs in its own lightweight VM. A compromised agent cannot affect the host or other sandboxes.
+6. **Boundaries** — The agent runs as the invoking non-root host UID under seccomp. Stdio MCP tool calls must pass through the root-owned proxy; direct server launches are terminated by eBPF.
 
 ## CLI Reference
 
@@ -247,6 +270,7 @@ SUBCOMMANDS:
   config        Validate or display resolved configuration
   devcontainer  Generate a devcontainer.json from the current config
   mcp           Inspect Model Context Protocol calls via eBPF
+  boundary      Inspect generated proxy, eBPF, seccomp, or bootstrap artifacts
   help          Show help for any subcommand
 ```
 

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Logging
 
@@ -11,6 +12,7 @@ public actor AgentRunner {
     private let secrets: SecretsVault
     private let devcontainerBuilder: DevContainerBuilder
     private let mcpInspector: MCPInspector?
+    private let boundaryEnforcer: BoundaryEnforcer?
     private let logger: Logger
 
     public enum RunnerState: String, Sendable {
@@ -42,6 +44,7 @@ public actor AgentRunner {
         case containerCreationFailed(String)
         case workspacePreparationFailed(String)
         case processExitedWithError(String, Int32)
+        case boundaryConfigurationInvalid(String)
 
         public var errorDescription: String? {
             switch self {
@@ -59,6 +62,8 @@ public actor AgentRunner {
                 return "Workspace preparation failed: \(msg)"
             case .processExitedWithError(let cmd, let code):
                 return "Process '\(cmd)' exited with code \(code)"
+            case .boundaryConfigurationInvalid(let message):
+                return "Boundary configuration is invalid: \(message)"
             }
         }
     }
@@ -81,6 +86,17 @@ public actor AgentRunner {
         } else {
             self.mcpInspector = nil
         }
+        if config.policy.boundaries.enabled {
+            self.boundaryEnforcer = BoundaryEnforcer(
+                config: config.policy.boundaries,
+                serverCommandPatterns: config.policy.boundaries.toolCalls
+                    .serverCommandPatterns,
+                runAsUID: getuid(),
+                runAsGID: getgid()
+            )
+        } else {
+            self.boundaryEnforcer = nil
+        }
         self.logger = logger
     }
 
@@ -93,6 +109,12 @@ public actor AgentRunner {
         }
 
         let startTime = Date()
+
+        do {
+            try boundaryEnforcer?.validate()
+        } catch {
+            throw RunnerError.boundaryConfigurationInvalid(error.localizedDescription)
+        }
 
         // Set up signal handling for graceful shutdown.
         signal(SIGINT, SIG_IGN)
@@ -204,6 +226,17 @@ public actor AgentRunner {
             throw RunnerError.invalidProjectPath(config.projectPath)
         }
 
+        if boundaryEnforcer != nil {
+            do {
+                try MCPBoundaryValidator(
+                    allowedServerCommands: config.policy.boundaries.toolCalls
+                        .allowedServerCommands
+                ).validateProject(at: config.projectPath)
+            } catch {
+                throw RunnerError.boundaryConfigurationInvalid(error.localizedDescription)
+            }
+        }
+
         logger.info("Project path validated", metadata: ["path": "\(config.projectPath)"])
     }
 
@@ -238,11 +271,15 @@ public actor AgentRunner {
             sandbox: config,
             imageReference: spec.image,
             firewall: firewall,
-            mcpInspector: mcpInspector
+            mcpInspector: mcpInspector,
+            boundaryEnforcer: boundaryEnforcer
         )
 
         if mcpInspector != nil {
             logger.info("eBPF MCP inspection enabled")
+        }
+        if boundaryEnforcer != nil {
+            logger.info("Fail-closed syscall and MCP boundary enforcement enabled")
         }
 
         // Merge authentication environment.
