@@ -458,7 +458,7 @@ public actor RuntimeSupervisor {
     ) -> Bool {
         for rule in config.autoApprovePatterns {
             guard rule.category == category else { continue }
-            if globMatch(action, pattern: rule.pattern) {
+            if GlobPattern.matches(action, pattern: rule.pattern) {
                 if let maxUses = rule.maxUses {
                     let usedCount = decisionHistory.filter {
                         $0.automated && $0.category == category
@@ -482,7 +482,7 @@ public actor RuntimeSupervisor {
             guard grant.category == category else { return false }
             if let expiresAt = grant.expiresAt, expiresAt < now { return false }
             if let uses = grant.usesRemaining, uses <= 0 { return false }
-            return globMatch(action, pattern: grant.pattern)
+            return GlobPattern.matches(action, pattern: grant.pattern)
         }
     }
 
@@ -606,38 +606,6 @@ public actor RuntimeSupervisor {
             automated: automated
         )
         decisionHistory.append(decision)
-    }
-
-    /// Simple glob matching: `*` matches zero or more of any character.
-    private func globMatch(_ string: String, pattern: String) -> Bool {
-        if pattern == "*" { return true }
-
-        var si = string.startIndex
-        var pi = pattern.startIndex
-        var starMatchSI = string.endIndex
-        var starPI = pattern.endIndex
-
-        while si < string.endIndex {
-            if pi < pattern.endIndex && (pattern[pi] == "?" || pattern[pi] == string[si]) {
-                si = string.index(after: si)
-                pi = pattern.index(after: pi)
-            } else if pi < pattern.endIndex && pattern[pi] == "*" {
-                starPI = pi
-                starMatchSI = si
-                pi = pattern.index(after: pi)
-            } else if starPI != pattern.endIndex {
-                pi = pattern.index(after: starPI)
-                starMatchSI = string.index(after: starMatchSI)
-                si = starMatchSI
-            } else {
-                return false
-            }
-        }
-
-        while pi < pattern.endIndex && pattern[pi] == "*" {
-            pi = pattern.index(after: pi)
-        }
-        return pi == pattern.endIndex
     }
 
     /// Run an async closure with a timeout. Returns `.deny` on timeout.

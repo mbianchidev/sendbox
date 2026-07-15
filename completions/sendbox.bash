@@ -173,13 +173,13 @@ _sendbox() {
     unset 'unparsed_words[0]'
     unparsed_words=("${unparsed_words[@]}")
     case "${subcommand}" in
-    run|init|analyze|secrets|policy|mcp|completions|help)
+    run|init|analyze|secrets|policy|mcp|boundary|completions|help)
         # Offer subcommand argument completions
         "_sendbox_${subcommand}"
         ;;
     *)
         # Offer subcommand completions
-        COMPREPLY+=($(compgen -W 'run init analyze secrets policy mcp completions help' -- "${cur}"))
+        COMPREPLY+=($(compgen -W 'run init analyze secrets policy mcp boundary completions help' -- "${cur}"))
         ;;
     esac
 }
@@ -403,6 +403,48 @@ _sendbox_mcp_report() {
     repeating_options=()
     non_repeating_options=()
     __sendbox_offer_flags_options 1
+}
+
+_sendbox_boundary() {
+    repeating_flags=()
+    non_repeating_flags=(--version -h --help)
+    repeating_options=()
+    non_repeating_options=()
+    __sendbox_offer_flags_options 0
+
+    # Offer subcommand / subcommand argument completions
+    local -r subcommand="${unparsed_words[0]}"
+    unset 'unparsed_words[0]'
+    unparsed_words=("${unparsed_words[@]}")
+    case "${subcommand}" in
+    script)
+        # Offer subcommand argument completions
+        "_sendbox_boundary_${subcommand}"
+        ;;
+    *)
+        # Offer subcommand completions
+        COMPREPLY+=($(compgen -W 'script' -- "${cur}"))
+        ;;
+    esac
+}
+
+_sendbox_boundary_script() {
+    repeating_flags=()
+    non_repeating_flags=(--version -h --help)
+    repeating_options=()
+    non_repeating_options=(--config --component)
+    __sendbox_offer_flags_options 0
+
+    # Offer option value completions
+    case "${prev}" in
+    '--config')
+        return
+        ;;
+    '--component')
+        __sendbox_add_completions -W 'bootstrap'$'\n''bpftrace'$'\n''proxy'$'\n''proxy-client'$'\n''seccomp'
+        return
+        ;;
+    esac
 }
 
 _sendbox_completions() {

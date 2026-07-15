@@ -28,7 +28,10 @@ struct SendBox: AsyncParsableCommand {
         commandName: "sendbox",
         abstract: "Secure hardware-isolated sandbox for AI agents",
         version: "0.1.0",
-        subcommands: [Run.self, Init.self, Analyze.self, Secrets.self, Policy.self, Mcp.self, Completions.self]
+        subcommands: [
+            Run.self, Init.self, Analyze.self, Secrets.self, Policy.self,
+            Mcp.self, Boundary.self, Completions.self,
+        ]
     )
 }
 
@@ -369,6 +372,44 @@ extension SendBox {
                         printStatus("    ✗ \(domain)")
                     }
                 }
+
+                printStatus("")
+                printStatus("Boundary Policy:")
+                printStatus("  Enabled:        \(policy.boundaries.enabled)")
+                printStatus(
+                    "  MCP transport:  \(policy.boundaries.toolCalls.transport.rawValue)"
+                )
+                printStatus(
+                    "  Tool default:    \(policy.boundaries.toolCalls.defaultAction.rawValue)"
+                )
+                printStatus(
+                    "  Max frame bytes: \(policy.boundaries.toolCalls.maxFrameBytes)"
+                )
+                printStatus("  Log path:       \(policy.boundaries.logPath)")
+                if !policy.boundaries.toolCalls.allowlist.isEmpty {
+                    printStatus("  Tool allowlist:")
+                    for tool in policy.boundaries.toolCalls.allowlist {
+                        printStatus("    ✓ \(tool)")
+                    }
+                }
+                if !policy.boundaries.toolCalls.denylist.isEmpty {
+                    printStatus("  Tool denylist:")
+                    for tool in policy.boundaries.toolCalls.denylist {
+                        printStatus("    ✗ \(tool)")
+                    }
+                }
+                if !policy.boundaries.syscalls.additionalDenylist.isEmpty {
+                    printStatus("  Additional denied syscalls:")
+                    for syscall in policy.boundaries.syscalls.additionalDenylist {
+                        printStatus("    ✗ \(syscall)")
+                    }
+                }
+                if !policy.boundaries.toolCalls.allowedServerCommands.isEmpty {
+                    printStatus("  Allowed MCP server commands:")
+                    for command in policy.boundaries.toolCalls.allowedServerCommands {
+                        printStatus("    ✓ \(command.joined(separator: " "))")
+                    }
+                }
             }
         }
 
@@ -420,6 +461,22 @@ extension SendBox {
                         && policy.commands.defaultAction == .deny {
                         warnings.append(
                             "Command allowlist is empty with default deny — no commands will be allowed"
+                        )
+                    }
+
+                    if policy.boundaries.enabled {
+                        let enforcer = BoundaryEnforcer(
+                            config: policy.boundaries,
+                            serverCommandPatterns: policy.boundaries.toolCalls
+                                .serverCommandPatterns,
+                            runAsUID: getuid(),
+                            runAsGID: getgid()
+                        )
+                        try enforcer.validate()
+                    } else {
+                        warnings.append(
+                            "Boundary enforcement is disabled — agent syscalls and MCP tools "
+                                + "will not be fail-closed"
                         )
                     }
 
@@ -618,6 +675,87 @@ extension SendBox {
                 if !summary.distinctMethods.isEmpty {
                     printStatus("")
                     printStatus("Distinct methods: \(summary.distinctMethods.joined(separator: ", "))")
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Boundary Enforcement
+
+extension SendBox {
+    struct Boundary: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Inspect fail-closed syscall and MCP boundary artifacts",
+            subcommands: [Script.self]
+        )
+
+        struct Script: ParsableCommand {
+            enum Component: String, ExpressibleByArgument, CaseIterable {
+                case bootstrap
+                case bpftrace
+                case proxy
+                case proxyClient = "proxy-client"
+                case seccomp
+            }
+
+            static let configuration = CommandConfiguration(
+                abstract: "Print a generated boundary component"
+            )
+
+            @Option(name: .long, help: "Path to sendbox config file")
+            var config: String?
+
+            @Option(
+                name: .long,
+                help: "Component: bootstrap, bpftrace, proxy, proxy-client, or seccomp"
+            )
+            var component: Component = .bootstrap
+
+            func run() throws {
+                let sandbox = try loadConfiguration(configPath: config, projectPath: nil)
+                guard sandbox.policy.boundaries.enabled else {
+                    printError("Boundary enforcement is disabled in this configuration")
+                    throw ExitCode.failure
+                }
+
+                let enforcer = BoundaryEnforcer(
+                    config: sandbox.policy.boundaries,
+                    serverCommandPatterns: sandbox.policy.boundaries.toolCalls
+                        .serverCommandPatterns,
+                    runAsUID: getuid(),
+                    runAsGID: getgid()
+                )
+                try enforcer.validate()
+
+                switch component {
+                case .bootstrap:
+                    let firewall = NetworkFirewall(config: sandbox.policy.network)
+                    let inspector: MCPInspector?
+                    if let mcpConfig = sandbox.observability?.mcpInspection,
+                        mcpConfig.enabled
+                    {
+                        inspector = MCPInspector(config: mcpConfig)
+                    } else {
+                        inspector = nil
+                    }
+                    var scripts = [firewall.generateStartupScript()]
+                    if let inspector {
+                        scripts.append(inspector.generateStartupScript())
+                    }
+                    print(
+                        enforcer.generateBootstrapScript(
+                            command: ["/bin/bash"],
+                            preflightScripts: scripts
+                        ))
+                case .bpftrace:
+                    print(enforcer.generateBpftraceProgram())
+                case .proxy:
+                    print(enforcer.generateProxyScript())
+                case .proxyClient:
+                    print(enforcer.generateProxyClientScript())
+                case .seccomp:
+                    print(enforcer.generateSeccompLauncherSource())
                 }
             }
         }

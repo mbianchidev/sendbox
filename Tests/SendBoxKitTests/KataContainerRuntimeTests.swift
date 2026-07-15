@@ -112,6 +112,57 @@ struct KataContainerRuntimeTests {
         )
     }
 
+    @Test func testKataRuntimeAppliesBoundaryBootstrapAndExecPrefix() async throws {
+        let recorder = KataCommandRecorder()
+        let runtime = KataContainerRuntime(
+            configuration: .default,
+            commandRunner: { executable, arguments, environment in
+                await recorder.run(
+                    executable: executable,
+                    arguments: arguments,
+                    environment: environment
+                )
+            }
+        )
+        let config = makeContainerConfig(
+            boundaryExecPrefix: ["/run/sendbox-boundary/seccomp-launcher", "--"],
+            boundaryReadyPath: "/run/sendbox-boundary/ready"
+        )
+
+        try await runtime.initialize()
+        _ = try await runtime.createContainer(config)
+        _ = try await runtime.exec(
+            containerId: config.id,
+            command: ["echo", "ok"],
+            policy: CommandPolicy(config: PolicyConfiguration.default.commands)
+        )
+
+        let snapshot = await recorder.snapshot()
+        let runInvocation = try #require(
+            snapshot.invocations.first { $0.arguments.contains("run") }
+        )
+        #expect(flagValue("--pid", in: runInvocation.arguments) == "host")
+        #expect(
+            flagValue("--security-opt", in: runInvocation.arguments)
+                == "seccomp=unconfined"
+        )
+        #expect(flagValues("--cap-add", in: runInvocation.arguments).contains("BPF"))
+        #expect(flagValues("--cap-add", in: runInvocation.arguments).contains("SYS_ADMIN"))
+        #expect(snapshot.environmentContents?.contains("SENDBOX_AGENT_ENV_B64=") == true)
+        #expect(
+            snapshot.invocations.contains { invocation in
+                invocation.arguments.suffix(5)
+                    == [
+                        "sandbox-id",
+                        "/run/sendbox-boundary/seccomp-launcher",
+                        "--",
+                        "echo",
+                        "ok",
+                    ]
+            }
+        )
+    }
+
     @Test func testKataInitializationExplainsContainerdPermissions() async {
         let runtime = KataContainerRuntime(
             configuration: .default,
@@ -165,7 +216,9 @@ struct KataContainerRuntimeTests {
 
     private func makeContainerConfig(
         firewallScript: String? = nil,
-        mcpInspectionScript: String? = nil
+        mcpInspectionScript: String? = nil,
+        boundaryExecPrefix: [String] = [],
+        boundaryReadyPath: String? = nil
     ) -> ContainerConfig {
         ContainerConfig(
             id: "sandbox-id",
@@ -200,7 +253,9 @@ struct KataContainerRuntimeTests {
             ),
             firewallScript: firewallScript,
             dnsConfig: nil,
-            mcpInspectionScript: mcpInspectionScript
+            mcpInspectionScript: mcpInspectionScript,
+            boundaryExecPrefix: boundaryExecPrefix,
+            boundaryReadyPath: boundaryReadyPath
         )
     }
 

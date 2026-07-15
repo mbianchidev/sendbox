@@ -16,6 +16,7 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 - **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
 - **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
 - **MCP Inspection (eBPF)** — Observe Model Context Protocol JSON-RPC traffic between the agent and its MCP servers at the kernel boundary. Captures both stdio and HTTP/SSE transports, classifies tool calls, and feeds the audit trail. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
+- **Boundary Enforcement** — Run every agent process under a seccomp-BPF syscall denylist and route stdio MCP servers through a framing-aware tool proxy. eBPF detects direct proxy bypass attempts and records denied syscalls. Enforcement is fail-closed.
 - **Supply Chain Provenance** — Ed25519 signing for config and policy files ensures they were authored by trusted identities. Multi-signer support with a configurable trust store.
 - **Runtime Supervisor** — Dynamic permission expansion with approval workflows. Agents start restricted and earn broader permissions through supervised interaction (one-time, session-wide, or pattern-based grants).
 - **VM Hardening** — Defense-in-depth sysctl lockdown, capability dropping, and seccomp profiles covering all 18 [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) scenarios.
@@ -34,6 +35,11 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 | Kata runtime | Kata Containers | 3.28 |
 | Kata runtime | containerd | 1.7 |
 | Kata runtime | nerdctl and CNI plugins | Current compatible releases |
+
+Boundary-enabled guest images must include `python3`, `bpftrace`, a C compiler,
+libseccomp development headers, and the Yama LSM with writable
+`kernel.yama.ptrace_scope`. SendBox refuses to launch the agent when any required
+enforcement component is unavailable.
 
 ## Quick Start
 
@@ -112,8 +118,9 @@ sendbox run --config sendbox.yaml --runtime kata
 SendBox is configured through YAML. See [config/example-sandbox.yaml](config/example-sandbox.yaml) for the fully annotated reference.
 
 ```yaml
+# sendbox.yaml
 name: my-agent-sandbox
-project_path: /home/developer/my-project
+project_path: ./workspace
 
 runtime:
   provider: auto # auto | apple | kata
@@ -125,25 +132,59 @@ runtime:
 resources:
   cpus: 2
   memory_mb: 2048
-  disk_size_mb: 5120
+  disk_size_mb: 10240
 
 policy:
   commands:
     default_action: deny
-    allowlist: ["git *", "npm *", "swift *"]
-    denylist: ["sudo *"]
+    allowlist:
+      - "git *"
+      - "npm *"
+      - "python3 *"
+    denylist:
+      - "sudo *"
     log_blocked: true
+
   network:
     default_action: deny
-    allowed_domains: ["github.com", "*.github.com"]
-    blocked_domains: []
     allow_dns: true
+    allowed_domains:
+      - github.com
+      - "*.github.com"
+      - registry.npmjs.org
+    blocked_domains: []
 
-secrets: [GITHUB_TOKEN]
+  boundaries:
+    enabled: true
+    tool_calls:
+      transport: stdio       # HTTP/SSE MCP is rejected in boundary mode
+      default_action: deny
+      allowlist:
+        - read_file
+        - list_directory
+        - search_code
+      denylist:
+        - "*delete*"
+      max_frame_bytes: 1048576
+      server_command_patterns:
+        - mcp-server
+        - "@modelcontextprotocol"
+      allowed_server_commands:
+        - ["/usr/local/bin/node", "/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspaces/my-project"]
+    syscalls:
+      additional_denylist:
+        - io_uring_setup
+      log_blocked: true
+    log_path: /var/log/sendbox/boundary.log
+
+secrets:
+  - GITHUB_TOKEN
+  - NPM_TOKEN
 
 devcontainer:
   auto_generate: true
-  extensions: [github.copilot]
+  extensions:
+    - github.copilot
 
 github:
   forward_auth: true
@@ -173,6 +214,9 @@ observability:
 | `resources.disk_size_mb` | int | Requested writable-layer size |
 | `policy.commands` | object | Command allowlist/denylist policy |
 | `policy.network` | object | Outbound network policy |
+| `policy.boundaries.enabled` | bool | Install fail-closed MCP and syscall boundaries |
+| `policy.boundaries.tool_calls` | object | Framed stdio MCP tool allow/deny rules |
+| `policy.boundaries.syscalls.additional_denylist` | list | Extra syscall names blocked by seccomp |
 | `secrets` | list | Secret names injected at runtime |
 | `devcontainer.auto_generate` | bool | Generate a devcontainer spec |
 | `observability.mcp_inspection.enabled` | bool | Enable eBPF MCP call inspection (opt-in) |
@@ -213,6 +257,7 @@ SendBox follows a **deny-by-default** security posture:
 3. **Network** — Outbound connections are blocked unless a matching `allow` rule exists. DNS resolution is restricted to permitted hosts.
 4. **Secrets** — Credentials are injected at container creation and never persisted in the guest filesystem. Host storage uses Keychain on macOS and mode-restricted files on Linux.
 5. **Isolation** — Each sandbox runs in its own lightweight VM. A compromised agent cannot affect the host or other sandboxes.
+6. **Boundaries** — The agent runs as the invoking non-root host UID under seccomp. Stdio MCP tool calls must pass through the root-owned proxy; direct server launches are terminated by eBPF.
 
 ## CLI Reference
 
@@ -226,6 +271,7 @@ SUBCOMMANDS:
   secrets       Add, remove, or list stored secrets
   policy        Show or validate policies
   mcp           Inspect Model Context Protocol calls via eBPF
+  boundary      Inspect generated proxy, eBPF, seccomp, or bootstrap artifacts
   completions   Install or print shell completions
   help          Show help for any subcommand
 ```
