@@ -10,7 +10,8 @@ enum HostCommand {
     static func run(
         executable: String,
         arguments: [String],
-        environment: [String: String] = [:]
+        environment: [String: String] = [:],
+        inheritEnvironment: Bool = true
     ) async throws -> HostCommandResult {
         let cancellation = ProcessCancellation()
         return try await withTaskCancellationHandler {
@@ -19,6 +20,7 @@ enum HostCommand {
                     executable: executable,
                     arguments: arguments,
                     environment: environment,
+                    inheritEnvironment: inheritEnvironment,
                     cancellation: cancellation
                 )
             }.value
@@ -31,6 +33,7 @@ enum HostCommand {
         executable: String,
         arguments: [String],
         environment: [String: String],
+        inheritEnvironment: Bool,
         cancellation: ProcessCancellation
     ) throws -> HostCommandResult {
         let fileManager = FileManager.default
@@ -60,11 +63,13 @@ enum HostCommand {
         process.arguments = [executable] + arguments
         process.standardOutput = stdoutHandle
         process.standardError = stderrHandle
-        if !environment.isEmpty {
+        if inheritEnvironment {
             process.environment = ProcessInfo.processInfo.environment.merging(
                 environment,
                 uniquingKeysWith: { _, override in override }
             )
+        } else {
+            process.environment = environment
         }
 
         try process.run()

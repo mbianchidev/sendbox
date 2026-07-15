@@ -19,7 +19,10 @@ struct SandboxConfigTests {
         #expect(config.devcontainer?.autoGenerate == true)
         #expect(config.runtime?.provider == .automatic)
         #expect(config.runtime?.kata.runtimeHandler == "io.containerd.kata.v2")
-        #expect(config.runtime?.hyperlight.executable == "hyperlight-unikraft")
+        #expect(
+            config.runtime?.hyperlight.executable
+                == "/usr/local/bin/hyperlight-unikraft"
+        )
     }
 
     // MARK: - YAML serialization round-trip

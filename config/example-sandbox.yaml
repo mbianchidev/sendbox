@@ -43,7 +43,7 @@ runtime:
   # Used only when provider is "hyperlight". The kernel and initrd must contain
   # a shell and every command or MCP server that the guest will execute.
   hyperlight:
-    executable: hyperlight-unikraft
+    executable: /usr/local/bin/hyperlight-unikraft
     kernel_path: /opt/hyperlight/shell-kernel
     initrd_path: /opt/hyperlight/shell.cpio
     stack_mb: 8

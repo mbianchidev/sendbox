@@ -69,12 +69,15 @@ struct HyperlightRuntimeTests {
         #expect(arguments.last == #"'printf' '%s' 'value'\''; rm -rf /'"#)
     }
 
-    @Test func testExecChecksPolicyBeforeSpawningMicroVM() async throws {
+    @Test func testExecAndMCPCheckPolicyBeforeSpawningMicroVM() async throws {
         let recorder = HyperlightCommandRecorder()
         let runtime = HyperlightRuntime(
             configuration: HyperlightRuntimeConfiguration(kernelPath: "/kernel"),
             commandRunner: { executable, arguments, _ in
                 await recorder.record(executable: executable, arguments: arguments)
+                if arguments != ["--version"] {
+                    try await Task.sleep(for: .seconds(10))
+                }
                 return HostCommandResult(exitCode: 0, stdout: "", stderr: "")
             },
             hostValidator: { _ in }
@@ -102,12 +105,116 @@ struct HyperlightRuntimeTests {
             #expect(error.localizedDescription.contains("denied by policy"))
         }
 
+        do {
+            _ = try await runtime.mcpExec(
+                containerId: id,
+                command: ["rm", "-rf", "/"],
+                policy: policy
+            )
+            Issue.record("Expected command policy to deny MCP execution")
+        } catch {
+            #expect(error.localizedDescription.contains("denied by policy"))
+        }
+
         let invocations = await recorder.snapshot()
         #expect(
             !invocations.contains { invocation in
                 invocation.arguments.contains("'rm' '-rf' '/'")
             }
         )
+        try await runtime.stopContainer(id: id)
+    }
+
+    @Test func testRuntimeStagesReadOnlyMounts() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sendbox-hyperlight-test-\(UUID().uuidString)")
+        let protectedDirectory = root.appendingPathComponent(".devcontainer")
+        try FileManager.default.createDirectory(
+            at: protectedDirectory,
+            withIntermediateDirectories: true
+        )
+        try Data("protected".utf8).write(
+            to: protectedDirectory.appendingPathComponent("devcontainer.json")
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let recorder = HyperlightCommandRecorder()
+        let runtime = HyperlightRuntime(
+            configuration: HyperlightRuntimeConfiguration(kernelPath: "/kernel"),
+            commandRunner: { executable, arguments, _ in
+                await recorder.record(executable: executable, arguments: arguments)
+                if arguments != ["--version"] {
+                    try await Task.sleep(for: .seconds(10))
+                }
+                return HostCommandResult(exitCode: 0, stdout: "", stderr: "")
+            },
+            hostValidator: { _ in }
+        )
+        var config = makeContainerConfig()
+        config.mounts.insert(
+            .init(
+                source: protectedDirectory.path,
+                destination: "/workspaces/project/.devcontainer",
+                readOnly: true
+            ),
+            at: 0
+        )
+
+        try await runtime.initialize()
+        let id = try await runtime.createContainer(config)
+
+        var invocations = await recorder.snapshot()
+        for _ in 0..<100 where !invocations.contains(where: { $0.arguments.contains("--exec") }) {
+            await Task.yield()
+            invocations = await recorder.snapshot()
+        }
+        let invocation = try #require(
+            invocations.first { $0.arguments.contains("--exec") }
+        )
+        let stagedMount = try #require(
+            flagValues("--mount", in: invocation.arguments).first {
+                $0.hasSuffix(":/workspaces/project/.devcontainer")
+            }
+        )
+        let stagedPath = String(
+            stagedMount.dropLast(":/workspaces/project/.devcontainer".count)
+        )
+        #expect(stagedPath != protectedDirectory.path)
+        #expect(
+            FileManager.default.fileExists(
+                atPath: (stagedPath as NSString)
+                    .appendingPathComponent("devcontainer.json")
+            )
+        )
+
+        try await runtime.stopContainer(id: id)
+        #expect(!FileManager.default.fileExists(atPath: stagedPath))
+    }
+
+    @Test func testRuntimeRejectsNetworkWhenDNSIsDisabled() async throws {
+        let runtime = HyperlightRuntime(
+            configuration: HyperlightRuntimeConfiguration(kernelPath: "/kernel"),
+            commandRunner: { _, _, _ in
+                HostCommandResult(exitCode: 0, stdout: "", stderr: "")
+            },
+            hostValidator: { _ in }
+        )
+        var config = makeContainerConfig(allowedHosts: ["api.github.com"])
+        config.network = .init(
+            address: config.network.address,
+            gateway: config.network.gateway,
+            nameservers: config.network.nameservers,
+            allowedHosts: config.network.allowedHosts,
+            allowDNS: false
+        )
+
+        try await runtime.initialize()
+        do {
+            _ = try await runtime.createContainer(config)
+            Issue.record("Expected unsupported DNS policy to fail closed")
+        } catch {
+            #expect(error.localizedDescription.contains("DNS disabled"))
+        }
     }
 
     private func makeContainerConfig(allowedHosts: [String] = []) -> ContainerConfig {
@@ -122,11 +229,6 @@ struct HyperlightRuntimeTests {
             command: ["/bin/sh"],
             environment: [:],
             mounts: [
-                .init(
-                    source: "/host/project/.devcontainer",
-                    destination: "/workspaces/project/.devcontainer",
-                    readOnly: true
-                ),
                 .init(
                     source: "/host/project",
                     destination: "/workspaces/project",

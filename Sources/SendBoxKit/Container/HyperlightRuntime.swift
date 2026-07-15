@@ -46,7 +46,10 @@ public actor HyperlightRuntime: RuntimeProvider {
         let config: ContainerConfig
         var status: RuntimeContainerStatus
         var task: Task<HostCommandResult, Error>?
+        var execTasks: [UUID: Task<HostCommandResult, Error>]
+        var mcpSessions: [UUID: HyperlightMCPSession]
         var result: HostCommandResult?
+        var temporaryMounts: [URL]
     }
 
     private let configuration: HyperlightRuntimeConfiguration
@@ -62,7 +65,14 @@ public actor HyperlightRuntime: RuntimeProvider {
     ) {
         self.configuration = configuration
         self.logger = logger
-        self.commandRunner = HostCommand.run
+        self.commandRunner = { executable, arguments, environment in
+            try await HostCommand.run(
+                executable: executable,
+                arguments: arguments,
+                environment: environment,
+                inheritEnvironment: false
+            )
+        }
         self.hostValidator = Self.validateHost
     }
 
@@ -83,7 +93,11 @@ public actor HyperlightRuntime: RuntimeProvider {
 
         let result: HostCommandResult
         do {
-            result = try await commandRunner(configuration.executable, ["--version"], [:])
+            result = try await commandRunner(
+                configuration.executable,
+                ["--version"],
+                Self.hostEnvironment
+            )
         } catch {
             throw RuntimeError.invalidConfiguration(
                 "could not execute \(configuration.executable): \(error.localizedDescription)"
@@ -115,20 +129,24 @@ public actor HyperlightRuntime: RuntimeProvider {
             throw RuntimeError.containerAlreadyExists(config.id)
         }
         try validate(config)
+        let (preparedConfig, temporaryMounts) = try prepareMounts(for: config)
 
         let arguments = HyperlightCommandBuilder(configuration: configuration)
-            .arguments(for: config, command: config.command)
+            .arguments(for: preparedConfig, command: preparedConfig.command)
         let executable = configuration.executable
         let runner = commandRunner
         let task = Task {
-            try await runner(executable, arguments, [:])
+            try await runner(executable, arguments, Self.hostEnvironment)
         }
 
         activeVMs[config.id] = ManagedVM(
-            config: config,
+            config: preparedConfig,
             status: .running,
             task: task,
-            result: nil
+            execTasks: [:],
+            mcpSessions: [:],
+            result: nil,
+            temporaryMounts: temporaryMounts
         )
 
         Task { [weak self] in
@@ -149,8 +167,21 @@ public actor HyperlightRuntime: RuntimeProvider {
             throw RuntimeError.containerNotFound(id)
         }
         vm.task?.cancel()
+        for task in vm.execTasks.values {
+            task.cancel()
+        }
+        for session in vm.mcpSessions.values {
+            session.stop()
+        }
         vm.status = .stopped
         activeVMs[id] = vm
+        if let task = vm.task {
+            _ = try? await task.value
+        }
+        for task in vm.execTasks.values {
+            _ = try? await task.value
+        }
+        removeTemporaryMounts(vm.temporaryMounts)
         logger.info("Stopped Hyperlight micro-VM \(id)")
     }
 
@@ -165,6 +196,11 @@ public actor HyperlightRuntime: RuntimeProvider {
     ) async throws -> ExecResult {
         guard let vm = activeVMs[containerId] else {
             throw RuntimeError.containerNotFound(containerId)
+        }
+        guard vm.status == .running else {
+            throw RuntimeError.unsupported(
+                "exec in a micro-VM with status \(vm.status.rawValue)"
+            )
         }
         guard !command.isEmpty else {
             throw RuntimeError.invalidConfiguration("command cannot be empty")
@@ -181,9 +217,25 @@ public actor HyperlightRuntime: RuntimeProvider {
 
         let arguments = HyperlightCommandBuilder(configuration: configuration)
             .arguments(for: vm.config, command: command)
+        let executable = configuration.executable
+        let runner = commandRunner
+        let task = Task {
+            try await runner(executable, arguments, Self.hostEnvironment)
+        }
+        let execID = UUID()
+        var updatedVM = vm
+        updatedVM.execTasks[execID] = task
+        activeVMs[containerId] = updatedVM
+        defer {
+            if var currentVM = activeVMs[containerId] {
+                currentVM.execTasks.removeValue(forKey: execID)
+                activeVMs[containerId] = currentVM
+            }
+        }
+
         let result: HostCommandResult
         do {
-            result = try await commandRunner(configuration.executable, arguments, [:])
+            result = try await task.value
         } catch {
             throw RuntimeError.commandFailed(exitCode: -1, stderr: error.localizedDescription)
         }
@@ -193,6 +245,50 @@ public actor HyperlightRuntime: RuntimeProvider {
             stdout: result.stdout,
             stderr: result.stderr
         )
+    }
+
+    /// Start a bidirectional stdio MCP server in a fresh Hyperlight micro-VM.
+    public func mcpExec(
+        containerId: String,
+        command: [String],
+        policy: CommandPolicy
+    ) async throws -> HyperlightMCPSession {
+        guard var vm = activeVMs[containerId] else {
+            throw RuntimeError.containerNotFound(containerId)
+        }
+        guard vm.status == .running else {
+            throw RuntimeError.unsupported(
+                "MCP exec in a micro-VM with status \(vm.status.rawValue)"
+            )
+        }
+        guard !command.isEmpty else {
+            throw RuntimeError.invalidConfiguration("MCP command cannot be empty")
+        }
+
+        let commandString = command.joined(separator: " ")
+        let decision = await policy.evaluatePipeline(commandString)
+        guard decision.isAllowed else {
+            if case .denied(let reason) = decision {
+                throw RuntimeError.commandDenied(reason)
+            }
+            throw RuntimeError.commandDenied("MCP command blocked by policy")
+        }
+
+        let arguments = HyperlightCommandBuilder(configuration: configuration)
+            .arguments(for: vm.config, command: command)
+        let session: HyperlightMCPSession
+        do {
+            session = try HyperlightMCPSession(
+                executable: configuration.executable,
+                arguments: arguments
+            )
+        } catch {
+            throw RuntimeError.commandFailed(exitCode: -1, stderr: error.localizedDescription)
+        }
+
+        vm.mcpSessions[UUID()] = session
+        activeVMs[containerId] = vm
+        return session
     }
 
     public func attachOutput(containerId: String) async throws -> AsyncStream<String> {
@@ -233,8 +329,24 @@ public actor HyperlightRuntime: RuntimeProvider {
     }
 
     public func cleanup() async throws {
-        for (_, vm) in activeVMs {
+        let vms = Array(activeVMs.values)
+        for vm in vms {
             vm.task?.cancel()
+            for task in vm.execTasks.values {
+                task.cancel()
+            }
+            for session in vm.mcpSessions.values {
+                session.stop()
+            }
+        }
+        for vm in vms {
+            if let task = vm.task {
+                _ = try? await task.value
+            }
+            for task in vm.execTasks.values {
+                _ = try? await task.value
+            }
+            removeTemporaryMounts(vm.temporaryMounts)
         }
         activeVMs.removeAll()
         logger.info("All Hyperlight micro-VMs cleaned up")
@@ -243,6 +355,11 @@ public actor HyperlightRuntime: RuntimeProvider {
     private func validateConfiguration() throws {
         guard !configuration.executable.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw RuntimeError.invalidConfiguration("executable cannot be empty")
+        }
+        guard configuration.executable.hasPrefix("/") else {
+            throw RuntimeError.invalidConfiguration(
+                "executable must be an administrator-controlled absolute path"
+            )
         }
         guard !configuration.kernelPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw RuntimeError.invalidConfiguration("kernel_path is required")
@@ -254,6 +371,7 @@ public actor HyperlightRuntime: RuntimeProvider {
     }
 
     private static func validateHost(_ configuration: HyperlightRuntimeConfiguration) throws {
+        try validateTrustedExecutable(configuration.executable)
         guard FileManager.default.fileExists(atPath: configuration.kernelPath) else {
             throw RuntimeError.invalidConfiguration(
                 "kernel not found at \(configuration.kernelPath)"
@@ -273,6 +391,45 @@ public actor HyperlightRuntime: RuntimeProvider {
         #endif
     }
 
+    private static func validateTrustedExecutable(_ path: String) throws {
+        let configuredURL = URL(fileURLWithPath: path).standardizedFileURL
+        let executableURL = configuredURL.resolvingSymlinksInPath()
+        guard configuredURL.path == executableURL.path else {
+            throw RuntimeError.invalidConfiguration(
+                "executable path must not contain symbolic links"
+            )
+        }
+        var currentURL = executableURL
+
+        while currentURL.path != "/" {
+            let attributes: [FileAttributeKey: Any]
+            do {
+                attributes = try FileManager.default.attributesOfItem(
+                    atPath: currentURL.path
+                )
+            } catch {
+                throw RuntimeError.invalidConfiguration(
+                    "trusted executable path component not found: \(currentURL.path)"
+                )
+            }
+
+            let ownerID = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value
+            let permissions =
+                (attributes[.posixPermissions] as? NSNumber)?.uint16Value ?? 0o777
+            guard ownerID == 0, permissions & 0o022 == 0 else {
+                throw RuntimeError.invalidConfiguration(
+                    "executable and parent directories must be root-owned and not group- or world-writable"
+                )
+            }
+            currentURL = currentURL.deletingLastPathComponent()
+        }
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: executableURL.path)
+        guard attributes[.type] as? FileAttributeType == .typeRegular else {
+            throw RuntimeError.invalidConfiguration("executable must be a regular file")
+        }
+    }
+
     private func validate(_ config: ContainerConfig) throws {
         guard !config.command.isEmpty else {
             throw RuntimeError.invalidConfiguration("command cannot be empty")
@@ -288,6 +445,62 @@ public actor HyperlightRuntime: RuntimeProvider {
         if config.mcpInspectionScript != nil {
             throw RuntimeError.unsupported("eBPF MCP inspection in a unikernel guest")
         }
+        let networkingEnabled =
+            config.network.allowsUnrestrictedOutbound || !config.network.allowedHosts.isEmpty
+        if networkingEnabled && !config.network.allowDNS {
+            throw RuntimeError.unsupported(
+                "network access with DNS disabled because Hyperlight permits resolver traffic"
+            )
+        }
+    }
+
+    private static let hostEnvironment = [
+        "LANG": "C",
+        "PATH": "/usr/bin:/bin",
+    ]
+
+    private func prepareMounts(for config: ContainerConfig) throws -> (ContainerConfig, [URL]) {
+        var preparedConfig = config
+        var temporaryMounts: [URL] = []
+
+        do {
+            for index in preparedConfig.mounts.indices
+            where preparedConfig.mounts[index].readOnly {
+                let mount = preparedConfig.mounts[index]
+                let stagingRoot = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(
+                        "sendbox-hyperlight-mount-\(UUID().uuidString)",
+                        isDirectory: true
+                    )
+                try SecureFile.ensureDirectory(at: stagingRoot)
+                temporaryMounts.append(stagingRoot)
+
+                let sourceURL = URL(fileURLWithPath: mount.source)
+                let stagedSource = stagingRoot.appendingPathComponent(
+                    sourceURL.lastPathComponent,
+                    isDirectory: sourceURL.hasDirectoryPath
+                )
+                try FileManager.default.copyItem(at: sourceURL, to: stagedSource)
+                preparedConfig.mounts[index] = .init(
+                    source: stagedSource.path,
+                    destination: mount.destination,
+                    readOnly: false
+                )
+            }
+        } catch {
+            removeTemporaryMounts(temporaryMounts)
+            throw RuntimeError.invalidConfiguration(
+                "could not stage a read-only mount: \(error.localizedDescription)"
+            )
+        }
+
+        return (preparedConfig, temporaryMounts)
+    }
+
+    private func removeTemporaryMounts(_ mounts: [URL]) {
+        for mount in mounts {
+            try? FileManager.default.removeItem(at: mount)
+        }
     }
 
     private func recordCompletion(id: String, result: HostCommandResult) {
@@ -296,6 +509,14 @@ public actor HyperlightRuntime: RuntimeProvider {
         }
         vm.result = result
         vm.status = result.exitCode == 0 ? .stopped : .failed
+        for task in vm.execTasks.values {
+            task.cancel()
+        }
+        for session in vm.mcpSessions.values {
+            session.stop()
+        }
+        removeTemporaryMounts(vm.temporaryMounts)
+        vm.temporaryMounts.removeAll()
         activeVMs[id] = vm
     }
 
@@ -309,7 +530,92 @@ public actor HyperlightRuntime: RuntimeProvider {
             stderr: error.localizedDescription
         )
         vm.status = .failed
+        for task in vm.execTasks.values {
+            task.cancel()
+        }
+        for session in vm.mcpSessions.values {
+            session.stop()
+        }
+        removeTemporaryMounts(vm.temporaryMounts)
+        vm.temporaryMounts.removeAll()
         activeVMs[id] = vm
+    }
+}
+
+/// A bidirectional stdio connection to an MCP server running in Hyperlight.
+public final class HyperlightMCPSession: @unchecked Sendable {
+    private let process: Process
+    private let input: FileHandle
+    private let output: FileHandle
+    private let errorOutput: FileHandle
+    private let lock = NSLock()
+
+    fileprivate init(executable: String, arguments: [String]) throws {
+        let process = Process()
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [executable] + arguments
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        process.environment = [
+            "LANG": "C",
+            "PATH": "/usr/bin:/bin",
+        ]
+        try process.run()
+
+        self.process = process
+        self.input = inputPipe.fileHandleForWriting
+        self.output = outputPipe.fileHandleForReading
+        self.errorOutput = errorPipe.fileHandleForReading
+    }
+
+    public var isRunning: Bool {
+        process.isRunning
+    }
+
+    /// Write one newline-delimited JSON-RPC message to the MCP server.
+    public func send(_ message: Data) throws {
+        var payload = message
+        if payload.last != 0x0A {
+            payload.append(0x0A)
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        try input.write(contentsOf: payload)
+    }
+
+    /// Read the next available response bytes from the MCP server.
+    public func receive(maxBytes: Int = 65_536) async throws -> Data {
+        try await Task.detached {
+            try self.output.read(upToCount: maxBytes) ?? Data()
+        }.value
+    }
+
+    /// Read diagnostic bytes emitted on stderr.
+    public func receiveError(maxBytes: Int = 65_536) async throws -> Data {
+        try await Task.detached {
+            try self.errorOutput.read(upToCount: maxBytes) ?? Data()
+        }.value
+    }
+
+    public func stop() {
+        lock.lock()
+        try? input.close()
+        if process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
+        lock.unlock()
+    }
+
+    deinit {
+        stop()
+        try? output.close()
+        try? errorOutput.close()
     }
 }
 

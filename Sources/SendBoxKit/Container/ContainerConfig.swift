@@ -51,6 +51,7 @@ public struct ContainerConfig: Sendable {
         public let allowsUnrestrictedOutbound: Bool
         public let allowedHosts: [String]
         public let blockedHosts: [String]
+        public let allowDNS: Bool
 
         public init(
             address: String,
@@ -58,7 +59,8 @@ public struct ContainerConfig: Sendable {
             nameservers: [String],
             allowsUnrestrictedOutbound: Bool = false,
             allowedHosts: [String] = [],
-            blockedHosts: [String] = []
+            blockedHosts: [String] = [],
+            allowDNS: Bool = true
         ) {
             self.address = address
             self.gateway = gateway
@@ -66,6 +68,7 @@ public struct ContainerConfig: Sendable {
             self.allowsUnrestrictedOutbound = allowsUnrestrictedOutbound
             self.allowedHosts = allowedHosts
             self.blockedHosts = blockedHosts
+            self.allowDNS = allowDNS
         }
     }
 
@@ -118,7 +121,8 @@ public struct ContainerConfig: Sendable {
             nameservers: ["192.168.64.1", "1.1.1.1"],
             allowsUnrestrictedOutbound: sandbox.policy.network.defaultAction == .allow,
             allowedHosts: sandbox.policy.network.allowedDomains,
-            blockedHosts: sandbox.policy.network.blockedDomains
+            blockedHosts: sandbox.policy.network.blockedDomains,
+            allowDNS: sandbox.policy.network.allowDNS
         )
 
         let environment: [String: String] = [

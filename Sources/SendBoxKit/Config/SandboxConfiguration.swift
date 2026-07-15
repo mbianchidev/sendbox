@@ -56,7 +56,7 @@ public struct HyperlightRuntimeConfiguration: Codable, Sendable, Equatable {
     public static let `default` = HyperlightRuntimeConfiguration()
 
     public init(
-        executable: String = "hyperlight-unikraft",
+        executable: String = "/usr/local/bin/hyperlight-unikraft",
         kernelPath: String = "",
         initrdPath: String? = nil,
         stackMB: Int = 8
@@ -78,7 +78,7 @@ public struct HyperlightRuntimeConfiguration: Codable, Sendable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.executable =
             try container.decodeIfPresent(String.self, forKey: .executable)
-            ?? "hyperlight-unikraft"
+            ?? "/usr/local/bin/hyperlight-unikraft"
         self.kernelPath =
             try container.decodeIfPresent(String.self, forKey: .kernelPath) ?? ""
         self.initrdPath = try container.decodeIfPresent(String.self, forKey: .initrdPath)
