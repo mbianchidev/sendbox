@@ -183,8 +183,6 @@ struct SandboxConfigTests {
                 kernel_path: /opt/hyperlight/shell-kernel
                 initrd_path: /opt/hyperlight/shell.cpio
                 stack_mb: 16
-                allowed_hosts:
-                  - api.github.com
             resources:
               cpus: 2
               memory_mb: 256
@@ -214,7 +212,6 @@ struct SandboxConfigTests {
         #expect(runtime.hyperlight.kernelPath == "/opt/hyperlight/shell-kernel")
         #expect(runtime.hyperlight.initrdPath == "/opt/hyperlight/shell.cpio")
         #expect(runtime.hyperlight.stackMB == 16)
-        #expect(runtime.hyperlight.allowedHosts == ["api.github.com"])
     }
 
     // MARK: - Policy presets

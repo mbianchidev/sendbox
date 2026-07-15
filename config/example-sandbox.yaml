@@ -26,7 +26,8 @@ project_path: /Users/developer/my-project
 # Runtime Provider
 # ─────────────────────────────────────────────────────────────────────────────
 # "auto" selects Apple Containerization on supported macOS hosts and Kata
-# Containers on Linux. Override it with `sendbox run --runtime apple|kata`.
+# Containers on Linux. Hyperlight is an explicit Linux/KVM-only provider.
+# Override it with `sendbox run --runtime apple|kata|hyperlight`.
 runtime:
   provider: auto
 
@@ -38,6 +39,14 @@ runtime:
     # address: /run/containerd/containerd.sock
     # snapshotter: overlayfs
     # configuration_path: /etc/kata-containers/configuration.toml
+
+  # Used only when provider is "hyperlight". The kernel and initrd must contain
+  # a shell and every command or MCP server that the guest will execute.
+  hyperlight:
+    executable: hyperlight-unikraft
+    kernel_path: /opt/hyperlight/shell-kernel
+    initrd_path: /opt/hyperlight/shell.cpio
+    stack_mb: 8
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Container Resources

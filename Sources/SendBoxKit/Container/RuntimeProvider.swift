@@ -72,6 +72,15 @@ public enum RuntimeProviderFactory {
             #endif
         case .kata:
             return KataContainerRuntime(configuration: configuration.kata, logger: logger)
+        case .hyperlight:
+            #if os(Linux)
+            return HyperlightRuntime(configuration: configuration.hyperlight, logger: logger)
+            #else
+            return UnavailableRuntimeProvider(
+                provider: .hyperlight,
+                reason: "Hyperlight requires Linux with KVM"
+            )
+            #endif
         }
     }
 

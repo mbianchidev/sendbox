@@ -7,24 +7,29 @@ public struct RuntimeConfiguration: Codable, Sendable, Equatable {
         case automatic = "auto"
         case apple
         case kata
+        case hyperlight
     }
 
     public var provider: Provider
     public var kata: KataRuntimeConfiguration
+    public var hyperlight: HyperlightRuntimeConfiguration
 
     public static let `default` = RuntimeConfiguration()
 
     public init(
         provider: Provider = .automatic,
-        kata: KataRuntimeConfiguration = .default
+        kata: KataRuntimeConfiguration = .default,
+        hyperlight: HyperlightRuntimeConfiguration = .default
     ) {
         self.provider = provider
         self.kata = kata
+        self.hyperlight = hyperlight
     }
 
     private enum CodingKeys: String, CodingKey {
         case provider
         case kata
+        case hyperlight
     }
 
     public init(from decoder: Decoder) throws {
@@ -33,6 +38,51 @@ public struct RuntimeConfiguration: Codable, Sendable, Equatable {
             try container.decodeIfPresent(Provider.self, forKey: .provider) ?? .automatic
         self.kata =
             try container.decodeIfPresent(KataRuntimeConfiguration.self, forKey: .kata) ?? .default
+        self.hyperlight =
+            try container.decodeIfPresent(
+                HyperlightRuntimeConfiguration.self,
+                forKey: .hyperlight
+            ) ?? .default
+    }
+}
+
+/// Settings for one-shot Linux applications hosted by hyperlight-unikraft.
+public struct HyperlightRuntimeConfiguration: Codable, Sendable, Equatable {
+    public var executable: String
+    public var kernelPath: String
+    public var initrdPath: String?
+    public var stackMB: Int
+
+    public static let `default` = HyperlightRuntimeConfiguration()
+
+    public init(
+        executable: String = "hyperlight-unikraft",
+        kernelPath: String = "",
+        initrdPath: String? = nil,
+        stackMB: Int = 8
+    ) {
+        self.executable = executable
+        self.kernelPath = kernelPath
+        self.initrdPath = initrdPath
+        self.stackMB = stackMB
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case executable
+        case kernelPath = "kernel_path"
+        case initrdPath = "initrd_path"
+        case stackMB = "stack_mb"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.executable =
+            try container.decodeIfPresent(String.self, forKey: .executable)
+            ?? "hyperlight-unikraft"
+        self.kernelPath =
+            try container.decodeIfPresent(String.self, forKey: .kernelPath) ?? ""
+        self.initrdPath = try container.decodeIfPresent(String.self, forKey: .initrdPath)
+        self.stackMB = try container.decodeIfPresent(Int.self, forKey: .stackMB) ?? 8
     }
 }
 

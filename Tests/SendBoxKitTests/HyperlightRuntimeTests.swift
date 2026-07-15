@@ -8,13 +8,14 @@ struct HyperlightRuntimeTests {
             executable: "hyperlight-unikraft",
             kernelPath: "/opt/hyperlight/shell-kernel",
             initrdPath: "/opt/hyperlight/shell.cpio",
-            stackMB: 16,
-            allowedHosts: ["api.github.com", "registry.npmjs.org"]
+            stackMB: 16
         )
         let builder = HyperlightCommandBuilder(configuration: configuration)
 
         let arguments = builder.arguments(
-            for: makeContainerConfig(),
+            for: makeContainerConfig(
+                allowedHosts: ["api.github.com", "registry.npmjs.org"]
+            ),
             command: ["node", "/workspaces/project/server.js", "--stdio"]
         )
 
@@ -24,8 +25,7 @@ struct HyperlightRuntimeTests {
         #expect(flagValue("--stack", in: arguments) == "16Mi")
         #expect(
             flagValues("--mount", in: arguments) == [
-                "/host/project/.devcontainer:/workspaces/project/.devcontainer",
-                "/host/project:/workspaces/project",
+                "/host/project:/workspaces/project"
             ]
         )
         #expect(
@@ -35,8 +35,11 @@ struct HyperlightRuntimeTests {
             ]
         )
         #expect(
-            arguments.suffix(4)
-                == ["--", "node", "/workspaces/project/server.js", "--stdio"]
+            arguments.suffix(2)
+                == [
+                    "--exec",
+                    "'node' '/workspaces/project/server.js' '--stdio'",
+                ]
         )
     }
 
@@ -53,7 +56,61 @@ struct HyperlightRuntimeTests {
         #expect(!arguments.contains("--net-allow"))
     }
 
-    private func makeContainerConfig() -> ContainerConfig {
+    @Test func testCommandBuilderQuotesShellMetacharacters() {
+        let builder = HyperlightCommandBuilder(
+            configuration: HyperlightRuntimeConfiguration(kernelPath: "/kernel")
+        )
+
+        let arguments = builder.arguments(
+            for: makeContainerConfig(),
+            command: ["printf", "%s", "value'; rm -rf /"]
+        )
+
+        #expect(arguments.last == #"'printf' '%s' 'value'\''; rm -rf /'"#)
+    }
+
+    @Test func testExecChecksPolicyBeforeSpawningMicroVM() async throws {
+        let recorder = HyperlightCommandRecorder()
+        let runtime = HyperlightRuntime(
+            configuration: HyperlightRuntimeConfiguration(kernelPath: "/kernel"),
+            commandRunner: { executable, arguments, _ in
+                await recorder.record(executable: executable, arguments: arguments)
+                return HostCommandResult(exitCode: 0, stdout: "", stderr: "")
+            },
+            hostValidator: { _ in }
+        )
+        let policy = CommandPolicy(
+            config: .init(
+                defaultAction: .deny,
+                allowlist: ["git *"],
+                denylist: [],
+                logBlocked: true
+            )
+        )
+
+        try await runtime.initialize()
+        let id = try await runtime.createContainer(makeContainerConfig())
+
+        do {
+            _ = try await runtime.exec(
+                containerId: id,
+                command: ["rm", "-rf", "/"],
+                policy: policy
+            )
+            Issue.record("Expected command policy to deny execution")
+        } catch {
+            #expect(error.localizedDescription.contains("denied by policy"))
+        }
+
+        let invocations = await recorder.snapshot()
+        #expect(
+            !invocations.contains { invocation in
+                invocation.arguments.contains("'rm' '-rf' '/'")
+            }
+        )
+    }
+
+    private func makeContainerConfig(allowedHosts: [String] = []) -> ContainerConfig {
         ContainerConfig(
             id: "sandbox-id",
             hostname: "project",
@@ -79,12 +136,30 @@ struct HyperlightRuntimeTests {
             network: .init(
                 address: "192.168.64.2/24",
                 gateway: "192.168.64.1",
-                nameservers: ["1.1.1.1"]
+                nameservers: ["1.1.1.1"],
+                allowedHosts: allowedHosts
             ),
             firewallScript: nil,
             dnsConfig: nil,
             mcpInspectionScript: nil
         )
+    }
+
+    private actor HyperlightCommandRecorder {
+        struct Invocation: Sendable {
+            let executable: String
+            let arguments: [String]
+        }
+
+        private var invocations: [Invocation] = []
+
+        func record(executable: String, arguments: [String]) {
+            invocations.append(Invocation(executable: executable, arguments: arguments))
+        }
+
+        func snapshot() -> [Invocation] {
+            invocations
+        }
     }
 
     private func flagValue(_ flag: String, in arguments: [String]) -> String? {
