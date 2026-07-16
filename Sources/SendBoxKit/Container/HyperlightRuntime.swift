@@ -80,7 +80,7 @@ public actor HyperlightRuntime: RuntimeProvider {
         configuration: HyperlightRuntimeConfiguration,
         logger: Logger = Logger(label: "sendbox.runtime.hyperlight"),
         commandRunner: @escaping CommandRunner,
-        hostValidator: @escaping HostValidator = Self.validateHost
+        hostValidator: @escaping HostValidator = HyperlightRuntime.validateHost
     ) {
         self.configuration = configuration
         self.logger = logger
