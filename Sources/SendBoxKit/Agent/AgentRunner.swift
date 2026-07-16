@@ -13,6 +13,7 @@ public actor AgentRunner {
     private let config: SandboxConfiguration
     private let runtime: any RuntimeProvider
     private let commandPolicy: CommandPolicy
+    private let startupCommandPolicy: CommandPolicy
     private let firewall: NetworkFirewall
     private let secrets: SecretsVault
     private let devcontainerBuilder: DevContainerBuilder
@@ -82,6 +83,9 @@ public actor AgentRunner {
             logger: logger
         )
         self.commandPolicy = CommandPolicy(config: config.policy.commands, logger: logger)
+        self.startupCommandPolicy = CommandPolicy.exactlyAllowing([
+            ContainerConfig.runtimeBootstrapCommand
+        ])
         self.firewall = NetworkFirewall(config: config.policy.network, logger: logger)
         self.secrets = SecretsVault(logger: logger)
         self.devcontainerBuilder = DevContainerBuilder(logger: logger)
@@ -276,7 +280,10 @@ public actor AgentRunner {
         }
 
         do {
-            let id = try await runtime.createContainer(containerConfig)
+            let id = try await runtime.createContainer(
+                containerConfig,
+                policy: startupCommandPolicy
+            )
             logger.info("Container created and started", metadata: ["id": "\(id)"])
             return id
         } catch {

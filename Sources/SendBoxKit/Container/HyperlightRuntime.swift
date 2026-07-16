@@ -1,6 +1,10 @@
 import Foundation
 import Logging
 
+#if os(Linux)
+import Glibc
+#endif
+
 /// Runs Linux applications in one-shot Hyperlight micro-VMs through hyperlight-unikraft.
 public actor HyperlightRuntime: RuntimeProvider {
     typealias CommandRunner =
@@ -121,7 +125,10 @@ public actor HyperlightRuntime: RuntimeProvider {
     }
 
     @discardableResult
-    public func createContainer(_ config: ContainerConfig) async throws -> String {
+    public func createContainer(
+        _ config: ContainerConfig,
+        policy: CommandPolicy
+    ) async throws -> String {
         guard initialized else {
             throw RuntimeError.notInitialized
         }
@@ -129,10 +136,24 @@ public actor HyperlightRuntime: RuntimeProvider {
             throw RuntimeError.containerAlreadyExists(config.id)
         }
         try validate(config)
-        let (preparedConfig, temporaryMounts) = try prepareMounts(for: config)
+        try await requireAllowed(
+            config.command,
+            policy: policy,
+            fallbackReason: "Startup command blocked by policy"
+        )
 
-        let arguments = HyperlightCommandBuilder(configuration: configuration)
-            .arguments(for: preparedConfig, command: preparedConfig.command)
+        let builder = HyperlightCommandBuilder(configuration: configuration)
+        let (preparedConfig, temporaryMounts) = try prepareMounts(for: config)
+        let arguments: [String]
+        do {
+            arguments = try builder.arguments(
+                for: preparedConfig,
+                command: preparedConfig.command
+            )
+        } catch {
+            removeTemporaryMounts(temporaryMounts)
+            throw error
+        }
         let executable = configuration.executable
         let runner = commandRunner
         let task = Task {
@@ -140,7 +161,7 @@ public actor HyperlightRuntime: RuntimeProvider {
         }
 
         activeVMs[config.id] = ManagedVM(
-            config: preparedConfig,
+            config: config,
             status: .running,
             task: task,
             execTasks: [:],
@@ -206,17 +227,25 @@ public actor HyperlightRuntime: RuntimeProvider {
             throw RuntimeError.invalidConfiguration("command cannot be empty")
         }
 
-        let commandString = command.joined(separator: " ")
-        let decision = await policy.evaluatePipeline(commandString)
-        guard decision.isAllowed else {
-            if case .denied(let reason) = decision {
-                throw RuntimeError.commandDenied(reason)
-            }
-            throw RuntimeError.commandDenied("Command blocked by policy")
-        }
+        try await requireAllowed(
+            command,
+            policy: policy,
+            fallbackReason: "Command blocked by policy"
+        )
 
-        let arguments = HyperlightCommandBuilder(configuration: configuration)
-            .arguments(for: vm.config, command: command)
+        let builder = HyperlightCommandBuilder(configuration: configuration)
+        try builder.validate(config: vm.config)
+        let (preparedConfig, temporaryMounts) = try prepareMounts(for: vm.config)
+        let arguments: [String]
+        do {
+            arguments = try builder.arguments(for: preparedConfig, command: command)
+        } catch {
+            removeTemporaryMounts(temporaryMounts)
+            throw error
+        }
+        defer {
+            removeTemporaryMounts(temporaryMounts)
+        }
         let executable = configuration.executable
         let runner = commandRunner
         let task = Task {
@@ -252,9 +281,11 @@ public actor HyperlightRuntime: RuntimeProvider {
     }
 
     /// Start a network-transport MCP server in a fresh Hyperlight micro-VM.
+    /// `listenPort` is the guest port Hyperlight permits the server to bind.
     public func mcpExec(
         containerId: String,
         command: [String],
+        listenPort: UInt16,
         policy: CommandPolicy
     ) async throws -> HyperlightMCPSession {
         guard var vm = activeVMs[containerId] else {
@@ -269,29 +300,55 @@ public actor HyperlightRuntime: RuntimeProvider {
             throw RuntimeError.invalidConfiguration("MCP command cannot be empty")
         }
 
-        let commandString = command.joined(separator: " ")
-        let decision = await policy.evaluatePipeline(commandString)
-        guard decision.isAllowed else {
-            if case .denied(let reason) = decision {
-                throw RuntimeError.commandDenied(reason)
-            }
-            throw RuntimeError.commandDenied("MCP command blocked by policy")
+        try await requireAllowed(
+            command,
+            policy: policy,
+            fallbackReason: "MCP command blocked by policy"
+        )
+
+        let builder = HyperlightCommandBuilder(configuration: configuration)
+        try builder.validate(config: vm.config, listenPorts: [listenPort])
+        let (preparedConfig, temporaryMounts) = try prepareMounts(for: vm.config)
+        let arguments: [String]
+        do {
+            arguments = try builder.arguments(
+                for: preparedConfig,
+                command: command,
+                listenPorts: [listenPort]
+            )
+        } catch {
+            removeTemporaryMounts(temporaryMounts)
+            throw error
         }
 
-        let arguments = HyperlightCommandBuilder(configuration: configuration)
-            .arguments(for: vm.config, command: command)
+        let sessionID = UUID()
         let session: HyperlightMCPSession
         do {
             session = try HyperlightMCPSession(
                 executable: configuration.executable,
-                arguments: arguments
+                arguments: arguments,
+                listenPort: listenPort,
+                temporaryMounts: temporaryMounts,
+                logger: logger,
+                onTermination: { [weak self] in
+                    Task {
+                        await self?.removeMCPSession(
+                            containerId: containerId,
+                            sessionID: sessionID
+                        )
+                    }
+                }
             )
         } catch {
+            removeTemporaryMounts(temporaryMounts)
             throw RuntimeError.commandFailed(exitCode: -1, stderr: error.localizedDescription)
         }
 
-        vm.mcpSessions[UUID()] = session
+        vm.mcpSessions[sessionID] = session
         activeVMs[containerId] = vm
+        if !session.isRunning {
+            removeMCPSession(containerId: containerId, sessionID: sessionID)
+        }
         return session
     }
 
@@ -387,9 +444,14 @@ public actor HyperlightRuntime: RuntimeProvider {
             throw RuntimeError.invalidConfiguration("initrd not found at \(initrdPath)")
         }
         #if os(Linux)
-        guard FileManager.default.isReadableFile(atPath: "/dev/kvm") else {
-            throw RuntimeError.invalidConfiguration("/dev/kvm is not accessible")
+        let descriptor = Glibc.open("/dev/kvm", O_RDWR | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            let detail = String(cString: Glibc.strerror(errno))
+            throw RuntimeError.invalidConfiguration(
+                "/dev/kvm must be readable and writable: \(detail)"
+            )
         }
+        _ = Glibc.close(descriptor)
         #else
         throw RuntimeError.unsupported("hosts without Linux KVM")
         #endif
@@ -438,6 +500,9 @@ public actor HyperlightRuntime: RuntimeProvider {
         guard !config.command.isEmpty else {
             throw RuntimeError.invalidConfiguration("command cannot be empty")
         }
+        let builder = HyperlightCommandBuilder(configuration: configuration)
+        try builder.validate(config: config)
+
         let unsupportedEnvironmentKeys = Set(config.environment.keys).subtracting([
             "HOME", "LANG", "PATH", "TERM",
         ])
@@ -449,8 +514,7 @@ public actor HyperlightRuntime: RuntimeProvider {
         if config.mcpInspectionScript != nil {
             throw RuntimeError.unsupported("eBPF MCP inspection in a unikernel guest")
         }
-        let networkingEnabled =
-            config.network.allowsUnrestrictedOutbound || !config.network.allowedHosts.isEmpty
+        let networkingEnabled = try builder.networkingEnabled(for: config.network)
         if networkingEnabled && !config.network.allowDNS {
             throw RuntimeError.unsupported(
                 "network access with DNS disabled because Hyperlight permits resolver traffic"
@@ -460,6 +524,20 @@ public actor HyperlightRuntime: RuntimeProvider {
             throw RuntimeError.unsupported(
                 "network connection limits because Hyperlight cannot enforce them"
             )
+        }
+    }
+
+    private func requireAllowed(
+        _ command: [String],
+        policy: CommandPolicy,
+        fallbackReason: String
+    ) async throws {
+        let decision = await policy.evaluate(command)
+        guard decision.isAllowed else {
+            if case .denied(let reason) = decision {
+                throw RuntimeError.commandDenied(reason)
+            }
+            throw RuntimeError.commandDenied(fallbackReason)
         }
     }
 
@@ -508,8 +586,29 @@ public actor HyperlightRuntime: RuntimeProvider {
 
     private func removeTemporaryMounts(_ mounts: [URL]) {
         for mount in mounts {
-            try? FileManager.default.removeItem(at: mount)
+            guard FileManager.default.fileExists(atPath: mount.path) else {
+                continue
+            }
+            do {
+                try FileManager.default.removeItem(at: mount)
+            } catch {
+                logger.warning(
+                    "Failed to remove Hyperlight staged mount",
+                    metadata: [
+                        "path": "\(mount.path)",
+                        "error": "\(error.localizedDescription)",
+                    ]
+                )
+            }
         }
+    }
+
+    private func removeMCPSession(containerId: String, sessionID: UUID) {
+        guard var vm = activeVMs[containerId] else {
+            return
+        }
+        vm.mcpSessions.removeValue(forKey: sessionID)
+        activeVMs[containerId] = vm
     }
 
     private func recordCompletion(id: String, result: HostCommandResult) {
@@ -555,9 +654,31 @@ public actor HyperlightRuntime: RuntimeProvider {
 public final class HyperlightMCPSession: @unchecked Sendable {
     private let process: Process
     private let lock = NSLock()
+    private let logger: Logger
+    private let onTermination: @Sendable () -> Void
+    private var temporaryMounts: [URL]
+    private var finished = false
+    private var stopping = false
 
-    fileprivate init(executable: String, arguments: [String]) throws {
+    public let listenPort: UInt16
+    let stagedMountPaths: [String]
+
+    fileprivate init(
+        executable: String,
+        arguments: [String],
+        listenPort: UInt16,
+        temporaryMounts: [URL],
+        logger: Logger,
+        onTermination: @escaping @Sendable () -> Void
+    ) throws {
         let process = Process()
+
+        self.process = process
+        self.listenPort = listenPort
+        self.temporaryMounts = temporaryMounts
+        self.stagedMountPaths = temporaryMounts.map(\.path)
+        self.logger = logger
+        self.onTermination = onTermination
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [executable] + arguments
@@ -568,9 +689,10 @@ public final class HyperlightMCPSession: @unchecked Sendable {
             "LANG": "C",
             "PATH": "/usr/bin:/bin",
         ]
+        process.terminationHandler = { [weak self] _ in
+            self?.finish()
+        }
         try process.run()
-
-        self.process = process
     }
 
     public var isRunning: Bool {
@@ -578,12 +700,61 @@ public final class HyperlightMCPSession: @unchecked Sendable {
     }
 
     public func stop() {
+        let shouldTerminate: Bool
+        let shouldWait: Bool
         lock.lock()
-        if process.isRunning {
-            process.terminate()
-            process.waitUntilExit()
+        shouldWait = process.isRunning
+        shouldTerminate = !stopping && shouldWait
+        if shouldWait {
+            stopping = true
         }
         lock.unlock()
+
+        if shouldTerminate {
+            process.terminate()
+        }
+        if shouldWait {
+            process.waitUntilExit()
+        }
+        finish()
+    }
+
+    private func finish() {
+        let mounts: [URL]
+        let shouldNotify: Bool
+
+        lock.lock()
+        if finished {
+            mounts = []
+            shouldNotify = false
+        } else {
+            finished = true
+            mounts = temporaryMounts
+            temporaryMounts.removeAll()
+            shouldNotify = true
+        }
+        lock.unlock()
+
+        for mount in mounts {
+            guard FileManager.default.fileExists(atPath: mount.path) else {
+                continue
+            }
+            do {
+                try FileManager.default.removeItem(at: mount)
+            } catch {
+                logger.warning(
+                    "Failed to remove Hyperlight MCP staged mount",
+                    metadata: [
+                        "path": "\(mount.path)",
+                        "error": "\(error.localizedDescription)",
+                    ]
+                )
+            }
+        }
+
+        if shouldNotify {
+            onTermination()
+        }
     }
 
     deinit {
@@ -594,7 +765,44 @@ public final class HyperlightMCPSession: @unchecked Sendable {
 struct HyperlightCommandBuilder: Sendable {
     let configuration: HyperlightRuntimeConfiguration
 
-    func arguments(for config: ContainerConfig, command: [String]) -> [String] {
+    func validate(
+        config: ContainerConfig,
+        listenPorts: [UInt16] = []
+    ) throws {
+        guard !config.workingDirectory.isEmpty else {
+            throw HyperlightRuntime.RuntimeError.invalidConfiguration(
+                "working directory cannot be empty"
+            )
+        }
+        guard config.workingDirectory.hasPrefix("/") else {
+            throw HyperlightRuntime.RuntimeError.invalidConfiguration(
+                "working directory must be an absolute guest path"
+            )
+        }
+        guard !listenPorts.contains(0) else {
+            throw HyperlightRuntime.RuntimeError.invalidConfiguration(
+                "MCP listen port must be between 1 and 65535"
+            )
+        }
+        _ = try networkArguments(for: config.network)
+    }
+
+    func networkingEnabled(for network: ContainerConfig.NetworkConfig) throws -> Bool {
+        !(try networkArguments(for: network)).isEmpty
+    }
+
+    func arguments(
+        for config: ContainerConfig,
+        command: [String],
+        listenPorts: [UInt16] = []
+    ) throws -> [String] {
+        guard !command.isEmpty else {
+            throw HyperlightRuntime.RuntimeError.invalidConfiguration(
+                "command cannot be empty"
+            )
+        }
+        try validate(config: config, listenPorts: listenPorts)
+
         var arguments = [configuration.kernelPath]
 
         if let initrdPath = configuration.initrdPath {
@@ -613,27 +821,121 @@ struct HyperlightCommandBuilder: Sendable {
             arguments += ["--mount", "\(mount.source):\(mount.destination)"]
         }
 
-        if config.network.allowsUnrestrictedOutbound {
-            if config.network.blockedHosts.isEmpty {
-                arguments.append("--net")
-            } else {
-                for host in config.network.blockedHosts {
-                    arguments += ["--net-block", host]
-                }
-            }
-        } else {
-            for host in config.network.allowedHosts {
-                arguments += ["--net-allow", host]
-            }
+        arguments += try networkArguments(for: config.network)
+        for port in listenPorts {
+            arguments += ["--port", String(port)]
         }
 
-        arguments += ["--exec", shellCommand(command)]
+        arguments += [
+            "--exec",
+            "cd \(quote(config.workingDirectory)) && exec \(shellCommand(command))",
+        ]
         return arguments
     }
 
+    func networkArguments(
+        for network: ContainerConfig.NetworkConfig
+    ) throws -> [String] {
+        let allowedHosts = try normalize(network.allowedHosts)
+        let blockedHosts = try normalize(network.blockedHosts)
+
+        for entry in allowedHosts + blockedHosts
+        where containsWildcard(entry) && !isDomainWildcard(entry)
+        {
+            throw HyperlightRuntime.RuntimeError.invalidConfiguration(
+                "network entry '\(entry)' uses unsupported wildcard syntax; only '*.example.com' patterns are valid"
+            )
+        }
+
+        if network.allowsUnrestrictedOutbound {
+            if let wildcard = blockedHosts.first(where: containsWildcard) {
+                throw HyperlightRuntime.RuntimeError.invalidConfiguration(
+                    "Hyperlight network block entry '\(wildcard)' must use a concrete hostname or IP address"
+                )
+            }
+            if blockedHosts.isEmpty {
+                return ["--net"]
+            }
+            return blockedHosts.flatMap { ["--net-block", $0] }
+        }
+
+        let effectiveAllowedHosts = allowedHosts.filter { allowedHost in
+            !blockedHosts.contains { blockedHost in
+                blockedPattern(blockedHost, covers: allowedHost)
+            }
+        }
+        if let wildcard = effectiveAllowedHosts.first(where: containsWildcard) {
+            throw HyperlightRuntime.RuntimeError.invalidConfiguration(
+                "Hyperlight network allow entry '\(wildcard)' must use concrete hostnames or IP addresses"
+            )
+        }
+        return effectiveAllowedHosts.flatMap { ["--net-allow", $0] }
+    }
+
     private func shellCommand(_ command: [String]) -> String {
-        command.map { argument in
-            "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        }.joined(separator: " ")
+        command.map(quote).joined(separator: " ")
+    }
+
+    private func quote(_ argument: String) -> String {
+        "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func normalize(_ entries: [String]) throws -> [String] {
+        var seen: Set<String> = []
+        var normalized: [String] = []
+
+        for entry in entries {
+            var value = entry.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if value.hasSuffix(".") {
+                value.removeLast()
+            }
+            guard !value.isEmpty, !value.contains(where: \.isWhitespace) else {
+                throw HyperlightRuntime.RuntimeError.invalidConfiguration(
+                    "network host entries must be non-empty hostnames or IP addresses"
+                )
+            }
+            if seen.insert(value).inserted {
+                normalized.append(value)
+            }
+        }
+        return normalized
+    }
+
+    private func containsWildcard(_ entry: String) -> Bool {
+        entry.contains("*") || entry.contains("?")
+    }
+
+    private func isDomainWildcard(_ entry: String) -> Bool {
+        guard entry.hasPrefix("*.") else {
+            return false
+        }
+        let suffix = String(entry.dropFirst(2))
+        return !suffix.isEmpty && !containsWildcard(suffix)
+    }
+
+    private func blockedPattern(_ blocked: String, covers allowed: String) -> Bool {
+        if blocked == allowed {
+            return true
+        }
+
+        if !containsWildcard(allowed) {
+            return host(allowed, matches: blocked)
+        }
+
+        guard isDomainWildcard(allowed), isDomainWildcard(blocked) else {
+            return false
+        }
+        let allowedSuffix = String(allowed.dropFirst(2))
+        let blockedSuffix = String(blocked.dropFirst(2))
+        return allowedSuffix == blockedSuffix
+            || allowedSuffix.hasSuffix(".\(blockedSuffix)")
+    }
+
+    private func host(_ host: String, matches pattern: String) -> Bool {
+        guard isDomainWildcard(pattern) else {
+            return host == pattern
+        }
+        let suffix = String(pattern.dropFirst(2))
+        return host == suffix || host.hasSuffix(".\(suffix)")
     }
 }

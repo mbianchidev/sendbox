@@ -140,6 +140,7 @@ policy:
     log_blocked: true
   network:
     default_action: deny
+    # Hyperlight requires concrete hostnames instead of wildcard entries.
     allowed_domains: ["github.com", "*.github.com"]
     blocked_domains: []
     allow_dns: true

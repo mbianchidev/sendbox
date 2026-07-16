@@ -3,6 +3,8 @@ import Foundation
 /// Internal container configuration derived from SandboxConfiguration.
 /// Maps user-facing config to the low-level container runtime parameters.
 public struct ContainerConfig: Sendable {
+    static let runtimeBootstrapCommand = ["/bin/bash"]
+
     /// Unique container identifier
     public let id: String
     /// Container hostname
@@ -148,7 +150,7 @@ public struct ContainerConfig: Sendable {
             rootfsSizeInBytes: diskBytes,
             imageReference: imageReference,
             workingDirectory: workspaceDestination,
-            command: ["/bin/bash"],
+            command: runtimeBootstrapCommand,
             environment: environment,
             mounts: mountPoints,
             network: networkConfig,

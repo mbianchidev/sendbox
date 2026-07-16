@@ -131,7 +131,9 @@ policy:
     # Prevents runaway HTTP clients from exhausting resources.
     max_connections: 50
 
-    # Domains the agent can reach. Supports wildcard subdomains.
+    # Domains the agent can reach. Apple and Kata support wildcard subdomains.
+    # Hyperlight requires concrete hostnames because its host CLI resolves each
+    # entry before launching the micro-VM.
     allowed_domains:
       - "github.com"
       - "*.github.com"

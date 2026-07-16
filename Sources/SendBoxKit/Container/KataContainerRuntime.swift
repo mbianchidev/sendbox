@@ -96,12 +96,23 @@ public actor KataContainerRuntime: RuntimeProvider {
     }
 
     @discardableResult
-    public func createContainer(_ config: ContainerConfig) async throws -> String {
+    public func createContainer(
+        _ config: ContainerConfig,
+        policy: CommandPolicy
+    ) async throws -> String {
         guard initialized else {
             throw RuntimeError.notInitialized
         }
         guard activeContainers[config.id] == nil else {
             throw RuntimeError.containerAlreadyExists(config.id)
+        }
+
+        let decision = await policy.evaluate(config.command)
+        guard decision.isAllowed else {
+            if case .denied(let reason) = decision {
+                throw RuntimeError.commandDenied(reason)
+            }
+            throw RuntimeError.commandDenied("Startup command blocked by policy")
         }
 
         let preparedEnvironment = try prepareEnvironment(config.environment)
@@ -220,8 +231,7 @@ public actor KataContainerRuntime: RuntimeProvider {
             throw RuntimeError.containerNotFound(containerId)
         }
 
-        let commandString = command.joined(separator: " ")
-        let decision = await policy.evaluatePipeline(commandString)
+        let decision = await policy.evaluate(command)
         guard decision.isAllowed else {
             if case .denied(let reason) = decision {
                 throw RuntimeError.commandDenied(reason)

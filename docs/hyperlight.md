@@ -36,17 +36,36 @@ The host executable must be an absolute, root-owned file that is not writable
 by group or other users. SendBox launches it with only `PATH=/usr/bin:/bin` and
 `LANG=C`; project configuration cannot select a repository-local host program.
 
-Each runtime `exec` starts a fresh micro-VM. The command policy is evaluated
-before the host process is spawned. The existing `policy.network` allowlist or
-blocklist is mapped to Hyperlight's network options. Read-only mounts are
-staged in private temporary directories so the guest cannot modify their host
-sources.
+The initial runtime command and every `exec` or `mcpExec` argv vector are
+evaluated against a command policy before the host process is spawned. Each
+execution starts a fresh micro-VM and changes to its staged read-only mount
+copies are discarded when that invocation exits. Commands start in the
+configured workspace directory.
 
-Network-transport MCP servers use `HyperlightRuntime.mcpExec`, which returns a
-`HyperlightMCPSession` process handle. The server is stopped with its parent
-runtime. Include the server and its runtime (for example, Node.js or Python) in
-the CPIO rootfs and configure its destinations in
-`policy.network.allowed_domains`. Stdio MCP is not supported because
+Hyperlight resolves every network policy entry as a concrete hostname or IP
+address. Wildcards such as `*.github.com` are rejected before launch; list each
+required hostname explicitly. For default-deny policies, blocked entries take
+priority over matching allowed entries.
+
+```yaml
+policy:
+  network:
+    default_action: deny
+    allowed_domains:
+      - github.com
+      - api.github.com
+      - raw.githubusercontent.com
+    blocked_domains: []
+    allow_dns: true
+```
+
+Network-transport MCP servers use
+`HyperlightRuntime.mcpExec(containerId:command:listenPort:policy:)`, which maps
+the validated guest listen port to Hyperlight's `--port` option and returns a
+`HyperlightMCPSession` process handle. The session exposes `listenPort` and is
+stopped with its parent runtime. Include the server and its runtime (for
+example, Node.js or Python) in the CPIO rootfs and configure its destinations
+in `policy.network.allowed_domains`. Stdio MCP is not supported because
 `hyperlight-unikraft` does not forward host stdin into the guest.
 
 ## Limitations
@@ -59,5 +78,7 @@ the CPIO rootfs and configure its destinations in
   `allow_dns: false`.
 - Hyperlight cannot enforce a maximum connection count, so SendBox fails closed
   when networking is enabled and `max_connections` is configured.
+- Hyperlight network allow/block entries must be concrete hostnames or IP
+  addresses; wildcard domain entries are not supported.
 - Hyperlight is selected explicitly; `runtime.provider: auto` continues to use
   Apple Containerization on macOS and Kata Containers on Linux.

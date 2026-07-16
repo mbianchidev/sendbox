@@ -149,13 +149,24 @@ public actor ContainerRuntime: RuntimeProvider {
     ///
     /// - Returns: The container ID.
     @discardableResult
-    public func createContainer(_ config: ContainerConfig) async throws -> String {
+    public func createContainer(
+        _ config: ContainerConfig,
+        policy: CommandPolicy
+    ) async throws -> String {
         guard var mgr = manager else {
             throw RuntimeError.notInitialized
         }
 
         if activeContainers[config.id] != nil {
             throw RuntimeError.containerAlreadyExists(config.id)
+        }
+
+        let decision = await policy.evaluate(config.command)
+        guard decision.isAllowed else {
+            if case .denied(let reason) = decision {
+                throw RuntimeError.commandDenied(reason)
+            }
+            throw RuntimeError.commandDenied("Startup command blocked by policy")
         }
 
         logger.info("Creating container \(config.id) from image \(config.imageReference)")
@@ -306,9 +317,8 @@ public actor ContainerRuntime: RuntimeProvider {
             )
         }
 
-        // Check command against policy before executing.
         let commandString = command.joined(separator: " ")
-        let decision = await policy.evaluatePipeline(commandString)
+        let decision = await policy.evaluate(command)
         guard decision.isAllowed else {
             if case .denied(let reason) = decision {
                 throw RuntimeError.commandDenied(reason)
