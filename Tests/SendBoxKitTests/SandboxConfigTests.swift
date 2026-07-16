@@ -140,7 +140,7 @@ struct SandboxConfigTests {
         )
     }
 
-    @Test func testLoadPrivateRepositoryAccessOverride() throws {
+    @Test func testLoadAdditionalPrivateRepositoryAccessOverride() throws {
         let original = SandboxConfiguration.default(projectPath: "/projects/private")
         var github = original.github
         github.allowPrivateRepositoryAccess = true

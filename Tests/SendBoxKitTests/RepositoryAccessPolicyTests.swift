@@ -4,6 +4,21 @@ import Testing
 struct RepositoryAccessPolicyTests {
     private let policy = RepositoryAccessPolicy()
 
+    @Test func selectedPrivateRepositoryIsAllowedByDefault() {
+        let source = repository(
+            "source",
+            owner: "person",
+            visibility: .private
+        )
+        let selectedRepository = repository(
+            "SOURCE",
+            owner: "PERSON",
+            visibility: .private
+        )
+
+        #expect(policy.evaluate(source: source, target: selectedRepository) == .allow)
+    }
+
     @Test func publicRepositoryCannotAccessPrivateRepository() {
         let decision = policy.evaluate(
             source: repository("public-source", visibility: .public),
@@ -35,7 +50,7 @@ struct RepositoryAccessPolicyTests {
         #expect(decision == .allow)
     }
 
-    @Test func sameOrganizationPrivateAccessRequiresOverride() {
+    @Test func additionalSameOrganizationPrivateAccessRequiresOverride() {
         let source = repository("source", visibility: .private, organization: "acme")
         let target = repository("target", visibility: .private, organization: "ACME")
 
@@ -65,37 +80,128 @@ struct RepositoryAccessPolicyTests {
         }
     }
 
-    @Test func credentialsMustBeScopedToSourceOrganization() {
-        #expect(
-            policy.isCredentialScopeAllowed(
-                privateRepositoryOwners: ["acme", "ACME"],
-                organization: "acme"
-            )
+    @Test func credentialScopeAllowsOnlySelectedPrivateRepositoryByDefault() {
+        let source = repository(
+            "source",
+            owner: "person",
+            visibility: .private
         )
+
         #expect(
-            !policy.isCredentialScopeAllowed(
-                privateRepositoryOwners: ["acme", "other"],
-                organization: "acme"
-            )
+            policy.evaluateCredentialScope(
+                source: source,
+                accessiblePrivateRepositories: [source]
+            ) == .allow
         )
+    }
+
+    @Test func credentialScopeRequiresAccessToSelectedPrivateRepository() {
+        let source = repository("source", visibility: .private, organization: "acme")
+        let other = repository("other", visibility: .private, organization: "acme")
+
+        guard case .deny = policy.evaluateCredentialScope(
+            source: source,
+            accessiblePrivateRepositories: [other],
+            privateAccessOverride: true
+        ) else {
+            Issue.record("Expected credentials without selected-repository access to be denied")
+            return
+        }
+    }
+
+    @Test func credentialScopeGatesAdditionalPrivateRepositories() {
+        let source = repository("source", visibility: .private, organization: "acme")
+        let additional = repository("additional", visibility: .private, organization: "acme")
+
+        guard case .warn = policy.evaluateCredentialScope(
+            source: source,
+            accessiblePrivateRepositories: [source, additional]
+        ) else {
+            Issue.record("Expected additional private repository access to require an override")
+            return
+        }
+
         #expect(
-            !policy.isCredentialScopeAllowed(
-                privateRepositoryOwners: [],
-                organization: "acme"
-            )
+            policy.evaluateCredentialScope(
+                source: source,
+                accessiblePrivateRepositories: [source, additional],
+                privateAccessOverride: true
+            ) == .allow
         )
+    }
+
+    @Test func credentialScopeRejectsCrossOrganizationPrivateRepositories() {
+        let source = repository("source", visibility: .private, organization: "acme")
+        let additional = repository("additional", visibility: .private, organization: "other")
+
+        guard case .deny = policy.evaluateCredentialScope(
+            source: source,
+            accessiblePrivateRepositories: [source, additional],
+            privateAccessOverride: true
+        ) else {
+            Issue.record("Expected cross-organization credential scope to be denied")
+            return
+        }
+    }
+
+    @Test func publicSourceCredentialScopeAllowsNoPrivateRepositories() {
+        let source = repository("source", visibility: .public)
+
+        #expect(
+            policy.evaluateCredentialScope(
+                source: source,
+                accessiblePrivateRepositories: []
+            ) == .allow
+        )
+
+        guard case .deny = policy.evaluateCredentialScope(
+            source: source,
+            accessiblePrivateRepositories: [
+                repository("private", visibility: .private, organization: "acme")
+            ]
+        ) else {
+            Issue.record("Expected public-source credentials with private access to be denied")
+            return
+        }
     }
 
     private func repository(
         _ name: String,
+        owner: String = "owner",
         visibility: RepositoryAccessPolicy.Visibility,
         organization: String? = nil
     ) -> RepositoryAccessPolicy.Repository {
         RepositoryAccessPolicy.Repository(
-            owner: organization ?? "owner",
+            owner: organization ?? owner,
             name: name,
             visibility: visibility,
             organization: organization
         )
+    }
+}
+
+struct AgentAuthenticationEnvironmentTests {
+    @Test func copilotAuthDoesNotDependOnGitHubRepositoryCredentials() {
+        let environment = AgentAuthenticationEnvironment.make(
+            githubToken: "github-token",
+            forwardGitHubToken: false,
+            copilotToken: "copilot-token",
+            forwardCopilotToken: true
+        )
+
+        #expect(environment["GITHUB_TOKEN"] == nil)
+        #expect(environment["GITHUB_COPILOT_TOKEN"] == "copilot-token")
+    }
+
+    @Test func forwardsApprovedGitHubRepositoryCredentials() {
+        let environment = AgentAuthenticationEnvironment.make(
+            githubToken: "github-token",
+            forwardGitHubToken: true,
+            copilotToken: nil,
+            forwardCopilotToken: false
+        )
+
+        #expect(environment["GITHUB_TOKEN"] == "github-token")
+        #expect(environment["GITHUB_COPILOT_TOKEN"] == nil)
     }
 }

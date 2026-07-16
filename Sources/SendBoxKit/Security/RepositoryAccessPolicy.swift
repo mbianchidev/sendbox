@@ -39,6 +39,10 @@ public struct RepositoryAccessPolicy: Sendable {
         target: Repository,
         privateAccessOverride: Bool = false
     ) -> Decision {
+        if isSameRepository(source, target), source.visibility == target.visibility {
+            return .allow
+        }
+
         guard target.visibility == .private else {
             return .allow
         }
@@ -53,12 +57,16 @@ public struct RepositoryAccessPolicy: Sendable {
         guard let sourceOrganization = source.organization,
               let targetOrganization = target.organization,
               sourceOrganization.caseInsensitiveCompare(targetOrganization) == .orderedSame else {
-            return .deny("Private repository access is restricted to repositories in the same organization")
+            return .deny(
+                "Additional private repository \(target.owner)/\(target.name) is outside "
+                    + "the selected repository organization"
+            )
         }
 
         guard privateAccessOverride else {
             return .warn(
-                "Accessing another private repository can expose its data to "
+                "Accessing additional private repository \(target.owner)/\(target.name) "
+                    + "can expose its data to "
                     + "\(source.owner)/\(source.name); explicit approval is required"
             )
         }
@@ -66,13 +74,40 @@ public struct RepositoryAccessPolicy: Sendable {
         return .allow
     }
 
-    public func isCredentialScopeAllowed(
-        privateRepositoryOwners: [String],
-        organization: String
-    ) -> Bool {
-        !privateRepositoryOwners.isEmpty
-            && privateRepositoryOwners.allSatisfy {
-                $0.caseInsensitiveCompare(organization) == .orderedSame
+    public func evaluateCredentialScope(
+        source: Repository,
+        accessiblePrivateRepositories: [Repository],
+        privateAccessOverride: Bool = false
+    ) -> Decision {
+        if source.visibility == .private,
+           !accessiblePrivateRepositories.contains(where: {
+               isSameRepository(source, $0) && $0.visibility == .private
+           }) {
+            return .deny(
+                "GitHub credentials cannot access selected private repository "
+                    + "\(source.owner)/\(source.name)"
+            )
+        }
+
+        for repository in accessiblePrivateRepositories {
+            let decision = evaluate(
+                source: source,
+                target: repository,
+                privateAccessOverride: privateAccessOverride
+            )
+            switch decision {
+            case .allow:
+                continue
+            case .warn, .deny:
+                return decision
             }
+        }
+
+        return .allow
+    }
+
+    private func isSameRepository(_ lhs: Repository, _ rhs: Repository) -> Bool {
+        lhs.owner.caseInsensitiveCompare(rhs.owner) == .orderedSame
+            && lhs.name.caseInsensitiveCompare(rhs.name) == .orderedSame
     }
 }

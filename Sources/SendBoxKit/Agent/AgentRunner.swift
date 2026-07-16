@@ -7,6 +7,26 @@ import Glibc
 import Darwin
 #endif
 
+enum AgentAuthenticationEnvironment {
+    static func make(
+        githubToken: String?,
+        forwardGitHubToken: Bool,
+        copilotToken: String?,
+        forwardCopilotToken: Bool
+    ) -> [String: String] {
+        var environment: [String: String] = [:]
+
+        if forwardGitHubToken, let githubToken, !githubToken.isEmpty {
+            environment["GITHUB_TOKEN"] = githubToken
+        }
+        if forwardCopilotToken, let copilotToken, !copilotToken.isEmpty {
+            environment["GITHUB_COPILOT_TOKEN"] = copilotToken
+        }
+
+        return environment
+    }
+}
+
 /// Orchestrates the full agent sandbox lifecycle:
 /// analyze project → generate devcontainer → build container → apply policies → inject secrets → run agent
 public actor AgentRunner {
@@ -244,8 +264,8 @@ public actor AgentRunner {
         spec: DevContainerBuilder.DevContainerSpec
     ) async throws -> String {
         try prepareWorkspace()
-        let allowGitHubCredentials = shouldExposeGitHubCredentials()
-        let authEnv = try setupAuthForwarding(allowGitHubCredentials: allowGitHubCredentials)
+        let githubToken = config.github.forwardAuth ? approvedGitHubToken() : nil
+        let authEnv = setupAuthForwarding(githubToken: githubToken)
         let secretsEnv = try loadSecrets()
 
         var containerConfig = ContainerConfig.from(
@@ -331,10 +351,9 @@ public actor AgentRunner {
     private func loadSecrets() throws -> [String: String] {
         var env: [String: String] = [:]
         for key in config.secrets {
-            if Self.githubCredentialKeys.contains(key.uppercased()) {
+            if Self.githubRepositoryCredentialKeys.contains(key.uppercased()) {
                 logger.warning(
-                    "Refusing to inject \(key) from the vault; "
-                        + "GitHub credentials must use guarded auth forwarding"
+                    "Refusing to inject \(key) from the vault; GitHub repository credentials must use guarded auth forwarding"
                 )
                 continue
             }
@@ -345,55 +364,62 @@ public actor AgentRunner {
 
     /// Read GitHub / Copilot tokens and return as environment variables.
     private func setupAuthForwarding(
-        allowGitHubCredentials: Bool
-    ) throws -> [String: String] {
-        var env: [String: String] = [:]
-
-        if config.github.forwardAuth && allowGitHubCredentials {
-            if let token = try? executeProcess("gh", arguments: ["auth", "token"]) {
-                env["GITHUB_TOKEN"] = token
-                logger.info("GitHub auth forwarded")
-            } else {
-                logger.warning(
-                    "Could not retrieve GitHub auth token (is `gh` installed and authenticated?)"
-                )
-            }
+        githubToken: String?
+    ) -> [String: String] {
+        if config.github.forwardAuth, githubToken != nil {
+            logger.info("GitHub repository auth forwarded")
         }
 
-        if config.github.forwardCopilotAuth && allowGitHubCredentials {
-            if let copilotToken = ProcessInfo.processInfo.environment["GITHUB_COPILOT_TOKEN"] {
-                env["GITHUB_COPILOT_TOKEN"] = copilotToken
+        let copilotToken = ProcessInfo.processInfo.environment["GITHUB_COPILOT_TOKEN"]
+        if config.github.forwardCopilotAuth {
+            if copilotToken != nil {
                 logger.info("Copilot auth forwarded")
+            } else {
+                logger.warning("GITHUB_COPILOT_TOKEN is unavailable; Copilot cannot authenticate")
             }
         }
 
-        return env
+        return AgentAuthenticationEnvironment.make(
+            githubToken: githubToken,
+            forwardGitHubToken: config.github.forwardAuth,
+            copilotToken: copilotToken,
+            forwardCopilotToken: config.github.forwardCopilotAuth
+        )
     }
 
-    private static let githubCredentialKeys: Set<String> = [
+    private static let githubRepositoryCredentialKeys: Set<String> = [
         "COPILOT_GITHUB_TOKEN",
         "GH_ENTERPRISE_TOKEN",
         "GH_TOKEN",
-        "GITHUB_COPILOT_TOKEN",
         "GITHUB_ENTERPRISE_TOKEN",
         "GITHUB_TOKEN",
     ]
 
-    private func shouldExposeGitHubCredentials() -> Bool {
-        guard config.github.forwardAuth || config.github.forwardCopilotAuth else {
-            return false
+    private func approvedGitHubToken() -> String? {
+        let token: String
+        do {
+            token = try executeProcess("gh", arguments: ["auth", "token"])
+        } catch {
+            logger.warning("Could not retrieve GitHub auth token; GitHub operations are unavailable")
+            return nil
         }
+
+        guard !token.isEmpty else {
+            logger.warning("GitHub auth token is empty; GitHub operations are unavailable")
+            return nil
+        }
+        let tokenEnvironment = ["GH_TOKEN": token]
 
         guard let nameWithOwner = try? executeProcess(
             "gh",
             arguments: ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
-            currentDirectory: config.projectPath
+            currentDirectory: config.projectPath,
+            environment: tokenEnvironment
         ) else {
             logger.warning(
-                "Refusing to expose GitHub credentials because source repository visibility "
-                    + "could not be determined"
+                "Refusing to expose GitHub repository credentials because the selected repository could not be determined"
             )
-            return false
+            return nil
         }
 
         guard let details = try? executeProcess(
@@ -401,19 +427,19 @@ public actor AgentRunner {
             arguments: [
                 "api", "repos/\(nameWithOwner)",
                 "--jq", "[.visibility, .owner.login, .owner.type, .name] | @tsv",
-            ]
+            ],
+            environment: tokenEnvironment
         ) else {
             logger.warning(
-                "Refusing to expose GitHub credentials because source repository visibility "
-                    + "could not be determined"
+                "Refusing to expose GitHub repository credentials because selected repository metadata could not be determined"
             )
-            return false
+            return nil
         }
 
         let fields = details.split(separator: "\t", maxSplits: 3).map(String.init)
         guard fields.count == 4 else {
-            logger.warning("Refusing to expose GitHub credentials because repository metadata is invalid")
-            return false
+            logger.warning("Refusing to expose GitHub repository credentials because metadata is invalid")
+            return nil
         }
 
         let visibility: RepositoryAccessPolicy.Visibility =
@@ -425,62 +451,81 @@ public actor AgentRunner {
             visibility: visibility,
             organization: organization
         )
-        let decision = RepositoryAccessPolicy().evaluate(
+
+        guard let accessibleRepositoriesOutput = try? executeProcess(
+            "gh",
+            arguments: [
+                "api", "--method", "GET", "--paginate", "user/repos",
+                "-f", "visibility=all",
+                "-f", "affiliation=owner,collaborator,organization_member",
+                "-f", "per_page=100",
+                "--jq", ".[] | select(.visibility != \"public\") | [.owner.login, .name, .owner.type] | @tsv",
+            ],
+            environment: tokenEnvironment
+        ) else {
+            logger.warning(
+                "Refusing to expose GitHub repository credentials because non-public repository scope could not be determined"
+            )
+            return nil
+        }
+
+        guard let accessiblePrivateRepositories = parsePrivateRepositories(
+            accessibleRepositoriesOutput
+        ) else {
+            logger.warning(
+                "Refusing to expose GitHub repository credentials because non-public repository scope metadata is invalid"
+            )
+            return nil
+        }
+
+        let decision = RepositoryAccessPolicy().evaluateCredentialScope(
             source: repository,
-            target: RepositoryAccessPolicy.Repository(
-                owner: fields[1],
-                name: "*",
-                visibility: .private,
-                organization: organization
-            ),
+            accessiblePrivateRepositories: accessiblePrivateRepositories,
             privateAccessOverride: config.github.allowPrivateRepositoryAccess
         )
 
         switch decision {
         case .deny(let message):
-            logger.warning("Refusing to expose GitHub credentials: \(message)")
-            return false
-        case .warn:
+            logger.warning("Refusing to expose GitHub repository credentials: \(message)")
+            return nil
+        case .warn(let message):
             logger.warning(
-                "GitHub credentials withheld from private repository \(nameWithOwner); "
-                    + "set github.allow_private_repository_access only when accessing "
-                    + "private repositories in the same organization"
+                "GitHub repository credentials include unapproved private access: \(message). Set github.allow_private_repository_access only for additional private repositories in the same organization"
             )
-            return false
+            return nil
         case .allow:
-            guard isGitHubCredentialScoped(to: fields[1]) else {
-                logger.warning(
-                    "Refusing to expose GitHub credentials because they can access "
-                        + "private repositories outside \(fields[1])"
-                )
-                return false
-            }
-            logger.warning(
-                "GitHub private repository access enabled for \(nameWithOwner); "
-                    + "credentials must be scoped to \(fields[1])"
-            )
-            return true
+            logger.info("GitHub repository credentials approved for \(nameWithOwner)")
+            return token
         }
     }
 
-    private func isGitHubCredentialScoped(to organization: String) -> Bool {
-        guard let owners = try? executeProcess(
-            "gh",
-            arguments: [
-                "api", "--method", "GET", "--paginate", "user/repos",
-                "-f", "visibility=private",
-                "-f", "affiliation=owner,collaborator,organization_member",
-                "--jq", ".[].owner.login",
-            ]
-        ) else {
-            return false
+    private func parsePrivateRepositories(
+        _ output: String
+    ) -> [RepositoryAccessPolicy.Repository]? {
+        if output.isEmpty {
+            return []
         }
 
-        let accessibleOwners = owners.split(whereSeparator: \.isNewline).map(String.init)
-        return RepositoryAccessPolicy().isCredentialScopeAllowed(
-            privateRepositoryOwners: accessibleOwners,
-            organization: organization
-        )
+        var repositories: [RepositoryAccessPolicy.Repository] = []
+        for line in output.split(whereSeparator: \.isNewline) {
+            let fields = line.split(
+                separator: "\t",
+                maxSplits: 2,
+                omittingEmptySubsequences: false
+            ).map(String.init)
+            guard fields.count == 3 else {
+                return nil
+            }
+
+            let organization = fields[2].lowercased() == "organization" ? fields[0] : nil
+            repositories.append(RepositoryAccessPolicy.Repository(
+                owner: fields[0],
+                name: fields[1],
+                visibility: .private,
+                organization: organization
+            ))
+        }
+        return repositories
     }
 
     // MARK: - Helpers
@@ -489,13 +534,21 @@ public actor AgentRunner {
     private nonisolated func executeProcess(
         _ executable: String,
         arguments: [String],
-        currentDirectory: String? = nil
+        currentDirectory: String? = nil,
+        environment: [String: String] = [:]
     ) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [executable] + arguments
         if let currentDirectory {
             process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
+        }
+        if !environment.isEmpty {
+            var processEnvironment = ProcessInfo.processInfo.environment
+            for (key, value) in environment {
+                processEnvironment[key] = value
+            }
+            process.environment = processEnvironment
         }
 
         let pipe = Pipe()

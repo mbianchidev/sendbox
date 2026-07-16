@@ -168,7 +168,7 @@ public struct SandboxConfiguration: Codable, Sendable {
         public var forwardAuth: Bool
         /// Whether to forward Copilot CLI auth
         public var forwardCopilotAuth: Bool
-        /// Explicitly allow GitHub credentials in a private repository sandbox.
+        /// Allow credentials covering additional private repositories in the selected repo's organization.
         public var allowPrivateRepositoryAccess: Bool
         /// SSH key path to mount (optional)
         public var sshKeyPath: String?

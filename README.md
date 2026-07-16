@@ -159,6 +159,11 @@ observability:
     log_path: /var/log/sendbox/mcp-trace.log
 ```
 
+Copilot authentication is forwarded independently from repository credentials. By default, a
+GitHub token may cover the selected repository and public repositories only. Set
+`github.allow_private_repository_access` to permit additional private repositories in the
+selected repository's organization; cross-organization private access remains blocked.
+
 ### Configuration Reference
 
 | Section | Key | Description |
@@ -176,6 +181,9 @@ observability:
 | `policy.network` | object | Outbound network policy |
 | `secrets` | list | Secret names injected at runtime |
 | `devcontainer.auto_generate` | bool | Generate a devcontainer spec |
+| `github.forward_auth` | bool | Forward guarded GitHub credentials for the selected repository |
+| `github.forward_copilot_auth` | bool | Forward Copilot authentication independently |
+| `github.allow_private_repository_access` | bool | Permit additional same-organization private repositories |
 | `observability.mcp_inspection.enabled` | bool | Enable eBPF MCP call inspection (opt-in) |
 
 ## Architecture
@@ -212,7 +220,7 @@ SendBox follows a **deny-by-default** security posture:
 1. **Filesystem** — Only explicitly mounted paths are visible inside the VM. The host filesystem is never exposed wholesale.
 2. **Commands** — By default no binaries are available. Use `allowlist` mode to grant access to specific tools, or `denylist` mode to start permissive and lock down selectively.
 3. **Network** — Outbound connections are blocked unless a matching `allow` rule exists. DNS resolution is restricted to permitted hosts.
-4. **Secrets** — Credentials are injected at container creation and never persisted in the guest filesystem. Host storage uses Keychain on macOS and mode-restricted files on Linux.
+4. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when their private-repository scope matches policy. Credentials are never persisted in the guest filesystem. Host storage uses Keychain on macOS and mode-restricted files on Linux.
 5. **Isolation** — Each sandbox runs in its own lightweight VM. A compromised agent cannot affect the host or other sandboxes.
 
 ## CLI Reference
