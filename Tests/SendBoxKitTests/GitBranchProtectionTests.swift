@@ -2,28 +2,6 @@ import Foundation
 import Testing
 @testable import SendBoxKit
 
-private let gitPolicyPythonCommand: String? = {
-    for command in ["python3", "python"] {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [
-            command,
-            "-c",
-            "import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)",
-        ]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        guard (try? process.run()) != nil else {
-            continue
-        }
-        process.waitUntilExit()
-        if process.terminationStatus == 0 {
-            return command
-        }
-    }
-    return nil
-}()
-
 struct GitBranchProtectionTests {
     private let selectedRepository = GitBranchProtection.RepositoryIdentity(
         host: "github.com",
@@ -91,13 +69,7 @@ struct GitBranchProtectionTests {
         #expect(script.contains("remote.pushDefault"))
     }
 
-    @Test(
-        .enabled(
-            if: gitPolicyPythonCommand != nil,
-            "requires a Python 3 interpreter"
-        )
-    )
-    func generatedPolicyRejectsProtectedDestinationRefspec() throws {
+    @Test func generatedPolicyRejectsProtectedDestinationRefspec() throws {
         let fixture = try makeScriptFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -114,13 +86,7 @@ struct GitBranchProtectionTests {
         #expect((try? String(contentsOf: fixture.log, encoding: .utf8)) == nil)
     }
 
-    @Test(
-        .enabled(
-            if: gitPolicyPythonCommand != nil,
-            "requires a Python 3 interpreter"
-        )
-    )
-    func generatedPolicyAllowsFeaturePush() throws {
+    @Test func generatedPolicyAllowsFeaturePush() throws {
         let fixture = try makeScriptFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -137,13 +103,7 @@ struct GitBranchProtectionTests {
         #expect(log.contains("push origin feature/topic"))
     }
 
-    @Test(
-        .enabled(
-            if: gitPolicyPythonCommand != nil,
-            "requires a Python 3 interpreter"
-        )
-    )
-    func generatedPolicyAllowsOtherRepositoryPulls() throws {
+    @Test func generatedPolicyAllowsOtherRepositoryPulls() throws {
         let fixture = try makeScriptFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -166,13 +126,7 @@ struct GitBranchProtectionTests {
         #expect(log.contains("pull origin main"))
     }
 
-    @Test(
-        .enabled(
-            if: gitPolicyPythonCommand != nil,
-            "requires a Python 3 interpreter"
-        )
-    )
-    func generatedPolicyAllowsExplicitOtherRemoteFromSelectedWorkspace() throws {
+    @Test func generatedPolicyAllowsExplicitOtherRemoteFromSelectedWorkspace() throws {
         let fixture = try makeScriptFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -193,13 +147,7 @@ struct GitBranchProtectionTests {
         #expect(log.contains("push https://github.com/open-source/library.git release/1.0"))
     }
 
-    @Test(
-        .enabled(
-            if: gitPolicyPythonCommand != nil,
-            "requires a Python 3 interpreter"
-        )
-    )
-    func generatedPolicyRejectsSelectedRepositoryCloneElsewhere() throws {
+    @Test func generatedPolicyRejectsSelectedRepositoryCloneElsewhere() throws {
         let fixture = try makeScriptFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -218,13 +166,7 @@ struct GitBranchProtectionTests {
         #expect(result.stderr.contains("protected branch 'main'"))
     }
 
-    @Test(
-        .enabled(
-            if: gitPolicyPythonCommand != nil,
-            "requires a Python 3 interpreter"
-        )
-    )
-    func generatedPolicyRejectsPullFromProtectedBranch() throws {
+    @Test func generatedPolicyRejectsPullFromProtectedBranch() throws {
         let fixture = try makeScriptFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -240,13 +182,7 @@ struct GitBranchProtectionTests {
         #expect(result.stderr.contains("protected branch 'main'"))
     }
 
-    @Test(
-        .enabled(
-            if: gitPolicyPythonCommand != nil,
-            "requires a Python 3 interpreter"
-        )
-    )
-    func generatedPolicyRejectsPushFromProtectedCurrentBranch() throws {
+    @Test func generatedPolicyRejectsPushFromProtectedCurrentBranch() throws {
         let fixture = try makeScriptFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -262,13 +198,7 @@ struct GitBranchProtectionTests {
         #expect(result.stderr.contains("protected branch 'main'"))
     }
 
-    @Test(
-        .enabled(
-            if: gitPolicyPythonCommand != nil,
-            "requires a Python 3 interpreter"
-        )
-    )
-    func generatedPolicyRejectsMatchingPushDefault() throws {
+    @Test func generatedPolicyRejectsMatchingPushDefault() throws {
         let fixture = try makeScriptFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -401,14 +331,11 @@ struct GitBranchProtectionTests {
         currentDirectory: URL? = nil,
         pushDefault: String? = nil
     ) throws -> ScriptResult {
-        guard let pythonCommand = gitPolicyPythonCommand else {
-            throw ScriptTestError.pythonUnavailable
-        }
         let process = Process()
         let stderr = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [
-            pythonCommand,
+            "python3",
             "-I",
             "-B",
             fixture.policyScript.path,
@@ -436,9 +363,5 @@ struct GitBranchProtectionTests {
             exitCode: process.terminationStatus,
             stderr: String(data: data, encoding: .utf8) ?? ""
         )
-    }
-
-    private enum ScriptTestError: Error {
-        case pythonUnavailable
     }
 }
