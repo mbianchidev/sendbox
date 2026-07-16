@@ -26,7 +26,8 @@ project_path: /Users/developer/my-project
 # Runtime Provider
 # ─────────────────────────────────────────────────────────────────────────────
 # "auto" selects Apple Containerization on supported macOS hosts and Kata
-# Containers on Linux. Override it with `sendbox run --runtime apple|kata`.
+# Containers on Linux. Hyperlight is an explicit Linux/KVM-only provider.
+# Override it with `sendbox run --runtime apple|kata|hyperlight`.
 runtime:
   provider: auto
 
@@ -38,6 +39,14 @@ runtime:
     # address: /run/containerd/containerd.sock
     # snapshotter: overlayfs
     # configuration_path: /etc/kata-containers/configuration.toml
+
+  # Used only when provider is "hyperlight". The kernel and initrd must contain
+  # a shell and every command or MCP server that the guest will execute.
+  hyperlight:
+    executable: /usr/local/bin/hyperlight-unikraft
+    kernel_path: /opt/hyperlight/shell-kernel
+    initrd_path: /opt/hyperlight/shell.cpio
+    stack_mb: 8
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Container Resources
@@ -111,6 +120,8 @@ policy:
   # ── Kernel and MCP boundaries ─────────────────────────────────────────────
   boundaries:
     # Fail closed if eBPF, Python, the compiler, or libseccomp is unavailable.
+    # Hyperlight users must set this to false because the Unikraft guest cannot
+    # run the eBPF/seccomp boundary bootstrap.
     enabled: true
 
     tool_calls:
@@ -156,7 +167,9 @@ policy:
     # Prevents runaway HTTP clients from exhausting resources.
     max_connections: 50
 
-    # Domains the agent can reach. Supports wildcard subdomains.
+    # Domains the agent can reach. Apple and Kata support wildcard subdomains.
+    # Hyperlight requires concrete hostnames because its host CLI resolves each
+    # entry before launching the micro-VM.
     allowed_domains:
       - "github.com"
       - "*.github.com"

@@ -26,7 +26,10 @@ public struct ExecResult: Sendable {
 /// Runtime-neutral container lifecycle used by the agent runner.
 public protocol RuntimeProvider: Sendable {
     func initialize() async throws
-    func createContainer(_ config: ContainerConfig) async throws -> String
+    func createContainer(
+        _ config: ContainerConfig,
+        policy: CommandPolicy
+    ) async throws -> String
     func stopContainer(id: String) async throws
     func containerStatus(id: String) async -> RuntimeContainerStatus
     func exec(
@@ -72,6 +75,15 @@ public enum RuntimeProviderFactory {
             #endif
         case .kata:
             return KataContainerRuntime(configuration: configuration.kata, logger: logger)
+        case .hyperlight:
+            #if os(Linux)
+            return HyperlightRuntime(configuration: configuration.hyperlight, logger: logger)
+            #else
+            return UnavailableRuntimeProvider(
+                provider: .hyperlight,
+                reason: "Hyperlight requires Linux with KVM"
+            )
+            #endif
         }
     }
 
@@ -98,7 +110,10 @@ private struct UnavailableRuntimeProvider: RuntimeProvider {
         throw RuntimeProviderError.unavailable(provider, reason)
     }
 
-    func createContainer(_ config: ContainerConfig) async throws -> String {
+    func createContainer(
+        _ config: ContainerConfig,
+        policy: CommandPolicy
+    ) async throws -> String {
         throw RuntimeProviderError.unavailable(provider, reason)
     }
 

@@ -151,4 +151,32 @@ struct CommandPolicyTests {
         let decision = await policy.evaluate("echo 'hello world'")
         #expect(decision.isAllowed)
     }
+
+    @Test func testArgvMetacharactersRemainInert() async {
+        let policy = makePolicy(
+            allowlist: ["git *"],
+            denylist: ["rm *"]
+        )
+        let inertArguments = [
+            "topic;draft",
+            "topic|draft",
+            "topic&&draft",
+            "$(rm -rf /)",
+            "quoted ' value",
+            #"path\name"#,
+            "hello world",
+        ]
+
+        for argument in inertArguments {
+            let decision = await policy.evaluate(["git", "branch", argument])
+            #expect(decision.isAllowed)
+        }
+    }
+
+    @Test func testExactPolicyRequiresWholeArgvMatch() async {
+        let policy = CommandPolicy.exactlyAllowing([["/bin/bash"]])
+
+        #expect(await policy.evaluate(["/bin/bash"]).isAllowed)
+        #expect(!(await policy.evaluate(["/bin/bash", "-c", "rm -rf /"])).isAllowed)
+    }
 }

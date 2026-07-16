@@ -4,7 +4,16 @@ import Logging
 /// Evaluates commands against allowlist / denylist rules using glob-style patterns.
 public actor CommandPolicy {
 
-    private let config: PolicyConfiguration.CommandPolicyConfig
+    private struct CommandInvocation: Hashable, Sendable {
+        let arguments: [String]
+    }
+
+    private enum Rules: Sendable {
+        case configured(PolicyConfiguration.CommandPolicyConfig)
+        case exact(Set<CommandInvocation>)
+    }
+
+    private let rules: Rules
     private let logger: Logger
 
     // MARK: - Types
@@ -27,7 +36,22 @@ public actor CommandPolicy {
         config: PolicyConfiguration.CommandPolicyConfig,
         logger: Logger = Logger(label: "sendbox.command-policy")
     ) {
-        self.config = config
+        self.rules = .configured(config)
+        self.logger = logger
+    }
+
+    static func exactlyAllowing(
+        _ commands: [[String]],
+        logger: Logger = Logger(label: "sendbox.command-policy.bootstrap")
+    ) -> CommandPolicy {
+        CommandPolicy(
+            rules: .exact(Set(commands.map { CommandInvocation(arguments: $0) })),
+            logger: logger
+        )
+    }
+
+    private init(rules: Rules, logger: Logger) {
+        self.rules = rules
         self.logger = logger
     }
 
@@ -41,39 +65,91 @@ public actor CommandPolicy {
         }
 
         let parsed = parseCommand(trimmed)
+        return evaluate(
+            arguments: [parsed.binary] + parsed.arguments,
+            matchText: trimmed,
+            diagnosticText: trimmed
+        )
+    }
 
-        // Denylist always takes priority.
+    /// Evaluate one argv vector without interpreting shell metacharacters.
+    public func evaluate(_ arguments: [String]) -> CommandDecision {
+        guard let executable = arguments.first,
+            !executable.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return .denied(reason: "Empty command")
+        }
+
+        return evaluate(
+            arguments: arguments,
+            matchText: arguments.joined(separator: " "),
+            diagnosticText: diagnosticCommand(arguments)
+        )
+    }
+
+    private func evaluate(
+        arguments: [String],
+        matchText: String,
+        diagnosticText: String
+    ) -> CommandDecision {
+        switch rules {
+        case .exact(let allowedCommands):
+            if allowedCommands.contains(CommandInvocation(arguments: arguments)) {
+                logger.debug("Allowed exact command: \(diagnosticText)")
+                return .allowed
+            }
+            let binary = arguments.first ?? ""
+            return .denied(
+                reason: "Command '\(binary)' is not an approved runtime bootstrap invocation"
+            )
+
+        case .configured(let config):
+            return evaluateConfigured(
+                arguments: arguments,
+                matchText: matchText,
+                diagnosticText: diagnosticText,
+                config: config
+            )
+        }
+    }
+
+    private func evaluateConfigured(
+        arguments: [String],
+        matchText: String,
+        diagnosticText: String,
+        config: PolicyConfiguration.CommandPolicyConfig
+    ) -> CommandDecision {
         for pattern in config.denylist {
-            if matches(trimmed, pattern: pattern) {
+            if matches(arguments, matchText: matchText, pattern: pattern) {
                 let decision = CommandDecision.denied(
-                    reason: "Command '\(parsed.binary)' matches deny pattern '\(pattern)'"
+                    reason: "Command '\(arguments[0])' matches deny pattern '\(pattern)'"
                 )
                 if config.logBlocked {
-                    logger.warning("Blocked command: \(trimmed) (deny pattern: \(pattern))")
+                    logger.warning(
+                        "Blocked command: \(diagnosticText) (deny pattern: \(pattern))"
+                    )
                 }
                 return decision
             }
         }
 
-        // Check allowlist.
         for pattern in config.allowlist {
-            if matches(trimmed, pattern: pattern) {
-                logger.debug("Allowed command: \(trimmed) (pattern: \(pattern))")
+            if matches(arguments, matchText: matchText, pattern: pattern) {
+                logger.debug("Allowed command: \(diagnosticText) (pattern: \(pattern))")
                 return .allowed
             }
         }
 
-        // Fall through to default action.
         switch config.defaultAction {
         case .allow:
-            logger.debug("Allowed command by default: \(trimmed)")
+            logger.debug("Allowed command by default: \(diagnosticText)")
             return .allowed
         case .deny:
             let decision = CommandDecision.denied(
-                reason: "Command '\(parsed.binary)' not in allowlist"
+                reason: "Command '\(arguments[0])' not in allowlist"
             )
             if config.logBlocked {
-                logger.warning("Blocked command (default deny): \(trimmed)")
+                logger.warning("Blocked command (default deny): \(diagnosticText)")
             }
             return decision
         }
@@ -103,29 +179,40 @@ public actor CommandPolicy {
     ///   binary equals the prefix.
     /// - A pattern containing `*` elsewhere is matched character-by-character
     ///   against the full command string.
-    private func matches(_ command: String, pattern: String) -> Bool {
-        let parsed = parseCommand(command)
-
-        // Exact binary-only match (pattern has no wildcard).
-        if !pattern.contains("*") {
-            // Match full command or just binary.
-            if command == pattern || parsed.binary == pattern {
-                return true
+    private func matches(
+        _ arguments: [String],
+        matchText: String,
+        pattern: String
+    ) -> Bool {
+        let hasWildcard = pattern.contains("*") || pattern.contains("?")
+        if !hasWildcard {
+            let parsedPattern = parseCommand(pattern)
+            let patternArguments = [parsedPattern.binary] + parsedPattern.arguments
+            guard !patternArguments[0].isEmpty else {
+                return false
             }
-            // Support multi-word exact patterns like "git status".
-            return command.hasPrefix(pattern)
-                && (command.count == pattern.count
-                    || command[command.index(command.startIndex, offsetBy: pattern.count)] == " ")
+            if patternArguments.count == 1 {
+                return arguments.first == patternArguments[0]
+            }
+            return arguments.starts(with: patternArguments)
         }
 
-        // Pattern like "git *" — binary match + allow any arguments.
         if pattern.hasSuffix(" *") {
             let prefix = String(pattern.dropLast(2))
-            return parsed.binary == prefix
+            if !prefix.contains("*") && !prefix.contains("?") {
+                let parsedPrefix = parseCommand(prefix)
+                let prefixArguments = [parsedPrefix.binary] + parsedPrefix.arguments
+                return arguments.starts(with: prefixArguments)
+            }
         }
 
-        // General glob match against full command string.
-        return GlobPattern.matches(command, pattern: pattern)
+        return GlobPattern.matches(matchText, pattern: pattern)
+    }
+
+    private func diagnosticCommand(_ arguments: [String]) -> String {
+        arguments.map { argument in
+            "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }.joined(separator: " ")
     }
 
     /// Parse a raw command string into its binary name and argument list.

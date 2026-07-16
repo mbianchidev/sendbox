@@ -11,7 +11,8 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 - **File Isolation** — Mount only the directories an agent needs. Everything else is invisible.
 - **Command Filtering** — Allowlist or denylist which binaries an agent may execute inside the sandbox.
 - **Network Firewall** — Restrict outbound traffic to specific hosts, ports, or protocols.
-- **Runtime Providers** — Select Apple Containerization or Kata Containers through one lifecycle API and `--runtime`.
+- **Runtime Providers** — Select Apple Containerization, Kata Containers, or Hyperlight through one lifecycle API and `--runtime`.
+- **Hyperlight Execution** — Run commands and MCP servers in one-shot Hyperlight/Unikraft micro-VMs on Linux.
 - **Credential Injection** — Secrets load from macOS Keychain or the protected Linux secret store and are injected without persisting them in the guest filesystem.
 - **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
 - **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
@@ -35,6 +36,7 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 | Kata runtime | Kata Containers | 3.28 |
 | Kata runtime | containerd | 1.7 |
 | Kata runtime | nerdctl and CNI plugins | Current compatible releases |
+| Hyperlight runtime | `hyperlight-unikraft` and KVM | 0.12 |
 
 Boundary-enabled guest images must include `python3`, `bpftrace`, a C compiler,
 libseccomp development headers, and the Yama LSM with writable
@@ -123,11 +125,14 @@ name: my-agent-sandbox
 project_path: ./workspace
 
 runtime:
-  provider: auto # auto | apple | kata
+  provider: auto # auto | apple | kata | hyperlight
   kata:
     executable: nerdctl
     runtime_handler: io.containerd.kata.v2
     namespace: sendbox
+  hyperlight:
+    kernel_path: /opt/hyperlight/shell-kernel
+    initrd_path: /opt/hyperlight/shell.cpio
 
 resources:
   cpus: 2
@@ -148,6 +153,7 @@ policy:
   network:
     default_action: deny
     allow_dns: true
+    # Replace wildcard entries with concrete hostnames when using Hyperlight.
     allowed_domains:
       - github.com
       - "*.github.com"
@@ -155,6 +161,7 @@ policy:
     blocked_domains: []
 
   boundaries:
+    # Set to false when using Hyperlight.
     enabled: true
     tool_calls:
       transport: stdio       # HTTP/SSE MCP is rejected in boundary mode
@@ -228,6 +235,8 @@ defense in depth against direct API ref mutations or alternate Git clients. Disa
 | `runtime.kata.runtime_handler` | string | Kata containerd runtime v2 handler |
 | `runtime.kata.namespace` | string | containerd namespace |
 | `runtime.kata.configuration_path` | string | Absolute Kata config path on the containerd host |
+| `runtime.hyperlight.kernel_path` | string | Hyperlight-compatible Unikraft shell kernel |
+| `runtime.hyperlight.initrd_path` | string | Rootfs CPIO containing the commands or MCP servers to run |
 | `resources.cpus` | int | Number of virtual CPUs |
 | `resources.memory_mb` | int | Memory allocation in MB |
 | `resources.disk_size_mb` | int | Requested writable-layer size |
@@ -273,6 +282,8 @@ defense in depth against direct API ref mutations or alternate Git clients. Disa
 | `Agent` | Coordinate agent process execution and I/O |
 
 The **copilot-bridge** is an optional Node.js sidecar that exposes a JSON-RPC interface for IDE integrations.
+
+See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
 
 ## Security Model
 

@@ -3,6 +3,8 @@ import Foundation
 /// Internal container configuration derived from SandboxConfiguration.
 /// Maps user-facing config to the low-level container runtime parameters.
 public struct ContainerConfig: Sendable {
+    static let runtimeBootstrapCommand = ["/bin/bash"]
+
     /// Unique container identifier
     public let id: String
     /// Container hostname
@@ -52,11 +54,30 @@ public struct ContainerConfig: Sendable {
         public let address: String
         public let gateway: String
         public let nameservers: [String]
+        public let allowsUnrestrictedOutbound: Bool
+        public let allowedHosts: [String]
+        public let blockedHosts: [String]
+        public let allowDNS: Bool
+        public let maxConnections: Int?
 
-        public init(address: String, gateway: String, nameservers: [String]) {
+        public init(
+            address: String,
+            gateway: String,
+            nameservers: [String],
+            allowsUnrestrictedOutbound: Bool = false,
+            allowedHosts: [String] = [],
+            blockedHosts: [String] = [],
+            allowDNS: Bool = true,
+            maxConnections: Int? = nil
+        ) {
             self.address = address
             self.gateway = gateway
             self.nameservers = nameservers
+            self.allowsUnrestrictedOutbound = allowsUnrestrictedOutbound
+            self.allowedHosts = allowedHosts
+            self.blockedHosts = blockedHosts
+            self.allowDNS = allowDNS
+            self.maxConnections = maxConnections
         }
     }
 
@@ -144,7 +165,12 @@ public struct ContainerConfig: Sendable {
         let networkConfig = NetworkConfig(
             address: "192.168.64.2/24",
             gateway: "192.168.64.1",
-            nameservers: ["192.168.64.1", "1.1.1.1"]
+            nameservers: ["192.168.64.1", "1.1.1.1"],
+            allowsUnrestrictedOutbound: sandbox.policy.network.defaultAction == .allow,
+            allowedHosts: sandbox.policy.network.allowedDomains,
+            blockedHosts: sandbox.policy.network.blockedDomains,
+            allowDNS: sandbox.policy.network.allowDNS,
+            maxConnections: sandbox.policy.network.maxConnections
         )
 
         var environment: [String: String] = [
@@ -158,7 +184,7 @@ public struct ContainerConfig: Sendable {
         let firewallScript = firewall.generateStartupScript()
         let dnsConfig = firewall.generateDNSConfig()
         let mcpScript = mcpInspector?.generateStartupScript()
-        let baseCommand = ["/bin/bash"]
+        let baseCommand = runtimeBootstrapCommand
 
         let command: [String]
         let deferredFirewallScript: String?

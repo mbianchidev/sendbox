@@ -85,7 +85,10 @@ struct KataContainerRuntimeTests {
         )
 
         try await runtime.initialize()
-        let id = try await runtime.createContainer(makeContainerConfig())
+        let id = try await runtime.createContainer(
+            makeContainerConfig(),
+            policy: allowAllPolicy()
+        )
         #expect(id == "sandbox-id")
         #expect(await runtime.containerStatus(id: id) == .running)
 
@@ -112,6 +115,42 @@ struct KataContainerRuntimeTests {
         )
     }
 
+    @Test func testKataRejectsDeniedStartupBeforeRun() async throws {
+        let recorder = KataCommandRecorder()
+        let runtime = KataContainerRuntime(
+            configuration: .default,
+            commandRunner: { executable, arguments, environment in
+                await recorder.run(
+                    executable: executable,
+                    arguments: arguments,
+                    environment: environment
+                )
+            }
+        )
+        let policy = CommandPolicy(
+            config: .init(
+                defaultAction: .deny,
+                allowlist: ["git *"],
+                denylist: [],
+                logBlocked: false
+            )
+        )
+
+        try await runtime.initialize()
+        do {
+            _ = try await runtime.createContainer(
+                makeContainerConfig(command: ["rm", "-rf", "/"]),
+                policy: policy
+            )
+            Issue.record("Expected startup command to be denied")
+        } catch {
+            #expect(error.localizedDescription.contains("denied by policy"))
+        }
+
+        let snapshot = await recorder.snapshot()
+        #expect(!snapshot.invocations.contains { $0.arguments.contains("run") })
+    }
+
     @Test func testKataRuntimeAppliesBoundaryBootstrapAndExecPrefix() async throws {
         let recorder = KataCommandRecorder()
         let runtime = KataContainerRuntime(
@@ -130,7 +169,7 @@ struct KataContainerRuntimeTests {
         )
 
         try await runtime.initialize()
-        _ = try await runtime.createContainer(config)
+        _ = try await runtime.createContainer(config, policy: allowAllPolicy())
         _ = try await runtime.exec(
             containerId: config.id,
             command: ["echo", "ok"],
@@ -217,6 +256,7 @@ struct KataContainerRuntimeTests {
     private func makeContainerConfig(
         firewallScript: String? = nil,
         mcpInspectionScript: String? = nil,
+        command: [String] = ["/bin/bash"],
         boundaryExecPrefix: [String] = [],
         boundaryReadyPath: String? = nil
     ) -> ContainerConfig {
@@ -228,7 +268,7 @@ struct KataContainerRuntimeTests {
             rootfsSizeInBytes: 10_737_418_240,
             imageReference: "example/image:latest",
             workingDirectory: "/workspaces/project",
-            command: ["/bin/bash"],
+            command: command,
             environment: [
                 "API_TOKEN": "super-secret",
                 "MULTILINE_SECRET": "line one\nline two",
@@ -256,6 +296,17 @@ struct KataContainerRuntimeTests {
             mcpInspectionScript: mcpInspectionScript,
             boundaryExecPrefix: boundaryExecPrefix,
             boundaryReadyPath: boundaryReadyPath
+        )
+    }
+
+    private func allowAllPolicy() -> CommandPolicy {
+        CommandPolicy(
+            config: .init(
+                defaultAction: .allow,
+                allowlist: [],
+                denylist: [],
+                logBlocked: false
+            )
         )
     }
 

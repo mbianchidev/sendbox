@@ -12,12 +12,14 @@ enum RuntimeOption: String, ExpressibleByArgument, CaseIterable {
     case automatic = "auto"
     case apple
     case kata
+    case hyperlight
 
     var provider: RuntimeConfiguration.Provider {
         switch self {
         case .automatic: return .automatic
         case .apple: return .apple
         case .kata: return .kata
+        case .hyperlight: return .hyperlight
         }
     }
 }
@@ -52,7 +54,7 @@ extension SendBox {
         @Option(name: .long, help: "Security policy preset (default, permissive, strict)")
         var policy: PolicyPreset?
 
-        @Option(name: .long, help: "Runtime provider (auto, apple, kata)")
+        @Option(name: .long, help: "Runtime provider (auto, apple, kata, hyperlight)")
         var runtime: RuntimeOption?
 
         enum PolicyPreset: String, ExpressibleByArgument, CaseIterable {
@@ -130,7 +132,7 @@ extension SendBox {
         @Option(name: .long, help: "Security policy preset (default, permissive, strict)")
         var policy: Run.PolicyPreset?
 
-        @Option(name: .long, help: "Runtime provider (auto, apple, kata)")
+        @Option(name: .long, help: "Runtime provider (auto, apple, kata, hyperlight)")
         var runtime: RuntimeOption?
 
         func run() throws {

@@ -339,7 +339,13 @@ public actor AgentRunner {
         }
 
         do {
-            let id = try await runtime.createContainer(containerConfig)
+            let startupCommandPolicy = CommandPolicy.exactlyAllowing([
+                containerConfig.command
+            ])
+            let id = try await runtime.createContainer(
+                containerConfig,
+                policy: startupCommandPolicy
+            )
             logger.info("Container created and started", metadata: ["id": "\(id)"])
             return id
         } catch {
