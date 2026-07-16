@@ -314,7 +314,18 @@ The `CommandPolicy` engine provides an application-level defense layer:
 - **System admin commands blocked:** `sudo`, `su`, `mount`, `iptables`, `systemctl`, and other administrative commands are blocked in default and strict presets
 - **Logging:** Blocked commands are logged for audit
 
-### Layer 8: Secrets Protection
+### Layer 8: Git Branch Protection
+
+Selected-repository Git operations are guarded before the real git binary executes:
+
+- Enabled by default and requires boundary enforcement
+- Denies pushes and pulls involving `main`, `master`, or configured protected branches
+- Requires the current branch and remote push/pull refs to match configurable feature patterns
+- Matches normalized remote identity, so cloning the selected repository elsewhere does not bypass policy
+- Uses eBPF to terminate direct execution of the hidden real git binary
+- Does not replace GitHub server-side rulesets, which remain necessary against direct API ref mutation or alternate Git clients
+
+### Layer 9: Secrets Protection
 
 Secrets management prevents credential exposure:
 
@@ -382,6 +393,7 @@ These are threats SendBox is designed to defend against:
 | Agent attempts to intercept network traffic | `CAP_NET_RAW` dropped; separate virtual NIC |
 | Agent attempts to load malicious kernel modules | `kernel.modules_disabled=1`; `CAP_SYS_MODULE` dropped; seccomp blocks `init_module` |
 | Agent attempts a disallowed MCP tool call | Framing-aware stdio proxy returns a policy error; eBPF terminates direct proxy bypasses |
+| Agent attempts to push or pull a protected selected-repository branch | Root-installed git policy validates current and remote refs; eBPF terminates direct real-git execution |
 
 ### Out of Scope
 
@@ -397,6 +409,7 @@ These threats are not addressed by SendBox:
 | Supply chain attacks on the base VM image | Image provenance and signing are the user's responsibility |
 | Zero-day hypervisor escapes | No software sandbox can eliminate hypervisor zero-day risk |
 | Remote HTTP/SSE MCP authorization | Boundary mode intentionally supports stdio MCP only; HTTP/SSE remains audit-only |
+| Direct GitHub API/GraphQL ref mutation or alternate Git clients | The bundled-git guard cannot constrain arbitrary bearer-token API calls or independently installed clients; use GitHub server-side rulesets |
 
 ---
 

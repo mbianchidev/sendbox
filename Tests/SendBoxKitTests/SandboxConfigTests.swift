@@ -16,6 +16,13 @@ struct SandboxConfigTests {
         #expect(config.secrets.isEmpty)
         #expect(config.github.forwardAuth == true)
         #expect(config.github.forwardCopilotAuth == true)
+        #expect(config.github.allowPrivateRepositoryAccess == false)
+        #expect(config.github.branchProtection.enabled)
+        #expect(config.github.branchProtection.protectedBranches == ["main", "master"])
+        #expect(
+            config.github.branchProtection.allowedBranchPatterns
+                == ["{username}/*", "copilot/*", "feature/*"]
+        )
         #expect(config.devcontainer?.autoGenerate == true)
         #expect(config.policy.boundaries.enabled == true)
         #expect(config.policy.boundaries.toolCalls.defaultAction == Action.deny)
@@ -42,6 +49,7 @@ struct SandboxConfigTests {
         #expect(decoded.policy.commands.defaultAction == original.policy.commands.defaultAction)
         #expect(decoded.policy.network.defaultAction == original.policy.network.defaultAction)
         #expect(decoded.github.forwardAuth == original.github.forwardAuth)
+        #expect(decoded.github.branchProtection == original.github.branchProtection)
         #expect(decoded.secrets == original.secrets)
         #expect(decoded.runtime == original.runtime)
     }
@@ -88,6 +96,8 @@ struct SandboxConfigTests {
         #expect(config.policy.network.allowedDomains == ["github.com"])
         #expect(config.github.forwardAuth == false)
         #expect(config.github.forwardCopilotAuth == true)
+        #expect(config.github.allowPrivateRepositoryAccess == false)
+        #expect(config.github.branchProtection.enabled)
         #expect(config.policy.boundaries.enabled == true)
         #expect(config.runtime == nil)
     }
@@ -141,6 +151,45 @@ struct SandboxConfigTests {
         )
     }
 
+    @Test func testLoadAdditionalPrivateRepositoryAccessOverride() throws {
+        let original = SandboxConfiguration.default(projectPath: "/projects/private")
+        var github = original.github
+        github.allowPrivateRepositoryAccess = true
+
+        let encoded = try YAMLEncoder().encode(github)
+        let decoded = try YAMLDecoder().decode(
+            SandboxConfiguration.GitHubConfig.self,
+            from: encoded
+        )
+
+        #expect(decoded.allowPrivateRepositoryAccess)
+    }
+
+    @Test func testLoadCustomBranchProtection() throws {
+        let yaml = """
+            forward_auth: true
+            forward_copilot_auth: true
+            branch_protection:
+              enabled: false
+              username: octocat
+              protected_branches:
+                - trunk
+              allowed_branch_patterns:
+                - "octocat/*"
+                - "release/*"
+            """
+
+        let config = try YAMLDecoder().decode(
+            SandboxConfiguration.GitHubConfig.self,
+            from: yaml
+        )
+
+        #expect(!config.branchProtection.enabled)
+        #expect(config.branchProtection.username == "octocat")
+        #expect(config.branchProtection.protectedBranches == ["trunk"])
+        #expect(config.branchProtection.allowedBranchPatterns == ["octocat/*", "release/*"])
+    }
+
     @Test func testKataRuntimeDefaultsWhenSectionIsPartial() throws {
         let yaml = """
             name: kata-sandbox
@@ -170,7 +219,6 @@ struct SandboxConfigTests {
 
         let config = try SandboxConfiguration.load(from: Data(yaml.utf8))
         let runtime = try #require(config.runtime)
-        #expect(runtime.kata == .default)
         #expect(runtime.kata == .default)
     }
 

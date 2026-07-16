@@ -110,7 +110,8 @@ public struct ContainerConfig: Sendable {
         imageReference: String,
         firewall: NetworkFirewall,
         mcpInspector: MCPInspector? = nil,
-        boundaryEnforcer: BoundaryEnforcer? = nil
+        boundaryEnforcer: BoundaryEnforcer? = nil,
+        gitBranchProtection: GitBranchProtection? = nil
     ) -> ContainerConfig {
         let containerId = UUID().uuidString.lowercased()
 
@@ -166,7 +167,11 @@ public struct ContainerConfig: Sendable {
         let boundaryReadyPath: String?
 
         if let boundaryEnforcer {
-            let preflightScripts = [firewallScript, mcpScript]
+            let preflightScripts = [
+                gitBranchProtection?.generateInstallationScript(),
+                firewallScript,
+                mcpScript,
+            ]
                 .compactMap { $0 }
                 .filter { !$0.isEmpty }
             command = [

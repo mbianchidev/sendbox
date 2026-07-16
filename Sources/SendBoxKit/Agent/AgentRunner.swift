@@ -7,6 +7,26 @@ import Glibc
 import Darwin
 #endif
 
+enum AgentAuthenticationEnvironment {
+    static func make(
+        githubToken: String?,
+        forwardGitHubToken: Bool,
+        copilotToken: String?,
+        forwardCopilotToken: Bool
+    ) -> [String: String] {
+        var environment: [String: String] = [:]
+
+        if forwardGitHubToken, let githubToken, !githubToken.isEmpty {
+            environment["GITHUB_TOKEN"] = githubToken
+        }
+        if forwardCopilotToken, let copilotToken, !copilotToken.isEmpty {
+            environment["GITHUB_COPILOT_TOKEN"] = copilotToken
+        }
+
+        return environment
+    }
+}
+
 /// Orchestrates the full agent sandbox lifecycle:
 /// analyze project → generate devcontainer → build container → apply policies → inject secrets → run agent
 public actor AgentRunner {
@@ -50,6 +70,7 @@ public actor AgentRunner {
         case workspacePreparationFailed(String)
         case processExitedWithError(String, Int32)
         case boundaryConfigurationInvalid(String)
+        case branchProtectionConfigurationInvalid(String)
 
         public var errorDescription: String? {
             switch self {
@@ -69,6 +90,8 @@ public actor AgentRunner {
                 return "Process '\(cmd)' exited with code \(code)"
             case .boundaryConfigurationInvalid(let message):
                 return "Boundary configuration is invalid: \(message)"
+            case .branchProtectionConfigurationInvalid(let message):
+                return "Git branch protection configuration is invalid: \(message)"
             }
         }
     }
@@ -100,7 +123,8 @@ public actor AgentRunner {
                 serverCommandPatterns: config.policy.boundaries.toolCalls
                     .serverCommandPatterns,
                 runAsUID: getuid(),
-                runAsGID: getgid()
+                runAsGID: getgid(),
+                gitBranchProtectionEnabled: config.github.branchProtection.enabled
             )
         } else {
             self.boundaryEnforcer = nil
@@ -276,7 +300,9 @@ public actor AgentRunner {
         spec: DevContainerBuilder.DevContainerSpec
     ) async throws -> String {
         try prepareWorkspace()
-        let authEnv = try setupAuthForwarding()
+        let gitBranchProtection = try makeGitBranchProtection()
+        let githubToken = config.github.forwardAuth ? approvedGitHubToken() : nil
+        let authEnv = setupAuthForwarding(githubToken: githubToken)
         let secretsEnv = try loadSecrets()
 
         var containerConfig = ContainerConfig.from(
@@ -284,7 +310,8 @@ public actor AgentRunner {
             imageReference: spec.image,
             firewall: firewall,
             mcpInspector: mcpInspector,
-            boundaryEnforcer: boundaryEnforcer
+            boundaryEnforcer: boundaryEnforcer,
+            gitBranchProtection: gitBranchProtection
         )
 
         if mcpInspector != nil {
@@ -366,34 +393,236 @@ public actor AgentRunner {
     private func loadSecrets() throws -> [String: String] {
         var env: [String: String] = [:]
         for key in config.secrets {
+            if Self.githubRepositoryCredentialKeys.contains(key.uppercased()) {
+                logger.warning(
+                    "Refusing to inject \(key) from the vault; GitHub repository credentials must use guarded auth forwarding"
+                )
+                continue
+            }
             env[key] = try secrets.retrieve(key: key)
         }
         return env
     }
 
     /// Read GitHub / Copilot tokens and return as environment variables.
-    private func setupAuthForwarding() throws -> [String: String] {
-        var env: [String: String] = [:]
-
-        if config.github.forwardAuth {
-            if let token = try? executeProcess("gh", arguments: ["auth", "token"]) {
-                env["GITHUB_TOKEN"] = token
-                logger.info("GitHub auth forwarded")
-            } else {
-                logger.warning(
-                    "Could not retrieve GitHub auth token (is `gh` installed and authenticated?)"
-                )
-            }
+    private func setupAuthForwarding(
+        githubToken: String?
+    ) -> [String: String] {
+        if config.github.forwardAuth, githubToken != nil {
+            logger.info("GitHub repository auth forwarded")
         }
 
+        let copilotToken = ProcessInfo.processInfo.environment["GITHUB_COPILOT_TOKEN"]
         if config.github.forwardCopilotAuth {
-            if let copilotToken = ProcessInfo.processInfo.environment["GITHUB_COPILOT_TOKEN"] {
-                env["GITHUB_COPILOT_TOKEN"] = copilotToken
+            if copilotToken != nil {
                 logger.info("Copilot auth forwarded")
+            } else {
+                logger.warning("GITHUB_COPILOT_TOKEN is unavailable; Copilot cannot authenticate")
             }
         }
 
-        return env
+        return AgentAuthenticationEnvironment.make(
+            githubToken: githubToken,
+            forwardGitHubToken: config.github.forwardAuth,
+            copilotToken: copilotToken,
+            forwardCopilotToken: config.github.forwardCopilotAuth
+        )
+    }
+
+    private static let githubRepositoryCredentialKeys: Set<String> = [
+        "COPILOT_GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GITHUB_TOKEN",
+    ]
+
+    private func makeGitBranchProtection() throws -> GitBranchProtection? {
+        let branchConfig = config.github.branchProtection
+        guard branchConfig.enabled else {
+            return nil
+        }
+        guard boundaryEnforcer != nil else {
+            throw RunnerError.branchProtectionConfigurationInvalid(
+                "github.branch_protection requires policy.boundaries.enabled"
+            )
+        }
+
+        let repository: GitBranchProtection.RepositoryIdentity
+        do {
+            repository = try GitBranchProtection.resolveRepositoryIdentity(
+                projectPath: config.projectPath
+            )
+        } catch {
+            throw RunnerError.branchProtectionConfigurationInvalid(
+                error.localizedDescription
+            )
+        }
+
+        let configuredUsername = branchConfig.username?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let username = configuredUsername?.isEmpty == false
+            ? configuredUsername
+            : GitBranchProtection.resolveGitHubUsername(host: repository.host)
+        if username == nil,
+           branchConfig.allowedBranchPatterns.contains(where: {
+               $0.contains("{username}")
+           }) {
+            logger.warning(
+                "GitHub username could not be resolved; {username} branch patterns are disabled"
+            )
+        } else if let username {
+            logger.info("Git branch protection username resolved as \(username)")
+        }
+
+        let workspaceName = URL(fileURLWithPath: config.projectPath).lastPathComponent
+        let protection = GitBranchProtection(
+            config: branchConfig,
+            username: username,
+            selectedRepository: repository,
+            selectedWorkspace: "/workspaces/\(workspaceName)"
+        )
+        do {
+            try protection.validate()
+        } catch {
+            throw RunnerError.branchProtectionConfigurationInvalid(
+                error.localizedDescription
+            )
+        }
+        return protection
+    }
+
+    private func approvedGitHubToken() -> String? {
+        let token: String
+        do {
+            token = try executeProcess("gh", arguments: ["auth", "token"])
+        } catch {
+            logger.warning("Could not retrieve GitHub auth token; GitHub operations are unavailable")
+            return nil
+        }
+
+        guard !token.isEmpty else {
+            logger.warning("GitHub auth token is empty; GitHub operations are unavailable")
+            return nil
+        }
+        let tokenEnvironment = ["GH_TOKEN": token]
+
+        guard let nameWithOwner = try? executeProcess(
+            "gh",
+            arguments: ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+            currentDirectory: config.projectPath,
+            environment: tokenEnvironment
+        ) else {
+            logger.warning(
+                "Refusing to expose GitHub repository credentials because the selected repository could not be determined"
+            )
+            return nil
+        }
+
+        guard let details = try? executeProcess(
+            "gh",
+            arguments: [
+                "api", "repos/\(nameWithOwner)",
+                "--jq", "[.visibility, .owner.login, .owner.type, .name] | @tsv",
+            ],
+            environment: tokenEnvironment
+        ) else {
+            logger.warning(
+                "Refusing to expose GitHub repository credentials because selected repository metadata could not be determined"
+            )
+            return nil
+        }
+
+        let fields = details.split(separator: "\t", maxSplits: 3).map(String.init)
+        guard fields.count == 4 else {
+            logger.warning("Refusing to expose GitHub repository credentials because metadata is invalid")
+            return nil
+        }
+
+        let visibility: RepositoryAccessPolicy.Visibility =
+            fields[0].lowercased() == "public" ? .public : .private
+        let organization = fields[2].lowercased() == "organization" ? fields[1] : nil
+        let repository = RepositoryAccessPolicy.Repository(
+            owner: fields[1],
+            name: fields[3],
+            visibility: visibility,
+            organization: organization
+        )
+
+        guard let accessibleRepositoriesOutput = try? executeProcess(
+            "gh",
+            arguments: [
+                "api", "--method", "GET", "--paginate", "user/repos",
+                "-f", "visibility=all",
+                "-f", "affiliation=owner,collaborator,organization_member",
+                "-f", "per_page=100",
+                "--jq", ".[] | select(.visibility != \"public\") | [.owner.login, .name, .owner.type] | @tsv",
+            ],
+            environment: tokenEnvironment
+        ) else {
+            logger.warning(
+                "Refusing to expose GitHub repository credentials because non-public repository scope could not be determined"
+            )
+            return nil
+        }
+
+        guard let accessiblePrivateRepositories = parsePrivateRepositories(
+            accessibleRepositoriesOutput
+        ) else {
+            logger.warning(
+                "Refusing to expose GitHub repository credentials because non-public repository scope metadata is invalid"
+            )
+            return nil
+        }
+
+        let decision = RepositoryAccessPolicy().evaluateCredentialScope(
+            source: repository,
+            accessiblePrivateRepositories: accessiblePrivateRepositories,
+            privateAccessOverride: config.github.allowPrivateRepositoryAccess
+        )
+
+        switch decision {
+        case .deny(let message):
+            logger.warning("Refusing to expose GitHub repository credentials: \(message)")
+            return nil
+        case .warn(let message):
+            logger.warning(
+                "GitHub repository credentials include unapproved private access: \(message). Set github.allow_private_repository_access only for additional private repositories in the same organization"
+            )
+            return nil
+        case .allow:
+            logger.info("GitHub repository credentials approved for \(nameWithOwner)")
+            return token
+        }
+    }
+
+    private func parsePrivateRepositories(
+        _ output: String
+    ) -> [RepositoryAccessPolicy.Repository]? {
+        if output.isEmpty {
+            return []
+        }
+
+        var repositories: [RepositoryAccessPolicy.Repository] = []
+        for line in output.split(whereSeparator: \.isNewline) {
+            let fields = line.split(
+                separator: "\t",
+                maxSplits: 2,
+                omittingEmptySubsequences: false
+            ).map(String.init)
+            guard fields.count == 3 else {
+                return nil
+            }
+
+            let organization = fields[2].lowercased() == "organization" ? fields[0] : nil
+            repositories.append(RepositoryAccessPolicy.Repository(
+                owner: fields[0],
+                name: fields[1],
+                visibility: .private,
+                organization: organization
+            ))
+        }
+        return repositories
     }
 
     // MARK: - Helpers
@@ -401,11 +630,23 @@ public actor AgentRunner {
     /// Run an external process synchronously and capture its stdout.
     private nonisolated func executeProcess(
         _ executable: String,
-        arguments: [String]
+        arguments: [String],
+        currentDirectory: String? = nil,
+        environment: [String: String] = [:]
     ) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [executable] + arguments
+        if let currentDirectory {
+            process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
+        }
+        if !environment.isEmpty {
+            var processEnvironment = ProcessInfo.processInfo.environment
+            for (key, value) in environment {
+                processEnvironment[key] = value
+            }
+            process.environment = processEnvironment
+        }
 
         let pipe = Pipe()
         process.standardOutput = pipe

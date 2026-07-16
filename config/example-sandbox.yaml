@@ -173,13 +173,13 @@ policy:
 # Secrets are stored in the sendbox vault (not in this file).
 #
 # To add a secret to the vault:
-#   sendbox secret set GITHUB_TOKEN
+#   sendbox secret set NPM_TOKEN
 #
 # Secrets are injected at container start and are available as standard
-# environment variables (e.g., $GITHUB_TOKEN). They are never written
+# environment variables (e.g., $NPM_TOKEN). GitHub tokens are handled by
+# the guarded GitHub auth forwarding configuration below. Secrets are never written
 # to disk inside the container.
 secrets:
-  - GITHUB_TOKEN
   - NPM_TOKEN
   - DATABASE_URL
 
@@ -215,12 +215,13 @@ devcontainer:
 # GitHub Authentication
 # ─────────────────────────────────────────────────────────────────────────────
 # Controls how the sandbox authenticates with GitHub.
-# By default, sendbox forwards your local `gh` CLI credentials so the
-# agent can push commits, open PRs, and interact with the GitHub API
-# without storing long-lived tokens.
+# Copilot authentication is forwarded independently. GitHub CLI credentials
+# are forwarded when their private-repository scope contains only the selected
+# repository, plus any explicitly approved same-organization repositories.
 github:
   # Forward the host's `gh auth` token into the container.
-  # The agent can use `gh` commands and the GitHub API as you.
+  # The selected repository and public repositories are allowed by default.
+  # Use a fine-grained token scoped to the selected repository when possible.
   # Default: true
   forward_auth: true
 
@@ -228,6 +229,35 @@ github:
   # Required if the agent uses GitHub Copilot features.
   # Default: true
   forward_copilot_auth: true
+
+  # Allow credentials that also cover additional private repositories.
+  # Additional repositories must belong to the selected repository's
+  # organization. Cross-organization private access is always denied.
+  # Default: false
+  allow_private_repository_access: false
+
+  # Protect push and pull operations for the repository mounted at project_path.
+  # Requires policy.boundaries.enabled so direct execution of the hidden git
+  # binary is terminated by the eBPF boundary.
+  branch_protection:
+    # Default: true
+    enabled: true
+
+    # Username used to expand {username} in allowed_branch_patterns.
+    # When omitted, SendBox resolves the active `gh` account automatically.
+    # username: mbianchidev
+
+    # These branches are always denied, even if an allowed pattern matches.
+    protected_branches:
+      - main
+      - master
+
+    # Selected-repository push destinations, pull sources, and current local
+    # branches must match one of these glob patterns.
+    allowed_branch_patterns:
+      - "{username}/*"
+      - "copilot/*"
+      - "feature/*"
 
   # Path to an SSH private key to mount (read-only) into the container.
   # Use this if your project requires SSH-based git operations.
