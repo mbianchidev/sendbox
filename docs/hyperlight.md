@@ -49,6 +49,8 @@ priority over matching allowed entries.
 
 ```yaml
 policy:
+  boundaries:
+    enabled: false
   network:
     default_action: deny
     allowed_domains:
@@ -73,6 +75,8 @@ in `policy.network.allowed_domains`. Stdio MCP is not supported because
 - OCI image references and environment-variable injection are not supported by
   `hyperlight-unikraft`; use a purpose-built CPIO rootfs.
 - The existing eBPF MCP inspector cannot run in the Unikraft guest.
+- The eBPF/seccomp boundary bootstrap is not supported in a Unikraft guest;
+  configure `policy.boundaries.enabled: false` when selecting Hyperlight.
 - Hyperlight always permits resolver traffic when networking is enabled, so
   SendBox fails closed when a policy combines network access with
   `allow_dns: false`.

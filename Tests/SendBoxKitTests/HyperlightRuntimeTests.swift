@@ -400,10 +400,34 @@ struct HyperlightRuntimeTests {
         }
     }
 
+    @Test func testRuntimeRejectsBoundaryBootstrap() async throws {
+        let runtime = HyperlightRuntime(
+            configuration: HyperlightRuntimeConfiguration(kernelPath: "/kernel"),
+            commandRunner: { _, _, _ in
+                HostCommandResult(exitCode: 0, stdout: "", stderr: "")
+            },
+            hostValidator: { _ in }
+        )
+        let config = makeContainerConfig(
+            boundaryExecPrefix: ["/run/sendbox-boundary/seccomp-launcher", "--"],
+            boundaryReadyPath: "/run/sendbox-boundary/ready"
+        )
+
+        try await runtime.initialize()
+        do {
+            _ = try await runtime.createContainer(config, policy: allowAllPolicy())
+            Issue.record("Expected boundary bootstrap to be rejected")
+        } catch {
+            #expect(error.localizedDescription.contains("boundaries.enabled to false"))
+        }
+    }
+
     private func makeContainerConfig(
         allowedHosts: [String] = [],
         blockedHosts: [String] = [],
-        command: [String] = ["/bin/sh"]
+        command: [String] = ["/bin/sh"],
+        boundaryExecPrefix: [String] = [],
+        boundaryReadyPath: String? = nil
     ) -> ContainerConfig {
         ContainerConfig(
             id: "sandbox-id",
@@ -431,7 +455,9 @@ struct HyperlightRuntimeTests {
             ),
             firewallScript: nil,
             dnsConfig: nil,
-            mcpInspectionScript: nil
+            mcpInspectionScript: nil,
+            boundaryExecPrefix: boundaryExecPrefix,
+            boundaryReadyPath: boundaryReadyPath
         )
     }
 

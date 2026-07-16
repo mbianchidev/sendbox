@@ -20,6 +20,7 @@ SendBox supports direct hardware-isolated runtimes on macOS and Linux: Apple's [
 | YAML-based configuration with presets | ✅ Done |
 | CLI (`run`, `init`, `analyze`, `secrets`, `policy`) | ✅ Done |
 | Interactive setup script | ✅ Done |
+| Fail-closed seccomp syscall and stdio MCP tool boundaries | ✅ Done |
 
 ---
 

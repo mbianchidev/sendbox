@@ -13,7 +13,9 @@ invokes** (e.g. `tools/call` for a `read_file` tool) without trusting the agent 
 the MCP server to self-report. Because the agent runs inside a dedicated Linux VM,
 eBPF can observe this traffic from the kernel, where the agent cannot tamper with it.
 
-This is **opt-in** and **disabled by default**.
+Inspection is **opt-in** and **disabled by default**. It is an audit control, not
+the authorization boundary. Tool authorization is handled by the stdio MCP proxy
+described below.
 
 ---
 
@@ -61,9 +63,57 @@ sequenceDiagram
 
 ---
 
+## Tool-call boundary enforcement
+
+When `policy.boundaries.enabled` is `true`, SendBox installs a separate,
+fail-closed boundary before the agent starts:
+
+1. A root-owned Python policy daemon parses complete newline-framed stdio
+   JSON-RPC messages and evaluates each `tools/call` name against the configured
+   allowlist/denylist.
+2. Allowed frames are forwarded unchanged. Denied requests receive JSON-RPC
+   error `-32001`; denied notifications are dropped.
+3. An eBPF process monitor trusts only the daemon's direct seccomp-launcher
+   child. A configured MCP server launched directly instead of through the
+   proxy is terminated before it can serve requests.
+4. The agent and every runtime exec run as the invoking non-root host UID under
+   the same seccomp policy, so they cannot stop or rewrite the root-owned
+   boundary components.
+
+Prefix each stdio MCP server command with the injected proxy:
+
+```json
+{
+  "command": "/run/sendbox-boundary/mcp-proxy",
+  "args": ["--", "/usr/local/bin/node", "/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspaces"]
+}
+```
+
+HTTP/SSE MCP is deliberately rejected in boundary mode. Generic TLS uprobes
+cannot provide a security boundary across OpenSSL, BoringSSL, Go, Rustls, static
+binaries, and fragmented records. The eBPF TLS probes remain available for
+best-effort inspection only.
+
+Before VM startup, SendBox validates project-local MCP definitions in
+`.mcp.json`, `.vscode/mcp.json`, `.github/copilot/mcp.json`,
+`.cursor/mcp.json`, and `.claude/mcp.json`. Remote transports and unproxied
+stdio server commands fail validation.
+
+The daemon double-forks away from the agent process tree. Only its direct
+seccomp-launcher child is trusted by eBPF; trust is not recursively inherited by
+server descendants. Every allowed command must be absolute, exact, and match a
+configured `server_command_patterns` value in a non-executable argument.
+Package runners and shells (`npx`, `npm`, `pnpm`, `yarn`, `uvx`, `sh`, and
+similar wrappers) are rejected because they create an untrusted intermediate
+process. Configure the final native executable or interpreter command instead.
+Command arguments and server patterns are capped below the enforced
+`BPFTRACE_STRLEN=4096` boundary so matching cannot silently truncate.
+
+---
+
 ## Failure handling
 
-The guest bootstrap script is **best-effort and never blocks boot**:
+The audit-only inspector bootstrap is **best-effort and never blocks boot**:
 
 - If `bpftrace` is missing, it attempts an install via `apt-get`/`apk`/`dnf`; if
   that fails it logs a warning and exits `0`.
@@ -74,6 +124,12 @@ The guest bootstrap script is **best-effort and never blocks boot**:
 
 A missing or broken tracer therefore degrades observability but never prevents the
 agent from running.
+
+Boundary enforcement has the opposite behavior: it is **fail-closed**. The guest
+image must already contain `python3`, `bpftrace`, a C compiler, and libseccomp
+development headers, and expose Yama `ptrace_scope`. If the proxy, seccomp
+launcher, eBPF program, process isolation, privilege drop, or readiness check
+fails, SendBox exits before launching the agent.
 
 ---
 
@@ -93,6 +149,32 @@ observability:
     server_command_patterns:   # argv substrings identifying an MCP server
       - mcp-server
       - "@modelcontextprotocol"
+```
+
+Tool authorization lives under the security policy:
+
+```yaml
+policy:
+  boundaries:
+    enabled: true
+    tool_calls:
+      transport: stdio
+      default_action: deny
+      allowlist:
+        - read_file
+        - list_directory
+      denylist:
+        - "*delete*"
+      max_frame_bytes: 1048576
+      server_command_patterns:
+        - mcp-server
+        - "@modelcontextprotocol"
+      allowed_server_commands:
+        - ["/usr/local/bin/node", "/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspaces"]
+    syscalls:
+      additional_denylist: []
+      log_blocked: true
+    log_path: /var/log/sendbox/boundary.log
 ```
 
 ### Redaction
@@ -124,6 +206,13 @@ sendbox mcp parse /var/log/sendbox/mcp-trace.log --redact
 
 # Summarise MCP activity (tool counts, categories, transports, errors)
 sendbox mcp report /var/log/sendbox/mcp-trace.log
+
+# Inspect fail-closed boundary artifacts
+sendbox boundary script --config sendbox.yaml --component proxy
+sendbox boundary script --config sendbox.yaml --component proxy-client
+sendbox boundary script --config sendbox.yaml --component bpftrace
+sendbox boundary script --config sendbox.yaml --component seccomp
+sendbox boundary script --config sendbox.yaml --component bootstrap
 ```
 
 `--config <path>` seeds `mcp script` from the `observability` section of a config

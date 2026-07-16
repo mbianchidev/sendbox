@@ -45,6 +45,7 @@ public actor KataContainerRuntime: RuntimeProvider {
     private let commandRunner: CommandRunner
     private var initialized = false
     private var activeContainers: [String: RuntimeContainerStatus] = [:]
+    private var execPrefixes: [String: [String]] = [:]
 
     public init(
         configuration: KataRuntimeConfiguration = .default,
@@ -115,11 +116,18 @@ public actor KataContainerRuntime: RuntimeProvider {
             throw RuntimeError.commandDenied("Startup command blocked by policy")
         }
 
-        let preparedEnvironment = try prepareEnvironment(config.environment)
+        let environment = config.boundaryReadyPath == nil
+            ? config.environment
+            : BoundaryEnforcer.bootstrapEnvironment(
+                agentEnvironment: config.environment,
+                workingDirectory: config.workingDirectory
+            )
+        let preparedEnvironment = try prepareEnvironment(environment)
         defer {
             try? FileManager.default.removeItem(at: preparedEnvironment.fileURL)
         }
         activeContainers[config.id] = .creating
+        execPrefixes[config.id] = config.boundaryExecPrefix
 
         let builder = KataCommandBuilder(configuration: configuration)
         let arguments =
@@ -136,6 +144,13 @@ public actor KataContainerRuntime: RuntimeProvider {
                 action: "Starting Kata container \(config.id)",
                 environment: preparedEnvironment.inherited
             )
+
+            if let readyPath = config.boundaryReadyPath {
+                try await waitForBoundaryReady(
+                    at: readyPath,
+                    containerId: config.id
+                )
+            }
             activeContainers[config.id] = .running
 
             if config.rootfsSizeInBytes > 0 {
@@ -167,6 +182,7 @@ public actor KataContainerRuntime: RuntimeProvider {
         } catch {
             activeContainers[config.id] = .failed
             await removeContainerBestEffort(id: config.id)
+            execPrefixes.removeValue(forKey: config.id)
             throw error
         }
     }
@@ -184,6 +200,7 @@ public actor KataContainerRuntime: RuntimeProvider {
             action: "Stopping Kata container \(id)"
         )
         activeContainers[id] = .stopped
+        execPrefixes.removeValue(forKey: id)
         logger.info("Kata container \(id) stopped")
     }
 
@@ -241,7 +258,7 @@ public actor KataContainerRuntime: RuntimeProvider {
 
         let arguments =
             KataCommandBuilder(configuration: configuration).globalArguments
-            + ["exec", containerId] + command
+            + ["exec", containerId] + (execPrefixes[containerId] ?? []) + command
 
         do {
             let result = try await commandRunner(configuration.executable, arguments, [:])
@@ -327,6 +344,7 @@ public actor KataContainerRuntime: RuntimeProvider {
             await removeContainerBestEffort(id: id)
         }
         activeContainers.removeAll()
+        execPrefixes.removeAll()
         logger.info("All Kata containers cleaned up")
     }
 
@@ -383,6 +401,38 @@ public actor KataContainerRuntime: RuntimeProvider {
             )
         }
         return result
+    }
+
+    private func waitForBoundaryReady(
+        at path: String,
+        containerId: String
+    ) async throws {
+        let globalArguments = KataCommandBuilder(configuration: configuration).globalArguments
+        var lastError: Error?
+
+        for _ in 0..<240 {
+            do {
+                let result = try await commandRunner(
+                    configuration.executable,
+                    globalArguments + ["exec", containerId, "/bin/test", "-f", path],
+                    [:]
+                )
+                if result.exitCode == 0 {
+                    logger.info("Boundary enforcement ready in Kata container \(containerId)")
+                    return
+                }
+            } catch {
+                lastError = error
+            }
+            try await Task.sleep(for: .milliseconds(500))
+        }
+
+        let suffix = lastError.map { ": \($0.localizedDescription)" } ?? ""
+        throw RuntimeError.commandFailed(
+            action: "Waiting for boundary enforcement in Kata container \(containerId)",
+            exitCode: -1,
+            stderr: "readiness marker \(path) was not created\(suffix)"
+        )
     }
 
     private struct PreparedEnvironment: Sendable {
@@ -547,15 +597,25 @@ struct KataCommandBuilder: Sendable {
             ]
         }
 
+        var capabilities = Set<String>()
         if config.firewallScript != nil {
-            arguments += ["--cap-add", "NET_ADMIN"]
+            capabilities.insert("NET_ADMIN")
         }
         if config.mcpInspectionScript != nil {
+            capabilities.formUnion(["BPF", "PERFMON", "SYS_PTRACE"])
+        }
+        if config.boundaryReadyPath != nil {
+            capabilities.formUnion([
+                "BPF", "NET_ADMIN", "PERFMON", "SYS_ADMIN",
+                "SYS_PTRACE", "SYS_RESOURCE",
+            ])
             arguments += [
-                "--cap-add", "BPF",
-                "--cap-add", "PERFMON",
-                "--cap-add", "SYS_PTRACE",
+                "--pid", "host",
+                "--security-opt", "seccomp=unconfined",
             ]
+        }
+        for capability in capabilities.sorted() {
+            arguments += ["--cap-add", capability]
         }
 
         for mount in config.mounts {

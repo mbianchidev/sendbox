@@ -334,7 +334,7 @@ public struct MCPInspector: Sendable {
             "    exit 0",
             "fi",
             "",
-            "mkdir -p \(shellQuote(logDir))",
+            "mkdir -p \(ShellEscaping.quote(logDir))",
             "",
             "# Write the bpftrace program.",
             "cat > \(MCPInspector.programPath) << 'SENDBOX_MCP_PROG'",
@@ -367,7 +367,7 @@ public struct MCPInspector: Sendable {
         lines.append(contentsOf: [
             "log 'starting eBPF MCP inspector...'",
             "export BPFTRACE_STRLEN=\(strlen)",
-            "nohup bpftrace \(MCPInspector.programPath) >> \(shellQuote(logPath)) 2>&1 &",
+            "nohup bpftrace \(MCPInspector.programPath) >> \(ShellEscaping.quote(logPath)) 2>&1 &",
             "echo $! > \(MCPInspector.pidPath)",
             "log \"inspector running (pid $(cat \(MCPInspector.pidPath))), log: \(logPath)\"",
             "",
@@ -695,10 +695,4 @@ extension AuditTrail {
             details: details
         )
     }
-}
-
-// MARK: - Shell quoting
-
-private func shellQuote(_ value: String) -> String {
-    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }

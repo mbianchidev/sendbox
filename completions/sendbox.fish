@@ -63,6 +63,12 @@ function __sendbox_parse_tokens -S
             case 'report'
                 __sendbox_parse_subcommand 1 'version' 'h/help'
             end
+        case 'boundary'
+            __sendbox_parse_subcommand 0 'version' 'h/help'
+            switch $unparsed_tokens[1]
+            case 'script'
+                __sendbox_parse_subcommand 0 'config=' 'component=' 'version' 'h/help'
+            end
         case 'completions'
             __sendbox_parse_subcommand 0 'version' 'h/help'
             switch $unparsed_tokens[1]
@@ -141,6 +147,7 @@ complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_positional "sen
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_positional "sendbox" 1' -fa 'secrets' -d 'Manage secrets for sandbox injection'
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_positional "sendbox" 1' -fa 'policy' -d 'View and validate security policies'
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_positional "sendbox" 1' -fa 'mcp' -d 'Inspect Model Context Protocol (MCP) calls via eBPF'
+complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_positional "sendbox" 1' -fa 'boundary' -d 'Inspect fail-closed syscall and MCP boundary artifacts'
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_positional "sendbox" 1' -fa 'completions' -d 'Install shell completions for sendbox'
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_positional "sendbox" 1' -fa 'help' -d 'Show subcommand help information.'
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox run" config' -l 'config' -d 'Path to sendbox config file' -rfka ''
@@ -196,6 +203,13 @@ complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_option
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox mcp parse" h help' -s 'h' -l 'help' -d 'Show help information.'
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox mcp report" version' -l 'version' -d 'Show the version.'
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox mcp report" h help' -s 'h' -l 'help' -d 'Show help information.'
+complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox boundary" version' -l 'version' -d 'Show the version.'
+complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox boundary" h help' -s 'h' -l 'help' -d 'Show help information.'
+complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_positional "sendbox boundary" 1' -fa 'script' -d 'Print a generated boundary component'
+complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox boundary script" config' -l 'config' -d 'Path to sendbox config file' -rfka ''
+complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox boundary script" component' -l 'component' -d 'Component: bootstrap, bpftrace, proxy, proxy-client, or seccomp' -rfka 'bootstrap bpftrace proxy proxy-client seccomp'
+complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox boundary script" version' -l 'version' -d 'Show the version.'
+complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox boundary script" h help' -s 'h' -l 'help' -d 'Show help information.'
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox completions" version' -l 'version' -d 'Show the version.'
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_flags_or_options "sendbox completions" h help' -s 'h' -l 'help' -d 'Show help information.'
 complete -c 'sendbox' -n '__sendbox_should_offer_completions_for_positional "sendbox completions" 1' -fa 'install' -d 'Install completions for your current shell'

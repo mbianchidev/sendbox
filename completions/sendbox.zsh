@@ -56,6 +56,7 @@ _sendbox() {
             'secrets:Manage secrets for sandbox injection'
             'policy:View and validate security policies'
             'mcp:Inspect Model Context Protocol (MCP) calls via eBPF'
+            'boundary:Inspect fail-closed syscall and MCP boundary artifacts'
             'completions:Install shell completions for sendbox'
             'help:Show subcommand help information.'
         )
@@ -63,7 +64,7 @@ _sendbox() {
         ;;
     arg)
         case "${words[1]}" in
-        run|init|analyze|secrets|policy|mcp|completions|help)
+        run|init|analyze|secrets|policy|mcp|boundary|completions|help)
             "_sendbox_${words[1]}" && ret=0
             ;;
         esac
@@ -300,6 +301,48 @@ _sendbox_mcp_report() {
     local -i ret=1
     local -ar arg_specs=(
         ':logfile:'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_sendbox_boundary() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+        '(-): :->command'
+        '(-)*:: :->arg'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+    case "${state}" in
+    command)
+        local -ar subcommands=(
+            'script:Print a generated boundary component'
+        )
+        _describe -V subcommand subcommands && ret=0
+        ;;
+    arg)
+        case "${words[1]}" in
+        script)
+            "_sendbox_boundary_${words[1]}" && ret=0
+            ;;
+        esac
+        ;;
+    esac
+
+    return "${ret}"
+}
+
+_sendbox_boundary_script() {
+    local -i ret=1
+    local -ar ___component=('bootstrap' 'bpftrace' 'proxy' 'proxy-client' 'seccomp')
+    local -ar arg_specs=(
+        '--config[Path to sendbox config file]:config:'
+        '--component[Component\: bootstrap, bpftrace, proxy, proxy-client, or seccomp]:component:{__sendbox_complete "${___component[@]}"}'
         '--version[Show the version.]'
         '(-h --help)'{-h,--help}'[Show help information.]'
     )

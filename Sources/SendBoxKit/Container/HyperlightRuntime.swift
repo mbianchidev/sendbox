@@ -503,8 +503,13 @@ public actor HyperlightRuntime: RuntimeProvider {
         let builder = HyperlightCommandBuilder(configuration: configuration)
         try builder.validate(config: config)
 
+        if config.boundaryReadyPath != nil || !config.boundaryExecPrefix.isEmpty {
+            throw RuntimeError.unsupported(
+                "eBPF/seccomp boundary enforcement in a unikernel guest; set policy.boundaries.enabled to false"
+            )
+        }
         let unsupportedEnvironmentKeys = Set(config.environment.keys).subtracting([
-            "HOME", "LANG", "PATH", "TERM",
+            "HOME", "LANG", "PATH", "SENDBOX_WORKING_DIRECTORY", "TERM",
         ])
         guard unsupportedEnvironmentKeys.isEmpty else {
             throw RuntimeError.unsupported(

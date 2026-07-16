@@ -60,17 +60,17 @@ runtime:
 resources:
   # Number of CPU cores allocated to the container.
   # Fractional values are supported (e.g., 1.5).
-  # Default: 2
+  # Default: 4
   cpus: 4
 
   # Memory limit in megabytes.
   # The container is killed (OOM) if it exceeds this limit.
-  # Default: 2048
+  # Default: 4096
   memory_mb: 4096
 
   # Disk space limit in megabytes for the container's writable layer.
   # Does not include the project mount (which uses the host filesystem).
-  # Default: 5120
+  # Default: 10240
   disk_size_mb: 10240
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,6 +116,42 @@ policy:
     denylist:
       - "sudo *"
       - "rm -rf /*"
+
+  # ── Kernel and MCP boundaries ─────────────────────────────────────────────
+  boundaries:
+    # Fail closed if eBPF, Python, the compiler, or libseccomp is unavailable.
+    # Hyperlight users must set this to false because the Unikraft guest cannot
+    # run the eBPF/seccomp boundary bootstrap.
+    enabled: true
+
+    tool_calls:
+      # Secure enforcement currently supports newline-framed stdio MCP only.
+      # Prefix each configured server command with:
+      #   /run/sendbox-boundary/mcp-proxy --
+      transport: stdio
+      default_action: deny
+      allowlist:
+        - read_file
+        - list_directory
+        - search_code
+      denylist:
+        - "*delete*"
+        - "*shell*"
+      max_frame_bytes: 1048576
+      server_command_patterns:
+        - mcp-server
+        - "@modelcontextprotocol"
+      allowed_server_commands:
+        - ["/usr/local/bin/node", "/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspaces/my-project"]
+
+    syscalls:
+      # These extend the built-in ContainerHardening seccomp denylist.
+      additional_denylist:
+        - io_uring_setup
+        - io_uring_register
+      log_blocked: true
+
+    log_path: /var/log/sendbox/boundary.log
 
   # ── Network / Firewall ─────────────────────────────────────────────────
   network:

@@ -187,6 +187,48 @@ commands:
     - "apk *"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Kernel and MCP Boundary Enforcement
+# ─────────────────────────────────────────────────────────────────────────────
+# Boundary setup runs as trusted root code before the agent starts. The agent is
+# then dropped to the invoking host UID, every process inherits seccomp rules,
+# and configured stdio MCP servers must be prefixed with:
+#
+#   /run/sendbox-boundary/mcp-proxy -- <server> [args...]
+#
+# Direct launches matching the configured MCP server patterns are terminated by
+# the eBPF bypass detector. HTTP/SSE MCP is intentionally unsupported here:
+# application-layer policy cannot be enforced safely through generic TLS probes.
+boundaries:
+  enabled: true
+  tool_calls:
+    transport: stdio
+    default_action: deny
+    allowlist: []
+    denylist: []
+    max_frame_bytes: 1048576
+    server_command_patterns:
+      - mcp-server
+      - mcp_server
+      - modelcontextprotocol
+      - model-context-protocol
+      - "@modelcontextprotocol"
+      - mcp-remote
+      - server-mcp
+      - mcp.server
+    # Exact commands the root-owned MCP policy daemon may launch. Executables
+    # must be absolute paths, and a later argument must match one of the server
+    # patterns above. Package runners/shells such as npx, npm, yarn, pnpm, uvx,
+    # sh, and bash are rejected; use the final interpreter/native command.
+    # An empty list disables all MCP servers.
+    allowed_server_commands: []
+  syscalls:
+    # Added to the built-in hardening denylist (mount, ptrace, bpf, module
+    # loading, keyring, new mount API, perf_event_open, and related syscalls).
+    additional_denylist: []
+    log_blocked: true
+  log_path: /var/log/sendbox/boundary.log
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Network / Firewall Policy
 # ─────────────────────────────────────────────────────────────────────────────
 # Controls outbound network access from the sandbox.

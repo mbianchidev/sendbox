@@ -206,44 +206,13 @@ public actor CommandPolicy {
             }
         }
 
-        return globMatch(matchText, pattern: pattern)
+        return GlobPattern.matches(matchText, pattern: pattern)
     }
 
     private func diagnosticCommand(_ arguments: [String]) -> String {
         arguments.map { argument in
             "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
         }.joined(separator: " ")
-    }
-
-    /// Simple glob matching: `*` matches zero or more of any character.
-    private func globMatch(_ string: String, pattern: String) -> Bool {
-        var si = string.startIndex
-        var pi = pattern.startIndex
-
-        var starMatchSI = string.endIndex
-        var starPI = pattern.endIndex
-
-        while si < string.endIndex {
-            if pi < pattern.endIndex && (pattern[pi] == "?" || pattern[pi] == string[si]) {
-                si = string.index(after: si)
-                pi = pattern.index(after: pi)
-            } else if pi < pattern.endIndex && pattern[pi] == "*" {
-                starPI = pi
-                starMatchSI = si
-                pi = pattern.index(after: pi)
-            } else if starPI != pattern.endIndex {
-                pi = pattern.index(after: starPI)
-                starMatchSI = string.index(after: starMatchSI)
-                si = starMatchSI
-            } else {
-                return false
-            }
-        }
-
-        while pi < pattern.endIndex && pattern[pi] == "*" {
-            pi = pattern.index(after: pi)
-        }
-        return pi == pattern.endIndex
     }
 
     /// Parse a raw command string into its binary name and argument list.

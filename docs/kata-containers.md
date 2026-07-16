@@ -91,6 +91,11 @@ sendbox run --config .sendbox.yaml --runtime kata
 - SendBox adds `NET_ADMIN` only when the configured firewall script needs it.
 - eBPF MCP inspection adds `BPF`, `PERFMON`, and `SYS_PTRACE`; the guest kernel must expose BTF and the image must support `bpftrace`.
 - Firewall and MCP startup scripts remain best-effort and log explicit failures.
+- Boundary mode runs the trusted bootstrap with the Kata VM's PID namespace,
+  temporarily adds the BPF/sysctl capabilities it needs, and disables the outer
+  container seccomp profile. SendBox then waits for the boundary readiness
+  marker; the generated inner seccomp launcher and non-root UID constrain the
+  agent and every later `nerdctl exec`.
 
 ## Secrets on Linux
 
