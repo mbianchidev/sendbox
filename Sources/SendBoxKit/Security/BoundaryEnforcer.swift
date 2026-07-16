@@ -26,6 +26,7 @@ public struct BoundaryEnforcer: Sendable {
     private let blockedSyscalls: [String]
     private let runAsUID: UInt32
     private let runAsGID: UInt32
+    private let gitBranchProtectionEnabled: Bool
 
     public enum ValidationError: Error, LocalizedError, Equatable {
         case rootUserUnsupported
@@ -75,6 +76,7 @@ public struct BoundaryEnforcer: Sendable {
         serverCommandPatterns: [String],
         runAsUID: UInt32,
         runAsGID: UInt32,
+        gitBranchProtectionEnabled: Bool = false,
         hardening: ContainerHardening = ContainerHardening(profile: .standard)
     ) {
         self.config = config
@@ -89,6 +91,7 @@ public struct BoundaryEnforcer: Sendable {
         ).sorted()
         self.runAsUID = runAsUID
         self.runAsGID = runAsGID
+        self.gitBranchProtectionEnabled = gitBranchProtectionEnabled
     }
 
     public func validate() throws {
@@ -648,6 +651,44 @@ public struct BoundaryEnforcer: Sendable {
             blockedSyscalls
             .map { "probe == \"tracepoint:syscalls:sys_enter_\(bpfEscape($0))\"" }
             .joined(separator: " ||\n        ")
+        let gitForkTracking = gitBranchProtectionEnabled
+            ? #"""
+
+            tracepoint:sched:sched_process_fork /@git_policy_trusted[pid]/ {
+                @git_policy_trusted[args->child_pid] = 1;
+            }
+            """#
+            : ""
+        let gitExecProtection = gitBranchProtectionEnabled
+            ? #"""
+
+                if (
+                    $filename == "\#(bpfEscape(GitBranchProtection.wrapperPath))"
+                    || $filename == "/usr/bin/git"
+                    || $filename == "/bin/git"
+                ) {
+                    @git_policy_trusted[pid] = 1;
+                }
+
+                if (
+                    $filename == "\#(bpfEscape(GitBranchProtection.realGitPath))"
+                    && !@git_policy_trusted[pid]
+                ) {
+                    printf(
+                        "\#(Self.eventMarker)\t%lld\t%d\t%d\t%s\tgit_policy_bypass\t%s\n",
+                        nsecs,
+                        pid,
+                        ppid,
+                        comm,
+                        $filename
+                    );
+                    signal("SIGKILL");
+                }
+            """#
+            : ""
+        let gitCleanup = gitBranchProtectionEnabled
+            ? "\n    delete(@git_policy_trusted[args->pid]);"
+            : ""
 
         return #"""
             #!/usr/bin/env bpftrace
@@ -659,10 +700,12 @@ public struct BoundaryEnforcer: Sendable {
             tracepoint:sched:sched_process_fork /pid == \#(Self.proxyDaemonPIDPlaceholder)/ {
                 @trusted[args->child_pid] = 1;
             }
+            \#(gitForkTracking)
 
             tracepoint:syscalls:sys_enter_execve {
                 $filename = str(args->filename);
             \#(argumentDeclarations)
+            \#(gitExecProtection)
 
                 if ((\#(mcpServerPredicate)) && !@trusted[pid]) {
                     printf(
@@ -696,6 +739,7 @@ public struct BoundaryEnforcer: Sendable {
 
             tracepoint:sched:sched_process_exit {
                 delete(@trusted[args->pid]);
+            \#(gitCleanup)
             }
 
             END {

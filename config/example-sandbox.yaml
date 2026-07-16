@@ -236,6 +236,29 @@ github:
   # Default: false
   allow_private_repository_access: false
 
+  # Protect push and pull operations for the repository mounted at project_path.
+  # Requires policy.boundaries.enabled so direct execution of the hidden git
+  # binary is terminated by the eBPF boundary.
+  branch_protection:
+    # Default: true
+    enabled: true
+
+    # Username used to expand {username} in allowed_branch_patterns.
+    # When omitted, SendBox resolves the active `gh` account automatically.
+    # username: mbianchidev
+
+    # These branches are always denied, even if an allowed pattern matches.
+    protected_branches:
+      - main
+      - master
+
+    # Selected-repository push destinations, pull sources, and current local
+    # branches must match one of these glob patterns.
+    allowed_branch_patterns:
+      - "{username}/*"
+      - "copilot/*"
+      - "feature/*"
+
   # Path to an SSH private key to mount (read-only) into the container.
   # Use this if your project requires SSH-based git operations.
   # The key is mounted at ~/.ssh/ inside the container.

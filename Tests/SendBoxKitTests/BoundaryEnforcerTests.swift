@@ -38,7 +38,8 @@ struct BoundaryEnforcerTests {
 
     private func makeEnforcer(
         toolConfig: ToolConfig? = nil,
-        additionalSyscalls: [String] = []
+        additionalSyscalls: [String] = [],
+        gitBranchProtectionEnabled: Bool = false
     ) -> BoundaryEnforcer {
         let config = PolicyConfiguration.BoundaryPolicyConfig(
             enabled: true,
@@ -53,7 +54,8 @@ struct BoundaryEnforcerTests {
             config: config,
             serverCommandPatterns: ["mcp-server"],
             runAsUID: 501,
-            runAsGID: 20
+            runAsGID: 20,
+            gitBranchProtectionEnabled: gitBranchProtectionEnabled
         )
     }
 
@@ -154,6 +156,17 @@ struct BoundaryEnforcerTests {
         #expect(!program.contains("SSL_write"))
     }
 
+    @Test func testGeneratedBPFProtectsRealGitBinary() {
+        let program = makeEnforcer(
+            gitBranchProtectionEnabled: true
+        ).generateBpftraceProgram()
+
+        #expect(program.contains("git_policy_bypass"))
+        #expect(program.contains(GitBranchProtection.wrapperPath))
+        #expect(program.contains(GitBranchProtection.realGitPath))
+        #expect(program.contains("@git_policy_trusted"))
+    }
+
     @Test func testSeccompLauncherUsesHardeningRulesAndDropsPrivileges() {
         let source = makeEnforcer(additionalSyscalls: ["io_uring_setup"])
             .generateSeccompLauncherSource()
@@ -229,6 +242,32 @@ struct BoundaryEnforcerTests {
         #expect(config.boundaryExecPrefix == enforcer.execPrefix)
         #expect(config.boundaryReadyPath == BoundaryEnforcer.readyPath)
         #expect(config.environment["SENDBOX_MCP_PROXY"] == BoundaryEnforcer.proxyPath)
+    }
+
+    @Test func testContainerConfigInstallsGitBranchProtectionBeforeAgent() {
+        let sandbox = SandboxConfiguration.default(projectPath: "/tmp/project")
+        let firewall = NetworkFirewall(config: sandbox.policy.network)
+        let enforcer = makeEnforcer(gitBranchProtectionEnabled: true)
+        let branchProtection = GitBranchProtection(
+            config: sandbox.github.branchProtection,
+            username: "octocat",
+            selectedRepository: .init(
+                host: "github.com",
+                owner: "octocat",
+                name: "project"
+            ),
+            selectedWorkspace: "/workspaces/project"
+        )
+        let config = ContainerConfig.from(
+            sandbox: sandbox,
+            imageReference: "example/image:latest",
+            firewall: firewall,
+            boundaryEnforcer: enforcer,
+            gitBranchProtection: branchProtection
+        )
+
+        #expect(config.command.last?.contains(GitBranchProtection.policyScriptPath) == true)
+        #expect(config.command.last?.contains("SENDBOX_PREFLIGHT_0") == true)
     }
 
     @Test func testMCPConfigValidatorAcceptsProxiedStdioServer() throws {

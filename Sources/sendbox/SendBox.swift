@@ -724,7 +724,8 @@ extension SendBox {
                     serverCommandPatterns: sandbox.policy.boundaries.toolCalls
                         .serverCommandPatterns,
                     runAsUID: getuid(),
-                    runAsGID: getgid()
+                    runAsGID: getgid(),
+                    gitBranchProtectionEnabled: sandbox.github.branchProtection.enabled
                 )
                 try enforcer.validate()
 
@@ -739,7 +740,31 @@ extension SendBox {
                     } else {
                         inspector = nil
                     }
-                    var scripts = [firewall.generateStartupScript()]
+                    var scripts: [String] = []
+                    if sandbox.github.branchProtection.enabled {
+                        let repository = try GitBranchProtection.resolveRepositoryIdentity(
+                            projectPath: sandbox.projectPath
+                        )
+                        let configuredUsername = sandbox.github.branchProtection.username?
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        let username = configuredUsername?.isEmpty == false
+                            ? configuredUsername
+                            : GitBranchProtection.resolveGitHubUsername(
+                                host: repository.host
+                            )
+                        let workspaceName = URL(
+                            fileURLWithPath: sandbox.projectPath
+                        ).lastPathComponent
+                        let protection = GitBranchProtection(
+                            config: sandbox.github.branchProtection,
+                            username: username,
+                            selectedRepository: repository,
+                            selectedWorkspace: "/workspaces/\(workspaceName)"
+                        )
+                        try protection.validate()
+                        scripts.append(protection.generateInstallationScript())
+                    }
+                    scripts.append(firewall.generateStartupScript())
                     if let inspector {
                         scripts.append(inspector.generateStartupScript())
                     }

@@ -70,6 +70,7 @@ public actor AgentRunner {
         case workspacePreparationFailed(String)
         case processExitedWithError(String, Int32)
         case boundaryConfigurationInvalid(String)
+        case branchProtectionConfigurationInvalid(String)
 
         public var errorDescription: String? {
             switch self {
@@ -89,6 +90,8 @@ public actor AgentRunner {
                 return "Process '\(cmd)' exited with code \(code)"
             case .boundaryConfigurationInvalid(let message):
                 return "Boundary configuration is invalid: \(message)"
+            case .branchProtectionConfigurationInvalid(let message):
+                return "Git branch protection configuration is invalid: \(message)"
             }
         }
     }
@@ -120,7 +123,8 @@ public actor AgentRunner {
                 serverCommandPatterns: config.policy.boundaries.toolCalls
                     .serverCommandPatterns,
                 runAsUID: getuid(),
-                runAsGID: getgid()
+                runAsGID: getgid(),
+                gitBranchProtectionEnabled: config.github.branchProtection.enabled
             )
         } else {
             self.boundaryEnforcer = nil
@@ -296,6 +300,7 @@ public actor AgentRunner {
         spec: DevContainerBuilder.DevContainerSpec
     ) async throws -> String {
         try prepareWorkspace()
+        let gitBranchProtection = try makeGitBranchProtection()
         let githubToken = config.github.forwardAuth ? approvedGitHubToken() : nil
         let authEnv = setupAuthForwarding(githubToken: githubToken)
         let secretsEnv = try loadSecrets()
@@ -305,7 +310,8 @@ public actor AgentRunner {
             imageReference: spec.image,
             firewall: firewall,
             mcpInspector: mcpInspector,
-            boundaryEnforcer: boundaryEnforcer
+            boundaryEnforcer: boundaryEnforcer,
+            gitBranchProtection: gitBranchProtection
         )
 
         if mcpInspector != nil {
@@ -430,6 +436,61 @@ public actor AgentRunner {
         "GITHUB_ENTERPRISE_TOKEN",
         "GITHUB_TOKEN",
     ]
+
+    private func makeGitBranchProtection() throws -> GitBranchProtection? {
+        let branchConfig = config.github.branchProtection
+        guard branchConfig.enabled else {
+            return nil
+        }
+        guard boundaryEnforcer != nil else {
+            throw RunnerError.branchProtectionConfigurationInvalid(
+                "github.branch_protection requires policy.boundaries.enabled"
+            )
+        }
+
+        let repository: GitBranchProtection.RepositoryIdentity
+        do {
+            repository = try GitBranchProtection.resolveRepositoryIdentity(
+                projectPath: config.projectPath
+            )
+        } catch {
+            throw RunnerError.branchProtectionConfigurationInvalid(
+                error.localizedDescription
+            )
+        }
+
+        let configuredUsername = branchConfig.username?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let username = configuredUsername?.isEmpty == false
+            ? configuredUsername
+            : GitBranchProtection.resolveGitHubUsername(host: repository.host)
+        if username == nil,
+           branchConfig.allowedBranchPatterns.contains(where: {
+               $0.contains("{username}")
+           }) {
+            logger.warning(
+                "GitHub username could not be resolved; {username} branch patterns are disabled"
+            )
+        } else if let username {
+            logger.info("Git branch protection username resolved as \(username)")
+        }
+
+        let workspaceName = URL(fileURLWithPath: config.projectPath).lastPathComponent
+        let protection = GitBranchProtection(
+            config: branchConfig,
+            username: username,
+            selectedRepository: repository,
+            selectedWorkspace: "/workspaces/\(workspaceName)"
+        )
+        do {
+            try protection.validate()
+        } catch {
+            throw RunnerError.branchProtectionConfigurationInvalid(
+                error.localizedDescription
+            )
+        }
+        return protection
+    }
 
     private func approvedGitHubToken() -> String? {
         let token: String

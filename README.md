@@ -189,6 +189,13 @@ github:
   forward_auth: true
   forward_copilot_auth: true
   allow_private_repository_access: false
+  branch_protection:
+    enabled: true
+    protected_branches: [main, master]
+    allowed_branch_patterns:
+      - "{username}/*"
+      - "copilot/*"
+      - "feature/*"
 
 observability:
   mcp_inspection:
@@ -203,6 +210,13 @@ Copilot authentication is forwarded independently from repository credentials. B
 GitHub token may cover the selected repository and public repositories only. Set
 `github.allow_private_repository_access` to permit additional private repositories in the
 selected repository's organization; cross-organization private access remains blocked.
+
+Selected-repository `git push` and `git pull` operations are branch-protected by default.
+`main` and `master` are denied, while `{username}/*`, `copilot/*`, and `feature/*` are
+allowed. The username is auto-detected from `gh` or can be configured explicitly. This guard
+requires `policy.boundaries.enabled`; keep GitHub server-side branch protection enabled as
+defense in depth against direct API ref mutations or alternate Git clients. Disable
+`github.branch_protection.enabled` for non-Git projects.
 
 ### Configuration Reference
 
@@ -227,6 +241,10 @@ selected repository's organization; cross-organization private access remains bl
 | `github.forward_auth` | bool | Forward guarded GitHub credentials for the selected repository |
 | `github.forward_copilot_auth` | bool | Forward Copilot authentication independently |
 | `github.allow_private_repository_access` | bool | Permit additional same-organization private repositories |
+| `github.branch_protection.enabled` | bool | Guard selected-repository pushes and pulls by branch |
+| `github.branch_protection.username` | string | Username used to expand `{username}` patterns; auto-detected by default |
+| `github.branch_protection.protected_branches` | list | Branch names that push and pull can never target |
+| `github.branch_protection.allowed_branch_patterns` | list | Glob patterns allowed for selected-repository push and pull |
 | `observability.mcp_inspection.enabled` | bool | Enable eBPF MCP call inspection (opt-in) |
 
 ## Architecture
@@ -266,6 +284,7 @@ SendBox follows a **deny-by-default** security posture:
 4. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when their private-repository scope matches policy. Credentials are never persisted in the guest filesystem. Host storage uses Keychain on macOS and mode-restricted files on Linux.
 5. **Isolation** — Each sandbox runs in its own lightweight VM. A compromised agent cannot affect the host or other sandboxes.
 6. **Boundaries** — The agent runs as the invoking non-root host UID under seccomp. Stdio MCP tool calls must pass through the root-owned proxy; direct server launches are terminated by eBPF.
+7. **Branches** — A root-installed git guard and eBPF bypass detector restrict selected-repository pushes and pulls to configured feature branch patterns.
 
 ## CLI Reference
 

@@ -170,6 +170,8 @@ public struct SandboxConfiguration: Codable, Sendable {
         public var forwardCopilotAuth: Bool
         /// Allow credentials covering additional private repositories in the selected repo's organization.
         public var allowPrivateRepositoryAccess: Bool
+        /// Guard selected-repository push and pull operations by branch name.
+        public var branchProtection: BranchProtectionConfig
         /// SSH key path to mount (optional)
         public var sshKeyPath: String?
 
@@ -177,6 +179,7 @@ public struct SandboxConfiguration: Codable, Sendable {
             case forwardAuth = "forward_auth"
             case forwardCopilotAuth = "forward_copilot_auth"
             case allowPrivateRepositoryAccess = "allow_private_repository_access"
+            case branchProtection = "branch_protection"
             case sshKeyPath = "ssh_key_path"
         }
 
@@ -184,11 +187,13 @@ public struct SandboxConfiguration: Codable, Sendable {
             forwardAuth: Bool,
             forwardCopilotAuth: Bool,
             allowPrivateRepositoryAccess: Bool = false,
+            branchProtection: BranchProtectionConfig = .default,
             sshKeyPath: String? = nil
         ) {
             self.forwardAuth = forwardAuth
             self.forwardCopilotAuth = forwardCopilotAuth
             self.allowPrivateRepositoryAccess = allowPrivateRepositoryAccess
+            self.branchProtection = branchProtection
             self.sshKeyPath = sshKeyPath
         }
 
@@ -199,7 +204,68 @@ public struct SandboxConfiguration: Codable, Sendable {
             self.allowPrivateRepositoryAccess =
                 try container.decodeIfPresent(Bool.self, forKey: .allowPrivateRepositoryAccess)
                 ?? false
+            self.branchProtection =
+                try container.decodeIfPresent(
+                    BranchProtectionConfig.self,
+                    forKey: .branchProtection
+                ) ?? .default
             self.sshKeyPath = try container.decodeIfPresent(String.self, forKey: .sshKeyPath)
+        }
+
+        public struct BranchProtectionConfig: Codable, Equatable, Sendable {
+            public var enabled: Bool
+            public var username: String?
+            public var protectedBranches: [String]
+            public var allowedBranchPatterns: [String]
+
+            private enum CodingKeys: String, CodingKey {
+                case enabled
+                case username
+                case protectedBranches = "protected_branches"
+                case allowedBranchPatterns = "allowed_branch_patterns"
+            }
+
+            public init(
+                enabled: Bool,
+                username: String? = nil,
+                protectedBranches: [String],
+                allowedBranchPatterns: [String]
+            ) {
+                self.enabled = enabled
+                self.username = username
+                self.protectedBranches = protectedBranches
+                self.allowedBranchPatterns = allowedBranchPatterns
+            }
+
+            public init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                let base = BranchProtectionConfig.default
+                self.enabled =
+                    try container.decodeIfPresent(Bool.self, forKey: .enabled)
+                    ?? base.enabled
+                self.username =
+                    try container.decodeIfPresent(String.self, forKey: .username)
+                self.protectedBranches =
+                    try container.decodeIfPresent(
+                        [String].self,
+                        forKey: .protectedBranches
+                    ) ?? base.protectedBranches
+                self.allowedBranchPatterns =
+                    try container.decodeIfPresent(
+                        [String].self,
+                        forKey: .allowedBranchPatterns
+                    ) ?? base.allowedBranchPatterns
+            }
+
+            public static let `default` = BranchProtectionConfig(
+                enabled: true,
+                protectedBranches: ["main", "master"],
+                allowedBranchPatterns: [
+                    "{username}/*",
+                    "copilot/*",
+                    "feature/*",
+                ]
+            )
         }
     }
 }
