@@ -18,6 +18,8 @@ struct SandboxConfigTests {
         #expect(config.github.forwardCopilotAuth == true)
         #expect(config.github.allowPrivateRepositoryAccess == false)
         #expect(config.devcontainer?.autoGenerate == true)
+        #expect(config.policy.boundaries.enabled == true)
+        #expect(config.policy.boundaries.toolCalls.defaultAction == Action.deny)
         #expect(config.runtime?.provider == .automatic)
         #expect(config.runtime?.kata.runtimeHandler == "io.containerd.kata.v2")
     }
@@ -88,6 +90,7 @@ struct SandboxConfigTests {
         #expect(config.github.forwardAuth == false)
         #expect(config.github.forwardCopilotAuth == true)
         #expect(config.github.allowPrivateRepositoryAccess == false)
+        #expect(config.policy.boundaries.enabled == true)
         #expect(config.runtime == nil)
     }
 
@@ -183,7 +186,6 @@ struct SandboxConfigTests {
 
         let config = try SandboxConfiguration.load(from: Data(yaml.utf8))
         let runtime = try #require(config.runtime)
-
         #expect(runtime.kata == .default)
     }
 
@@ -217,6 +219,43 @@ struct SandboxConfigTests {
         #expect(!policy.commands.allowlist.contains("npm"))
         #expect(policy.network.maxConnections == 10)
         #expect(policy.network.allowedDomains.contains("github.com"))
+        #expect(policy.boundaries.toolCalls.maxFrameBytes == 262_144)
+    }
+
+    @Test func testLoadPartialBoundaryPolicy() throws {
+        let yaml = """
+            name: boundary-test
+            project_path: /tmp/project
+            resources:
+              cpus: 2
+              memory_mb: 2048
+              disk_size_mb: 5120
+            policy:
+              commands:
+                default_action: deny
+                allowlist: []
+                denylist: []
+                log_blocked: true
+              network:
+                default_action: deny
+                allowed_domains: []
+                blocked_domains: []
+                allow_dns: true
+              boundaries:
+                tool_calls:
+                  allowlist:
+                    - read_*
+            secrets: []
+            github:
+              forward_auth: false
+              forward_copilot_auth: false
+            """
+
+        let config = try SandboxConfiguration.load(from: Data(yaml.utf8))
+        #expect(config.policy.boundaries.enabled == true)
+        #expect(config.policy.boundaries.toolCalls.allowlist == ["read_*"])
+        #expect(config.policy.boundaries.toolCalls.defaultAction == Action.deny)
+        #expect(config.policy.boundaries.syscalls.logBlocked == true)
     }
 
     // MARK: - Resource defaults

@@ -31,6 +31,10 @@ public struct ContainerConfig: Sendable {
     public var dnsConfig: String?
     /// eBPF MCP inspector startup script content
     public var mcpInspectionScript: String?
+    /// Prefix applied to every runtime exec so seccomp is inherited.
+    public let boundaryExecPrefix: [String]
+    /// Guest readiness marker created only after fail-closed setup succeeds.
+    public let boundaryReadyPath: String?
 
     public struct MountPoint: Sendable {
         public let source: String
@@ -56,6 +60,42 @@ public struct ContainerConfig: Sendable {
         }
     }
 
+    public init(
+        id: String,
+        hostname: String,
+        cpus: Int,
+        memoryInBytes: UInt64,
+        rootfsSizeInBytes: UInt64,
+        imageReference: String,
+        workingDirectory: String,
+        command: [String],
+        environment: [String: String],
+        mounts: [MountPoint],
+        network: NetworkConfig,
+        firewallScript: String? = nil,
+        dnsConfig: String? = nil,
+        mcpInspectionScript: String? = nil,
+        boundaryExecPrefix: [String] = [],
+        boundaryReadyPath: String? = nil
+    ) {
+        self.id = id
+        self.hostname = hostname
+        self.cpus = cpus
+        self.memoryInBytes = memoryInBytes
+        self.rootfsSizeInBytes = rootfsSizeInBytes
+        self.imageReference = imageReference
+        self.workingDirectory = workingDirectory
+        self.command = command
+        self.environment = environment
+        self.mounts = mounts
+        self.network = network
+        self.firewallScript = firewallScript
+        self.dnsConfig = dnsConfig
+        self.mcpInspectionScript = mcpInspectionScript
+        self.boundaryExecPrefix = boundaryExecPrefix
+        self.boundaryReadyPath = boundaryReadyPath
+    }
+
     /// Create from a SandboxConfiguration.
     ///
     /// Maps user-facing sandbox settings to low-level container runtime parameters:
@@ -69,7 +109,8 @@ public struct ContainerConfig: Sendable {
         sandbox: SandboxConfiguration,
         imageReference: String,
         firewall: NetworkFirewall,
-        mcpInspector: MCPInspector? = nil
+        mcpInspector: MCPInspector? = nil,
+        boundaryEnforcer: BoundaryEnforcer? = nil
     ) -> ContainerConfig {
         let containerId = UUID().uuidString.lowercased()
 
@@ -105,16 +146,52 @@ public struct ContainerConfig: Sendable {
             nameservers: ["192.168.64.1", "1.1.1.1"]
         )
 
-        let environment: [String: String] = [
+        var environment: [String: String] = [
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOME": "/root",
             "TERM": "xterm-256color",
             "LANG": "en_US.UTF-8",
+            "SENDBOX_WORKING_DIRECTORY": workspaceDestination,
         ]
 
         let firewallScript = firewall.generateStartupScript()
         let dnsConfig = firewall.generateDNSConfig()
         let mcpScript = mcpInspector?.generateStartupScript()
+        let baseCommand = ["/bin/bash"]
+
+        let command: [String]
+        let deferredFirewallScript: String?
+        let deferredMCPInspectionScript: String?
+        let boundaryExecPrefix: [String]
+        let boundaryReadyPath: String?
+
+        if let boundaryEnforcer {
+            let preflightScripts = [firewallScript, mcpScript]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+            command = [
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                boundaryEnforcer.generateBootstrapScript(
+                    command: baseCommand,
+                    preflightScripts: preflightScripts
+                ),
+            ]
+            deferredFirewallScript = nil
+            deferredMCPInspectionScript = nil
+            boundaryExecPrefix = boundaryEnforcer.execPrefix
+            boundaryReadyPath = BoundaryEnforcer.readyPath
+            environment["HOME"] = "/home/sendbox"
+            environment["SENDBOX_MCP_PROXY"] = BoundaryEnforcer.proxyPath
+        } else {
+            command = baseCommand
+            deferredFirewallScript = firewallScript.isEmpty ? nil : firewallScript
+            deferredMCPInspectionScript = (mcpScript?.isEmpty ?? true) ? nil : mcpScript
+            boundaryExecPrefix = []
+            boundaryReadyPath = nil
+        }
 
         return ContainerConfig(
             id: containerId,
@@ -124,13 +201,15 @@ public struct ContainerConfig: Sendable {
             rootfsSizeInBytes: diskBytes,
             imageReference: imageReference,
             workingDirectory: workspaceDestination,
-            command: ["/bin/bash"],
+            command: command,
             environment: environment,
             mounts: mountPoints,
             network: networkConfig,
-            firewallScript: firewallScript.isEmpty ? nil : firewallScript,
+            firewallScript: deferredFirewallScript,
             dnsConfig: dnsConfig.isEmpty ? nil : dnsConfig,
-            mcpInspectionScript: (mcpScript?.isEmpty ?? true) ? nil : mcpScript
+            mcpInspectionScript: deferredMCPInspectionScript,
+            boundaryExecPrefix: boundaryExecPrefix,
+            boundaryReadyPath: boundaryReadyPath
         )
     }
 }

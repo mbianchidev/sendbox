@@ -368,94 +368,105 @@ public struct ContainerHardening: Sendable {
 
     // MARK: - Seccomp Profile
 
+    public struct SeccompRule: Sendable, Equatable {
+        public let names: [String]
+        public let comment: String
+
+        public init(names: [String], comment: String) {
+            self.names = names
+            self.comment = comment
+        }
+    }
+
+    /// Typed syscall rules shared by OCI profile generation and runtime enforcement.
+    public func seccompRules() -> [SeccompRule] {
+        [
+            SeccompRule(
+                names: ["mount", "umount", "umount2", "pivot_root", "chroot"],
+                comment: "Block filesystem manipulation (hostpath, mount escapes)"
+            ),
+            SeccompRule(
+                names: ["reboot", "kexec_load", "kexec_file_load"],
+                comment: "Block reboot and kexec"
+            ),
+            SeccompRule(
+                names: ["init_module", "finit_module", "delete_module"],
+                comment: "Block kernel module operations (CAP_SYS_MODULE attacks)"
+            ),
+            SeccompRule(
+                names: ["unshare", "setns"],
+                comment: "Block namespace creation and switching"
+            ),
+            SeccompRule(
+                names: ["ptrace"],
+                comment: "Block ptrace (PID namespace attacks and process injection)"
+            ),
+            SeccompRule(
+                names: ["keyctl", "add_key", "request_key"],
+                comment: "Block keyring manipulation"
+            ),
+            SeccompRule(
+                names: ["bpf"],
+                comment: "Block BPF syscall (bpf_privesc / CVE-2017-16995)"
+            ),
+            SeccompRule(
+                names: ["userfaultfd"],
+                comment: "Block userfaultfd race-condition exploit primitives"
+            ),
+            SeccompRule(
+                names: ["open_by_handle_at"],
+                comment: "Block open_by_handle_at (CAP_DAC_READ_SEARCH attacks)"
+            ),
+            SeccompRule(
+                names: ["personality"],
+                comment: "Block personality changes that can disable ASLR"
+            ),
+            SeccompRule(
+                names: ["execveat"],
+                comment: "Block fd-relative execution that bypasses exec path inspection"
+            ),
+            SeccompRule(
+                names: [
+                    "kcmp", "pidfd_getfd", "process_madvise",
+                    "process_vm_readv", "process_vm_writev",
+                ],
+                comment: "Block cross-process memory and descriptor access"
+            ),
+            SeccompRule(
+                names: ["swapon", "swapoff", "acct"],
+                comment: "Block swap and process-accounting manipulation"
+            ),
+            SeccompRule(
+                names: ["perf_event_open"],
+                comment: "Block kernel performance-monitoring information leaks"
+            ),
+            SeccompRule(
+                names: [
+                    "fsopen", "fsconfig", "fsmount", "fspick",
+                    "move_mount", "open_tree", "mount_setattr",
+                ],
+                comment: "Block the modern mount API"
+            ),
+        ]
+    }
+
+    public func blockedSyscalls() -> [String] {
+        Array(Set(seccompRules().flatMap(\.names))).sorted()
+    }
+
     /// Generate a seccomp profile (JSON) to restrict dangerous syscalls.
     ///
     /// Returns an OCI/Docker-compatible seccomp JSON profile that blocks
     /// syscalls commonly used in container escape attacks.
     public func seccompProfile() -> String {
-        var blockedSyscalls: [[String: Any]] = []
-
-        // Filesystem manipulation (mount, pivot_root, chroot)
-        blockedSyscalls.append([
-            "names": ["mount", "umount", "umount2", "pivot_root", "chroot"],
-            "action": "SCMP_ACT_ERRNO",
-            "errnoRet": 1,
-            "comment": "Block filesystem manipulation (hostpath, mount escapes)",
-        ])
-
-        // Reboot / kexec
-        blockedSyscalls.append([
-            "names": ["reboot", "kexec_load", "kexec_file_load"],
-            "action": "SCMP_ACT_ERRNO",
-            "errnoRet": 1,
-            "comment": "Block reboot and kexec",
-        ])
-
-        // Kernel module loading (CAP_SYS_MODULE)
-        blockedSyscalls.append([
-            "names": ["init_module", "finit_module", "delete_module"],
-            "action": "SCMP_ACT_ERRNO",
-            "errnoRet": 1,
-            "comment": "Block kernel module operations (CAP_SYS_MODULE attacks)",
-        ])
-
-        // Namespace manipulation
-        blockedSyscalls.append([
-            "names": ["unshare", "setns"],
-            "action": "SCMP_ACT_ERRNO",
-            "errnoRet": 1,
-            "comment": "Block namespace creation/switching",
-        ])
-
-        // Ptrace
-        blockedSyscalls.append([
-            "names": ["ptrace"],
-            "action": "SCMP_ACT_ERRNO",
-            "errnoRet": 1,
-            "comment": "Block ptrace (PID namespace attacks, process injection)",
-        ])
-
-        // Keyring manipulation
-        blockedSyscalls.append([
-            "names": ["keyctl", "add_key", "request_key"],
-            "action": "SCMP_ACT_ERRNO",
-            "errnoRet": 1,
-            "comment": "Block keyring manipulation",
-        ])
-
-        // BPF
-        blockedSyscalls.append([
-            "names": ["bpf"],
-            "action": "SCMP_ACT_ERRNO",
-            "errnoRet": 1,
-            "comment": "Block BPF syscall (bpf_privesc / CVE-2017-16995)",
-        ])
-
-        // userfaultfd — used in race-condition kernel exploits
-        blockedSyscalls.append([
-            "names": ["userfaultfd"],
-            "action": "SCMP_ACT_ERRNO",
-            "errnoRet": 1,
-            "comment":
-                "Block userfaultfd (dirty_cow, dirty_pipe race exploits)",
-        ])
-
-        // open_by_handle_at — Shocker exploit / CAP_DAC_READ_SEARCH
-        blockedSyscalls.append([
-            "names": ["open_by_handle_at"],
-            "action": "SCMP_ACT_ERRNO",
-            "errnoRet": 1,
-            "comment":
-                "Block open_by_handle_at (CAP_DAC_READ_SEARCH attacks)",
-        ])
-
-        // personality — can disable ASLR
-        blockedSyscalls.append([
-            "names": ["personality"],
-            "action": "SCMP_ACT_ERRNO",
-            "errnoRet": 1,
-            "comment": "Block personality (prevents ASLR bypass)",
-        ])
+        let blockedSyscalls: [[String: Any]] = seccompRules().map { rule in
+            [
+                "names": rule.names,
+                "action": "SCMP_ACT_ERRNO",
+                "errnoRet": 1,
+                "comment": rule.comment,
+            ]
+        }
 
         let profileDict: [String: Any] = [
             "defaultAction": "SCMP_ACT_ALLOW",
