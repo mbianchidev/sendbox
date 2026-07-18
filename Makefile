@@ -1,4 +1,5 @@
-.PHONY: all build release test clean install install-completions setup-bridge lint help
+.PHONY: all build release test clean install install-completions setup-bridge lint \
+	rust-build rust-release rust-test rust-lint help
 
 PREFIX ?= /usr/local
 DESTDIR ?=
@@ -37,6 +38,19 @@ setup-bridge:
 lint:
 	swift format lint --recursive Sources Tests
 
+rust-build:
+	cargo build --workspace
+
+rust-release:
+	cargo build --workspace --release
+
+rust-test:
+	cargo test --workspace --all-features
+
+rust-lint:
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
+
 help:
 	@echo "Available targets:"
 	@echo "  all                 Build release (default)"
@@ -48,4 +62,8 @@ help:
 	@echo "  install-completions Install shell completions only"
 	@echo "  setup-bridge        Install copilot-bridge dependencies"
 	@echo "  lint                Lint Swift sources"
+	@echo "  rust-build          Build the experimental Rust workspace"
+	@echo "  rust-release        Build the experimental Rust workspace in release mode"
+	@echo "  rust-test           Test the experimental Rust workspace"
+	@echo "  rust-lint           Check Rust formatting and run clippy"
 	@echo "  help                Show this help message"

@@ -1,0 +1,21 @@
+[package]
+name = "sendbox-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sendbox-rs"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+sendbox-config = { path = "../sendbox-config" }
+sendbox-core = { path = "../sendbox-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

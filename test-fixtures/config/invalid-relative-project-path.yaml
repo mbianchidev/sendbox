@@ -1,0 +1,21 @@
+name: relative-project
+project_path: ./project
+resources:
+  cpus: 2
+  memory_mb: 2048
+  disk_size_mb: 5120
+policy:
+  commands:
+    default_action: deny
+    allowlist: []
+    denylist: []
+    log_blocked: true
+  network:
+    default_action: deny
+    allowed_domains: []
+    blocked_domains: []
+    allow_dns: true
+secrets: []
+github:
+  forward_auth: false
+  forward_copilot_auth: false

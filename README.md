@@ -29,6 +29,7 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 |---|---|---|
 | Common | Swift | 6.2 |
 | Common | Node.js | 20+ for `copilot-bridge` |
+| Experimental validator | Rust | 1.93.1 (pinned by `rust-toolchain.toml`) |
 | Apple runtime | macOS | 26 (Tahoe) |
 | Apple runtime | Hardware | Apple Silicon |
 | Apple runtime | Xcode | 26 |
@@ -75,6 +76,23 @@ For an interactive runtime preflight and configuration flow:
 ```
 
 Kata installation and containerd configuration are documented in [docs/kata-containers.md](docs/kata-containers.md).
+
+### Experimental Rust validator
+
+The parallel Rust foundation builds an experimental `sendbox-rs` binary. In this
+phase it only parses and validates configuration and policy; all sandbox runtime
+execution remains on the production Swift `sendbox` binary.
+
+```bash
+make rust-build
+./target/debug/sendbox-rs --version
+./target/debug/sendbox-rs policy validate --config config/example-sandbox.yaml
+./target/debug/sendbox-rs policy validate --config config/example-sandbox.yaml --json
+```
+
+The JSON form is deterministic and intended for future Swift/Rust differential
+tests. Invalid configuration returns exit status `2`; text diagnostics are
+written to stderr, while `--json` always writes its result to stdout.
 
 ### Running Unsigned macOS Releases
 
@@ -282,6 +300,10 @@ defense in depth against direct API ref mutations or alternate Git clients. Disa
 | `Agent` | Coordinate agent process execution and I/O |
 
 The **copilot-bridge** is an optional Node.js sidecar that exposes a JSON-RPC interface for IDE integrations.
+
+The experimental Rust workspace currently contains only shared domain/error
+types, strict configuration decoding, pure policy validation, and the
+`sendbox-rs` validation CLI. It does not contain runtime adapters or enforcement.
 
 See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
 
