@@ -1,0 +1,22 @@
+name: invalid-resources
+project_path: /tmp/sendbox-project
+resources:
+  cpus: 0
+  memory_mb: -1
+  disk_size_mb: 0
+policy:
+  commands:
+    default_action: deny
+    allowlist: []
+    denylist: []
+    log_blocked: true
+  network:
+    default_action: deny
+    allowed_domains: []
+    blocked_domains: []
+    allow_dns: true
+secrets: []
+github:
+  forward_auth: false
+  forward_copilot_auth: false
+

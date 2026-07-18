@@ -1,4 +1,5 @@
 .build/
+/target/
 node_modules/
 copilot-bridge/dist/
 .DS_Store

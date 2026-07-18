@@ -1,0 +1,71 @@
+name: full-schema
+project_path: /tmp/sendbox-project
+runtime:
+  provider: kata
+  kata:
+    executable: /usr/local/bin/nerdctl
+    runtime_handler: io.containerd.kata-qemu.v2
+    namespace: sendbox-tests
+    address: /run/containerd/containerd.sock
+    snapshotter: overlayfs
+    configuration_path: /etc/kata-containers/configuration.toml
+  hyperlight:
+    executable: /usr/local/bin/hyperlight-unikraft
+    kernel_path: /opt/hyperlight/shell-kernel
+    initrd_path: /opt/hyperlight/shell.cpio
+    stack_mb: 16
+resources:
+  cpus: 2
+  memory_mb: 2048
+  disk_size_mb: 5120
+policy:
+  commands:
+    default_action: deny
+    allowlist: ["git *"]
+    denylist: ["sudo *"]
+    log_blocked: true
+  network:
+    default_action: deny
+    allowed_domains: [github.com]
+    blocked_domains: []
+    allow_dns: true
+    max_connections: 50
+  boundaries:
+    enabled: true
+    tool_calls:
+      transport: stdio
+      default_action: deny
+      allowlist: [read_file]
+      denylist: ["*delete*"]
+      max_frame_bytes: 1048576
+      server_command_patterns: ["@modelcontextprotocol"]
+      allowed_server_commands:
+        - ["/usr/local/bin/node", "/opt/@modelcontextprotocol/server/index.js"]
+    syscalls:
+      additional_denylist: [io_uring_setup]
+      log_blocked: true
+    log_path: /var/log/sendbox/boundary.log
+secrets: [NPM_TOKEN]
+devcontainer:
+  config_path: .devcontainer/devcontainer.json
+  auto_generate: false
+  extensions: [github.copilot]
+github:
+  forward_auth: true
+  forward_copilot_auth: true
+  allow_private_repository_access: false
+  branch_protection:
+    enabled: true
+    username: octocat
+    protected_branches: [main]
+    allowed_branch_patterns: ["octocat/*"]
+  ssh_key_path: ~/.ssh/id_ed25519
+observability:
+  mcp_inspection:
+    enabled: true
+    transports: [stdio, http]
+    capture_payloads: false
+    max_payload_bytes: 32768
+    log_path: /var/log/sendbox/mcp-trace.log
+    server_command_patterns: [mcp-server]
+
