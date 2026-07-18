@@ -30,4 +30,3 @@ github:
   forward_copilot_auth: false
   branch_protection:
     enabled: false
-

@@ -16,4 +16,3 @@ serde_yaml_ng.workspace = true
 
 [lints]
 workspace = true
-

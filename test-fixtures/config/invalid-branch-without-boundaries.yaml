@@ -21,4 +21,3 @@ secrets: []
 github:
   forward_auth: false
   forward_copilot_auth: false
-

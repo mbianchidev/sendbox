@@ -68,4 +68,3 @@ observability:
     max_payload_bytes: 32768
     log_path: /var/log/sendbox/mcp-trace.log
     server_command_patterns: [mcp-server]
-
