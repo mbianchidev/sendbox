@@ -306,6 +306,8 @@ types, strict configuration decoding, pure policy validation, and the
 `sendbox-rs` validation CLI. It does not contain runtime adapters or enforcement.
 
 See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
+The isolated Rust proof for Apple's official CLI is documented in
+[docs/apple-container-adapter-spike.md](docs/apple-container-adapter-spike.md).
 
 ## Security Model
 
