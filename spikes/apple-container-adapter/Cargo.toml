@@ -6,6 +6,8 @@ rust-version = "1.93.1"
 publish = false
 license = "MIT"
 
+[workspace]
+
 [dependencies]
 async-trait = "0.1.89"
 clap = { version = "4.6.2", features = ["derive"] }
