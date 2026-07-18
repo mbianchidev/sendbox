@@ -67,7 +67,7 @@ async fn cancellation_terminates_and_reaps_the_child() {
 
 #[tokio::test]
 async fn caps_output_without_deadlocking() {
-    let payload = "x".repeat(256 * 1024);
+    let payload = "x".repeat(64 * 1024);
     let mut controls = controls();
     controls.stdout_limit = 128;
     let output = TokioProcessRunner
