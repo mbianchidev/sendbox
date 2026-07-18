@@ -1,0 +1,25 @@
+{
+  "host": {
+    "operating_system": "macos",
+    "architecture": "aarch64",
+    "version": "26.5.2"
+  },
+  "version": "container CLI version 0.10.0 (build: release, commit: 6bdb647)\n",
+  "status": {
+    "exit_code": 1,
+    "stdout": "{\"installRoot\":\"\",\"apiServerCommit\":\"\",\"apiServerAppName\":\"\",\"apiServerVersion\":\"\",\"apiServerBuild\":\"\",\"appRoot\":\"\",\"status\":\"unregistered\"}\n"
+  },
+  "help": {
+    "root_help": "container create\ncontainer run\ncontainer exec\ncontainer logs\ncontainer kill\ncontainer stop\ncontainer delete\n",
+    "create_help": "USAGE: container create [<options>] <image> [<arguments> ...]\n--env\n--mount\n--volume\n--dns\n--network\n--cpus\n--memory\n--ulimit\n--kernel\n--publish-socket\n",
+    "run_help": "USAGE: container run [<options>] <image> [<arguments> ...]\n--detach\n",
+    "start_help": "USAGE: container start [--attach] [--interactive] <container-id>\n",
+    "exec_help": "USAGE: container exec [<options>] <container-id> <arguments> ...\n",
+    "logs_help": "USAGE: container logs [--follow] <container-id>\n",
+    "kill_help": "USAGE: container kill [--signal <signal>] <container-ids> ...\n",
+    "stop_help": "USAGE: container stop [--time <time>] <container-ids> ...\n",
+    "delete_help": "USAGE: container delete <container-ids> ...\n",
+    "inspect_help": "USAGE: container inspect <container-ids> ...\n",
+    "list_help": "USAGE: container list [--format <format>]\n"
+  }
+}

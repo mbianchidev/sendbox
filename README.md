@@ -284,6 +284,8 @@ defense in depth against direct API ref mutations or alternate Git clients. Disa
 The **copilot-bridge** is an optional Node.js sidecar that exposes a JSON-RPC interface for IDE integrations.
 
 See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
+The isolated Rust proof for Apple's official CLI is documented in
+[docs/apple-container-adapter-spike.md](docs/apple-container-adapter-spike.md).
 
 ## Security Model
 

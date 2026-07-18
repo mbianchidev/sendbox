@@ -1,0 +1,68 @@
+name: Apple container adapter spike
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "spikes/apple-container-adapter/**"
+      - "docs/apple-container-adapter-spike.md"
+      - ".github/workflows/apple-container-adapter-spike.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "spikes/apple-container-adapter/**"
+      - "docs/apple-container-adapter-spike.md"
+      - ".github/workflows/apple-container-adapter-spike.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-container-adapter-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: spikes/apple-container-adapter
+
+jobs:
+  macos:
+    name: macOS Rust qualification
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.1 --profile minimal --component clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo +1.93.1 fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo +1.93.1 clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo +1.93.1 test --all-targets
+
+      - name: Build release probe
+        run: cargo +1.93.1 build --release
+      - name: Install pinned cargo-audit
+        run: cargo +1.93.1 install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit dependencies
+        run: cargo +1.93.1 audit --file Cargo.lock
+
+  linux:
+    name: Linux unavailable-platform behavior
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.1 --profile minimal
+
+      - name: Compile and test
+        run: cargo +1.93.1 test --all-targets
+
+      - name: Build release probe
+        run: cargo +1.93.1 build --release
