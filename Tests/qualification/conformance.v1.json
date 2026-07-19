@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "fixture_version": "1.0.0",
+  "fixtures": [
+    {
+      "id": "cli.contracts",
+      "area": "cli",
+      "description": "Intended stdout, stderr, exit-code, help, and JSON channel contracts.",
+      "oracle": "intended_behavior",
+      "status": "specified",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/cli.v1.json",
+      "swift_observation": null,
+      "command": null
+    },
+    {
+      "id": "cli.policy-validate-common",
+      "area": "cli",
+      "description": "Common policy validation invocation available in the current Swift and Rust CLIs.",
+      "oracle": "swift_observation_only",
+      "status": "implemented",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/cli-policy-validate.v1.json",
+      "swift_observation": {
+        "evidence_path": "Sources/sendbox/SendBox.swift",
+        "note": "Swift output is recorded only to identify intentional preserved behavior; it is not the intended-behavior oracle."
+      },
+      "command": {
+        "args": ["policy", "validate", "--config", "config/example-sandbox.yaml"],
+        "timeout_ms": 5000,
+        "output_cap_bytes": 1048576,
+        "replacements": [],
+        "redact_json_keys": []
+      }
+    },
+    {
+      "id": "config.contracts",
+      "area": "config",
+      "description": "Canonical defaults, strict decoding, validation errors, and compatibility behavior.",
+      "oracle": "intended_behavior",
+      "status": "implemented",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/config.v1.json",
+      "swift_observation": null,
+      "command": null
+    },
+    {
+      "id": "policy.decisions",
+      "area": "policy",
+      "description": "Intended command, network, MCP, and repository decisions independent of current defects.",
+      "oracle": "intended_behavior",
+      "status": "specified",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/policy-decisions.v1.json",
+      "swift_observation": null,
+      "command": null
+    },
+    {
+      "id": "protocol.contracts",
+      "area": "protocol",
+      "description": "Canonical bounded protocol encoding, authentication, and failure contracts.",
+      "oracle": "intended_behavior",
+      "status": "implemented",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/protocol.v1.json",
+      "swift_observation": null,
+      "command": null
+    },
+    {
+      "id": "runtime.contracts",
+      "area": "runtime",
+      "description": "Lifecycle, streaming, cancellation, capability, and cleanup contracts.",
+      "oracle": "intended_behavior",
+      "status": "specified",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/runtime-contracts.v1.json",
+      "swift_observation": null,
+      "command": null
+    },
+    {
+      "id": "persisted.formats",
+      "area": "formats",
+      "description": "Versioned audit, snapshot, provenance, grants, config, and protocol samples.",
+      "oracle": "intended_behavior",
+      "status": "specified",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/persisted-formats.v1.json",
+      "swift_observation": null,
+      "command": null
+    },
+    {
+      "id": "known-defects.negative",
+      "area": "negative",
+      "description": "Known misleading or unsafe current behavior that must not be preserved.",
+      "oracle": "intended_behavior",
+      "status": "specified",
+      "negative_case": true,
+      "data_path": "Tests/qualification/fixtures/known-defects.v1.json",
+      "swift_observation": {
+        "evidence_path": "README.md",
+        "note": "Claims are observations of current documentation and are explicitly not accepted as an implementation oracle."
+      },
+      "command": null
+    },
+    {
+      "id": "setup.release",
+      "area": "setup_release",
+      "description": "Setup, completion, packaging, and release contracts.",
+      "oracle": "intended_behavior",
+      "status": "specified",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/setup-release.v1.json",
+      "swift_observation": null,
+      "command": null
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"id": "command-deny-wins", "input": "sudo git status", "decision": "deny"},
+    {"id": "command-default-deny", "input": "unknown-tool", "decision": "deny"},
+    {"id": "network-block-wins", "host": "evil.example.com", "allowed": ["*.example.com"], "blocked": ["evil.example.com"], "decision": "deny"},
+    {"id": "network-wildcard-subdomain", "host": "api.github.com", "allowed": ["*.github.com"], "decision": "allow"},
+    {"id": "network-wildcard-not-apex", "host": "github.com", "allowed": ["*.github.com"], "decision": "deny"},
+    {"id": "mcp-deny-wins", "tool": "delete_file", "allowed": ["*"], "blocked": ["*delete*"], "decision": "deny"},
+    {"id": "mcp-exact-command", "argv": ["/usr/bin/node", "/srv/mcp-server.js"], "decision": "allow"},
+    {"id": "repository-cross-org-private", "selected": "acme/app", "requested": "other/secret", "decision": "deny"},
+    {"id": "repository-public", "selected": "acme/app", "requested": "other/public", "decision": "allow"},
+    {"id": "protected-branch", "branch": "main", "decision": "deny"}
+  ],
+  "implementation_status": "specified_until_pure_rust_decision_apis_exist"
+}
+

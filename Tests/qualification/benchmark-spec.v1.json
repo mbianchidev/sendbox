@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "specification_version": "1.0.0",
+  "owner": "Rust rewrite qualification",
+  "reference_hosts": [
+    {
+      "id": "macos-arm64-reference",
+      "os": {"status": "unqualified", "value": null, "reason": "Exact supported macOS release and build are not yet selected."},
+      "architecture": {"status": "qualified", "value": "arm64", "reason": null},
+      "cpu": {"status": "unqualified", "value": null, "reason": "Reference Apple silicon model is not yet selected."},
+      "memory_bytes": {"status": "unqualified", "value": null, "reason": "Reference memory size is not yet selected."},
+      "kernel": {"status": "unqualified", "value": null, "reason": "Darwin kernel build is not yet selected."},
+      "runtime_versions": {
+        "apple-container": {"status": "unqualified", "value": null, "reason": "Pinned vendor version awaits ADR-003."}
+      }
+    },
+    {
+      "id": "linux-x86_64-reference",
+      "os": {"status": "unqualified", "value": null, "reason": "Distribution and release are not yet selected."},
+      "architecture": {"status": "qualified", "value": "x86_64", "reason": null},
+      "cpu": {"status": "unqualified", "value": null, "reason": "Reference CPU is not yet selected."},
+      "memory_bytes": {"status": "unqualified", "value": null, "reason": "Reference memory size is not yet selected."},
+      "kernel": {"status": "unqualified", "value": null, "reason": "Kernel, BTF, KVM, and BPF matrix awaits Phase 1 results."},
+      "runtime_versions": {
+        "kata": {"status": "unqualified", "value": null, "reason": "Pinned Kata version awaits fixed-adapter capture."},
+        "containerd": {"status": "unqualified", "value": null, "reason": "Pinned containerd version awaits ADR-006."},
+        "nerdctl": {"status": "unqualified", "value": null, "reason": "Pinned nerdctl version awaits ADR-006."},
+        "hyperlight": {"status": "unqualified", "value": null, "reason": "Pinned Hyperlight version awaits capability qualification."}
+      }
+    },
+    {
+      "id": "linux-arm64-reference",
+      "os": {"status": "unqualified", "value": null, "reason": "Distribution and release are not yet selected."},
+      "architecture": {"status": "qualified", "value": "aarch64", "reason": null},
+      "cpu": {"status": "unqualified", "value": null, "reason": "Reference CPU is not yet selected."},
+      "memory_bytes": {"status": "unqualified", "value": null, "reason": "Reference memory size is not yet selected."},
+      "kernel": {"status": "unqualified", "value": null, "reason": "Kernel, BTF, KVM, and BPF matrix awaits Phase 1 results."},
+      "runtime_versions": {}
+    }
+  ],
+  "methodology": {
+    "warmups": 10,
+    "repetitions": 100,
+    "cache_states": ["cold_process_warm_filesystem", "warm_process_warm_filesystem", "cold_build_cache", "warm_build_cache"],
+    "confidence_level": 0.95,
+    "confidence_interval": "normal approximation for smoke-capable pure paths; bootstrap resampling required for published qualification results",
+    "percentile_method": "nearest_rank",
+    "outlier_policy": "retain all valid samples; report environmental failures separately"
+  },
+  "build_controls": {
+    "rust_profile": "release with Cargo.lock and rustc 1.93.1",
+    "swift_configuration": "release with Package.resolved",
+    "c_optimization": "-O3 with pinned clang; debug symbols stripped only for size measurements",
+    "linker": {"status": "unqualified", "value": null, "reason": "Reference linker and flags are host-specific and not yet pinned."},
+    "allocator": {"status": "unqualified", "value": null, "reason": "System versus alternate allocator has not been selected."},
+    "logging": "disabled for latency/throughput measurements; separately measured when enabled"
+  },
+  "workloads": [
+    {"id": "cli.startup.help", "path": "Rust process startup through --help", "availability": "qualified", "unqualified_reason": null, "workload_sizes": [1], "adapter_baseline": null},
+    {"id": "config.load_validate", "path": "sendbox-config YAML load plus validation", "availability": "qualified", "unqualified_reason": null, "workload_sizes": [1, 10, 100], "adapter_baseline": null},
+    {"id": "policy.validate", "path": "sendbox-policy structural validation", "availability": "qualified", "unqualified_reason": null, "workload_sizes": [1, 100, 1000], "adapter_baseline": null},
+    {"id": "policy.decision", "path": "pure command/network/MCP/repository decision", "availability": "unqualified", "unqualified_reason": "No Rust decision API exists; adding one is product security work outside this PR.", "workload_sizes": [1, 1000], "adapter_baseline": null},
+    {"id": "protocol.encode_decode", "path": "canonical CBOR request encode and decode", "availability": "qualified", "unqualified_reason": null, "workload_sizes": [64, 4096, 1048576], "adapter_baseline": "c-protocol-codec"},
+    {"id": "protocol.authenticated_rtt", "path": "in-memory authenticated host/guest request-response RTT including MAC", "availability": "qualified", "unqualified_reason": null, "workload_sizes": [64, 4096], "adapter_baseline": "c-protocol-mac"},
+    {"id": "mcp.broker", "path": "framing, authorization, forwarding, and response correlation", "availability": "unqualified", "unqualified_reason": "Production Rust MCP broker interface does not exist.", "workload_sizes": [64, 4096, 1048576], "adapter_baseline": "c-mcp-framing"},
+    {"id": "host.idle_rss", "path": "idle host process resident set after initialization", "availability": "unqualified", "unqualified_reason": "Stable production Rust host process does not exist.", "workload_sizes": [1], "adapter_baseline": null},
+    {"id": "host.binary_size", "path": "stripped production host binary excluding guest and BPF artifacts", "availability": "unqualified", "unqualified_reason": "Production Rust host binary and release strip settings are not frozen.", "workload_sizes": [1], "adapter_baseline": null},
+    {"id": "exec_broker.decision_launch", "path": "broker authorization plus process launch", "availability": "unqualified", "unqualified_reason": "Production Rust broker interface is not in the root workspace.", "workload_sizes": [1], "adapter_baseline": "exec-broker-fixed"},
+    {"id": "egress.decision", "path": "DNS and egress policy decision", "availability": "unqualified", "unqualified_reason": "Production Rust egress interface is not in the root workspace.", "workload_sizes": [1, 1000], "adapter_baseline": "egress-fixed"},
+    {"id": "bpf.event_decode", "path": "ring-buffer event decode and loss accounting", "availability": "unqualified", "unqualified_reason": "Stable event ABI and production loader are not available.", "workload_sizes": [1, 1000, 100000], "adapter_baseline": "c-bpf-ring-buffer"},
+    {"id": "guest.bootstrap", "path": "guest bootstrap to signed readiness", "availability": "unqualified", "unqualified_reason": "Production guest bootstrap does not exist.", "workload_sizes": [1], "adapter_baseline": "guest-bootstrap-fixed"},
+    {"id": "runtime.apple.lifecycle", "path": "create-ready, exec, stop, cleanup", "availability": "unqualified", "unqualified_reason": "Reference host, vendor version, image, and fixed adapter are not qualified.", "workload_sizes": [1, 10, 100], "adapter_baseline": "apple-fixed-adapter"},
+    {"id": "runtime.kata.lifecycle", "path": "create-ready, exec, stop, cleanup", "availability": "unqualified", "unqualified_reason": "Reference host, vendor versions, image, and fixed adapter are not qualified.", "workload_sizes": [1, 10, 100], "adapter_baseline": "kata-fixed-adapter"},
+    {"id": "runtime.hyperlight.lifecycle", "path": "create-ready, exec, stop, cleanup", "availability": "unqualified", "unqualified_reason": "Reference host, vendor version, rootfs, and fixed adapter are not qualified.", "workload_sizes": [1, 10, 100], "adapter_baseline": "hyperlight-fixed-adapter"}
+  ],
+  "thresholds": [
+    {"id": "cli-help-p50", "workload_id": "cli.startup.help", "metric": "p50", "comparator": "less_than_or_equal", "value": 10.0, "unit": "milliseconds", "relative_to": null, "owner": "Rust rewrite qualification"},
+    {"id": "cli-help-p95", "workload_id": "cli.startup.help", "metric": "p95", "comparator": "less_than_or_equal", "value": 15.0, "unit": "milliseconds", "relative_to": null, "owner": "Rust rewrite qualification"},
+    {"id": "config-p50", "workload_id": "config.load_validate", "metric": "p50", "comparator": "less_than_or_equal", "value": 15.0, "unit": "milliseconds", "relative_to": null, "owner": "Rust rewrite qualification"},
+    {"id": "host-idle-rss", "workload_id": "host.idle_rss", "metric": "maximum", "comparator": "less_than_or_equal", "value": 20971520.0, "unit": "bytes", "relative_to": null, "owner": "Rust rewrite qualification"},
+    {"id": "host-binary-size", "workload_id": "host.binary_size", "metric": "size", "comparator": "less_than_or_equal", "value": 26214400.0, "unit": "bytes", "relative_to": null, "owner": "Rust rewrite qualification"},
+    {"id": "policy-p95-c", "workload_id": "policy.decision", "metric": "p95", "comparator": "less_than_or_equal", "value": 1.1, "unit": "ratio", "relative_to": "c-policy-decision", "owner": "Rust rewrite qualification"},
+    {"id": "protocol-p95-c", "workload_id": "protocol.encode_decode", "metric": "p95", "comparator": "less_than_or_equal", "value": 1.1, "unit": "ratio", "relative_to": "c-protocol-codec", "owner": "Rust rewrite qualification"},
+    {"id": "protocol-throughput-c", "workload_id": "protocol.encode_decode", "metric": "throughput", "comparator": "greater_than_or_equal", "value": 0.9, "unit": "ratio", "relative_to": "c-protocol-codec", "owner": "Rust rewrite qualification"},
+    {"id": "mcp-p95-c", "workload_id": "mcp.broker", "metric": "p95", "comparator": "less_than_or_equal", "value": 1.1, "unit": "ratio", "relative_to": "c-mcp-framing", "owner": "Rust rewrite qualification"},
+    {"id": "mcp-throughput-c", "workload_id": "mcp.broker", "metric": "throughput", "comparator": "greater_than_or_equal", "value": 0.9, "unit": "ratio", "relative_to": "c-mcp-framing", "owner": "Rust rewrite qualification"},
+    {"id": "bpf-p95-c", "workload_id": "bpf.event_decode", "metric": "p95", "comparator": "less_than_or_equal", "value": 1.1, "unit": "ratio", "relative_to": "c-bpf-ring-buffer", "owner": "Rust rewrite qualification"},
+    {"id": "bpf-throughput-c", "workload_id": "bpf.event_decode", "metric": "throughput", "comparator": "greater_than_or_equal", "value": 0.9, "unit": "ratio", "relative_to": "c-bpf-ring-buffer", "owner": "Rust rewrite qualification"},
+    {"id": "runtime-apple-p95", "workload_id": "runtime.apple.lifecycle", "metric": "p95", "comparator": "less_than_or_equal", "value": 1.05, "unit": "ratio", "relative_to": "apple-fixed-adapter", "owner": "Rust rewrite qualification"},
+    {"id": "runtime-kata-p95", "workload_id": "runtime.kata.lifecycle", "metric": "p95", "comparator": "less_than_or_equal", "value": 1.05, "unit": "ratio", "relative_to": "kata-fixed-adapter", "owner": "Rust rewrite qualification"},
+    {"id": "runtime-hyperlight-p95", "workload_id": "runtime.hyperlight.lifecycle", "metric": "p95", "comparator": "less_than_or_equal", "value": 1.05, "unit": "ratio", "relative_to": "hyperlight-fixed-adapter", "owner": "Rust rewrite qualification"}
+  ],
+  "c_references": [
+    {"id": "c-policy-decision", "interface": "Pure decision function accepting canonical policy and request bytes; no parsing or I/O in timed region.", "source_path": null, "status": "unqualified", "unqualified_reason": "Interface specified; reference implementation not yet approved."},
+    {"id": "c-protocol-codec", "interface": "Canonical CBOR encode/decode over preallocated buffers using the same message schema.", "source_path": null, "status": "unqualified", "unqualified_reason": "Interface specified; reference implementation not yet approved."},
+    {"id": "c-protocol-mac", "interface": "HMAC-SHA256 over the versioned frame header and payload with fixed key material.", "source_path": null, "status": "unqualified", "unqualified_reason": "Interface specified; reference implementation not yet approved."},
+    {"id": "c-mcp-framing", "interface": "Bounded newline/Content-Length framing over preallocated buffers; excludes policy parsing and server I/O.", "source_path": null, "status": "unqualified", "unqualified_reason": "Interface specified; reference implementation not yet approved."},
+    {"id": "c-bpf-ring-buffer", "interface": "libbpf ring-buffer callback decoding the versioned event ABI without policy logic.", "source_path": null, "status": "unqualified", "unqualified_reason": "Event ABI and reference implementation are not yet frozen."}
+  ],
+  "fixed_adapter_baselines": [
+    {"id": "apple-fixed-adapter", "runtime": "apple", "definition": "Pinned language-neutral harness issuing identical Apple container lifecycle calls with identical image, mounts, networking, logging, and guest policy services held constant or disabled.", "status": "unqualified", "unqualified_reason": "ADR-003 and reference host are pending."},
+    {"id": "kata-fixed-adapter", "runtime": "kata", "definition": "Pinned language-neutral harness issuing identical nerdctl/containerd/Kata lifecycle calls with identical image, kernel, mounts, networking, logging, and guest policy services held constant or disabled.", "status": "unqualified", "unqualified_reason": "ADR-006 and reference host are pending."},
+    {"id": "hyperlight-fixed-adapter", "runtime": "hyperlight", "definition": "Pinned language-neutral harness issuing identical Hyperlight lifecycle calls with identical kernel, rootfs, mounts, networking, logging, and guest policy services held constant or disabled.", "status": "unqualified", "unqualified_reason": "Capability matrix and reference host are pending."}
+  ],
+  "minimum_supported_bpf_event_rate": {
+    "status": "unqualified",
+    "value": null,
+    "reason": "The numeric no-loss event rate must be measured on the selected kernel/host matrix; guessing is prohibited."
+  }
+}

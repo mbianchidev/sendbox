@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "negative_cases": [
+    {"id": "no-universal-shell-claim", "must_reject": "claiming semantic policy for direct unbrokered exec"},
+    {"id": "no-post-exec-primary-auth", "must_reject": "eBPF process killing as primary command authorization"},
+    {"id": "no-http-mcp-boundary-claim", "must_reject": "generic TLS observation presented as MCP authorization"},
+    {"id": "no-silent-security-degradation", "must_reject": "mandatory boundary becoming observability-only"},
+    {"id": "no-missing-runtime-pass", "must_reject": "missing vendor binary treated as a successful benchmark"},
+    {"id": "no-runtime-autostart", "must_reject": "baseline capture starting containerd, Apple container service, or Hyperlight"},
+    {"id": "no-swift-oracle-by-default", "must_reject": "untested Swift behavior copied without an explicit preserve decision"}
+  ]
+}
+
