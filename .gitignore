@@ -1,5 +1,6 @@
 .build/
 /target/
+fuzz/*/target/
 node_modules/
 copilot-bridge/dist/
 .DS_Store
