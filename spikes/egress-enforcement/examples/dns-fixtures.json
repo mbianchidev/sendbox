@@ -1,0 +1,17 @@
+{
+  "example.com.": {
+    "cname_chain": [],
+    "final_name": "example.com.",
+    "addresses": [{ "ip": "93.184.216.34", "ttl_secs": 3600 }]
+  },
+  "evil.example.com.": {
+    "cname_chain": [],
+    "final_name": "evil.example.com.",
+    "addresses": [{ "ip": "203.0.113.9", "ttl_secs": 60 }]
+  },
+  "demo.internal.test.": {
+    "cname_chain": [],
+    "final_name": "demo.internal.test.",
+    "addresses": [{ "ip": "127.0.0.1", "ttl_secs": 30 }]
+  }
+}

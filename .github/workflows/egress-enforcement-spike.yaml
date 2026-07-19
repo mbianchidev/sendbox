@@ -1,0 +1,119 @@
+name: Egress enforcement spike
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "spikes/egress-enforcement/**"
+      - "docs/egress-enforcement-spike.md"
+      - ".github/workflows/egress-enforcement-spike.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "spikes/egress-enforcement/**"
+      - "docs/egress-enforcement-spike.md"
+      - ".github/workflows/egress-enforcement-spike.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: egress-enforcement-spike-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: spikes/egress-enforcement
+
+env:
+  RUST_VERSION: "1.93.1"
+  CARGO_AUDIT_VERSION: "0.22.2"
+
+jobs:
+  compile-and-unit:
+    name: Compile, lint, unit/property tests, audit (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo +${{ env.RUST_VERSION }} fmt --all -- --check
+
+      - name: Run clippy (deny warnings)
+        run: cargo +${{ env.RUST_VERSION }} clippy --all-targets --all-features -- -D warnings
+
+      - name: Run unit/integration/property tests
+        run: cargo +${{ env.RUST_VERSION }} test --all-targets --all-features
+
+      - name: Install pinned cargo-audit
+        run: cargo +${{ env.RUST_VERSION }} install cargo-audit --version ${{ env.CARGO_AUDIT_VERSION }} --locked
+
+      - name: Audit dependencies
+        run: cargo +${{ env.RUST_VERSION }} audit --file Cargo.lock
+
+      - name: Build release
+        run: cargo +${{ env.RUST_VERSION }} build --release
+
+  live-netns-suite:
+    name: Live Linux netns/nftables enforcement proof (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    needs: compile-and-unit
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+
+      - name: Install nftables/iproute2/util-linux
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2 util-linux
+
+      - name: Build test binaries and the egress gateway (no run)
+        run: |
+          cargo +${{ env.RUST_VERSION }} build --release --bins
+          cargo +${{ env.RUST_VERSION }} test --release --test live_netns --no-run
+
+      - name: Probe live capabilities under sudo (same privilege context as the live run)
+        id: probe
+        run: |
+          set -euo pipefail
+          sudo ./target/release/netns-harness probe | tee probe-verdict.json
+
+      - name: Publish capability verdict artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: egress-enforcement-live-capability-verdict
+          path: spikes/egress-enforcement/probe-verdict.json
+
+      # Fails this job explicitly, with the published verdict quoted in the
+      # log, instead of silently skipping the live suite below. The probe
+      # above deliberately ran under sudo so this verdict reflects the exact
+      # privilege context the live suite itself will run under; probing
+      # without sudo would under-report readiness (is_root would read
+      # false) and could hide a real capability gap in the actual run.
+      - name: Gate on the capability verdict
+        run: |
+          set -euo pipefail
+          ready=$(jq -r '(.is_linux and .is_root and .ip.available and .nft.available and .setpriv.available)' probe-verdict.json)
+          if [ "$ready" != "true" ]; then
+            echo "::error::live capability verdict indicates this runner cannot run the live network-namespace suite: $(cat probe-verdict.json)"
+            exit 1
+          fi
+
+      # This job explicitly claims to run the live suite: SENDBOX_EGRESS_LIVE_REQUIRE=1
+      # turns a missing capability into a hard failure instead of a silent skip,
+      # so this step can never quietly downgrade into a no-op even if the gate
+      # step above were ever bypassed. The compiled test binary is invoked
+      # directly under sudo (rather than `sudo cargo test`) so root does not
+      # need cargo/rustup on its PATH.
+      - name: Run live network-namespace enforcement suite as root
+        run: |
+          set -euo pipefail
+          TEST_BIN=$(find target/release/deps -maxdepth 1 -type f -name 'live_netns-*' ! -name '*.d' | head -n1)
+          if [ -z "$TEST_BIN" ]; then
+            echo "::error::could not locate the compiled live_netns test binary"
+            exit 1
+          fi
+          sudo SENDBOX_EGRESS_LIVE=1 SENDBOX_EGRESS_LIVE_REQUIRE=1 "$TEST_BIN" --nocapture --test-threads=1

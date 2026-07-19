@@ -1,0 +1,44 @@
+[package]
+name = "egress-enforcement-spike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93.1"
+publish = false
+license = "MIT"
+description = "Phase 1 spike: typed network policy, DNS-validating broker, CONNECT egress broker, and nftables/netns enforcement proof."
+
+[workspace]
+
+[[bin]]
+name = "egress-gateway"
+path = "src/bin/egress_gateway.rs"
+
+[[bin]]
+name = "netns-harness"
+path = "src/bin/netns_harness.rs"
+
+[dependencies]
+async-trait = "0.1.89"
+clap = { version = "4.6.2", features = ["derive"] }
+hickory-proto = "0.26.1"
+ipnet = "2.11.0"
+libc = "0.2.177"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tempfile = "3.26.0"
+thiserror = "2.0.18"
+tokio = { version = "1.53.0", features = [
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
