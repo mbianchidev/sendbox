@@ -1,0 +1,10 @@
+{
+  "default_action": "deny",
+  "allowed_domains": ["example.com", "demo.internal.test"],
+  "blocked_domains": ["evil.example.com"],
+  "allowed_networks": ["93.184.216.34/32", "127.0.0.1/32"],
+  "blocked_networks": ["203.0.113.0/24"],
+  "allowed_ports": [],
+  "max_concurrent_connections": 8,
+  "max_dns_ttl_secs": 60
+}
