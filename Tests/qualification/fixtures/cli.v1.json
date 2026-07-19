@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"id": "help", "exit_code": 0, "stdout": "nonempty", "stderr": "empty"},
+    {"id": "invalid-usage", "exit_code": 2, "stdout": "empty", "stderr": "diagnostic"},
+    {"id": "json-success", "exit_code": 0, "stdout": "single_canonical_json_value", "stderr": "empty"},
+    {"id": "json-failure", "exit_code": 2, "stdout": "single_canonical_json_value", "stderr": "empty"},
+    {"id": "signal", "exit_code": "128_plus_signal", "stdout_stderr_order": "preserved_per_stream"}
+  ],
+  "note": "Help wording is not frozen until Phase 10; channel and exit contracts are."
+}
+
