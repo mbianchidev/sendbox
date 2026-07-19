@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "args": ["policy", "validate", "--config", "config/example-sandbox.yaml"],
+  "comparison": "normalized stdout, stderr, and exit code",
+  "swift_role": "observation_only",
+  "missing_binary": "explicit_failure"
+}
+
