@@ -1,0 +1,74 @@
+name: Guest BPF Phase 1 Spike
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/guest-bpf-spike.yaml"
+      - "docs/guest-bpf-spike.md"
+      - "spikes/guest-bpf/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/guest-bpf-spike.yaml"
+      - "docs/guest-bpf-spike.md"
+      - "spikes/guest-bpf/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guest-bpf-spike-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format, clippy, tests, audit, and CO-RE compile
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.2
+
+      - name: Run pinned quality environment
+        run: docker build --no-cache --target quality spikes/guest-bpf
+
+  static-artifacts:
+    name: Static ${{ matrix.architecture }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.2
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          version: v0.33.0
+          driver-opts: image=moby/buildkit:buildx-stable-1@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Build twice without cache
+        run: |
+          for attempt in first second; do
+            docker buildx build \
+              --no-cache \
+              --platform "linux/${{ matrix.architecture }}" \
+              --target artifact \
+              --output "type=local,dest=dist/${{ matrix.architecture }}/${attempt}" \
+              spikes/guest-bpf
+          done
+
+      - name: Verify reproducibility and static proof
+        run: |
+          cmp \
+            "dist/${{ matrix.architecture }}/first/sendbox-guest-bpf" \
+            "dist/${{ matrix.architecture }}/second/sendbox-guest-bpf"
+          cmp \
+            "dist/${{ matrix.architecture }}/first/vmlinux.sha256" \
+            "dist/${{ matrix.architecture }}/second/vmlinux.sha256"
+          cat "dist/${{ matrix.architecture }}/first/static-link-proof.txt"
+          sha256sum "dist/${{ matrix.architecture }}/first/sendbox-guest-bpf"

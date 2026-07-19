@@ -44,6 +44,10 @@ libseccomp development headers, and the Yama LSM with writable
 `kernel.yama.ptrace_scope`. SendBox refuses to launch the agent when any required
 enforcement component is unavailable.
 
+The isolated [Phase 1 guest BPF spike](docs/guest-bpf-spike.md) documents the
+static-musl Rust/libbpf proof for Linux x86_64 and arm64. It is
+observation-only and is not part of the current enforcement path.
+
 ## Quick Start
 
 ### Install
