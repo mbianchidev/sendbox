@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use serde_json::Value;
+use tempfile::tempdir;
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -110,4 +111,96 @@ fn invalid_json_result_remains_machine_readable() {
             .unwrap()
             .contains("unexpected_section")
     );
+}
+
+#[test]
+fn analyzes_projects_with_stable_bridge_compatible_json() {
+    let arguments = [
+        "analyze",
+        "--project",
+        "crates/sendbox-project/tests/fixtures/node-ts",
+        "--json",
+    ];
+    let first = run(&arguments);
+    let second = run(&arguments);
+    assert!(first.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    assert!(first.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(result["language"], "typescript");
+    assert_eq!(result["framework"], "Next.js");
+    assert_eq!(result["packageManager"], "npm");
+    assert_eq!(result["refinement"]["status"], "not_requested");
+    assert!(result["scan"]["errors"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn analysis_errors_use_a_stable_exit_and_json_shape() {
+    let output = run(&["analyze", "--project", "does-not-exist", "--json"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["exit_code"], 3);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("could not access")
+    );
+}
+
+#[test]
+fn generates_and_merges_devcontainer_with_typed_overrides() {
+    let project = tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"dependencies":{"react":"19"}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir(project.path().join(".devcontainer")).unwrap();
+    std::fs::write(
+        project.path().join(".devcontainer/devcontainer.json"),
+        r#"{
+          // existing config
+          "containerEnv": {"EXISTING": "true"},
+          "customizations": {"vscode": {"extensions": ["example.existing",],},},
+        }"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sendbox-rs"))
+        .args([
+            "devcontainer",
+            "generate",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--image",
+            "example/image:1",
+            "--extension",
+            "example.override",
+            "--container-env",
+            "OVERRIDE=true",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["mergedExisting"], true);
+    assert_eq!(result["commentsPreserved"], false);
+    assert_eq!(result["spec"]["image"], "example/image:1");
+    assert_eq!(result["spec"]["containerEnv"]["EXISTING"], "true");
+    assert_eq!(result["spec"]["containerEnv"]["OVERRIDE"], "true");
+    assert!(
+        result["spec"]["customizations"]["vscode"]["extensions"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("example.existing".to_owned()))
+    );
+    let written: Value = serde_json::from_slice(
+        &std::fs::read(project.path().join(".devcontainer/devcontainer.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(written, result["spec"]);
 }

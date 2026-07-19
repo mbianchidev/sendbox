@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "surfaces": [
+    "setup.sh interactive preflight",
+    "Makefile install",
+    "Makefile install-completions",
+    "bash completion",
+    "zsh completion",
+    "fish completion",
+    "macOS tarball",
+    "macOS pkg",
+    "macOS dmg",
+    "GitHub release workflow",
+    "copilot-bridge npm build"
+  ],
+  "contract": "capture and validate only; do not install, mutate host configuration, or start services"
+}
+

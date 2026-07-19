@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "canonicalization": {
+    "format": "minified JSON with declaration-order object keys",
+    "defaults": {
+      "runtime.provider": "auto",
+      "runtime.kata.executable": "nerdctl",
+      "runtime.kata.runtime_handler": "io.containerd.kata.v2",
+      "runtime.kata.namespace": "sendbox",
+      "runtime.hyperlight.executable": "/usr/local/bin/hyperlight-unikraft",
+      "runtime.hyperlight.stack_mb": 8,
+      "resources.cpus": 4,
+      "resources.memory_mb": 4096,
+      "resources.disk_size_mb": 10240,
+      "policy.boundaries.enabled": true,
+      "policy.boundaries.tool_calls.transport": "stdio",
+      "policy.boundaries.tool_calls.default_action": "deny",
+      "policy.boundaries.tool_calls.max_frame_bytes": 1048576,
+      "policy.boundaries.syscalls.log_blocked": true,
+      "policy.boundaries.log_path": "/var/log/sendbox/boundary.log",
+      "github.allow_private_repository_access": false,
+      "github.branch_protection.enabled": true,
+      "observability.mcp_inspection.enabled": false,
+      "observability.mcp_inspection.max_payload_bytes": 16384
+    }
+  },
+  "errors": [
+    {"case": "unknown_field", "code": "invalid_yaml", "exit": 2},
+    {"case": "relative_project_path", "code": "invalid_path", "exit": 2},
+    {"case": "zero_resource", "code": "invalid_value", "exit": 2},
+    {"case": "hyperlight_with_boundaries", "code": "incompatible_configuration", "exit": 2},
+    {"case": "branch_protection_without_boundaries", "code": "incompatible_configuration", "exit": 2}
+  ]
+}
+

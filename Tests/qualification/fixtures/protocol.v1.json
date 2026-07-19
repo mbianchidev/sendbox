@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "wire_version": 1,
+  "contracts": [
+    "canonical CBOR only",
+    "bounded frames before allocation",
+    "HMAC authenticated post-handshake frames",
+    "session and direction binding",
+    "strict sequence numbers",
+    "explicit cancellation and graceful close",
+    "unsupported versions and capabilities fail closed"
+  ],
+  "sample": "test-fixtures/protocol/v1-authenticated-session.json"
+}
+

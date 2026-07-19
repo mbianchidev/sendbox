@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "formats": [
+    {"id": "sandbox-config-yaml", "current_version": 1, "reader_required": true, "writer_required": true},
+    {"id": "protocol-cbor", "current_version": 1, "reader_required": true, "writer_required": true},
+    {"id": "audit-export-json", "current_version": "unversioned_swift", "migration": "required_before_phase_9"},
+    {"id": "snapshot-manifest-json", "current_version": "unversioned_swift", "migration": "required_before_phase_9"},
+    {"id": "provenance-signature-json", "current_version": "unversioned_swift", "migration": "required_before_phase_9"},
+    {"id": "supervisor-grant-json", "current_version": "unversioned_swift", "migration": "required_before_phase_9"}
+  ],
+  "swift_samples": "observation_only_until_versioned_fixtures_are_captured"
+}
+
