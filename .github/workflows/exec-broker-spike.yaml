@@ -1,0 +1,149 @@
+name: Exec broker spike
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "spikes/exec-broker/**"
+      - "docs/exec-broker-phase-1.md"
+      - ".github/workflows/exec-broker-spike.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "spikes/exec-broker/**"
+      - "docs/exec-broker-phase-1.md"
+      - ".github/workflows/exec-broker-spike.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: exec-broker-spike-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: spikes/exec-broker
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 live qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    container:
+      image: ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned toolchain and system dependencies
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            build-essential ca-certificates curl git libseccomp-dev pkg-config
+          useradd --create-home --uid 42424 execprobe
+          chown -R execprobe:execprobe "$GITHUB_WORKSPACE"
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            sh -c 'curl --proto "=https" --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.93.1'
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            rustup component add clippy rustfmt
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Check formatting
+        run: |
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: |
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run unprivileged live tests
+        run: |
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            cargo test --all-targets --all-features -- --test-threads=1 --nocapture
+
+      - name: Audit dependencies
+        run: |
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            cargo audit --file Cargo.lock
+
+      - name: Build release binaries
+        run: |
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            cargo build --release --all-targets
+
+  linux-arm64:
+    name: Linux arm64 live and compile qualification
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    container:
+      image: ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned toolchain and system dependencies
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            build-essential ca-certificates curl git libseccomp-dev pkg-config
+          useradd --create-home --uid 42424 execprobe
+          chown -R execprobe:execprobe "$GITHUB_WORKSPACE"
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            sh -c 'curl --proto "=https" --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.93.1'
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            rustup component add clippy
+
+      - name: Compile with warnings denied
+        run: |
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run native arm64 live tests
+        run: |
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            cargo test --all-targets --all-features -- --test-threads=1 --nocapture
+
+      - name: Build arm64 release binaries
+        run: |
+          runuser -u execprobe -- env HOME=/home/execprobe \
+            PATH=/home/execprobe/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            cargo build --release --all-targets
+
+  self-hosted-second-uid:
+    name: Self-hosted second-UID socket gate
+    if: vars.EXEC_BROKER_SELF_HOSTED_RUNNER == 'enabled'
+    runs-on: [self-hosted, linux, x64, exec-broker-security]
+    timeout-minutes: 30
+    container:
+      image: ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned toolchain and system dependencies
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            build-essential ca-certificates curl git libseccomp-dev pkg-config
+          curl --proto "=https" --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain 1.93.1
+
+      - name: Run root-only second-UID live gate
+        env:
+          EXEC_BROKER_LIVE_SELF_HOSTED_SECOND_UID: "1"
+          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: |
+          cargo test --test raw_frame_boundary \
+            unauthorized_peer_uid_is_dropped_before_handle_connection \
+            -- --ignored --exact --nocapture

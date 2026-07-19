@@ -1,0 +1,74 @@
+[package]
+name = "exec-broker-spike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93.1"
+publish = false
+license = "MIT"
+
+[workspace]
+
+[[bin]]
+name = "exec-broker-agent"
+path = "src/bin/agent.rs"
+
+[[bin]]
+name = "exec-broker"
+path = "src/bin/broker.rs"
+
+[[bin]]
+name = "exec-broker-launcher"
+path = "src/bin/contained_launcher.rs"
+
+[[bin]]
+name = "exec-broker-supervisor"
+path = "src/bin/supervisor.rs"
+
+[[bin]]
+name = "exec-broker-test-helper"
+path = "src/bin/test_helper.rs"
+
+[dependencies]
+base64 = "0.22.1"
+clap = { version = "4.6.2", features = ["derive"] }
+getrandom = { version = "0.3.4", features = ["std"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tokio = { version = "1.53.0", features = [
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7.18", features = ["codec"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = "0.5.6"
+libc = "0.2.186"
+libseccomp = "0.4.0"
+nix = { version = "0.31.3", features = [
+    "fs",
+    "process",
+    "resource",
+    "signal",
+    "socket",
+    "user",
+] }
+rlimit = "0.10.2"
+
+[dev-dependencies]
+tempfile = "3.26.0"
+
+[lints.rust]
+# Crate-wide default: unsafe is denied. The single narrow exception is the
+# Linux platform adapter (src/platform/linux/adapter.rs), which carries an
+# explicit `#![allow(unsafe_code)]` and documents every unsafe block's
+# invariants. `deny` (rather than `forbid`) is required here specifically so
+# that a narrower `#[allow(unsafe_code)]` can lift the restriction for that
+# one module; `forbid` cannot be overridden anywhere in the crate.
+unsafe_code = "deny"
