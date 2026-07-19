@@ -82,9 +82,7 @@ jobs:
             echo "reason=runner denied cgroup subtree creation" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          sudo chown "$USER:$(id -gn)" \
-            "$parent" "$parent/cgroup.procs" "$parent/cgroup.subtree_control"
-          if ! printf '+pids +memory\n' > "$parent/cgroup.subtree_control"; then
+          if ! sudo sh -c "printf '+pids +memory\n' > '$parent/cgroup.subtree_control'"; then
             sudo rmdir "$parent" || true
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "reason=runner did not delegate pids and memory controllers" >> "$GITHUB_OUTPUT"
@@ -106,8 +104,11 @@ jobs:
               -name 'linux_live-*' | sort | head -1
           )"
           test -n "$test_binary"
+          installed_test="/tmp/sendbox-linux-live-${{ matrix.arch }}"
+          sudo install -m 0755 "$test_binary" "$installed_test"
           sudo env SENDBOX_CGROUP_PARENT="$SENDBOX_CGROUP_PARENT" \
-            "$test_binary" --test-threads=1 --nocapture
+            "$installed_test" --test-threads=1 --nocapture
+          sudo rm -f "$installed_test"
 
       - name: Record unavailable cgroup live gate
         if: steps.cgroup.outputs.available != 'true'
@@ -127,9 +128,12 @@ jobs:
               -name 'linux_live-*' | head -1
           )"
           test -n "$test_binary"
-          sudo "$test_binary" \
+          installed_test="/tmp/sendbox-linux-live-${{ matrix.arch }}"
+          sudo install -m 0755 "$test_binary" "$installed_test"
+          sudo "$installed_test" \
             --exact unauthorized_second_uid_peer_is_rejected_when_available \
             --nocapture
+          sudo rm -f "$installed_test"
 
       - name: Build release
         run: cargo build --workspace --release
