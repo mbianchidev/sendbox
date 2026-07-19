@@ -103,15 +103,11 @@ impl RuntimeDirectory {
         validate_directory(&self.path, self.expected_uid, RUNTIME_MODE)?;
         let credentials_path = self.credentials_path();
         session.write_credentials(&credentials_path)?;
-        let credentials_identity = path_identity(&credentials_path)?;
+        let credentials_identity = artifact_identity(&credentials_path)?;
         match self.bind() {
             Ok(listener) => Ok(listener),
             Err(error) => {
-                rollback_owned_artifact(
-                    &credentials_path,
-                    credentials_identity,
-                    ArtifactKind::RegularFile,
-                );
+                rollback_owned_artifact(&credentials_path, credentials_identity);
                 Err(error)
             }
         }
@@ -154,8 +150,8 @@ impl RuntimeDirectory {
             Ok(())
         })();
         if let Err(error) = setup {
+            rollback_owned_socket(&path, identity);
             drop(listener);
-            rollback_owned_artifact(&path, identity, ArtifactKind::Socket);
             return Err(error);
         }
         Ok(AuthenticatedUnixListener {
@@ -287,9 +283,11 @@ struct PathIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArtifactKind {
-    RegularFile,
-    Socket,
+struct ArtifactIdentity {
+    path: PathIdentity,
+    size: u64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 fn path_identity(path: &Path) -> Result<PathIdentity, RuntimeError> {
@@ -304,20 +302,54 @@ fn path_identity(path: &Path) -> Result<PathIdentity, RuntimeError> {
     })
 }
 
-fn rollback_owned_artifact(path: &Path, expected: PathIdentity, kind: ArtifactKind) {
+fn artifact_identity(path: &Path) -> Result<ArtifactIdentity, RuntimeError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| RuntimeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(ArtifactIdentity {
+        path: PathIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+        },
+        size: metadata.size(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+fn rollback_owned_artifact(path: &Path, expected: ArtifactIdentity) {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
     };
-    let type_matches = match kind {
-        ArtifactKind::RegularFile => metadata.is_file() && !metadata.file_type().is_symlink(),
-        ArtifactKind::Socket => metadata.file_type().is_socket(),
-    };
-    let identity = PathIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        uid: metadata.uid(),
+    let type_matches = metadata.is_file() && !metadata.file_type().is_symlink();
+    let identity = ArtifactIdentity {
+        path: PathIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+        },
+        size: metadata.size(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
     };
     if type_matches && identity == expected {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn rollback_owned_socket(path: &Path, expected: PathIdentity) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_socket()
+        && (PathIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+        }) == expected
+    {
         let _ = fs::remove_file(path);
     }
 }
@@ -397,10 +429,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("artifact");
         fs::write(&path, b"original").expect("write original");
-        let identity = path_identity(&path).expect("identity");
+        let identity = artifact_identity(&path).expect("identity");
         fs::remove_file(&path).expect("remove original");
         fs::write(&path, b"replacement").expect("write replacement");
-        rollback_owned_artifact(&path, identity, ArtifactKind::RegularFile);
+        rollback_owned_artifact(&path, identity);
         assert_eq!(
             fs::read(&path).expect("replacement remains"),
             b"replacement"

@@ -175,7 +175,6 @@ impl BrokerSession {
             .map_err(|source| SessionError::Io(path.to_path_buf(), source))
             .and_then(|()| validate_credentials_metadata(path, metadata.uid()));
         if result.is_err() {
-            drop(file);
             rollback_regular_file(path, identity);
         }
         result
