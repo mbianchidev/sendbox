@@ -1,0 +1,22 @@
+[package]
+name = "sendbox-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sendbox-protocol = { path = "../sendbox-protocol" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.1", default-features = false, features = ["process", "signal"] }
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

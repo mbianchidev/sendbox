@@ -1,0 +1,99 @@
+{
+  "node-ts": {
+    "language": "typescript",
+    "framework": "Next.js",
+    "packageManager": "npm",
+    "buildSystem": "tsc",
+    "runtimeVersion": ">=22",
+    "dependencies": ["next", "react"],
+    "devDependencies": ["typescript"],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/typescript-node:1-22-bookworm"
+  },
+  "python": {
+    "language": "python",
+    "framework": "FastAPI",
+    "packageManager": "pip",
+    "runtimeVersion": ">=3.12",
+    "dependencies": ["fastapi", "httpx", "pydantic", "uvicorn"],
+    "devDependencies": ["pytest"],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm"
+  },
+  "rust": {
+    "language": "rust",
+    "packageManager": "cargo",
+    "buildSystem": "cargo",
+    "runtimeVersion": "1.93",
+    "dependencies": ["serde", "tokio"],
+    "devDependencies": ["proptest"],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/rust:1-bookworm"
+  },
+  "go": {
+    "language": "go",
+    "packageManager": "go",
+    "runtimeVersion": "1.24",
+    "dependencies": ["github.com/gin-gonic/gin", "golang.org/x/sync"],
+    "devDependencies": [],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/go:1-1.22-bookworm"
+  },
+  "java": {
+    "language": "java",
+    "packageManager": "maven",
+    "buildSystem": "maven",
+    "runtimeVersion": "21",
+    "dependencies": ["org.springframework.boot:spring-boot-starter-web"],
+    "devDependencies": ["org.junit.jupiter:junit-jupiter"],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/java:1-21-bookworm"
+  },
+  "ruby": {
+    "language": "ruby",
+    "framework": "Rails",
+    "packageManager": "bundle",
+    "dependencies": ["pg", "rails"],
+    "devDependencies": [],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/ruby:1-3.3-bookworm"
+  },
+  "swift": {
+    "language": "swift",
+    "packageManager": "swift",
+    "dependencies": [],
+    "devDependencies": [],
+    "suggestedImage": "swift:5.10"
+  },
+  "polyglot": {
+    "language": "typescript",
+    "framework": "Express",
+    "packageManager": "npm",
+    "buildSystem": "cargo",
+    "dependencies": ["express"],
+    "devDependencies": [],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/typescript-node:1-22-bookworm"
+  },
+  "unknown": {
+    "language": "unknown",
+    "dependencies": [],
+    "devDependencies": [],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/base:bookworm"
+  },
+  "php": {
+    "language": "php",
+    "packageManager": "composer",
+    "dependencies": ["laravel/framework"],
+    "devDependencies": ["phpunit/phpunit"],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/php:1-8.3-bookworm"
+  },
+  "elixir": {
+    "language": "elixir",
+    "packageManager": "mix",
+    "dependencies": ["jason", "phoenix"],
+    "devDependencies": [],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/base:bookworm"
+  },
+  "csharp": {
+    "language": "csharp",
+    "packageManager": "dotnet",
+    "runtimeVersion": "net10.0",
+    "dependencies": ["Microsoft.Extensions.Hosting"],
+    "devDependencies": [],
+    "suggestedImage": "mcr.microsoft.com/devcontainers/dotnet:1-8.0-bookworm"
+  }
+}
