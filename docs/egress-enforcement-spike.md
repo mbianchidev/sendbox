@@ -11,16 +11,12 @@ namespaces + nftables + UID separation); it makes no claim about Kata, Apple
 `container`, Hyperlight, or any other SendBox provider's production
 integration.
 
-**Verification status: the kernel-level enforcement claims in this document
-are unverified pending CI.** Everything about the typed policy engine, the
-DNS broker's decode/validate/authorize logic, the CONNECT protocol, and the
-nftables ruleset *generation* is proven now by a portable unit/integration
-test suite that has actually run (see "Verified in this session" below).
-Whether the generated ruleset + network namespace + UID separation actually
-enforce the intended boundary on a real Linux kernel is a separate claim
-that requires root and a Linux host, is exercised by `tests/live_netns.rs`,
-and has not yet executed to completion anywhere — see "Live test result"
-for the exact current status and what will update it.
+**Verification status: the kernel-level mechanism passed the privileged
+Ubuntu 24.04 CI suite.** The portable suite proves the typed policy, DNS,
+CONNECT, authorization, and deterministic nftables-generation behavior. The
+root CI suite separately proved the generated rules in a real Linux network
+namespace; see "Live test result" for the exact runner capabilities and
+adversarial result.
 
 Safe Rust only: the crate sets `#![forbid(unsafe_code)]` and
 `unsafe_code = "forbid"`/`clippy::all = "deny"` lints. No C, BPF, seccomp, TLS
@@ -337,13 +333,10 @@ The atomic apply/cleanup strategy above depends on `nft destroy table`
 being supported. Ubuntu 24.04 ("noble") ships `nftables` **1.0.9** (package
 `nftables_1.0.9-1build1`, per `packages.ubuntu.com`/`ubuntuupdates.org`),
 and `destroy` as an idempotent-delete variant for tables/chains/rules/sets
-has been present since early in the 1.0.x series (and by some accounts
-earlier still) — well before 1.0.9. This spike does not re-derive that
-history independently at runtime; if a future CI run on `ubuntu-24.04`
-ever showed `nft -f` rejecting a `destroy` statement, that would be a
-concrete, actionable signal to fall back to an existence-check-then-
-`delete`-or-`add` strategy instead, but there is no version-compatibility
-evidence today suggesting that fallback is needed on the pinned CI image.
+has been present since early in the 1.0.x series. The live CI run used
+`nftables v1.0.9` and successfully applied, re-applied, inspected, and
+removed the spike-owned table, directly confirming compatibility on the
+pinned runner.
 
 ### Cloud metadata addresses (`src/address.rs`)
 
@@ -452,28 +445,24 @@ conflated:
   destroy-then-redefine strategy is structurally proof against stale rules
   surviving a reapply.
 
-**Unverified pending CI** — the claim that network namespaces + the atomic
-nftables transaction + UID separation actually enforce "agent reaches only
-the two broker ports, agent cannot bypass via direct IP/alternate
-DNS/UDP/metadata, the broker itself is kernel-blocked from metadata, and
-this all survives broker death/restart and cleans up after an injected
-failure" as a kernel-level default-deny boundary. This requires a real
-Linux kernel, root, `ip`/`nft`/`setpriv`, and is exercised by
-`tests/live_netns.rs` (`live_netns_enforcement_proof` and
-`live_netns_injected_failure_cleanup`). Neither test has completed on
-Linux as of this writing (see "Live test result" below); both correctly
-self-skip on this spike's macOS development host rather than claiming
-proof they did not perform.
+**Proven on the pinned Ubuntu CI runner** — network namespaces + the atomic
+nftables transaction + UID separation enforced "agent reaches only the two
+broker ports." The live suite proved brokered IPv4 and IPv6 success; direct
+allowed-address and arbitrary-address IPv4/IPv6 denial; alternate TCP/UDP
+DNS denial; general UDP denial with reachable positive controls; agent and
+broker metadata denial; empty agent capability sets; firewall persistence
+after gateway death; brokered recovery after restart; and namespace,
+process, nftables, veth, socket, and temporary-resource cleanup after both
+normal completion and an injected panic.
 
-ADR-004 should therefore treat the **mechanism design** as ready for
-evaluation, and the **mechanism's actual enforcement behavior on a real
-Linux kernel** as pending the first CI run of the `live-netns-suite` job,
-while carrying forward two unresolved items into any production design:
-(1) the UID-vs-cgroup/socket-mark strength question above, and (2) DNS
-exfiltration residual risk (see below). This spike does not attempt to
-prove — and does not claim — anything about Kata, Apple `container`,
-Hyperlight, or gVisor integration; those remain separate, unproven
-questions.
+ADR-004 can therefore accept the **Linux namespace/nftables mechanism** as
+proven for this isolated topology. Production design must still replace or
+strengthen UID identity with dedicated cgroup v2/socket-mark enforcement,
+address DNS query-name exfiltration, and qualify the same controls inside
+Kata and Apple guests. Hyperlight and gVisor integration also remain
+unproven. Raw-socket creation was not attempted directly; the suite instead
+proved all agent capability sets, including the `CAP_NET_RAW` bounding set,
+were empty.
 
 ## DNS exfiltration: explicit residual risk
 
@@ -580,30 +569,21 @@ veth pairs, and to apply/remove the nftables table.
   (`SKIP (documented limitation): ... current host OS is 'macos'`) rather
   than silently passing or claiming proof they did not perform. All portable
   unit/property/integration tests were run directly on this host and pass;
-  see the "Verified in this session" table below. **The netns/nftables/UID
-  kernel-enforcement claims in this document are therefore unverified
-  pending the first CI run** — they are design/implementation claims backed
-  by code review and the portable test suite, not yet by an actual Linux
-  kernel execution.
-- **CI (`ubuntu-24.04`, hosted GitHub Actions runner)**: the
-  `.github/workflows/egress-enforcement-spike.yaml` workflow's
-  `live-netns-suite` job probes capabilities **under `sudo`** (the same
-  privilege context the live suite itself runs under, so the published
-  verdict cannot under-report readiness the way an unprivileged probe
-  would), publishes that verdict as a build artifact, explicitly gates on
-  it (failing the job with the verdict quoted in the log if any capability
-  is missing, rather than silently proceeding or skipping), and then runs
-  both live tests under `sudo` with `SENDBOX_EGRESS_LIVE_REQUIRE=1` as a
-  second, defense-in-depth hard-fail path. **This document will be updated
-  with the actual recorded CI run result (pass/fail and the published
-  capability verdict) once that workflow has executed** — it has not yet
-  run as of this revision, since live execution requires the workflow to
-  run in GitHub Actions, which this authoring session could not do from a
-  local macOS host. Until that update lands, treat every claim in this
-  document about actual kernel-level enforcement (as opposed to the typed
-  policy engine, DNS broker, CONNECT protocol, and nft-generation
-  properties proven by the portable test suite) as **unverified pending
-  CI**.
+  see the "Verified in this session" table below. The local skip is not the
+  proof result; the separate privileged Ubuntu CI execution below is.
+- **CI (`ubuntu-24.04`, hosted GitHub Actions runner)**: **passed** in
+  workflow run `29672453900`, job `88154015071`. The root capability verdict
+  was `is_linux=true`, `is_root=true`, `iproute2=6.1.0`,
+  `nftables=1.0.9`, and `setpriv=util-linux 2.39.3`; all required tools were
+  available. `live_netns_enforcement_proof` and
+  `live_netns_injected_failure_cleanup` both passed in 7.10 seconds with
+  `SENDBOX_EGRESS_LIVE_REQUIRE=1`, so no capability skip was possible. The
+  first test exercised the IPv4/IPv6 allow and bypass-deny matrix,
+  alternate DNS, UDP, metadata, capability clearing, gateway crash,
+  fail-closed ruleset persistence, and restart. The second intentionally
+  panicked mid-run and then verified the gateway process and unique
+  namespace were removed. The published capability artifact is
+  `egress-enforcement-live-capability-verdict` from that run.
 
 ## Verified in this session (macOS host, no Linux/root available)
 
@@ -619,4 +599,4 @@ veth pairs, and to apply/remove the nftables table.
 | Manual `egress-gateway` + `dig` + `connect-attempt` end-to-end | Real DNS decode/encode/validate/authorize and CONNECT allow/deny/mismatch, and shared-authorization reuse across the two listeners, proven live — see "Runnable local behavior" above |
 | Manual `netns-harness caps-probe`/`probe` | Correctly report `"unavailable"`/all-capabilities-false on macOS (no `/proc/self/status`, no `ip`/`nft`/`setpriv`) rather than panicking or fabricating a result |
 | `gateway_probe_helpers_detect_a_real_running_broker_pair` / `..._report_not_ready_with_nothing_listening` (`src/bin/netns_harness.rs`) | Directly exercise the `gateway-probe` DNS (UDP+TCP) and CONNECT readiness checks against a real running broker pair and against nothing listening, without needing a namespace |
-| `tests/live_netns.rs` (both tests: the netns/nftables/UID proof and the injected-failure cleanup proof) | Correctly self-skip on macOS with an explicit reason; **not executed end-to-end** — Linux + root required, pending first CI run |
+| `tests/live_netns.rs` (both tests: the netns/nftables/UID proof and the injected-failure cleanup proof) | Correctly self-skip locally on macOS; both passed under root on Ubuntu 24.04 in CI run `29672453900` |
