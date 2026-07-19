@@ -83,8 +83,14 @@ The parallel Rust foundation builds an experimental `sendbox-rs` binary. In this
 phase it only parses and validates configuration and policy; all sandbox runtime
 execution remains on the production Swift `sendbox` binary.
 
+The workspace also contains the pre-1.0 `sendbox-protocol` foundation for
+bounded, authenticated host/guest communication. It is transport-neutral and
+does not start VMs or select runtime-specific socket mappings. See
+[docs/architecture/authenticated-guest-protocol.md](docs/architecture/authenticated-guest-protocol.md).
+
 ```bash
 make rust-build
+make rust-test
 ./target/debug/sendbox-rs --version
 ./target/debug/sendbox-rs policy validate --config config/example-sandbox.yaml
 ./target/debug/sendbox-rs policy validate --config config/example-sandbox.yaml --json

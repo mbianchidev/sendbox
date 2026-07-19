@@ -4,6 +4,7 @@ members = [
     "crates/sendbox-config",
     "crates/sendbox-core",
     "crates/sendbox-policy",
+    "crates/sendbox-protocol",
 ]
 resolver = "3"
 
@@ -16,10 +17,19 @@ repository = "https://github.com/mbianchidev/sendbox"
 
 [workspace.dependencies]
 clap = { version = "4.6.2", features = ["derive"] }
+getrandom = "0.4.3"
+hkdf = "0.13.0"
+hmac = { version = "0.13.0", features = ["zeroize"] }
+minicbor = { version = "2.2.2", features = ["std"] }
+proptest = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml_ng = "0.10.0"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
 thiserror = "2.0.18"
+tokio = { version = "1.53.0", features = ["io-util"] }
+zeroize = "1.9.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
