@@ -1,0 +1,135 @@
+name: Production exec broker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/sendbox-core/**"
+      - "crates/sendbox-policy/**"
+      - "crates/sendbox-protocol/**"
+      - "crates/sendbox-exec/**"
+      - "docs/architecture/execution-broker.md"
+      - "docs/security-model.md"
+      - ".github/workflows/exec-broker.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/sendbox-core/**"
+      - "crates/sendbox-policy/**"
+      - "crates/sendbox-protocol/**"
+      - "crates/sendbox-exec/**"
+      - "docs/architecture/execution-broker.md"
+      - "docs/security-model.md"
+      - ".github/workflows/exec-broker.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: exec-broker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }} live qualification
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libseccomp-dev pkg-config
+
+      - name: Rust version
+        run: rustc --version --verbose
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run portable workspace tests
+        run: cargo test --workspace --all-features -- --test-threads=1
+
+      - name: Prepare delegated cgroup v2 parent
+        id: cgroup
+        shell: bash
+        run: |
+          set -euo pipefail
+          parent="/sys/fs/cgroup/sendbox-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "reason=unified cgroup v2 is unavailable" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! sudo mkdir "$parent"; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "reason=runner denied cgroup subtree creation" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sudo chown "$USER:$(id -gn)" \
+            "$parent" "$parent/cgroup.procs" "$parent/cgroup.subtree_control"
+          if ! printf '+pids +memory\n' > "$parent/cgroup.subtree_control"; then
+            sudo rmdir "$parent" || true
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "reason=runner did not delegate pids and memory controllers" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "parent=$parent" >> "$GITHUB_OUTPUT"
+
+      - name: Run production Linux live tests
+        if: steps.cgroup.outputs.available == 'true'
+        env:
+          SENDBOX_CGROUP_PARENT: ${{ steps.cgroup.outputs.parent }}
+        run: cargo test -p sendbox-exec --test linux_live -- --test-threads=1 --nocapture
+
+      - name: Record unavailable cgroup live gate
+        if: steps.cgroup.outputs.available != 'true'
+        run: |
+          echo "::warning title=Exec broker cgroup qualification skipped::${{ steps.cgroup.outputs.reason }}"
+          cargo test -p sendbox-exec --test linux_live \
+            cgroup_v2_gate_reports_the_exact_unavailable_primitive \
+            -- --exact --nocapture
+
+      - name: Run conclusive second-UID socket gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary="$(
+            find target/debug/deps -maxdepth 1 -type f -perm -111 \
+              -name 'linux_live-*' | head -1
+          )"
+          test -n "$test_binary"
+          sudo "$test_binary" \
+            --exact unauthorized_second_uid_peer_is_rejected_when_available \
+            --nocapture
+
+      - name: Build release
+        run: cargo build --workspace --release
+
+      - name: Audit dependencies
+        if: matrix.arch == 'x86_64'
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit
+
+      - name: Remove delegated cgroup parent
+        if: always() && steps.cgroup.outputs.available == 'true'
+        run: sudo rmdir "${{ steps.cgroup.outputs.parent }}"
+
