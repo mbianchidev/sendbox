@@ -5,6 +5,7 @@ members = [
     "crates/sendbox-core",
     "crates/sendbox-policy",
     "crates/sendbox-protocol",
+    "crates/sendbox-secrets",
 ]
 resolver = "3"
 
@@ -17,7 +18,9 @@ repository = "https://github.com/mbianchidev/sendbox"
 
 [workspace.dependencies]
 clap = { version = "4.6.2", features = ["derive"] }
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 getrandom = "0.4.3"
+http = "1.4.0"
 hkdf = "0.13.0"
 hmac = { version = "0.13.0", features = ["zeroize"] }
 minicbor = { version = "2.2.2", features = ["std"] }
@@ -29,6 +32,8 @@ sha2 = "0.11.0"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.53.0", features = ["io-util"] }
+unicode-normalization = "0.1.25"
+url = "2.5.8"
 zeroize = "1.9.0"
 
 [workspace.lints.rust]
