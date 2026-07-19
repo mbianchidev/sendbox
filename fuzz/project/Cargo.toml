@@ -1,0 +1,30 @@
+[package]
+name = "sendbox-project-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+sendbox-project = { path = "../../crates/sendbox-project" }
+tempfile = "3.27.0"
+
+[[bin]]
+name = "jsonc"
+path = "fuzz_targets/jsonc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "project_analysis"
+path = "fuzz_targets/project_analysis.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
