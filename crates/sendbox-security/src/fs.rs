@@ -93,7 +93,7 @@ mod platform {
             Ok(Self {
                 fd,
                 expected_owner,
-                device: u64::try_from(stat.st_dev).unwrap_or(0),
+                device: normalize_u64(stat.st_dev),
             })
         }
 
@@ -482,9 +482,9 @@ mod platform {
         };
         EntryMetadata {
             entry_type,
-            mode: u32::from(Mode::from_raw_mode(stat.st_mode).bits()),
+            mode: normalize_u32(Mode::from_raw_mode(stat.st_mode).bits()),
             owner: stat.st_uid,
-            device: u64::try_from(stat.st_dev).unwrap_or(0),
+            device: normalize_u64(stat.st_dev),
             inode: stat.st_ino,
             size: u64::try_from(stat.st_size).unwrap_or(0),
             allocated_bytes: u64::try_from(stat.st_blocks)
@@ -492,7 +492,7 @@ mod platform {
                 .saturating_mul(512),
             modified_unix_seconds: stat.st_mtime,
             modified_nanoseconds: normalize_nanoseconds(stat.st_mtime_nsec),
-            hardlink_count: u64::from(stat.st_nlink),
+            hardlink_count: normalize_u64(stat.st_nlink),
         }
     }
 
@@ -501,6 +501,14 @@ mod platform {
     }
 
     fn normalize_nanoseconds<T: TryInto<i64>>(value: T) -> i64 {
+        value.try_into().unwrap_or_default()
+    }
+
+    fn normalize_u32<T: TryInto<u32>>(value: T) -> u32 {
+        value.try_into().unwrap_or_default()
+    }
+
+    fn normalize_u64<T: TryInto<u64>>(value: T) -> u64 {
         value.try_into().unwrap_or_default()
     }
 
