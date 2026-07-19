@@ -95,9 +95,19 @@ jobs:
 
       - name: Run production Linux live tests
         if: steps.cgroup.outputs.available == 'true'
+        shell: bash
         env:
           SENDBOX_CGROUP_PARENT: ${{ steps.cgroup.outputs.parent }}
-        run: cargo test -p sendbox-exec --test linux_live -- --test-threads=1 --nocapture
+        run: |
+          set -euo pipefail
+          cargo test -p sendbox-exec --test linux_live --no-run
+          test_binary="$(
+            find target/debug/deps -maxdepth 1 -type f -perm -111 \
+              -name 'linux_live-*' | sort | head -1
+          )"
+          test -n "$test_binary"
+          sudo env SENDBOX_CGROUP_PARENT="$SENDBOX_CGROUP_PARENT" \
+            "$test_binary" --test-threads=1 --nocapture
 
       - name: Record unavailable cgroup live gate
         if: steps.cgroup.outputs.available != 'true'
@@ -108,6 +118,7 @@ jobs:
             -- --exact --nocapture
 
       - name: Run conclusive second-UID socket gate
+        if: steps.cgroup.outputs.available != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -132,4 +143,3 @@ jobs:
       - name: Remove delegated cgroup parent
         if: always() && steps.cgroup.outputs.available == 'true'
         run: sudo rmdir "${{ steps.cgroup.outputs.parent }}"
-
