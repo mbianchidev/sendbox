@@ -3,6 +3,7 @@ members = [
     "crates/sendbox-cli",
     "crates/sendbox-config",
     "crates/sendbox-core",
+    "crates/sendbox-egress",
     "crates/sendbox-policy",
     "crates/sendbox-protocol",
 ]
@@ -16,19 +17,26 @@ license = "Apache-2.0"
 repository = "https://github.com/mbianchidev/sendbox"
 
 [workspace.dependencies]
+async-trait = "0.1.89"
+cap-std = "4.0.2"
 clap = { version = "4.6.2", features = ["derive"] }
 getrandom = "0.4.3"
+hickory-proto = "0.26.1"
 hkdf = "0.13.0"
 hmac = { version = "0.13.0", features = ["zeroize"] }
+ipnet = "2.11.0"
+libc = "0.2.177"
 minicbor = { version = "2.2.2", features = ["std"] }
 proptest = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml_ng = "0.10.0"
 sha2 = "0.11.0"
+socket2 = { version = "0.6.5", features = ["all"] }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.53.0", features = ["io-util"] }
+tokio-util = { version = "0.7.16", features = ["rt"] }
 zeroize = "1.9.0"
 
 [workspace.lints.rust]
