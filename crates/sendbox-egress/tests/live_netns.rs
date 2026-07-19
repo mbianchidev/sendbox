@@ -471,14 +471,11 @@ fn run_live_suite(env: &mut LiveEnvironment) {
     });
     let armed = ArmedEgress::arm_under(&env.cgroup_root, runner, config)
         .expect("arming egress must succeed with a ready environment");
-    let agent_procs = env
-        .cgroup_root
-        .join(armed.agent_identity().relative_path())
-        .join("cgroup.procs");
-    let broker_procs = env
-        .cgroup_root
-        .join(armed.broker_identity().relative_path())
-        .join("cgroup.procs");
+    // Use the supervisor's mount-relative `cgroup.procs` accessors, never the
+    // global nft identity path (which carries the process's own cgroup prefix
+    // and would not resolve when joined onto the mounted root).
+    let agent_procs = armed.agent_procs_path();
+    let broker_procs = armed.broker_procs_path();
     env.armed = Some(armed);
 
     let allowed_v4 = SocketAddr::new(IpAddr::V4(env.topo.host_v4), allowed_v4_port);
@@ -661,10 +658,17 @@ fn run_live_suite(env: &mut LiveEnvironment) {
     // survives intact. Explicit disruption then rollback restores enforcement.
     // (`table`, captured in scenario 10, is the last-known-good ruleset.)
     std::fs::create_dir_all(&env.candidate_dir).expect("create candidate cgroup");
-    let candidate_rel = format!("sendbox/{}/candidate", env.topo.instance_id);
     env.remove_candidate.store(true, Ordering::SeqCst);
     let mut bad = env.armed.as_ref().unwrap().current_config().clone();
-    bad.agent = CgroupIdentity::new(candidate_rel).expect("candidate identity");
+    // The candidate's nft identity must carry the same global cgroup prefix as
+    // the agent (a sibling leaf under the instance base), so `--check` resolves
+    // it before the runner deletes it ahead of the real commit.
+    let agent_global = bad.agent.relative_path().to_owned();
+    let candidate_global = agent_global
+        .rsplit_once('/')
+        .map(|(base, _)| format!("{base}/candidate"))
+        .expect("agent identity has a parent");
+    bad.agent = CgroupIdentity::new(candidate_global).expect("candidate identity");
     let update_res = env.armed.as_mut().unwrap().update(bad);
     assert!(
         update_res.is_err(),

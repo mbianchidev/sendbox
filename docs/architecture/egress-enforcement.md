@@ -124,6 +124,24 @@ the opened root (Linux `openat2`/`RESOLVE_BENEATH`), so a symlink planted under
 the root can never redirect an operation outside it; a regression test proves an
 escaping symlink is refused.
 
+### Local mount path vs. global nft identity
+
+Filesystem operations use the **mount-relative** path (`sendbox/<instance>/…`),
+but `nft socket cgroupv2 level N "path"` resolves its path against the **global**
+cgroup hierarchy. When the supervisor is itself inside a non-root cgroup — a
+hosted CI runner (`/actions_job/<id>`) or a container (`/docker/<id>`) — a cgroup
+created under the mount is globally `<current-cgroup>/sendbox/…`, so an nft rule
+that omitted the current prefix would fail to resolve (`cgroupv2 path fails: No
+such file or directory`). The crate therefore reads the process's own unified
+cgroup path from `/proc/self/cgroup` (`own_cgroup_prefix`), prepends it to build
+the nft `CgroupIdentity` (path **and** `level`), and keeps every filesystem
+operation mount-relative. `CgroupHierarchy` stores the two path families
+separately and exposes `agent_procs_path()`/`broker_procs_path()` (always
+mount-relative) for a self-placing helper. At the true cgroup root the prefix is
+empty and the two coincide. The preflight probe references the *same* prefixed
+path, so a passing preflight now guarantees the real rules resolve, and the
+verdict includes `own_cgroup_path` for diagnostics.
+
 ## Safe setup ordering (never fail open)
 
 `ArmedEgress::arm` performs, in order:

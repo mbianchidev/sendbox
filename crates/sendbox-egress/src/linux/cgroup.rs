@@ -13,6 +13,18 @@
 //! (Linux `openat2`/`RESOLVE_BENEATH`), so a symlink planted under the root can
 //! never redirect a hierarchy operation outside it.
 //!
+//! **Local mount path vs. global nft identity.** Filesystem operations are done
+//! *relative to the mounted cgroup v2 root* (e.g. `sendbox/<instance>/agent`).
+//! But `nft socket cgroupv2 level N "path"` resolves its path against the
+//! **global** cgroup hierarchy, so when the supervisor process is itself already
+//! inside a non-root cgroup (`/actions_job/<id>` on a hosted CI runner,
+//! `/docker/<id>` in a container), a cgroup created under the mount is globally
+//! `<current-cgroup>/sendbox/...`. The crate therefore reads the process's own
+//! unified cgroup path from `/proc/self/cgroup` ([`own_cgroup_prefix`]) and
+//! prepends it to build the nft [`CgroupIdentity`] (path **and** `level`), while
+//! keeping every filesystem operation relative to the mount root. At the true
+//! cgroup root the prefix is empty and the two coincide.
+//!
 //! The broker cgroup directory is *stable across broker process restarts*: the
 //! supervisor never removes/recreates it when the broker process dies, so the
 //! cgroup id baked into the loaded nftables rules stays valid. A restarted
@@ -35,6 +47,62 @@ use crate::linux::nft::{CgroupIdentity, NftError};
 pub const DEFAULT_CGROUP2_ROOT: &str = "/sys/fs/cgroup";
 /// Top-level directory the crate owns under the cgroup v2 root.
 pub const SENDBOX_CGROUP_PREFIX: &str = "sendbox";
+
+/// Parses the process's own **unified (v2)** cgroup path from `/proc/self/cgroup`
+/// content: the value on the `0::<path>` line (controller list empty, hierarchy
+/// id 0). Returns the raw path (e.g. `/`, `/actions_job/abc`, `/docker/<id>`) or
+/// `None` when there is no unified entry. Pure, so it is unit tested without a
+/// real `/proc`.
+#[must_use]
+pub fn parse_own_cgroup_path(proc_self_cgroup: &str) -> Option<String> {
+    proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(str::to_owned)
+}
+
+/// Normalizes a raw unified cgroup path into a mount-root-relative **global
+/// prefix**: surrounding slashes trimmed, the root path (`/` or empty) mapped to
+/// the empty string. Every remaining component must be a plain, safe segment
+/// (non-empty, not `.`/`..`); an unsafe component yields `None` so the caller
+/// fails closed rather than emitting a bogus nft path. Pure.
+#[must_use]
+pub fn normalize_cgroup_prefix(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_matches('/');
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    for component in trimmed.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return None;
+        }
+    }
+    Some(trimmed.to_owned())
+}
+
+/// The process's own unified cgroup path as a normalized global prefix, read
+/// from `/proc/self/cgroup`. Empty when the process is at the true cgroup root,
+/// when `/proc` is unreadable, or when the path is unusable — in every case the
+/// nft identity falls back to the plain mount-relative path.
+#[must_use]
+pub fn own_cgroup_prefix() -> String {
+    std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|contents| parse_own_cgroup_path(&contents))
+        .and_then(|raw| normalize_cgroup_prefix(&raw))
+        .unwrap_or_default()
+}
+
+/// Joins a global cgroup `prefix` (possibly empty) with a mount-relative path,
+/// yielding the global path an `nft socket cgroupv2` rule must reference.
+#[must_use]
+fn join_global(prefix: &str, mount_relative: &str) -> String {
+    if prefix.is_empty() {
+        mount_relative.to_owned()
+    } else {
+        format!("{prefix}/{mount_relative}")
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum CgroupError {
@@ -99,12 +167,19 @@ pub fn detect_cgroup2_root() -> Result<PathBuf, CgroupError> {
 pub struct CgroupHierarchy {
     root_dir: Dir,
     root_path: PathBuf,
+    /// Mount-relative base path `sendbox/<instance>` (filesystem operations).
     base_rel: String,
+    /// Mount-relative agent leaf `sendbox/<instance>/agent` (filesystem ops).
+    agent_rel: String,
+    /// Mount-relative broker leaf `sendbox/<instance>/broker` (filesystem ops).
+    broker_rel: String,
     /// Whether this instance's base cgroup directory already existed when the
     /// hierarchy was (re)created. Used by the supervisor to avoid tearing down a
     /// live instance's cgroups on a failed re-arm.
     preexisting: bool,
+    /// Global nft identity for the agent (`<prefix>/sendbox/<instance>/agent`).
     agent: CgroupIdentity,
+    /// Global nft identity for the broker.
     broker: CgroupIdentity,
 }
 
@@ -116,11 +191,25 @@ impl CgroupHierarchy {
     }
 
     /// Creates the hierarchy under an explicit root (a real cgroup v2 mount, or
-    /// a tempdir in tests). Opens the root as a capability directory and does
-    /// every subsequent operation relative to it. Idempotent: existing
-    /// directories are reused, which keeps the broker cgroup stable across
-    /// process restarts.
+    /// a tempdir in tests), using the process's own cgroup path (read from
+    /// `/proc/self/cgroup`) as the global nft-identity prefix. Opens the root as
+    /// a capability directory and does every filesystem operation relative to
+    /// it. Idempotent: existing directories are reused, which keeps the broker
+    /// cgroup stable across process restarts.
     pub fn create_under(root: &Path, instance_id: &str) -> Result<Self, CgroupError> {
+        Self::create_under_with_prefix(root, instance_id, &own_cgroup_prefix())
+    }
+
+    /// Like [`Self::create_under`] but with an explicit global cgroup `prefix`
+    /// (the process's own cgroup path, normalized). An empty prefix means the
+    /// process is at the true cgroup root and the nft identity equals the
+    /// mount-relative path. Kept separate so the prefix logic is deterministically
+    /// testable without depending on the test process's real cgroup.
+    pub fn create_under_with_prefix(
+        root: &Path,
+        instance_id: &str,
+        prefix: &str,
+    ) -> Result<Self, CgroupError> {
         if !is_valid_instance_id(instance_id) {
             return Err(CgroupError::InvalidInstanceId(instance_id.to_owned()));
         }
@@ -131,9 +220,15 @@ impl CgroupHierarchy {
             }
         })?;
 
+        // Mount-relative paths for every filesystem operation.
         let base_rel = format!("{SENDBOX_CGROUP_PREFIX}/{instance_id}");
         let agent_rel = format!("{base_rel}/agent");
         let broker_rel = format!("{base_rel}/broker");
+
+        // Global paths (with the process's own cgroup prefix) for the nft
+        // identities; `CgroupIdentity::new` recomputes and validates the level.
+        let agent_global = join_global(prefix, &agent_rel);
+        let broker_global = join_global(prefix, &broker_rel);
 
         // Record whether this instance's base cgroup already existed *before* we
         // (idempotently) create it. A re-arm of a live instance must not tear
@@ -143,13 +238,19 @@ impl CgroupHierarchy {
         let hierarchy = Self {
             root_dir,
             root_path: root.to_path_buf(),
-            base_rel: base_rel.clone(),
+            base_rel,
+            agent_rel,
+            broker_rel,
             preexisting,
-            agent: CgroupIdentity::new(agent_rel.clone())?,
-            broker: CgroupIdentity::new(broker_rel.clone())?,
+            agent: CgroupIdentity::new(agent_global)?,
+            broker: CgroupIdentity::new(broker_global)?,
         };
 
-        for rel in [&base_rel, &agent_rel, &broker_rel] {
+        for rel in [
+            &hierarchy.base_rel,
+            &hierarchy.agent_rel,
+            &hierarchy.broker_rel,
+        ] {
             hierarchy.create_dir_relative(rel)?;
         }
         Ok(hierarchy)
@@ -189,28 +290,44 @@ impl CgroupHierarchy {
         self.preexisting
     }
 
-    /// Deterministic reporting path for the agent cgroup (root + relative
-    /// path). Reporting only; operations use the descriptor.
+    /// Deterministic reporting path for the agent cgroup directory on the local
+    /// mounted filesystem (mount root + mount-relative path). Reporting/probing
+    /// only; hierarchy operations use the descriptor.
     #[must_use]
     pub fn agent_dir(&self) -> PathBuf {
-        self.root_path.join(self.agent.relative_path())
+        self.root_path.join(&self.agent_rel)
     }
 
-    /// Deterministic reporting path for the broker cgroup.
+    /// Deterministic reporting path for the broker cgroup directory on the local
+    /// mounted filesystem.
     #[must_use]
     pub fn broker_dir(&self) -> PathBuf {
-        self.root_path.join(self.broker.relative_path())
+        self.root_path.join(&self.broker_rel)
+    }
+
+    /// Local filesystem path of the agent cgroup's `cgroup.procs`, for a helper
+    /// (e.g. the live harness) that self-places by writing its pid. This is the
+    /// *mount-relative* path, never the global nft identity.
+    #[must_use]
+    pub fn agent_procs_path(&self) -> PathBuf {
+        self.agent_dir().join("cgroup.procs")
+    }
+
+    /// Local filesystem path of the broker cgroup's `cgroup.procs`.
+    #[must_use]
+    pub fn broker_procs_path(&self) -> PathBuf {
+        self.broker_dir().join("cgroup.procs")
     }
 
     /// Moves `pid` into the agent cgroup via a descriptor-relative write.
     pub fn place_agent(&self, pid: u32) -> Result<(), CgroupError> {
-        self.place(self.agent.relative_path(), pid)
+        self.place(&self.agent_rel, pid)
     }
 
     /// Moves `pid` into the broker cgroup. Safe to call again with a new pid
     /// after a broker restart; the cgroup directory is never recreated.
     pub fn place_broker(&self, pid: u32) -> Result<(), CgroupError> {
-        self.place(self.broker.relative_path(), pid)
+        self.place(&self.broker_rel, pid)
     }
 
     fn place(&self, leaf_rel: &str, pid: u32) -> Result<(), CgroupError> {
@@ -239,8 +356,8 @@ impl CgroupHierarchy {
     pub fn teardown(&self) -> Vec<CgroupError> {
         let mut errors = Vec::new();
         for rel in [
-            self.broker.relative_path().to_owned(),
-            self.agent.relative_path().to_owned(),
+            self.broker_rel.clone(),
+            self.agent_rel.clone(),
             self.base_rel.clone(),
         ] {
             if let Err(err) = self.remove_owned_dir(&rel) {
@@ -304,6 +421,45 @@ tmpfs /run tmpfs rw 0 0
     }
 
     #[test]
+    fn parses_own_unified_cgroup_path() {
+        // Pure v2 host at the root.
+        assert_eq!(parse_own_cgroup_path("0::/\n").as_deref(), Some("/"));
+        // GitHub-Actions-style job cgroup.
+        assert_eq!(
+            parse_own_cgroup_path("0::/actions_job/abcd1234\n").as_deref(),
+            Some("/actions_job/abcd1234")
+        );
+        // Docker-style, with legacy v1 controller lines that must be ignored.
+        let hybrid =
+            "12:pids:/docker/deadbeef\n1:name=systemd:/docker/deadbeef\n0::/docker/deadbeef\n";
+        assert_eq!(
+            parse_own_cgroup_path(hybrid).as_deref(),
+            Some("/docker/deadbeef")
+        );
+        // No unified entry.
+        assert_eq!(parse_own_cgroup_path("1:name=systemd:/foo\n"), None);
+    }
+
+    #[test]
+    fn normalizes_cgroup_prefix_for_root_actions_and_docker() {
+        // The true root maps to an empty prefix (identity == mount path).
+        assert_eq!(normalize_cgroup_prefix("/").as_deref(), Some(""));
+        assert_eq!(normalize_cgroup_prefix("").as_deref(), Some(""));
+        // GitHub Actions and Docker prefixes are trimmed of surrounding slashes.
+        assert_eq!(
+            normalize_cgroup_prefix("/actions_job/abcd").as_deref(),
+            Some("actions_job/abcd")
+        );
+        assert_eq!(
+            normalize_cgroup_prefix("/docker/deadbeef/").as_deref(),
+            Some("docker/deadbeef")
+        );
+        // Traversal / empty components are refused (fail closed).
+        assert_eq!(normalize_cgroup_prefix("/a/../b"), None);
+        assert_eq!(normalize_cgroup_prefix("/a//b"), None);
+    }
+
+    #[test]
     fn rejects_invalid_instance_ids() {
         let root = tempfile::tempdir().unwrap();
         assert!(matches!(
@@ -323,7 +479,10 @@ tmpfs /run tmpfs rw 0 0
     #[test]
     fn creates_hierarchy_with_correct_identities_and_levels() {
         let root = tempfile::tempdir().unwrap();
-        let hierarchy = CgroupHierarchy::create_under(root.path(), "inst01").unwrap();
+        // Explicit empty (root) prefix so the identity equals the mount path,
+        // regardless of the test process's own cgroup.
+        let hierarchy =
+            CgroupHierarchy::create_under_with_prefix(root.path(), "inst01", "").unwrap();
         assert_eq!(
             hierarchy.agent_identity().relative_path(),
             "sendbox/inst01/agent"
@@ -335,6 +494,42 @@ tmpfs /run tmpfs rw 0 0
         );
         assert!(hierarchy.agent_dir().is_dir());
         assert!(hierarchy.broker_dir().is_dir());
+    }
+
+    #[test]
+    fn global_prefix_is_prepended_to_nft_identity_but_not_filesystem_paths() {
+        let root = tempfile::tempdir().unwrap();
+        // A GitHub-Actions-style prefix: the process is already at global cgroup
+        // `/actions_job/abcd`.
+        let hierarchy =
+            CgroupHierarchy::create_under_with_prefix(root.path(), "inst01", "actions_job/abcd")
+                .unwrap();
+        // The nft identity carries the global prefix and the full level.
+        assert_eq!(
+            hierarchy.agent_identity().relative_path(),
+            "actions_job/abcd/sendbox/inst01/agent"
+        );
+        assert_eq!(hierarchy.agent_identity().level(), 5);
+        assert_eq!(
+            hierarchy.broker_identity().relative_path(),
+            "actions_job/abcd/sendbox/inst01/broker"
+        );
+        assert_eq!(hierarchy.broker_identity().level(), 5);
+        // Filesystem paths stay mount-relative (no global prefix), and the dirs
+        // are created there.
+        assert!(hierarchy.agent_dir().ends_with("sendbox/inst01/agent"));
+        assert!(hierarchy.agent_dir().is_dir());
+        assert!(hierarchy.broker_dir().is_dir());
+        assert!(
+            hierarchy
+                .agent_procs_path()
+                .ends_with("sendbox/inst01/agent/cgroup.procs")
+        );
+        assert!(!root.path().join("actions_job").exists());
+        // Placement writes to the mount-relative path.
+        hierarchy.place_agent(4242).unwrap();
+        let contents = std::fs::read_to_string(hierarchy.agent_procs_path()).unwrap();
+        assert_eq!(contents, "4242\n");
     }
 
     #[test]

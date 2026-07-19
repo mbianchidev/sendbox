@@ -224,6 +224,19 @@ impl ArmedEgress {
         self.hierarchy.broker_identity()
     }
 
+    /// Local filesystem path of the agent cgroup's `cgroup.procs` (mount-relative,
+    /// never the global nft identity), for a helper that self-places into it.
+    #[must_use]
+    pub fn agent_procs_path(&self) -> std::path::PathBuf {
+        self.hierarchy.agent_procs_path()
+    }
+
+    /// Local filesystem path of the broker cgroup's `cgroup.procs`.
+    #[must_use]
+    pub fn broker_procs_path(&self) -> std::path::PathBuf {
+        self.hierarchy.broker_procs_path()
+    }
+
     #[must_use]
     pub fn broker_mark(&self) -> u32 {
         self.config.broker_mark
@@ -428,12 +441,21 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let runner = Box::new(ScriptRunner::ok());
         let armed = ArmedEgress::arm_under(root.path(), runner, config()).unwrap();
-        assert_eq!(
-            armed.agent_identity().relative_path(),
-            "sendbox/inst01/agent"
+        // The nft identity may carry the test process's own cgroup prefix, so
+        // assert on the stable suffix and the mount-relative procs path.
+        assert!(
+            armed
+                .agent_identity()
+                .relative_path()
+                .ends_with("sendbox/inst01/agent")
+        );
+        assert!(
+            armed
+                .agent_procs_path()
+                .ends_with("sendbox/inst01/agent/cgroup.procs")
         );
         assert_eq!(armed.broker_mark(), 0x5b0e);
-        // cgroups were created.
+        // cgroups were created at the mount-relative path.
         assert!(root.path().join("sendbox/inst01/agent").is_dir());
         drop(armed);
     }
