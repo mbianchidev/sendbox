@@ -491,13 +491,17 @@ mod platform {
                 .unwrap_or(0)
                 .saturating_mul(512),
             modified_unix_seconds: stat.st_mtime,
-            modified_nanoseconds: stat.st_mtime_nsec,
+            modified_nanoseconds: normalize_nanoseconds(stat.st_mtime_nsec),
             hardlink_count: u64::from(stat.st_nlink),
         }
     }
 
     fn mode_from(mode: u32) -> Mode {
         Mode::from_raw_mode((mode & 0o777) as rustix::fs::RawMode)
+    }
+
+    fn normalize_nanoseconds<T: TryInto<i64>>(value: T) -> i64 {
+        value.try_into().unwrap_or_default()
     }
 
     fn temporary_name(name: &OsStr) -> SecurityResult<OsString> {
