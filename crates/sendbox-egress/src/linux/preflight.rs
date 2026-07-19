@@ -23,10 +23,6 @@ pub const CAP_NET_ADMIN_BIT: u32 = 12;
 #[derive(Debug, Clone, Serialize)]
 pub struct Preflight {
     pub cgroup2_root: Option<String>,
-    /// The process's own unified cgroup path (from `/proc/self/cgroup`), which
-    /// is prefixed onto every nft `socket cgroupv2` identity. Reported for
-    /// diagnostics so a path-resolution failure is debuggable.
-    pub own_cgroup_path: Option<String>,
     pub cap_net_admin: bool,
     pub so_mark_settable: bool,
     pub nft_version: Option<String>,
@@ -55,17 +51,12 @@ impl Preflight {
         let cgroup2_root = cgroup::detect_cgroup2_root()
             .ok()
             .map(|p| p.display().to_string());
-        let prefix = cgroup::own_cgroup_prefix();
         let nft_socket_cgroupv2 = match cgroup2_root.as_deref() {
-            Some(root) => probe_nft_socket_cgroupv2_with_prefix(runner, Path::new(root), &prefix),
+            Some(root) => probe_nft_socket_cgroupv2(runner, Path::new(root)),
             None => false,
         };
         Self {
             cgroup2_root,
-            own_cgroup_path: fs::read_to_string("/proc/self/cgroup")
-                .ok()
-                .as_deref()
-                .and_then(cgroup::parse_own_cgroup_path),
             cap_net_admin: current_has_cap_net_admin(),
             so_mark_settable: mark::probe_can_set_mark().is_ok(),
             nft_version: nft_version(runner),
@@ -114,43 +105,18 @@ pub fn nft_version(runner: &dyn NftRunner) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Builds the throwaway probe ruleset for `probe_name` created under the mount
-/// root, referencing it at its **global** path (`<prefix>/<probe_name>`) and the
-/// matching level. Pure, so the prefix/level logic is unit tested.
-#[must_use]
-pub fn probe_ruleset(prefix: &str, probe_name: &str) -> String {
-    let global = if prefix.is_empty() {
-        probe_name.to_owned()
-    } else {
-        format!("{prefix}/{probe_name}")
-    };
-    let level = global.split('/').count();
-    format!(
-        "table inet sendbox_cgprobe {{\n  chain c {{\n    type filter hook output priority filter; policy accept;\n    socket cgroupv2 level {level} \"{global}\" accept\n  }}\n}}\n"
-    )
-}
-
-/// Probes whether `nft` (and the kernel) support `socket cgroupv2`. Uses the
-/// process's own cgroup path as the global prefix.
+/// Probes whether `nft` (and the kernel) support `socket cgroupv2`. Creates a
+/// throwaway cgroup under `root`, validates a ruleset referencing it with
+/// `nft --check` (no commit), and removes the cgroup. Returns `false` on any
+/// failure rather than assuming support.
 #[must_use]
 pub fn probe_nft_socket_cgroupv2(runner: &dyn NftRunner, root: &Path) -> bool {
-    probe_nft_socket_cgroupv2_with_prefix(runner, root, &cgroup::own_cgroup_prefix())
-}
-
-/// Probes `socket cgroupv2` support with an explicit global `prefix`. Creates a
-/// throwaway cgroup under `root` (mount-relative), validates a ruleset
-/// referencing it at its global path with `nft --check` (no commit), and removes
-/// the cgroup. Returns `false` on any failure rather than assuming support.
-#[must_use]
-pub fn probe_nft_socket_cgroupv2_with_prefix(
-    runner: &dyn NftRunner,
-    root: &Path,
-    prefix: &str,
-) -> bool {
     let probe_name = format!("sendbox_cgprobe_{}", std::process::id());
     let probe_dir = root.join(&probe_name);
     let created = fs::create_dir_all(&probe_dir).is_ok();
-    let ruleset = probe_ruleset(prefix, &probe_name);
+    let ruleset = format!(
+        "table inet sendbox_cgprobe {{\n  chain c {{\n    type filter hook output priority filter; policy accept;\n    socket cgroupv2 level 1 \"{probe_name}\" accept\n  }}\n}}\n"
+    );
     let supported = runner
         .run(&["--check", "-f", "-"], Some(ruleset.as_bytes()))
         .map(|output| output.status.success())
@@ -251,18 +217,5 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         assert!(!probe_nft_socket_cgroupv2(&unsupported, root.path()));
-    }
-
-    #[test]
-    fn probe_ruleset_uses_global_prefixed_path_and_level() {
-        // Root prefix: mount-relative path at level 1.
-        let root = probe_ruleset("", "sendbox_cgprobe_1");
-        assert!(root.contains("socket cgroupv2 level 1 \"sendbox_cgprobe_1\" accept"));
-        // Non-root prefix: full global path and matching level.
-        let nested = probe_ruleset("actions_job/abcd", "sendbox_cgprobe_1");
-        assert!(
-            nested
-                .contains("socket cgroupv2 level 3 \"actions_job/abcd/sendbox_cgprobe_1\" accept")
-        );
     }
 }

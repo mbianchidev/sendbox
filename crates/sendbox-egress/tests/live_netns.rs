@@ -88,19 +88,48 @@ fn has_setpriv() -> bool {
         .unwrap_or(false)
 }
 
+fn has_nsenter() -> bool {
+    run("nsenter", &["--version"])
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The filesystem path of a named network namespace created by `ip netns add`.
+fn netns_path(ns_name: &str) -> String {
+    format!("/var/run/netns/{ns_name}")
+}
+
+/// Builds the exact argv for running `nft` inside the target *network* namespace
+/// while preserving the caller's mount namespace. We use
+/// `nsenter --net=<netns> -- nft <args>` rather than `ip netns exec`: the latter
+/// additionally unshares the mount namespace and remounts `/sys`, which hides the
+/// supervisor-owned `/sys/fs/cgroup/sendbox/...` cgroups from nft's userspace
+/// `stat`, so `socket cgroupv2` path resolution fails even though the network
+/// namespace is targeted correctly. `nsenter --net=` enters only the network
+/// namespace, keeping the host cgroup mount view.
+fn nsenter_nft_argv(netns_path: &str, args: &[&str]) -> Vec<String> {
+    let mut argv = vec![
+        format!("--net={netns_path}"),
+        "--".to_owned(),
+        "nft".to_owned(),
+    ];
+    argv.extend(args.iter().map(|a| (*a).to_owned()));
+    argv
+}
+
 /// Applies nftables inside the harness's network namespace via
-/// `ip netns exec <ns> nft ...`, passing the ruleset on stdin.
+/// `nsenter --net=/var/run/netns/<ns> -- nft ...`, passing the ruleset on stdin.
 struct NetnsNftRunner {
     ns_name: String,
 }
 
 impl NftRunner for NetnsNftRunner {
     fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> std::io::Result<Output> {
-        let mut full: Vec<&str> = vec!["netns", "exec", &self.ns_name, "nft"];
-        full.extend_from_slice(args);
-        let mut command = Command::new("ip");
+        let path = netns_path(&self.ns_name);
+        let argv = nsenter_nft_argv(&path, args);
+        let mut command = Command::new("nsenter");
         command
-            .args(&full)
+            .args(&argv)
             .env("LC_ALL", "C")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -328,8 +357,13 @@ fn gate_or_skip() -> Option<PathBuf> {
             return None;
         }
     };
-    if !is_root() || !preflight.all_ready() || !has_setpriv() {
-        let verdict = format!("{} setpriv={}", preflight.to_json(), has_setpriv());
+    if !is_root() || !preflight.all_ready() || !has_setpriv() || !has_nsenter() {
+        let verdict = format!(
+            "{} setpriv={} nsenter={}",
+            preflight.to_json(),
+            has_setpriv(),
+            has_nsenter()
+        );
         assert!(
             !require,
             "live suite required but environment not ready: {verdict}"
@@ -660,15 +694,11 @@ fn run_live_suite(env: &mut LiveEnvironment) {
     std::fs::create_dir_all(&env.candidate_dir).expect("create candidate cgroup");
     env.remove_candidate.store(true, Ordering::SeqCst);
     let mut bad = env.armed.as_ref().unwrap().current_config().clone();
-    // The candidate's nft identity must carry the same global cgroup prefix as
-    // the agent (a sibling leaf under the instance base), so `--check` resolves
-    // it before the runner deletes it ahead of the real commit.
-    let agent_global = bad.agent.relative_path().to_owned();
-    let candidate_global = agent_global
-        .rsplit_once('/')
-        .map(|(base, _)| format!("{base}/candidate"))
-        .expect("agent identity has a parent");
-    bad.agent = CgroupIdentity::new(candidate_global).expect("candidate identity");
+    // The candidate's nft identity is the mount-relative sibling of the agent
+    // leaf, so `--check` resolves it before the runner deletes it ahead of the
+    // real commit.
+    let candidate_rel = format!("sendbox/{}/candidate", env.topo.instance_id);
+    bad.agent = CgroupIdentity::new(candidate_rel).expect("candidate identity");
     let update_res = env.armed.as_mut().unwrap().update(bad);
     assert!(
         update_res.is_err(),
@@ -827,21 +857,14 @@ fn setup_namespace_and_veth(topo: &Topology) {
 }
 
 fn table_present(topo: &Topology, config: &NftConfig) -> bool {
-    run(
-        "ip",
-        &[
-            "netns",
-            "exec",
-            &topo.ns_name,
-            "nft",
-            "list",
-            "table",
-            "inet",
-            &config.table_name,
-        ],
-    )
-    .map(|o| o.status.success())
-    .unwrap_or(false)
+    // Use `nsenter --net=` for consistency with `NetnsNftRunner`; listing does
+    // not stat cgroups but this keeps every nft execution on one path.
+    let path = netns_path(&topo.ns_name);
+    let argv = nsenter_nft_argv(&path, &["list", "table", "inet", &config.table_name]);
+    let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run("nsenter", &borrowed)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn spawn_echo(addr: SocketAddr) -> thread::JoinHandle<()> {
@@ -962,6 +985,43 @@ fn harness_binary() -> PathBuf {
     path
 }
 
+/// Base argv for running the harness binary inside the target *network*
+/// namespace while keeping the caller's mount view: `nsenter --net=<netns> --
+/// <harness>`. This matters because the harness self-places by writing an
+/// absolute `/sys/fs/cgroup/.../cgroup.procs` path — `ip netns exec` would
+/// remount `/sys` and hide those cgroups (identical to the nft resolution
+/// problem), so a self-placement would silently target the wrong (or a missing)
+/// cgroup.
+fn netns_harness_argv_prefix(ns_name: &str) -> Vec<String> {
+    vec![
+        format!("--net={}", netns_path(ns_name)),
+        "--".to_owned(),
+        harness_binary().to_string_lossy().into_owned(),
+    ]
+}
+
+/// A `Command` that runs the harness inside the target netns (mount view
+/// preserved) via `nsenter`. Callers append the subcommand + flags and set stdio.
+fn netns_harness_command(ns_name: &str) -> Command {
+    let mut command = Command::new("nsenter");
+    command
+        .args(netns_harness_argv_prefix(ns_name))
+        .env("LC_ALL", "C")
+        .env("LANG", "C");
+    command
+}
+
+/// Runs a harness subcommand inside the target netns and returns its output.
+fn run_netns_harness(ns_name: &str, harness_args: &[&str]) -> std::io::Result<Output> {
+    let mut argv = netns_harness_argv_prefix(ns_name);
+    argv.extend(harness_args.iter().map(|a| (*a).to_owned()));
+    Command::new("nsenter")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .args(&argv)
+        .output()
+}
+
 fn policy_json(topo: &Topology) -> String {
     serde_json::json!({
         "default_action": "deny",
@@ -1009,12 +1069,8 @@ fn fixtures_json(v4: SocketAddr, v6: SocketAddr) -> String {
 }
 
 fn spawn_gateway(topo: &Topology, policy: &Path, fixtures: &Path, broker_procs: &Path) -> Child {
-    Command::new("ip")
+    netns_harness_command(&topo.ns_name)
         .args([
-            "netns",
-            "exec",
-            &topo.ns_name,
-            harness_binary().to_str().unwrap(),
             "gateway",
             "--policy",
             policy.to_str().unwrap(),
@@ -1041,12 +1097,8 @@ fn spawn_forwarding_gateway(
     dns_upstream: SocketAddr,
     broker_procs: &Path,
 ) -> Child {
-    Command::new("ip")
+    netns_harness_command(&topo.ns_name)
         .args([
-            "netns",
-            "exec",
-            &topo.ns_name,
-            harness_binary().to_str().unwrap(),
             "gateway",
             "--policy",
             policy.to_str().unwrap(),
@@ -1069,13 +1121,9 @@ fn spawn_forwarding_gateway(
 
 fn wait_for_gateway_ready(topo: &Topology, agent_procs: &Path, require_dns: bool) {
     for _ in 0..80 {
-        let probe = run(
-            "ip",
+        let probe = run_netns_harness(
+            &topo.ns_name,
             &[
-                "netns",
-                "exec",
-                &topo.ns_name,
-                harness_binary().to_str().unwrap(),
                 "gateway-probe",
                 "--dns",
                 &format!("127.0.0.1:{DNS_PORT}"),
@@ -1100,13 +1148,9 @@ fn wait_for_gateway_ready(topo: &Topology, agent_procs: &Path, require_dns: bool
 
 fn connect_attempt(topo: &Topology, agent_procs: &Path, target: &str, port: u16) -> Value {
     // The agent connects unprivileged (all caps cleared, no_new_privs).
-    let output = run(
-        "ip",
+    let output = run_netns_harness(
+        &topo.ns_name,
         &[
-            "netns",
-            "exec",
-            &topo.ns_name,
-            harness_binary().to_str().unwrap(),
             "connect-attempt",
             "--broker",
             &format!("127.0.0.1:{CONNECT_PORT}"),
@@ -1178,32 +1222,17 @@ fn sibling_raw(topo: &Topology, protocol: &str, target: SocketAddr) -> Value {
 }
 
 fn raw_invoke(topo: &Topology, extra: &[&str], protocol: &str, target: SocketAddr) -> Value {
-    let harness = harness_binary();
     let target = target.to_string();
-    let mut args: Vec<&str> = vec![
-        "netns",
-        "exec",
-        &topo.ns_name,
-        harness.to_str().unwrap(),
-        "raw-attempt",
-        "--protocol",
-        protocol,
-        "--target",
-        &target,
-    ];
+    let mut args: Vec<&str> = vec!["raw-attempt", "--protocol", protocol, "--target", &target];
     args.extend_from_slice(extra);
-    let output = run("ip", &args).expect("raw-attempt");
+    let output = run_netns_harness(&topo.ns_name, &args).expect("raw-attempt");
     parse_last_json(&output.stdout).expect("raw-attempt json")
 }
 
 fn caps_probe(topo: &Topology, agent_procs: &Path) -> Value {
-    let output = run(
-        "ip",
+    let output = run_netns_harness(
+        &topo.ns_name,
         &[
-            "netns",
-            "exec",
-            &topo.ns_name,
-            harness_binary().to_str().unwrap(),
             "caps-probe",
             "--cgroup-procs",
             agent_procs.to_str().unwrap(),
@@ -1216,13 +1245,9 @@ fn caps_probe(topo: &Topology, agent_procs: &Path) -> Value {
 }
 
 fn raw_socket_probe(topo: &Topology, agent_procs: &Path) -> Value {
-    let output = run(
-        "ip",
+    let output = run_netns_harness(
+        &topo.ns_name,
         &[
-            "netns",
-            "exec",
-            &topo.ns_name,
-            harness_binary().to_str().unwrap(),
             "raw-socket-probe",
             "--cgroup-procs",
             agent_procs.to_str().unwrap(),
@@ -1242,4 +1267,34 @@ fn parse_last_json(stdout: &[u8]) -> Result<Value, serde_json::Error> {
         .find(|l| l.trim_start().starts_with('{'))
         .unwrap_or("{}");
     serde_json::from_str(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{netns_path, nsenter_nft_argv};
+
+    #[test]
+    fn netns_path_is_the_iproute2_convention() {
+        assert_eq!(netns_path("sbxeg7"), "/var/run/netns/sbxeg7");
+    }
+
+    #[test]
+    fn nsenter_nft_argv_enters_only_the_network_namespace() {
+        // `nsenter --net=<path> -- nft <args>` targets the network namespace but
+        // keeps the caller's mount namespace, so nft can still stat the host
+        // `/sys/fs/cgroup/sendbox/...` cgroups. `ip netns exec` would remount
+        // /sys and hide them.
+        let argv = nsenter_nft_argv("/var/run/netns/sbxeg7", &["--check", "-f", "-"]);
+        assert_eq!(
+            argv,
+            vec![
+                "--net=/var/run/netns/sbxeg7".to_owned(),
+                "--".to_owned(),
+                "nft".to_owned(),
+                "--check".to_owned(),
+                "-f".to_owned(),
+                "-".to_owned(),
+            ]
+        );
+    }
 }

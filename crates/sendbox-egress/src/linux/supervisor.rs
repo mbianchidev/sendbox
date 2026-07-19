@@ -441,13 +441,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let runner = Box::new(ScriptRunner::ok());
         let armed = ArmedEgress::arm_under(root.path(), runner, config()).unwrap();
-        // The nft identity may carry the test process's own cgroup prefix, so
-        // assert on the stable suffix and the mount-relative procs path.
-        assert!(
-            armed
-                .agent_identity()
-                .relative_path()
-                .ends_with("sendbox/inst01/agent")
+        // The nft identity is the mount-relative cgroup path.
+        assert_eq!(
+            armed.agent_identity().relative_path(),
+            "sendbox/inst01/agent"
         );
         assert!(
             armed

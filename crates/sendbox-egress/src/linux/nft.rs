@@ -28,14 +28,15 @@ use thiserror::Error;
 /// ownership/version is deterministic and auditable.
 pub const SENDBOX_EGRESS_TABLE_VERSION: u32 = 1;
 
-/// A cgroup v2 identity for an `nft socket cgroupv2` match: the **global**
-/// cgroup path as nftables resolves it (no leading slash) and its depth
+/// A cgroup v2 identity for an `nft socket cgroupv2` match: the cgroup path
+/// **relative to the cgroup v2 mount root** (no leading slash) and its depth
 /// (`level`), which nftables requires to equal the number of path components.
 ///
-/// nftables resolves `socket cgroupv2` paths against the whole cgroup hierarchy,
-/// so when the supervisor process is itself inside a non-root cgroup this path
-/// includes that prefix (e.g. `actions_job/<id>/sendbox/<inst>/agent`), even
-/// though the crate's *filesystem* operations stay relative to the mount root.
+/// The path is exactly what nftables userspace stats under `/sys/fs/cgroup`;
+/// the kernel adds the current cgroup-namespace subtree level internally, so the
+/// crate's supervisor-owned `sendbox/<instance>/…` hierarchy (created directly
+/// under the mount root) is referenced by that mount-relative path, never a
+/// process-cgroup-prefixed one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CgroupIdentity {
     relative_path: String,
@@ -58,9 +59,9 @@ impl CgroupIdentity {
             let ok = !component.is_empty()
                 && *component != "."
                 && *component != ".."
-                && component.bytes().all(|b| {
-                    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':' | b'@')
-                });
+                && component
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'));
             if !ok {
                 return Err(NftError::InvalidCgroupPath(relative_path));
             }
@@ -480,26 +481,6 @@ mod tests {
         // The agent identity never gets a blanket accept.
         assert!(!text.contains("\"sendbox/inst01/agent\" meta mark"));
         assert!(!text.contains("\"sendbox/inst01/agent\" accept"));
-    }
-
-    #[test]
-    fn render_uses_global_prefixed_paths_and_levels() {
-        // Identities carrying a process-cgroup prefix (e.g. a hosted CI runner
-        // already inside `/actions_job/abcd`) must render the full global path
-        // and the matching level, not the mount-relative path.
-        let mut cfg = config();
-        cfg.agent = identity("actions_job/abcd/sendbox/inst01/agent");
-        cfg.broker = identity("actions_job/abcd/sendbox/inst01/broker");
-        let text = cfg.render();
-        assert!(text.contains(
-            "socket cgroupv2 level 5 \"actions_job/abcd/sendbox/inst01/agent\" ip daddr 127.0.0.1 tcp dport 15080 accept"
-        ));
-        assert!(text.contains(&format!(
-            "socket cgroupv2 level 5 \"actions_job/abcd/sendbox/inst01/broker\" meta mark {} accept",
-            cfg.broker_mark
-        )));
-        // The un-prefixed level-3 path must not appear.
-        assert!(!text.contains("level 3 \"sendbox/inst01/agent\""));
     }
 
     #[test]
