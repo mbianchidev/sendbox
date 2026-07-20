@@ -98,7 +98,7 @@ struct GitBranchProtectionTests {
             repositoryRoot: fixture.selectedWorkspace.path
         )
 
-        #expect(result.exitCode == 0)
+        try #require(result.exitCode == 0, "stderr: \(result.stderr)")
         let log = try String(contentsOf: fixture.log, encoding: .utf8)
         #expect(log.contains("push origin feature/topic"))
     }
