@@ -1,13 +1,17 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
+use proptest::prelude::*;
 use sendbox_core::SessionId;
 use sendbox_session_security::lifecycle::AuditRecorder;
 use sendbox_session_security::supervisor::{
-    ApprovalDecision, ApprovalHandler, ApprovalHandlerError, AuditPermissionEventSink,
-    AutoApproveRule, NoopPermissionEventSink, PermissionCategory, PermissionPattern,
-    PermissionRequest, PermissionSupervisor, RiskLevel, SupervisorCheckpoint, SupervisorClock,
-    SupervisorConfig, SupervisorError, classify_risk, glob_matches,
+    ApprovalCancellation, ApprovalContext, ApprovalDecision, ApprovalHandler, ApprovalHandlerError,
+    AuditPermissionEventSink, AutoApproveRule, GrantMatcher, GrantType, NoopPermissionEventSink,
+    PermissionCategory, PermissionGrant, PermissionPattern, PermissionRequest,
+    PermissionSupervisor, RiskLevel, SharedPermissionSupervisor, SupervisorCheckpoint,
+    SupervisorClock, SupervisorConfig, SupervisorError, classify_risk, glob_matches,
 };
 
 const SESSION: SessionId = SessionId::from_bytes([0x34; 16]);
@@ -52,10 +56,9 @@ impl ApprovalHandler for Handler {
     fn approve(
         &mut self,
         _request: &PermissionRequest,
-        _risk: RiskLevel,
-        deadline_unix_ms: u64,
+        context: &ApprovalContext,
     ) -> Result<ApprovalDecision, ApprovalHandlerError> {
-        self.deadlines.push(deadline_unix_ms);
+        self.deadlines.push(context.deadline_unix_ms);
         self.decisions.pop_front().expect("decision")
     }
 }
@@ -70,8 +73,32 @@ fn request(id: &str, category: PermissionCategory, subject: &str) -> PermissionR
         request_id: id.to_owned(),
         category,
         subject: subject.to_owned(),
+        context: "test context".to_owned(),
         timestamp_unix_ms: 5,
     }
+}
+
+#[test]
+fn defaults_and_presets_match_swift_configuration() {
+    let default = SupervisorConfig::default();
+    assert!(default.interactive);
+    assert!(default.auto_approve.is_empty());
+    assert_eq!(default.prompt_budget, 50);
+    assert!(default.allow_session_grants);
+    assert_eq!(default.approval_timeout_ms, 30_000);
+
+    let strict = SupervisorConfig::strict();
+    assert!(strict.interactive);
+    assert_eq!(strict.prompt_budget, 100);
+    assert!(!strict.allow_session_grants);
+    assert_eq!(strict.approval_timeout_ms, 15_000);
+
+    let autonomous = SupervisorConfig::autonomous();
+    assert!(!autonomous.interactive);
+    assert_eq!(autonomous.auto_approve.len(), 3);
+    assert_eq!(autonomous.prompt_budget, 0);
+    assert!(autonomous.allow_session_grants);
+    assert_eq!(autonomous.approval_timeout_ms, 0);
 }
 
 #[test]
@@ -122,7 +149,7 @@ fn swift_risk_literals_and_globs_match_expected_behavior() {
 }
 
 #[test]
-fn approve_once_does_not_leave_an_extra_use() {
+fn approve_once_preserves_the_swift_single_use_grant() {
     let mut supervisor = make_supervisor(SupervisorConfig::default());
     let mut handler = Handler::new([ApprovalDecision::ApproveOnce]);
     let allowed = supervisor
@@ -133,12 +160,22 @@ fn approve_once_does_not_leave_an_extra_use() {
         )
         .expect("decision");
     assert!(allowed.allowed);
+    assert_eq!(supervisor.grants().len(), 1);
+
+    let granted = supervisor
+        .evaluate(
+            request("once-2", PermissionCategory::Command, "cargo test"),
+            &SequenceClock::new([11]),
+            None,
+        )
+        .expect("decision");
+    assert!(granted.allowed);
     assert!(supervisor.grants().is_empty());
 
     let denied = supervisor
         .evaluate(
-            request("once-2", PermissionCategory::Command, "cargo test"),
-            &SequenceClock::new([11]),
+            request("once-3", PermissionCategory::Command, "cargo test"),
+            &SequenceClock::new([12]),
             None,
         )
         .expect("decision");
@@ -277,6 +314,25 @@ fn timeout_replay_prompt_budget_and_noninteractive_are_denied() {
 }
 
 #[test]
+fn cancellation_fails_closed_before_the_approval_handler() {
+    let mut supervisor = make_supervisor(SupervisorConfig::default());
+    let cancellation = ApprovalCancellation::new();
+    cancellation.cancel();
+    let mut handler = Handler::new([ApprovalDecision::ApproveOnce]);
+    let decision = supervisor
+        .evaluate_with_cancellation(
+            request("cancelled", PermissionCategory::Command, "cargo test"),
+            &SequenceClock::new([1]),
+            Some(&mut handler),
+            cancellation,
+        )
+        .expect("cancelled decision");
+    assert!(!decision.allowed);
+    assert_eq!(decision.reason, "approval_cancelled");
+    assert!(handler.deadlines.is_empty());
+}
+
+#[test]
 fn auto_rules_are_bounded_and_exact_denies_take_precedence() {
     let config = SupervisorConfig {
         auto_approve: vec![AutoApproveRule {
@@ -392,8 +448,130 @@ fn deny_always_is_literal_and_session_grants_can_be_disabled() {
             Some(&mut handler),
         )
         .expect("disabled session grant");
-    assert!(!decision.allowed);
-    assert!(disabled.grants().is_empty());
+    assert!(decision.allowed);
+    assert_eq!(decision.reason, "approval_once");
+    assert_eq!(disabled.grants().len(), 1);
+}
+
+#[test]
+fn manual_grants_history_and_summary_are_public_and_deterministic() {
+    let mut supervisor = make_supervisor(SupervisorConfig::default());
+    supervisor
+        .grant(
+            PermissionGrant {
+                id: "manual-1".to_owned(),
+                category: PermissionCategory::Command,
+                matcher: GrantMatcher::Exact {
+                    subject: "cargo test".to_owned(),
+                },
+                granted_at_unix_ms: 1,
+                expires_at_unix_ms: Some(100),
+                uses_remaining: Some(2),
+                grant_type: GrantType::Session,
+            },
+            1,
+        )
+        .expect("manual grant");
+    assert_eq!(supervisor.active_grants(2).len(), 1);
+    assert!(
+        supervisor
+            .evaluate(
+                request("manual-use", PermissionCategory::Command, "cargo test"),
+                &SequenceClock::new([2]),
+                None,
+            )
+            .expect("manual use")
+            .allowed
+    );
+    let history = supervisor.history();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].request_id, "manual-use");
+    let summary = supervisor.summary(2);
+    assert_eq!(summary.total_requests, 1);
+    assert_eq!(summary.approved, 1);
+    assert_eq!(summary.denied, 0);
+    assert_eq!(summary.active_grant_count, 1);
+    assert_eq!(
+        summary.category_counts.get(&PermissionCategory::Command),
+        Some(&1)
+    );
+}
+
+struct FixedClock(u64);
+
+impl SupervisorClock for FixedClock {
+    fn now_unix_ms(&self) -> u64 {
+        self.0
+    }
+}
+
+#[test]
+fn shared_supervisor_consumes_use_limits_atomically() {
+    let mut supervisor = make_supervisor(SupervisorConfig::default());
+    supervisor
+        .grant(
+            PermissionGrant {
+                id: "concurrent".to_owned(),
+                category: PermissionCategory::Command,
+                matcher: GrantMatcher::Exact {
+                    subject: "cargo test".to_owned(),
+                },
+                granted_at_unix_ms: 1,
+                expires_at_unix_ms: None,
+                uses_remaining: Some(10),
+                grant_type: GrantType::Session,
+            },
+            1,
+        )
+        .expect("grant");
+    let shared = Arc::new(SharedPermissionSupervisor::new(supervisor));
+    let allowed = Arc::new(AtomicUsize::new(0));
+    let mut threads = Vec::new();
+    for index in 0..32 {
+        let shared = Arc::clone(&shared);
+        let allowed = Arc::clone(&allowed);
+        threads.push(thread::spawn(move || {
+            let decision = shared
+                .evaluate(
+                    request(
+                        &format!("concurrent-{index}"),
+                        PermissionCategory::Command,
+                        "cargo test",
+                    ),
+                    &FixedClock(2),
+                )
+                .expect("decision");
+            if decision.allowed {
+                allowed.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+    }
+    for thread in threads {
+        thread.join().expect("join");
+    }
+    assert_eq!(allowed.load(Ordering::SeqCst), 10);
+}
+
+#[test]
+fn manual_grants_cannot_collide_with_reserved_generated_ids() {
+    let mut supervisor = make_supervisor(SupervisorConfig::default());
+    let error = supervisor
+        .grant(
+            PermissionGrant {
+                id: "grant-2".to_owned(),
+                category: PermissionCategory::Network,
+                matcher: GrantMatcher::Exact {
+                    subject: "important.example.com".to_owned(),
+                },
+                granted_at_unix_ms: 1,
+                expires_at_unix_ms: None,
+                uses_remaining: None,
+                grant_type: GrantType::Session,
+            },
+            1,
+        )
+        .expect_err("reserved prefix");
+    assert!(matches!(error, SupervisorError::InvalidDecision(_)));
 }
 
 #[test]
@@ -633,4 +811,88 @@ fn equal_exact_checkpoint_is_accepted() {
     )
     .expect("equal checkpoint");
     assert_eq!(decoded.checkpoint(), checkpoint);
+}
+
+#[test]
+fn empty_supervisor_matches_v1_golden_fixture() {
+    let supervisor = make_supervisor(SupervisorConfig::default());
+    let fixture = include_bytes!("fixtures/supervisor-state-v1-empty.json");
+    let fixture = fixture.strip_suffix(b"\n").unwrap_or(fixture);
+    assert_eq!(supervisor.encode_canonical().expect("bytes"), fixture);
+    PermissionSupervisor::decode_unanchored_first_import(
+        fixture,
+        Arc::new(NoopPermissionEventSink),
+    )
+    .expect("golden fixture decodes");
+}
+
+#[test]
+fn persisted_versions_reject_upgrade_and_downgrade_without_migration() {
+    let supervisor = make_supervisor(SupervisorConfig::default());
+    let bytes = supervisor.encode_canonical().expect("bytes");
+    for version in [0, 2] {
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        value["version"] = serde_json::Value::from(version);
+        let changed = serde_json::to_vec(&value).expect("changed JSON");
+        assert!(matches!(
+            PermissionSupervisor::decode_unanchored_first_import(
+                &changed,
+                Arc::new(NoopPermissionEventSink)
+            ),
+            Err(SupervisorError::Corrupt(_))
+        ));
+    }
+}
+
+proptest! {
+    #[test]
+    fn permission_state_machine_round_trips_after_each_transition(
+        maximum_uses in 1_u32..32,
+        attempts in prop::collection::vec(any::<bool>(), 1..64),
+    ) {
+        let mut supervisor = make_supervisor(SupervisorConfig::default());
+        supervisor
+            .grant(
+                PermissionGrant {
+                    id: "property-grant".to_owned(),
+                    category: PermissionCategory::Command,
+                    matcher: GrantMatcher::Exact {
+                        subject: "cargo test".to_owned(),
+                    },
+                    granted_at_unix_ms: 1,
+                    expires_at_unix_ms: None,
+                    uses_remaining: Some(maximum_uses),
+                    grant_type: GrantType::Session,
+                },
+                1,
+            )
+            .expect("grant");
+        let mut allowed = 0_u32;
+        for (index, matches_grant) in attempts.into_iter().enumerate() {
+            let subject = if matches_grant { "cargo test" } else { "cargo fmt" };
+            let decision = supervisor
+                .evaluate(
+                    request(
+                        &format!("property-{index}"),
+                        PermissionCategory::Command,
+                        subject,
+                    ),
+                    &FixedClock(2),
+                    None,
+                )
+                .expect("decision");
+            if decision.allowed {
+                allowed += 1;
+            }
+            prop_assert!(allowed <= maximum_uses);
+            let bytes = supervisor.encode_canonical().expect("encode");
+            let checkpoint = supervisor.checkpoint();
+            supervisor = PermissionSupervisor::decode_with_checkpoint(
+                &bytes,
+                &checkpoint,
+                Arc::new(NoopPermissionEventSink),
+            )
+            .expect("round trip");
+        }
+    }
 }

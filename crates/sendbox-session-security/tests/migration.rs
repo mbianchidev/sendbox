@@ -87,7 +87,7 @@ fn swift_grants_are_observational_and_permission_broadening_is_gated() {
         Err(MigrationError::Malformed(_))
     ));
 
-    let actual_codable = br#"[{"id":"grant-1","category":"network","pattern":"github.com","grantedAt":765432100.0,"expiresAt":765432200.0,"usesRemaining":3,"grantType":"session"}]"#;
+    let actual_codable = include_bytes!("fixtures/swift-supervisor-grants-v1.json");
     let (actual_report, actual) =
         inspect_swift_codable_grants(actual_codable, &MigrationLimits::default())
             .expect("actual Codable grants");

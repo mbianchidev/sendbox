@@ -2,7 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use sendbox_core::SessionId;
 use sendbox_security::audit::{AuditCategory, AuditResult};
@@ -34,6 +35,26 @@ pub enum PermissionCategory {
     FileWrite,
     SecretAccess,
     SystemCall,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionHistoryRecord {
+    pub request_id: String,
+    pub timestamp_unix_ms: u64,
+    pub category: PermissionCategory,
+    pub action: String,
+    pub response: String,
+    pub automated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupervisorSummary {
+    pub total_requests: usize,
+    pub approved: usize,
+    pub denied: usize,
+    pub auto_approved: usize,
+    pub active_grant_count: usize,
+    pub category_counts: BTreeMap<PermissionCategory, usize>,
 }
 
 impl PermissionCategory {
@@ -171,9 +192,55 @@ impl Default for SupervisorConfig {
         Self {
             interactive: true,
             auto_approve: Vec::new(),
-            prompt_budget: 32,
+            prompt_budget: 50,
             allow_session_grants: true,
             approval_timeout_ms: 30_000,
+            limits: SupervisorLimits::default(),
+        }
+    }
+}
+
+impl SupervisorConfig {
+    #[must_use]
+    pub fn strict() -> Self {
+        Self {
+            prompt_budget: 100,
+            allow_session_grants: false,
+            approval_timeout_ms: 15_000,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn autonomous() -> Self {
+        Self {
+            interactive: false,
+            auto_approve: vec![
+                AutoApproveRule {
+                    matcher: PermissionPattern {
+                        category: PermissionCategory::Command,
+                        pattern: "*".to_owned(),
+                    },
+                    max_uses: None,
+                },
+                AutoApproveRule {
+                    matcher: PermissionPattern {
+                        category: PermissionCategory::FileWrite,
+                        pattern: "*".to_owned(),
+                    },
+                    max_uses: None,
+                },
+                AutoApproveRule {
+                    matcher: PermissionPattern {
+                        category: PermissionCategory::Network,
+                        pattern: "*".to_owned(),
+                    },
+                    max_uses: None,
+                },
+            ],
+            prompt_budget: 0,
+            allow_session_grants: true,
+            approval_timeout_ms: 0,
             limits: SupervisorLimits::default(),
         }
     }
@@ -184,6 +251,7 @@ pub struct PermissionRequest {
     pub request_id: String,
     pub category: PermissionCategory,
     pub subject: String,
+    pub context: String,
     pub timestamp_unix_ms: u64,
 }
 
@@ -213,13 +281,40 @@ pub struct ApprovalHandlerError {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ApprovalCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ApprovalCancellation {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ApprovalContext {
+    pub risk: RiskLevel,
+    pub deadline_unix_ms: u64,
+    pub cancellation: ApprovalCancellation,
+}
+
 pub trait ApprovalHandler {
     /// Handler failures are recorded as denied requests and then returned as explicit errors.
     fn approve(
         &mut self,
         request: &PermissionRequest,
-        risk: RiskLevel,
-        deadline_unix_ms: u64,
+        context: &ApprovalContext,
     ) -> Result<ApprovalDecision, ApprovalHandlerError>;
 }
 
@@ -344,14 +439,24 @@ pub enum GrantMatcher {
     Pattern { pattern: String },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantType {
+    Once,
+    Session,
+    Pattern,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionGrant {
     pub id: String,
     pub category: PermissionCategory,
     pub matcher: GrantMatcher,
+    pub granted_at_unix_ms: u64,
     pub expires_at_unix_ms: Option<u64>,
     pub uses_remaining: Option<u32>,
+    pub grant_type: GrantType,
 }
 
 impl PermissionGrant {
@@ -383,7 +488,9 @@ enum HistoryKind {
     DeniedNoHandler,
     DeniedApproval,
     DeniedTimeout,
+    DeniedCancelled,
     HandlerError,
+    GrantAdded,
     GrantRevoked,
     GrantsRevokedAll,
     DenyAdded,
@@ -415,7 +522,7 @@ struct PersistedState {
     config: SupervisorConfig,
     grants: BTreeMap<String, PermissionGrant>,
     deny_rules: BTreeSet<ExactDenyRule>,
-    auto_use_counters: BTreeMap<u32, u32>,
+    auto_use_counters: BTreeMap<PermissionCategory, u32>,
     request_ids: BTreeSet<String>,
     prompts_used: u32,
     history: Vec<HistoryEntry>,
@@ -431,7 +538,7 @@ struct StateHashPayload<'a> {
     config: &'a SupervisorConfig,
     grants: &'a BTreeMap<String, PermissionGrant>,
     deny_rules: &'a BTreeSet<ExactDenyRule>,
-    auto_use_counters: &'a BTreeMap<u32, u32>,
+    auto_use_counters: &'a BTreeMap<PermissionCategory, u32>,
     request_ids: &'a BTreeSet<String>,
     prompts_used: u32,
     history: &'a [HistoryEntry],
@@ -510,6 +617,84 @@ impl PermissionSupervisor {
     }
 
     #[must_use]
+    pub fn active_grants(&self, now_unix_ms: u64) -> Vec<&PermissionGrant> {
+        self.state
+            .grants
+            .values()
+            .filter(|grant| {
+                grant
+                    .expires_at_unix_ms
+                    .is_none_or(|expiry| expiry > now_unix_ms)
+                    && grant.uses_remaining != Some(0)
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn history(&self) -> Vec<PermissionHistoryRecord> {
+        self.state
+            .history
+            .iter()
+            .filter_map(|entry| {
+                Some(PermissionHistoryRecord {
+                    request_id: entry.request_id.clone()?,
+                    timestamp_unix_ms: entry.timestamp_unix_ms,
+                    category: entry.category?,
+                    action: entry.subject.clone()?,
+                    response: entry.detail.clone(),
+                    automated: matches!(
+                        entry.kind,
+                        HistoryKind::AllowedGrant
+                            | HistoryKind::AllowedAuto
+                            | HistoryKind::DeniedRule
+                            | HistoryKind::DeniedNoninteractive
+                            | HistoryKind::DeniedBudget
+                            | HistoryKind::DeniedNoHandler
+                    ),
+                })
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn summary(&self, now_unix_ms: u64) -> SupervisorSummary {
+        let history = self.history();
+        let approved = self
+            .state
+            .history
+            .iter()
+            .filter(|entry| {
+                entry.request_id.is_some()
+                    && matches!(
+                        entry.kind,
+                        HistoryKind::AllowedGrant
+                            | HistoryKind::AllowedAuto
+                            | HistoryKind::AllowedApproval
+                    )
+            })
+            .count();
+        let denied = history.len().saturating_sub(approved);
+        let auto_approved = self
+            .state
+            .history
+            .iter()
+            .filter(|entry| matches!(entry.kind, HistoryKind::AllowedAuto))
+            .count();
+        let mut category_counts = BTreeMap::new();
+        for entry in &history {
+            *category_counts.entry(entry.category).or_default() += 1;
+        }
+        SupervisorSummary {
+            total_requests: history.len(),
+            approved,
+            denied,
+            auto_approved,
+            active_grant_count: self.active_grants(now_unix_ms).len(),
+            category_counts,
+        }
+    }
+
+    #[must_use]
     pub const fn session_id(&self) -> SessionId {
         self.session_id
     }
@@ -518,7 +703,17 @@ impl PermissionSupervisor {
         &mut self,
         request: PermissionRequest,
         clock: &dyn SupervisorClock,
+        handler: Option<&mut dyn ApprovalHandler>,
+    ) -> Result<PermissionDecision, SupervisorError> {
+        self.evaluate_with_cancellation(request, clock, handler, ApprovalCancellation::new())
+    }
+
+    pub fn evaluate_with_cancellation(
+        &mut self,
+        request: PermissionRequest,
+        clock: &dyn SupervisorClock,
         mut handler: Option<&mut dyn ApprovalHandler>,
+        cancellation: ApprovalCancellation,
     ) -> Result<PermissionDecision, SupervisorError> {
         validate_request(&request, &self.state.config.limits)?;
         if self.state.request_ids.contains(&request.request_id) {
@@ -578,11 +773,11 @@ impl PermissionSupervisor {
                 .auto_approve
                 .iter()
                 .enumerate()
-                .find(|(index, rule)| {
+                .find(|(_index, rule)| {
                     let used = self
                         .state
                         .auto_use_counters
-                        .get(&u32::try_from(*index).unwrap_or(u32::MAX))
+                        .get(&request.category)
                         .copied()
                         .unwrap_or(0);
                     rule.matcher.category == request.category
@@ -600,7 +795,7 @@ impl PermissionSupervisor {
                 HistoryKind::AllowedAuto,
                 now,
                 move |state| {
-                    let used = state.auto_use_counters.entry(index).or_default();
+                    let used = state.auto_use_counters.entry(request.category).or_default();
                     *used = used.checked_add(1).ok_or_else(|| {
                         SupervisorError::Corrupt("auto-use counter overflow".to_owned())
                     })?;
@@ -642,17 +837,54 @@ impl PermissionSupervisor {
                 |_| Ok(()),
             );
         };
-        let deadline = now
-            .checked_add(self.state.config.approval_timeout_ms)
-            .ok_or_else(|| {
-                SupervisorError::InvalidConfig("approval deadline overflow".to_owned())
-            })?;
-        let handler_result = approval_handler.approve(&request, risk, deadline);
+        let deadline = if self.state.config.approval_timeout_ms == 0 {
+            u64::MAX
+        } else {
+            now.checked_add(self.state.config.approval_timeout_ms)
+                .ok_or_else(|| {
+                    SupervisorError::InvalidConfig("approval deadline overflow".to_owned())
+                })?
+        };
+        if cancellation.is_cancelled() {
+            return self.record_request_decision(
+                &request,
+                risk,
+                false,
+                "approval_cancelled",
+                HistoryKind::DeniedCancelled,
+                now,
+                |state| {
+                    state.prompts_used += 1;
+                    Ok(())
+                },
+            );
+        }
+        let approval_context = ApprovalContext {
+            risk,
+            deadline_unix_ms: deadline,
+            cancellation: cancellation.clone(),
+        };
+        let handler_result = approval_handler.approve(&request, &approval_context);
         let after = clock.now_unix_ms();
 
         let decision = match handler_result {
+            Ok(_) if cancellation.is_cancelled() => {
+                return self.record_request_decision(
+                    &request,
+                    risk,
+                    false,
+                    "approval_cancelled",
+                    HistoryKind::DeniedCancelled,
+                    after,
+                    |state| {
+                        state.prompts_used += 1;
+                        Ok(())
+                    },
+                );
+            }
             Ok(decision) if after <= deadline => decision,
             Ok(_) => {
+                cancellation.cancel();
                 return self.record_request_decision(
                     &request,
                     risk,
@@ -720,6 +952,51 @@ impl PermissionSupervisor {
                 subject,
                 action: "deny_added".to_owned(),
                 allowed: false,
+                generation: 0,
+                state_hash: String::new(),
+            },
+        )?;
+        Ok(self.checkpoint())
+    }
+
+    pub fn grant(
+        &mut self,
+        grant: PermissionGrant,
+        timestamp_unix_ms: u64,
+    ) -> Result<SupervisorCheckpoint, SupervisorError> {
+        validate_grant(&grant, &self.state.config.limits, timestamp_unix_ms)?;
+        if grant.id.starts_with("grant-") {
+            return Err(SupervisorError::InvalidDecision(
+                "manual grant identifiers cannot use the reserved grant- prefix".to_owned(),
+            ));
+        }
+        if self.state.grants.contains_key(&grant.id) {
+            return Err(SupervisorError::InvalidDecision(
+                "grant identifier already exists".to_owned(),
+            ));
+        }
+        let subject = match &grant.matcher {
+            GrantMatcher::Exact { subject } => subject.clone(),
+            GrantMatcher::Pattern { pattern } => pattern.clone(),
+        };
+        let mut next = self.state.clone();
+        insert_grant(&mut next, grant.clone())?;
+        self.commit(
+            next,
+            HistoryDraft {
+                timestamp_unix_ms,
+                kind: HistoryKind::GrantAdded,
+                request_id: None,
+                category: Some(grant.category),
+                subject: Some(subject.clone()),
+                detail: grant.id,
+            },
+            PermissionEvent {
+                timestamp_unix_ms,
+                category: grant.category,
+                subject,
+                action: "grant_added".to_owned(),
+                allowed: true,
                 generation: 0,
                 state_hash: String::new(),
             },
@@ -901,7 +1178,21 @@ impl PermissionSupervisor {
                 timestamp_unix_ms,
                 |state| {
                     state.prompts_used += 1;
-                    Ok(())
+                    let grant_id = format!("grant-{}", state.generation.saturating_add(1));
+                    insert_grant(
+                        state,
+                        PermissionGrant {
+                            id: grant_id,
+                            category: request.category,
+                            matcher: GrantMatcher::Exact {
+                                subject: request.subject.clone(),
+                            },
+                            granted_at_unix_ms: timestamp_unix_ms,
+                            expires_at_unix_ms: None,
+                            uses_remaining: Some(1),
+                            grant_type: GrantType::Once,
+                        },
+                    )
                 },
             ),
             ApprovalDecision::ApproveSession {
@@ -909,17 +1200,11 @@ impl PermissionSupervisor {
                 max_uses,
             } => {
                 if !self.state.config.allow_session_grants {
-                    return self.record_request_decision(
-                        &request,
+                    return self.apply_approval_decision(
+                        request,
                         risk,
-                        false,
-                        "session_grants_disabled",
-                        HistoryKind::DeniedApproval,
+                        ApprovalDecision::ApproveOnce,
                         timestamp_unix_ms,
-                        |state| {
-                            state.prompts_used += 1;
-                            Ok(())
-                        },
                     );
                 }
                 validate_grant_limits(max_uses, expires_at_unix_ms, timestamp_unix_ms)?;
@@ -948,8 +1233,10 @@ impl PermissionSupervisor {
                                 matcher: GrantMatcher::Exact {
                                     subject: subject.clone(),
                                 },
+                                granted_at_unix_ms: timestamp_unix_ms,
                                 expires_at_unix_ms,
                                 uses_remaining: current_consumed_uses(max_uses),
+                                grant_type: GrantType::Session,
                             },
                         )
                     },
@@ -1016,8 +1303,10 @@ impl PermissionSupervisor {
                                 matcher: GrantMatcher::Pattern {
                                     pattern: pattern.clone(),
                                 },
+                                granted_at_unix_ms: timestamp_unix_ms,
                                 expires_at_unix_ms,
                                 uses_remaining: current_consumed_uses(max_uses),
+                                grant_type: GrantType::Pattern,
                             },
                         )
                     },
@@ -1170,6 +1459,11 @@ fn insert_grant(state: &mut PersistedState, grant: PermissionGrant) -> Result<()
             "grant limit reached".to_owned(),
         ));
     }
+    if state.grants.contains_key(&grant.id) {
+        return Err(SupervisorError::InvalidDecision(
+            "grant identifier collision".to_owned(),
+        ));
+    }
     state.grants.insert(grant.id.clone(), grant);
     Ok(())
 }
@@ -1214,7 +1508,6 @@ fn validate_config(config: &SupervisorConfig) -> Result<(), SupervisorError> {
         || limits.max_subject_bytes == 0
         || limits.max_subject_bytes > HARD_MAX_SUBJECT_BYTES
         || config.prompt_budget > HARD_MAX_PROMPTS
-        || config.approval_timeout_ms == 0
         || config.approval_timeout_ms > HARD_MAX_TIMEOUT_MS
         || config.auto_approve.len() > limits.max_grants
     {
@@ -1238,7 +1531,15 @@ fn validate_request(
     limits: &SupervisorLimits,
 ) -> Result<(), SupervisorError> {
     validate_id(&request.request_id).map_err(SupervisorError::InvalidRequest)?;
-    validate_subject(&request.subject, limits)
+    validate_subject(&request.subject, limits)?;
+    if request.context.len() > limits.max_subject_bytes
+        || request.context.chars().any(char::is_control)
+    {
+        return Err(SupervisorError::InvalidRequest(
+            "context is too long or contains control characters".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_id(value: &str) -> Result<(), String> {
@@ -1349,7 +1650,7 @@ fn validate_state(state: &PersistedState) -> Result<(), SupervisorError> {
         || state.deny_rules.len() > state.config.limits.max_deny_rules
         || state.request_ids.len() > state.config.limits.max_request_ids
         || state.prompts_used > state.config.prompt_budget
-        || state.auto_use_counters.len() > state.config.auto_approve.len()
+        || state.auto_use_counters.len() > 5
     {
         return Err(SupervisorError::Corrupt(
             "persisted collection count exceeds limits".to_owned(),
@@ -1396,6 +1697,7 @@ fn validate_state(state: &PersistedState) -> Result<(), SupervisorError> {
             HistoryKind::AllowedApproval
                 | HistoryKind::DeniedApproval
                 | HistoryKind::DeniedTimeout
+                | HistoryKind::DeniedCancelled
                 | HistoryKind::HandlerError
         ) {
             history_prompts = history_prompts
@@ -1422,24 +1724,11 @@ fn validate_state(state: &PersistedState) -> Result<(), SupervisorError> {
                 "grant key, identifier, or use count is invalid".to_owned(),
             ));
         }
-        match &grant.matcher {
-            GrantMatcher::Exact { subject } => {
-                validate_subject(subject, &state.config.limits)
-                    .map_err(|error| SupervisorError::Corrupt(error.to_string()))?;
-            }
-            GrantMatcher::Pattern { pattern } => {
-                validate_pattern(pattern, &state.config.limits)
-                    .map_err(|error| SupervisorError::Corrupt(error.to_string()))?;
-            }
-        }
+        validate_grant(grant, &state.config.limits, grant.granted_at_unix_ms)
+            .map_err(|error| SupervisorError::Corrupt(error.to_string()))?;
     }
-    for (index, used) in &state.auto_use_counters {
-        let rule = state
-            .config
-            .auto_approve
-            .get(*index as usize)
-            .ok_or_else(|| SupervisorError::Corrupt("unknown auto-rule counter".to_owned()))?;
-        if *used == 0 || rule.max_uses.is_some_and(|maximum| *used > maximum) {
+    for used in state.auto_use_counters.values() {
+        if *used == 0 {
             return Err(SupervisorError::Corrupt(
                 "auto-rule use counter is invalid".to_owned(),
             ));
@@ -1514,4 +1803,61 @@ pub fn glob_matches(pattern: &str, value: &str) -> bool {
         previous = current;
     }
     previous[value.len()]
+}
+
+pub struct SharedPermissionSupervisor {
+    inner: Mutex<PermissionSupervisor>,
+}
+
+impl SharedPermissionSupervisor {
+    #[must_use]
+    pub const fn new(supervisor: PermissionSupervisor) -> Self {
+        Self {
+            inner: Mutex::new(supervisor),
+        }
+    }
+
+    pub fn evaluate(
+        &self,
+        request: PermissionRequest,
+        clock: &dyn SupervisorClock,
+    ) -> Result<PermissionDecision, SupervisorError> {
+        self.inner
+            .lock()
+            .map_err(|_| SupervisorError::Corrupt("supervisor mutex poisoned".to_owned()))?
+            .evaluate(request, clock, None)
+    }
+
+    pub fn checkpoint(&self) -> Result<SupervisorCheckpoint, SupervisorError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| SupervisorError::Corrupt("supervisor mutex poisoned".to_owned()))?
+            .checkpoint())
+    }
+}
+
+fn validate_grant(
+    grant: &PermissionGrant,
+    limits: &SupervisorLimits,
+    now_unix_ms: u64,
+) -> Result<(), SupervisorError> {
+    validate_id(&grant.id).map_err(SupervisorError::InvalidDecision)?;
+    if grant
+        .expires_at_unix_ms
+        .is_some_and(|expiry| expiry <= now_unix_ms)
+    {
+        return Err(SupervisorError::InvalidDecision(
+            "grant expiry must be after its validation time".to_owned(),
+        ));
+    }
+    if grant.uses_remaining == Some(0) {
+        return Err(SupervisorError::InvalidDecision(
+            "grant uses must be positive".to_owned(),
+        ));
+    }
+    match &grant.matcher {
+        GrantMatcher::Exact { subject } => validate_subject(subject, limits),
+        GrantMatcher::Pattern { pattern } => validate_pattern(pattern, limits),
+    }
 }

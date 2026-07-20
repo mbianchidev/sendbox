@@ -864,6 +864,7 @@ name = "sendbox-security-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "sendbox-secrets",
  "sendbox-security",
  "sendbox-session-security",
 ]

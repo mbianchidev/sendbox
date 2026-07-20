@@ -40,11 +40,27 @@ classification intent while making decisions replay-safe and deterministic:
 - caller-clock deadline checks without UI or real-time sleeps;
 - revocation and bounded decision history.
 
+The default, strict, and autonomous configurations retain the Swift prompt
+budgets, session-grant flags, timeout values, and autonomous wildcard rules. A
+zero timeout disables deadline expiry. When session grants are disabled,
+`approveForSession` falls back to the Swift one-time behavior. That behavior
+records the current approval and creates one exact-action use for the next
+matching check.
+
+`denyAlways` is the intentional redesign exception: Swift only recorded the
+denial and would prompt again. Rust persists an exact deny rule, checks it before
+positive grants, and requires explicit revocation. This strengthens denial
+without broadening permission.
+
 Canonical JSON state includes the session ID, generation, previous state hash,
 current state hash, grants, deny rules, replay set, prompt counters, and history.
 Every mutation advances the generation and is emitted through a
 `PermissionEventSink`. `AuditPermissionEventSink` records the generation and
 state hash in the session audit chain.
+
+`SharedPermissionSupervisor` serializes only non-interactive checks so use-limited
+grant consumption remains atomic without holding a mutex across an approval
+handler. Interactive approval remains owned by the orchestration layer.
 
 The supervisor checkpoint is an external high-water mark. Loading an older
 generation, an equivocated state at the same generation, an unlinked next

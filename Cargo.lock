@@ -1561,6 +1561,7 @@ dependencies = [
 name = "sendbox-session-security"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "sendbox-core",
  "sendbox-secrets",
  "sendbox-security",

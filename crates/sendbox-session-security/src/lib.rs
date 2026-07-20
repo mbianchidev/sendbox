@@ -15,8 +15,9 @@ pub use migration::{
     MigrationAuthorization, MigrationError, MigrationLimits, MigrationProposal, MigrationReport,
 };
 pub use supervisor::{
-    PermissionCategory, PermissionRequest, PermissionSupervisor, RiskLevel, SupervisorCheckpoint,
-    SupervisorError,
+    ApprovalCancellation, ApprovalContext, GrantMatcher, GrantType, PermissionCategory,
+    PermissionGrant, PermissionHistoryRecord, PermissionRequest, PermissionSupervisor, RiskLevel,
+    SharedPermissionSupervisor, SupervisorCheckpoint, SupervisorError, SupervisorSummary,
 };
 
 #[doc(hidden)]
