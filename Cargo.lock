@@ -264,6 +264,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db8b397918185f0161ff3d6fcaa9e4bfc09b8367caf6e1d4a2848e5477ed027b"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1372,8 +1381,10 @@ name = "sendbox-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "clap_complete",
  "sendbox-config",
  "sendbox-core",
+ "sendbox-policy",
  "sendbox-project",
  "serde",
  "serde_json",
@@ -1384,11 +1395,13 @@ dependencies = [
 name = "sendbox-config"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "sendbox-core",
  "sendbox-policy",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "tempfile",
  "thiserror",
 ]
 
@@ -1421,6 +1434,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-exec"
+version = "0.1.0"
+dependencies = [
+ "caps",
+ "getrandom 0.4.3",
+ "libc",
+ "libseccomp",
+ "rlimit",
+ "sendbox-core",
+ "sendbox-policy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "sendbox-guest"
 version = "0.1.0"
 dependencies = [
@@ -1436,24 +1467,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "zeroize",
-]
-
-[[package]]
-name = "sendbox-exec"
-version = "0.1.0"
-dependencies = [
- "caps",
- "getrandom 0.4.3",
- "libc",
- "libseccomp",
- "rlimit",
- "sendbox-core",
- "sendbox-policy",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
  "zeroize",
 ]
 

@@ -32,6 +32,7 @@ pub struct NetworkPolicy {
     pub allowed_domains: Vec<String>,
     pub blocked_domains: Vec<String>,
     pub allow_dns: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<i64>,
     /// Exact IP or CIDR literals (v4 or v6) that are always permitted, e.g.
     /// `"93.184.216.34/32"` or `"2001:db8::/32"`. An explicit network grant

@@ -1,8 +1,11 @@
+use std::fs;
 use std::path::PathBuf;
 
-use sendbox_config::{RuntimeProvider, SandboxConfiguration};
+use proptest::prelude::*;
+use sendbox_config::{AtomicWriteMode, PolicyPreset, RuntimeProvider, SandboxConfiguration};
 use sendbox_core::DiagnosticCode;
 use sendbox_policy::Action;
+use tempfile::tempdir;
 
 fn workspace_path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -111,6 +114,151 @@ fn canonical_json_round_trips_deterministically() {
 
     assert_eq!(first, second);
     assert_eq!(decoded, config);
+}
+
+#[test]
+fn canonical_yaml_round_trips_with_snake_case_and_omitted_options() {
+    let config = SandboxConfiguration::for_project(
+        PathBuf::from("/projects/example"),
+        PolicyPreset::Default,
+        RuntimeProvider::Auto,
+    );
+    let first = config.to_canonical_yaml().unwrap();
+    let second = config.to_canonical_yaml().unwrap();
+    let decoded = SandboxConfiguration::parse(&first).unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(decoded, config);
+    assert!(first.contains("project_path: /projects/example\n"));
+    assert!(first.contains("memory_mb: 4096\n"));
+    assert!(first.contains("default_action: deny\n"));
+    assert!(!first.contains("projectPath"));
+    assert!(!first.contains(": null"));
+}
+
+#[test]
+fn migration_accepts_implicit_and_explicit_v1_and_rejects_future_versions() {
+    let implicit =
+        fs::read_to_string(workspace_path("test-fixtures/config/partial-runtime.yaml")).unwrap();
+    let implicit_result = SandboxConfiguration::migrate(&implicit).unwrap();
+    assert_eq!(implicit_result.migration.source_version, 1);
+    assert!(!implicit_result.migration.explicit_source_version);
+    assert!(!implicit_result.migration.schema_changed);
+    assert!(implicit_result.migration.canonicalized);
+
+    let explicit = format!("schema_version: 1\n{implicit}");
+    let explicit_result = SandboxConfiguration::migrate(&explicit).unwrap();
+    assert!(explicit_result.migration.explicit_source_version);
+    assert_eq!(explicit_result.configuration, implicit_result.configuration);
+    assert!(!explicit_result.yaml.contains("schema_version"));
+
+    let future = explicit.replacen("schema_version: 1", "schema_version: 2", 1);
+    let error = SandboxConfiguration::migrate(&future).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported configuration schema version 2")
+    );
+}
+
+#[test]
+fn secure_atomic_write_refuses_existing_files_and_replaces_explicitly() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let mut config = SandboxConfiguration::for_project(
+        PathBuf::from("/projects/one"),
+        PolicyPreset::Default,
+        RuntimeProvider::Auto,
+    );
+
+    config.write(&path, AtomicWriteMode::CreateNew).unwrap();
+    let original = fs::read_to_string(&path).unwrap();
+    let error = config.write(&path, AtomicWriteMode::CreateNew).unwrap_err();
+    assert_eq!(error.diagnostic().code, DiagnosticCode::Io);
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    config.name = "replacement".to_owned();
+    config.write(&path, AtomicWriteMode::Replace).unwrap();
+    let replaced = fs::read_to_string(&path).unwrap();
+    assert!(replaced.starts_with("name: replacement\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn configuration_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    SandboxConfiguration::for_project(
+        PathBuf::from("/projects/private"),
+        PolicyPreset::Strict,
+        RuntimeProvider::Kata,
+    )
+    .write(&path, AtomicWriteMode::CreateNew)
+    .unwrap();
+
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn invalid_configuration_is_not_written() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let mut config = SandboxConfiguration::for_project(
+        PathBuf::from("/projects/invalid"),
+        PolicyPreset::Default,
+        RuntimeProvider::Auto,
+    );
+    config.resources.cpus = 0;
+
+    let error = config.write(&path, AtomicWriteMode::CreateNew).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("configuration validation failed")
+    );
+    assert!(!path.exists());
+}
+
+proptest! {
+    #[test]
+    fn generated_configs_round_trip_through_yaml(
+        name in "[a-z][a-z0-9-]{0,31}",
+        cpus in 1_i64..64,
+        memory_mb in 1_i64..131_072,
+        disk_size_mb in 1_i64..1_048_576,
+        preset_index in 0_u8..3,
+        runtime_index in 0_u8..4,
+    ) {
+        let preset = match preset_index {
+            0 => PolicyPreset::Default,
+            1 => PolicyPreset::Permissive,
+            _ => PolicyPreset::Strict,
+        };
+        let runtime = match runtime_index {
+            0 => RuntimeProvider::Auto,
+            1 => RuntimeProvider::Apple,
+            2 => RuntimeProvider::Kata,
+            _ => RuntimeProvider::Hyperlight,
+        };
+        let mut config = SandboxConfiguration::for_project(
+            PathBuf::from(format!("/projects/{name}")),
+            preset,
+            runtime,
+        );
+        config.name = name;
+        config.resources.cpus = cpus;
+        config.resources.memory_mb = memory_mb;
+        config.resources.disk_size_mb = disk_size_mb;
+
+        let yaml = config.to_canonical_yaml().unwrap();
+        let decoded = SandboxConfiguration::parse(&yaml).unwrap();
+        prop_assert_eq!(decoded, config);
+    }
 }
 
 #[test]

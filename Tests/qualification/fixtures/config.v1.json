@@ -1,7 +1,9 @@
 {
   "schema_version": 1,
   "canonicalization": {
-    "format": "minified JSON with declaration-order object keys",
+    "json_format": "minified JSON with declaration-order object keys",
+    "yaml_format": "deterministic UTF-8 YAML with declaration-order snake_case keys and one trailing newline",
+    "optional_values": "omit absent optional keys and sections; preserve explicit empty collections",
     "defaults": {
       "runtime.provider": "auto",
       "runtime.kata.executable": "nerdctl",
@@ -22,7 +24,27 @@
       "github.branch_protection.enabled": true,
       "observability.mcp_inspection.enabled": false,
       "observability.mcp_inspection.max_payload_bytes": 16384
-    }
+    },
+    "migration": {
+      "implicit_version": 1,
+      "accepted_explicit_versions": [1],
+      "future_versions": "reject with invalid_yaml diagnostic",
+      "unknown_fields": "reject during strict decode",
+      "report_fields": [
+        "source_version",
+        "target_version",
+        "explicit_source_version",
+        "schema_changed",
+        "canonicalized"
+      ]
+    },
+    "persistence": {
+      "create": "atomic no-clobber",
+      "replace": "explicit atomic replacement",
+      "file_mode_octal": "0600",
+      "validate_before_write": true
+    },
+    "roundtrip": ["golden fixture coverage", "property-generated valid configurations", "fuzz/config yaml_roundtrip"]
   },
   "errors": [
     {"case": "unknown_field", "code": "invalid_yaml", "exit": 2},
@@ -32,4 +54,3 @@
     {"case": "branch_protection_without_boundaries", "code": "incompatible_configuration", "exit": 2}
   ]
 }
-

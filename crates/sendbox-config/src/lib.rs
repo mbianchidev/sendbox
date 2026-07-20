@@ -8,6 +8,15 @@ use sendbox_policy::PolicyConfiguration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod persistence;
+mod presets;
+
+pub use persistence::{
+    AtomicWriteMode, CONFIG_FILE_MODE, LoadedConfiguration, MigrationReport, MigrationResult,
+    atomic_write_file,
+};
+pub use presets::PolicyPreset;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeProvider {
@@ -23,8 +32,11 @@ pub struct KataRuntimeConfiguration {
     pub executable: String,
     pub runtime_handler: String,
     pub namespace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshotter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub configuration_path: Option<PathBuf>,
 }
 
@@ -46,6 +58,7 @@ impl Default for KataRuntimeConfiguration {
 pub struct HyperlightRuntimeConfiguration {
     pub executable: PathBuf,
     pub kernel_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub initrd_path: Option<PathBuf>,
     pub stack_mb: i64,
 }
@@ -100,6 +113,7 @@ impl Default for ResourceConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevContainerConfiguration {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub config_path: Option<PathBuf>,
     pub auto_generate: bool,
     pub extensions: Vec<String>,
@@ -109,6 +123,7 @@ pub struct DevContainerConfiguration {
 #[serde(default, deny_unknown_fields)]
 pub struct BranchProtectionConfiguration {
     pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     pub protected_branches: Vec<String>,
     pub allowed_branch_patterns: Vec<String>,
@@ -138,6 +153,7 @@ pub struct GitHubConfiguration {
     pub allow_private_repository_access: bool,
     #[serde(default)]
     pub branch_protection: BranchProtectionConfiguration,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_key_path: Option<PathBuf>,
 }
 
@@ -196,12 +212,15 @@ pub struct ObservabilityConfiguration {
 pub struct SandboxConfiguration {
     pub name: String,
     pub project_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeConfiguration>,
     pub resources: ResourceConfiguration,
     pub policy: PolicyConfiguration,
     pub secrets: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub devcontainer: Option<DevContainerConfiguration>,
     pub github: GitHubConfiguration,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub observability: Option<ObservabilityConfiguration>,
 }
 
@@ -211,15 +230,73 @@ impl SandboxConfiguration {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigurationError> {
+        Ok(Self::load_with_migration(path)?.configuration)
+    }
+
+    pub fn load_with_migration(
+        path: impl AsRef<Path>,
+    ) -> Result<LoadedConfiguration, ConfigurationError> {
         let path = path.as_ref();
         let yaml = fs::read_to_string(path).map_err(|source| ConfigurationError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::parse(&yaml).map_err(|source| ConfigurationError::Decode {
-            path: path.to_path_buf(),
-            source,
-        })
+        persistence::parse_with_migration(&yaml, path)
+    }
+
+    pub fn migrate(yaml: &str) -> Result<MigrationResult, ConfigurationError> {
+        persistence::migrate(yaml, Path::new("<memory>"))
+    }
+
+    pub fn for_project(
+        project_path: PathBuf,
+        policy_preset: PolicyPreset,
+        runtime_provider: RuntimeProvider,
+    ) -> Self {
+        let name = project_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("sendbox")
+            .to_owned();
+        let mut policy = policy_preset.configuration();
+        let mut runtime = RuntimeConfiguration {
+            provider: runtime_provider,
+            ..RuntimeConfiguration::default()
+        };
+        let mut branch_protection = BranchProtectionConfiguration::default();
+
+        if runtime_provider == RuntimeProvider::Hyperlight {
+            runtime.hyperlight.kernel_path = PathBuf::from("/opt/hyperlight/shell-kernel");
+            policy.boundaries.enabled = false;
+            policy
+                .network
+                .allowed_domains
+                .retain(|domain| !domain.contains('*'));
+            branch_protection.enabled = false;
+        }
+
+        Self {
+            name,
+            project_path,
+            runtime: Some(runtime),
+            resources: ResourceConfiguration::default(),
+            policy,
+            secrets: Vec::new(),
+            devcontainer: Some(DevContainerConfiguration {
+                config_path: None,
+                auto_generate: true,
+                extensions: Vec::new(),
+            }),
+            github: GitHubConfiguration {
+                forward_auth: true,
+                forward_copilot_auth: true,
+                allow_private_repository_access: false,
+                branch_protection,
+                ssh_key_path: None,
+            },
+            observability: Some(ObservabilityConfiguration::default()),
+        }
     }
 
     pub fn validate(&self) -> Result<(), ValidationFailure> {
@@ -278,6 +355,26 @@ impl SandboxConfiguration {
 
     pub fn to_canonical_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+
+    pub fn to_canonical_yaml(&self) -> Result<String, ConfigurationError> {
+        self.validate().map_err(ConfigurationError::Validation)?;
+        persistence::serialize(self)
+    }
+
+    pub fn write(
+        &self,
+        path: impl AsRef<Path>,
+        mode: AtomicWriteMode,
+    ) -> Result<(), ConfigurationError> {
+        let path = path.as_ref();
+        let yaml = self.to_canonical_yaml()?;
+        atomic_write_file(path, yaml.as_bytes(), CONFIG_FILE_MODE, mode).map_err(|source| {
+            ConfigurationError::Write {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
     }
 
     fn validate_runtime(&self, diagnostics: &mut Vec<Diagnostic>) {
@@ -406,6 +503,21 @@ pub enum ConfigurationError {
         #[source]
         source: serde_yaml_ng::Error,
     },
+    #[error("could not encode configuration: {source}")]
+    Encode {
+        #[source]
+        source: serde_yaml_ng::Error,
+    },
+    #[error("unsupported configuration schema version {found}; current version is {current}")]
+    UnsupportedVersion { found: u64, current: u32 },
+    #[error("configuration validation failed: {0}")]
+    Validation(ValidationFailure),
+    #[error("could not write configuration {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl ConfigurationError {
@@ -419,6 +531,28 @@ impl ConfigurationError {
             ),
             Self::Decode { path, source } => Diagnostic::new(
                 DiagnosticCode::InvalidYaml,
+                path.display().to_string(),
+                source.to_string(),
+            ),
+            Self::Encode { source } => Diagnostic::new(
+                DiagnosticCode::InvalidYaml,
+                "configuration",
+                source.to_string(),
+            ),
+            Self::UnsupportedVersion { found, current } => Diagnostic::new(
+                DiagnosticCode::InvalidYaml,
+                "schema_version",
+                format!("unsupported version {found}; current version is {current}"),
+            ),
+            Self::Validation(error) => error.diagnostics().first().cloned().unwrap_or_else(|| {
+                Diagnostic::new(
+                    DiagnosticCode::InvalidValue,
+                    "configuration",
+                    "configuration validation failed",
+                )
+            }),
+            Self::Write { path, source } => Diagnostic::new(
+                DiagnosticCode::Io,
                 path.display().to_string(),
                 source.to_string(),
             ),
