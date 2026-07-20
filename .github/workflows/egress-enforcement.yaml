@@ -1,0 +1,140 @@
+name: Egress enforcement (production)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/sendbox-egress/**"
+      - "crates/sendbox-policy/**"
+      - "config/default-policy.yaml"
+      - "config/example-sandbox.yaml"
+      - "docs/architecture/egress-enforcement.md"
+      - "docs/security/egress-enforcement-trust-boundary.md"
+      - ".github/workflows/egress-enforcement.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/sendbox-egress/**"
+      - "crates/sendbox-policy/**"
+      - "config/default-policy.yaml"
+      - "config/example-sandbox.yaml"
+      - "docs/architecture/egress-enforcement.md"
+      - "docs/security/egress-enforcement-trust-boundary.md"
+      - ".github/workflows/egress-enforcement.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: egress-enforcement-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: "1.93.1"
+  CARGO_AUDIT_VERSION: "0.22.2"
+
+jobs:
+  checks:
+    name: Format, clippy, tests, release, audit (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo +${{ env.RUST_VERSION }} fmt --all -- --check
+
+      - name: Run clippy (deny warnings)
+        run: cargo +${{ env.RUST_VERSION }} clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run egress + policy tests
+        run: cargo +${{ env.RUST_VERSION }} test -p sendbox-egress -p sendbox-policy --all-features
+
+      - name: Build release
+        run: cargo +${{ env.RUST_VERSION }} build -p sendbox-egress --release
+
+      - name: Install pinned cargo-audit
+        run: cargo +${{ env.RUST_VERSION }} install cargo-audit --version ${{ env.CARGO_AUDIT_VERSION }} --locked
+
+      - name: Audit dependencies
+        run: cargo +${{ env.RUST_VERSION }} audit --file Cargo.lock
+
+  aarch64-compile:
+    name: aarch64 cross compile check (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned Rust toolchain with aarch64 target
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component clippy
+          rustup target add aarch64-unknown-linux-gnu --toolchain ${{ env.RUST_VERSION }}
+
+      # Compile-check (no link/run) the whole crate — library, harness bin, and
+      # the cfg(linux) enforcement layer + gated live test — for aarch64 Linux.
+      # This gives reliable arm64 compile coverage on a GitHub-hosted x86 runner.
+      # A *live* arm64 run additionally requires a privileged arm64 Linux runner
+      # (e.g. ubuntu-24.04-arm) with nftables/iproute2; it is intentionally not
+      # inlined here because reliable hosted privileged arm64 availability is not
+      # guaranteed. Enable it by adding a job mirroring `live-linux` on an arm64
+      # runner when one is available.
+      - name: cargo clippy (aarch64-unknown-linux-gnu)
+        run: cargo +${{ env.RUST_VERSION }} clippy -p sendbox-egress --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+
+  live-linux:
+    name: Privileged Linux netns/cgroup/nftables live proof (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    needs: checks
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+
+      - name: Install nftables, iproute2, and util-linux (setpriv)
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2 util-linux jq
+
+      - name: Build the harness and live test binary (no run)
+        run: |
+          cargo +${{ env.RUST_VERSION }} build --release -p sendbox-egress --bin sendbox-egress-harness
+          cargo +${{ env.RUST_VERSION }} test --release -p sendbox-egress --test live_netns --no-run
+
+      - name: Probe live capabilities under sudo (same privilege as the live run)
+        run: sudo ./target/release/sendbox-egress-harness probe | tee egress-probe-verdict.json
+
+      - name: Publish capability verdict artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: egress-enforcement-live-capability-verdict
+          path: egress-probe-verdict.json
+
+      # Fail explicitly (with the verdict quoted) instead of silently skipping
+      # the live suite when the runner cannot enforce.
+      - name: Gate on the capability verdict
+        run: |
+          set -euo pipefail
+          ready=$(jq -r '(.cgroup2_root != null and .cap_net_admin and .so_mark_settable and (.nft_version != null) and .nft_socket_cgroupv2)' egress-probe-verdict.json)
+          if [ "$ready" != "true" ]; then
+            echo "::error::live capability verdict indicates this runner cannot enforce egress: $(cat egress-probe-verdict.json)"
+            exit 1
+          fi
+
+      # SENDBOX_EGRESS_LIVE_REQUIRE=1 turns a missing capability into a hard
+      # failure so this job can never silently degrade into a no-op. The compiled
+      # test binary is invoked directly under sudo so root needs no cargo/rustup
+      # on PATH.
+      - name: Run the live enforcement suite as root
+        run: |
+          set -euo pipefail
+          TEST_BIN=$(find target/release/deps -maxdepth 1 -type f -name 'live_netns-*' ! -name '*.d' | head -n1)
+          if [ -z "$TEST_BIN" ]; then
+            echo "::error::could not locate the compiled live_netns test binary"
+            exit 1
+          fi
+          sudo SENDBOX_EGRESS_LIVE=1 SENDBOX_EGRESS_LIVE_REQUIRE=1 "$TEST_BIN" --nocapture --test-threads=1

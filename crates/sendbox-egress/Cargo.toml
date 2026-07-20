@@ -1,0 +1,60 @@
+[package]
+name = "sendbox-egress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Production network egress enforcement: typed policy compilation, a DNS-validating broker, a CONNECT egress broker, and Linux cgroup-v2/nftables enforcement."
+
+[lib]
+name = "sendbox_egress"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sendbox-egress-harness"
+path = "src/bin/harness.rs"
+
+[dependencies]
+sendbox-core = { path = "../sendbox-core" }
+sendbox-policy = { path = "../sendbox-policy" }
+async-trait.workspace = true
+clap.workspace = true
+hickory-proto.workspace = true
+ipnet.workspace = true
+libc.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-util.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cap-std.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+hickory-proto.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-util.workspace = true
+
+[lints]
+workspace = true
