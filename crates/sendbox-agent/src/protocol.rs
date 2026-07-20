@@ -4,6 +4,8 @@ use sendbox_protocol::{
 };
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
 
+use std::{future::Future, time::Duration};
+
 use crate::{
     AgentError, BoxFuture, GuestConnectionConfiguration, GuestConnector, GuestEvent,
     GuestExecution, GuestLaunchRequest, GuestSession,
@@ -11,6 +13,7 @@ use crate::{
 
 const LAUNCH_OPERATION: &str = "agent.launch";
 const REQUEST_ID: u64 = 1;
+const PROTOCOL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
 pub struct ProtocolGuestConnector;
@@ -73,13 +76,16 @@ impl GuestSession for ProtocolGuestSession {
                 .writer
                 .take()
                 .ok_or_else(|| AgentError::Guest("guest session already started".to_owned()))?;
-            writer
-                .send(&Message::Request(Request {
+            protocol_io(
+                "send guest launch request",
+                cancellation,
+                writer.send(&Message::Request(Request {
                     request_id: REQUEST_ID,
                     operation: LAUNCH_OPERATION.to_owned(),
                     payload,
-                }))
-                .await?;
+                })),
+            )
+            .await?;
             let reader = self
                 .reader
                 .take()
@@ -102,12 +108,15 @@ impl GuestSession for ProtocolGuestSession {
                 return Ok(());
             }
             if let Some(writer) = self.writer.as_mut() {
-                writer
-                    .send(&Message::GracefulClose(GracefulClose {
+                protocol_io(
+                    "send guest graceful close",
+                    cancellation,
+                    writer.send(&Message::GracefulClose(GracefulClose {
                         code: CloseCode::Shutdown,
                         reason: "agent cleanup".to_owned(),
-                    }))
-                    .await?;
+                    })),
+                )
+                .await?;
             }
             Ok(())
         })
@@ -179,20 +188,40 @@ impl GuestExecution for ProtocolGuestExecution {
 
     fn cancel<'a>(
         &'a mut self,
-        _cancellation: &'a CancellationToken,
+        cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
             if self.cancelled || self.terminal {
                 return Ok(());
             }
-            self.writer
-                .send(&Message::Cancellation(sendbox_protocol::Cancellation {
-                    request_id: REQUEST_ID,
-                    reason: Some("agent cancellation".to_owned()),
-                }))
-                .await?;
+            protocol_io(
+                "send guest cancellation",
+                cancellation,
+                self.writer
+                    .send(&Message::Cancellation(sendbox_protocol::Cancellation {
+                        request_id: REQUEST_ID,
+                        reason: Some("agent cancellation".to_owned()),
+                    })),
+            )
+            .await?;
             self.cancelled = true;
             Ok(())
         })
+    }
+}
+
+async fn protocol_io<T>(
+    operation: &'static str,
+    cancellation: &CancellationToken,
+    future: impl Future<Output = Result<T, sendbox_protocol::ProtocolError>>,
+) -> Result<T, AgentError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(AgentError::Cancelled),
+        result = tokio::time::timeout(PROTOCOL_IO_TIMEOUT, future) => {
+            result
+                .map_err(|_| AgentError::Guest(format!("{operation} timed out")))?
+                .map_err(AgentError::Protocol)
+        }
     }
 }

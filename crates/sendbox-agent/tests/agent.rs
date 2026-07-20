@@ -468,6 +468,20 @@ async fn signal_cancellation_is_idempotent_and_cleanup_failures_do_not_replace_p
 }
 
 #[tokio::test]
+async fn closed_signal_source_does_not_starve_guest_events() {
+    let runtime = Arc::new(FakeRuntime::new(runtime_capabilities()).expect("runtime"));
+    let report = fake_run(
+        Arc::new(FakeConnector::successful()),
+        Arc::new(RecordingOutput::default()),
+        Arc::new(OneSignal(Mutex::new(None))),
+        runtime,
+    )
+    .await
+    .expect("run");
+    assert_eq!(report.terminal, GuestTerminal::Exited { code: 0 });
+}
+
+#[tokio::test]
 async fn runtime_cleanup_failures_are_reported_after_success() {
     let runtime = Arc::new(FakeRuntime::new(runtime_capabilities()).expect("runtime"));
     runtime.failure_injector().fail_next("stop", "stop failed");
@@ -728,5 +742,64 @@ proptest! {
         let second = states[from].can_transition_to(states[to]);
         prop_assert_eq!(first, second);
         prop_assert!(!states[from].can_transition_to(states[from]));
+    }
+}
+
+#[test]
+fn guest_launch_debug_redacts_envelopes_and_environment_values() {
+    let command = GuestCommand {
+        program: "/usr/bin/agent".to_owned(),
+        arguments: Vec::new(),
+        working_directory: "/workspace".to_owned(),
+    };
+    let environment = [EnvironmentIntent {
+        name: "TOKEN".to_owned(),
+        value: "raw-environment-secret".to_owned(),
+    }];
+    let request = GuestLaunchRequest {
+        command: &command,
+        environment: &environment,
+        secrets: vec![sendbox_agent::GuestSecretEnvelope {
+            reference: "TOKEN",
+            envelope: b"raw-envelope-secret",
+        }],
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("raw-environment-secret"));
+    assert!(!debug.contains("raw-envelope-secret"));
+}
+
+#[tokio::test]
+async fn cleanup_uses_the_provider_returned_container_id() {
+    let resources = TempResource::new().expect("resources");
+    resources.create_directory("state").expect("state");
+    let runtime = Arc::new(FakeRuntime::new(runtime_capabilities()).expect("runtime"));
+    let actual = sendbox_runtime::ContainerId::new("provider-container").expect("container");
+    runtime.set_created_container_id(actual.clone());
+    let (host, _guest) = tokio::io::duplex(4096);
+    runtime.set_control_stream(Box::new(host));
+    let plan = plan(
+        &resources,
+        &runtime.capabilities(),
+        SessionId::from_bytes([15; 16]),
+    );
+    let report = AgentOrchestrator::new(
+        runtime.clone(),
+        Arc::new(FakeSecrets),
+        Arc::new(FakeConnector::successful()),
+        Arc::new(RecordingOutput::default()),
+        Arc::new(NoSignals),
+    )
+    .run(&plan, &CancellationToken::new())
+    .await
+    .expect("run");
+    assert_eq!(report.terminal, GuestTerminal::Exited { code: 0 });
+    for operation in runtime
+        .recorder()
+        .commands()
+        .into_iter()
+        .filter(|command| matches!(command.operation.as_str(), "start" | "stop" | "cleanup"))
+    {
+        assert_eq!(operation.container.as_ref(), Some(&actual));
     }
 }

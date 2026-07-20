@@ -52,17 +52,38 @@ pub trait SecretResolver: Send + Sync {
     ) -> BoxFuture<'a, Result<SecretEnvelope, AgentError>>;
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct GuestSecretEnvelope<'a> {
     pub reference: &'a str,
     pub envelope: &'a [u8],
 }
 
-#[derive(Debug, Serialize)]
+impl fmt::Debug for GuestSecretEnvelope<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestSecretEnvelope")
+            .field("reference", &self.reference)
+            .field("envelope", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
 pub struct GuestLaunchRequest<'a> {
     pub command: &'a GuestCommand,
     pub environment: &'a [EnvironmentIntent],
     pub secrets: Vec<GuestSecretEnvelope<'a>>,
+}
+
+impl fmt::Debug for GuestLaunchRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestLaunchRequest")
+            .field("command", &self.command.program)
+            .field("environment_entries", &self.environment.len())
+            .field("secret_envelopes", &self.secrets.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

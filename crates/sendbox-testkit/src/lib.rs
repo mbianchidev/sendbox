@@ -163,6 +163,7 @@ pub struct FakeRuntime {
     capabilities: RuntimeCapabilities,
     lifecycle: LifecycleStateMachine,
     container: Mutex<Option<ContainerId>>,
+    created_container: Mutex<Option<ContainerId>>,
     recorder: CommandRecorder,
     failures: FailureInjector,
     control_stream: Mutex<Option<Box<dyn ControlStream>>>,
@@ -186,6 +187,7 @@ impl FakeRuntime {
             capabilities,
             lifecycle: LifecycleStateMachine::default(),
             container: Mutex::new(None),
+            created_container: Mutex::new(None),
             recorder: CommandRecorder::default(),
             failures: FailureInjector::default(),
             control_stream: Mutex::new(None),
@@ -207,6 +209,13 @@ impl FakeRuntime {
             .control_stream
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(stream);
+    }
+
+    pub fn set_created_container_id(&self, container: ContainerId) {
+        *self
+            .created_container
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(container);
     }
 
     fn before(
@@ -293,11 +302,17 @@ impl RuntimeProvider for FakeRuntime {
                 ));
             }
             self.transition(LifecycleState::Created)?;
+            let container = self
+                .created_container
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+                .unwrap_or(request.container_id);
             *self
                 .container
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) = Some(request.container_id.clone());
-            Ok(request.container_id)
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(container.clone());
+            Ok(container)
         })
     }
 

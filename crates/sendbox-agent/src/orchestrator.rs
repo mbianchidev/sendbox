@@ -133,7 +133,7 @@ impl AgentOrchestrator {
         &self,
         plan: &RunPlan,
         cancellation: &CancellationToken,
-        context: &mut RunContext<'_>,
+        context: &mut RunContext,
     ) -> Result<GuestTerminal, AgentError> {
         check_cancelled(cancellation)?;
         let preflight = self
@@ -174,7 +174,7 @@ impl AgentOrchestrator {
                 cancellation,
             )
             .await?;
-        context.container_created = true;
+        context.container = Some(container.clone());
         context.transition(AgentState::Created)?;
 
         self.runtime
@@ -285,30 +285,31 @@ impl AgentOrchestrator {
     async fn monitor(
         &self,
         cancellation: &CancellationToken,
-        context: &mut RunContext<'_>,
+        context: &mut RunContext,
     ) -> Result<GuestTerminal, AgentError> {
+        let mut signals_open = true;
         loop {
             let execution = context.execution.as_mut().expect("execution was stored");
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => {
-                    execution.cancel(&CancellationToken::new()).await?;
                     return Err(AgentError::Cancelled);
                 }
-                signal = self.signals.next_signal() => {
-                    if signal.is_some() {
-                        cancellation.cancel();
-                        execution.cancel(&CancellationToken::new()).await?;
-                        return Err(AgentError::Cancelled);
+                signal = self.signals.next_signal(), if signals_open => {
+                    match signal {
+                        Some(_) => {
+                            cancellation.cancel();
+                            return Err(AgentError::Cancelled);
+                        }
+                        None => {
+                            signals_open = false;
+                        }
                     }
                 }
                 event = execution.next_event(cancellation) => {
                     match event? {
                         GuestEvent::Output { stream, bytes } => {
-                            if let Err(error) = self.output.write(stream, &bytes, cancellation).await {
-                                execution.cancel(&CancellationToken::new()).await?;
-                                return Err(error);
-                            }
+                            self.output.write(stream, &bytes, cancellation).await?;
                         }
                         GuestEvent::Terminal(terminal) => return Ok(terminal),
                     }
@@ -320,7 +321,7 @@ impl AgentOrchestrator {
     async fn cleanup(
         &self,
         cancellation: &CancellationToken,
-        context: &mut RunContext<'_>,
+        context: &mut RunContext,
     ) -> Vec<CleanupFailure> {
         let cleanup_cancellation = CancellationToken::new();
         let mut failures = Vec::new();
@@ -357,7 +358,10 @@ impl AgentOrchestrator {
             && let Err(error) = self
                 .runtime
                 .stop(
-                    context.plan.container_id(),
+                    context
+                        .container
+                        .as_ref()
+                        .expect("created container was stored"),
                     StopRequest::default(),
                     &cleanup_cancellation,
                 )
@@ -368,12 +372,8 @@ impl AgentOrchestrator {
                 error: AgentError::Runtime(error),
             });
         }
-        if context.container_created {
-            match self
-                .runtime
-                .cleanup(context.plan.container_id(), &cleanup_cancellation)
-                .await
-            {
+        if let Some(container) = context.container.as_ref() {
+            match self.runtime.cleanup(container, &cleanup_cancellation).await {
                 Ok(report) => append_runtime_cleanup_failures(report, &mut failures),
                 Err(error) => failures.push(CleanupFailure {
                     step: "runtime cleanup",
@@ -386,26 +386,24 @@ impl AgentOrchestrator {
     }
 }
 
-struct RunContext<'a> {
-    plan: &'a RunPlan,
+struct RunContext {
     state: AgentState,
     states: Vec<AgentState>,
     initialized: bool,
-    container_created: bool,
+    container: Option<sendbox_runtime::ContainerId>,
     started: bool,
     channel: Option<Box<dyn ProvisionedControlChannel>>,
     guest: Option<Box<dyn GuestSession>>,
     execution: Option<Box<dyn GuestExecution>>,
 }
 
-impl<'a> RunContext<'a> {
-    fn new(plan: &'a RunPlan) -> Self {
+impl RunContext {
+    fn new(_plan: &RunPlan) -> Self {
         Self {
-            plan,
             state: AgentState::Planned,
             states: vec![AgentState::Planned],
             initialized: false,
-            container_created: false,
+            container: None,
             started: false,
             channel: None,
             guest: None,
