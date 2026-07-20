@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "addedAt": "2025-01-01T00:00:00Z",
+      "email": null,
+      "expiresAt": "2030-01-01T00:00:00Z",
+      "fingerprint": "21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9",
+      "name": "RFC 8032 fixture",
+      "publicKey": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+    }
+  ],
+  "minimumSigners": 1,
+  "requireSignature": true
+}
