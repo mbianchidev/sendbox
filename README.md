@@ -309,11 +309,17 @@ defense in depth against direct API ref mutations or alternate Git clients. Disa
 | `Container` | Select and manage Apple or Kata VM runtimes |
 | `Agent` | Coordinate agent process execution and I/O |
 
-The **copilot-bridge** is an optional Node.js sidecar that exposes a JSON-RPC interface for IDE integrations.
+The **copilot-bridge** is a temporary Node.js migration bridge. New project
+analysis and devcontainer generation are native Rust and do not require Node.js
+or Copilot.
 
-The experimental Rust workspace currently contains only shared domain/error
-types, strict configuration decoding, pure policy validation, and the
-`sendbox-rs` validation CLI. It does not contain runtime adapters or enforcement.
+The Rust workspace contains shared domain/error types, strict configuration and
+policy validation, native project analysis, runtime and credential primitives,
+and the production Linux execution broker. See the architecture documents for
+[project analysis](docs/architecture/native-project-analysis.md),
+[runtime core](docs/architecture/runtime-core.md),
+[secrets](docs/architecture/secrets-and-credential-broker.md), and
+[execution brokerage](docs/architecture/execution-broker.md).
 
 See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
 The isolated Rust proof for Apple's official CLI is documented in
@@ -362,6 +368,12 @@ sendbox analyze --project . --output .devcontainer/
 
 # Validate a sandbox configuration's policy
 sendbox policy validate --config sendbox.yaml
+
+# Experimental native analysis with automation JSON
+cargo run -p sendbox-cli -- analyze --project . --json
+
+# Experimental native devcontainer generation
+cargo run -p sendbox-cli -- devcontainer generate --project . --json
 
 # Print the eBPF program SendBox uses to inspect MCP calls
 sendbox mcp script

@@ -148,4 +148,3 @@ or `SO_PEERCRED`.
 | Safe voluntary lockdown by an arbitrary malicious agent binary | Remaining; trusted bootstrap is mandatory |
 | Complete guest/VM containment | Remaining; runtime and VM integration are separate layers |
 | Guest supervisor and runtime-adapter wiring | Remaining and explicitly outside this component |
-
