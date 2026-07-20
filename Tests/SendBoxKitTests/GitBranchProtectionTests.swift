@@ -98,7 +98,7 @@ struct GitBranchProtectionTests {
             repositoryRoot: fixture.selectedWorkspace.path
         )
 
-        #expect(result.exitCode == 0)
+        #expect(result.exitCode == 0, "stderr: \(result.stderr)")
         let log = try String(contentsOf: fixture.log, encoding: .utf8)
         #expect(log.contains("push origin feature/topic"))
     }
@@ -240,7 +240,6 @@ struct GitBranchProtectionTests {
     private struct ScriptFixture {
         let root: URL
         let selectedWorkspace: URL
-        let fakeGit: URL
         let policyScript: URL
         let log: URL
     }
@@ -259,48 +258,11 @@ struct GitBranchProtectionTests {
             withIntermediateDirectories: true
         )
 
-        let fakeGit = root.appendingPathComponent("git-real")
-        let fakeGitScript = """
-            #!/bin/sh
-            if [ "$1" = "branch" ] && [ "$2" = "--show-current" ]; then
-              printf '%s\\n' "$FAKE_GIT_BRANCH"
-              exit 0
-            fi
-            if [ "$1" = "rev-parse" ] && [ "$2" = "--show-toplevel" ]; then
-              printf '%s\\n' "$FAKE_GIT_ROOT"
-              exit 0
-            fi
-            if [ "$1" = "rev-parse" ] && [ "$2" = "--abbrev-ref" ]; then
-              [ -n "${FAKE_GIT_UPSTREAM:-}" ] || exit 1
-              printf '%s\\n' "$FAKE_GIT_UPSTREAM"
-              exit 0
-            fi
-            if [ "$1" = "remote" ] && [ "$2" = "get-url" ]; then
-              printf '%s\\n' "$FAKE_GIT_REMOTE_URL"
-              exit 0
-            fi
-            if [ "$1" = "config" ] && [ "$2" = "--get" ]; then
-              if [ "$3" = "push.default" ] && [ -n "${FAKE_GIT_PUSH_DEFAULT:-}" ]; then
-                printf '%s\\n' "$FAKE_GIT_PUSH_DEFAULT"
-                exit 0
-              fi
-              exit 1
-            fi
-            if [ "$1" = "config" ] && [ "$2" = "--get-all" ]; then
-              exit 1
-            fi
-            if [ "$1" = "show-ref" ]; then
-              [ "$4" = "refs/heads/$FAKE_GIT_BRANCH" ]
-              exit $?
-            fi
-            printf '%s\\n' "$*" >> "$FAKE_GIT_LOG"
-            exit 0
-            """
-        try Data(fakeGitScript.utf8).write(to: fakeGit, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755],
-            ofItemAtPath: fakeGit.path
-        )
+        let fakeGit = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("test-fixtures/git/fake-git.sh")
 
         let policy = GitBranchProtection(
             config: .default,
@@ -316,7 +278,6 @@ struct GitBranchProtectionTests {
         return ScriptFixture(
             root: root,
             selectedWorkspace: selectedWorkspace,
-            fakeGit: fakeGit,
             policyScript: policyScript,
             log: root.appendingPathComponent("git.log")
         )

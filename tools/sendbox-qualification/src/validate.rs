@@ -193,50 +193,40 @@ fn validate_source_coverage(
     evidence_paths: &BTreeSet<String>,
     errors: &mut Vec<String>,
 ) {
-    for relative_root in ["Sources", "copilot-bridge/src"] {
-        let directory = root.join(relative_root);
-        if !directory.exists() {
+    let mut source_roots = ["Sources", "copilot-bridge/src"]
+        .into_iter()
+        .map(|relative| root.join(relative))
+        .collect::<Vec<_>>();
+    let crates = root.join("crates");
+    if let Ok(entries) = fs::read_dir(crates) {
+        source_roots.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path().join("src"))
+                .filter(|directory| directory.is_dir()),
+        );
+    }
+
+    let mut files = BTreeSet::new();
+    for directory in source_roots {
+        if directory.exists() {
+            collect_source_files(&directory, &mut files);
+        }
+    }
+    for file in files {
+        let Ok(relative) = file.strip_prefix(root) else {
             continue;
-        }
-        let mut files = Vec::new();
-        collect_source_files(&directory, &mut files);
-        for file in files {
-            let Ok(relative) = file.strip_prefix(root) else {
-                continue;
-            };
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            if !evidence_paths.contains(&relative) {
-                errors.push(format!(
-                    "source module is not represented in the inventory: {relative}"
-                ));
-            }
-        }
-        let crates = root.join("crates");
-        if let Ok(entries) = fs::read_dir(crates) {
-            for entry in entries.flatten() {
-                let source_directory = entry.path().join("src");
-                if !source_directory.is_dir() {
-                    continue;
-                }
-                let mut files = Vec::new();
-                collect_source_files(&source_directory, &mut files);
-                for file in files {
-                    let Ok(relative) = file.strip_prefix(root) else {
-                        continue;
-                    };
-                    let relative = relative.to_string_lossy().replace('\\', "/");
-                    if !evidence_paths.contains(&relative) {
-                        errors.push(format!(
-                            "source module is not represented in the inventory: {relative}"
-                        ));
-                    }
-                }
-            }
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if !evidence_paths.contains(&relative) {
+            errors.push(format!(
+                "source module is not represented in the inventory: {relative}"
+            ));
         }
     }
 }
 
-fn collect_source_files(directory: &Path, files: &mut Vec<std::path::PathBuf>) {
+fn collect_source_files(directory: &Path, files: &mut BTreeSet<std::path::PathBuf>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
@@ -248,7 +238,7 @@ fn collect_source_files(directory: &Path, files: &mut Vec<std::path::PathBuf>) {
             path.extension().and_then(|extension| extension.to_str()),
             Some("swift" | "rs" | "ts")
         ) {
-            files.push(path);
+            files.insert(path);
         }
     }
 }
@@ -385,6 +375,36 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("inventory must contain"))
         );
+    }
+
+    #[test]
+    fn reports_each_crate_source_once_without_other_source_roots() {
+        let root = std::env::temp_dir().join(format!(
+            "sendbox-qualification-source-coverage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let source = root.join("crates/example/src/lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent")).expect("create source root");
+        fs::write(&source, "pub fn example() {}\n").expect("write source");
+
+        let mut errors = Vec::new();
+        validate_source_coverage(&root, &BTreeSet::new(), &mut errors);
+
+        let expected =
+            "source module is not represented in the inventory: crates/example/src/lib.rs";
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.as_str() == expected)
+                .count(),
+            1,
+            "{errors:?}"
+        );
+        fs::remove_dir_all(root).expect("remove source root");
     }
 
     fn minimal_benchmark() -> BenchmarkSpecification {
