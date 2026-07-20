@@ -338,7 +338,7 @@ fn validates_the_current_example() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "valid configuration: config/example-sandbox.yaml (sandbox: my-project-sandbox)\n"
+        "Validating config/example-sandbox.yaml...\n✅ Configuration is valid\n"
     );
     assert!(output.stderr.is_empty());
 }

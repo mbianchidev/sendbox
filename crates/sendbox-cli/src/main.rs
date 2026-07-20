@@ -629,11 +629,8 @@ fn validate(arguments: ValidateArgs) -> ExitCode {
                         diagnostics: Vec::new(),
                     });
                 } else {
-                    println!(
-                        "valid configuration: {} (sandbox: {})",
-                        arguments.config.display(),
-                        configuration.name
-                    );
+                    println!("Validating {}...", arguments.config.display());
+                    println!("✅ Configuration is valid");
                 }
                 ExitCode::SUCCESS
             }
