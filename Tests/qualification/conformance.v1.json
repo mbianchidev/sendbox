@@ -56,6 +56,17 @@
       "command": null
     },
     {
+      "id": "mcp.contracts",
+      "area": "mcp",
+      "description": "Bounded framing, strict JSON-RPC, deny-first stdio policy, exact command brokering, config validation, and versioned observation contracts.",
+      "oracle": "intended_behavior",
+      "status": "implemented",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/mcp.v1.json",
+      "swift_observation": null,
+      "command": null
+    },
+    {
       "id": "protocol.contracts",
       "area": "protocol",
       "description": "Canonical bounded protocol encoding, authentication, and failure contracts.",

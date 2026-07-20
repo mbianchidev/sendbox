@@ -16,8 +16,8 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 - **Credential Injection** — Secrets load from macOS Keychain or the protected Linux secret store and are injected without persisting them in the guest filesystem.
 - **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
 - **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
-- **MCP Inspection (eBPF)** — Observe Model Context Protocol JSON-RPC traffic between the agent and its MCP servers at the kernel boundary. Captures both stdio and HTTP/SSE transports, classifies tool calls, and feeds the audit trail. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
-- **Boundary Enforcement** — Run every agent process under a seccomp-BPF syscall denylist and route stdio MCP servers through a framing-aware tool proxy. eBPF detects direct proxy bypass attempts and records denied syscalls. Enforcement is fail-closed.
+- **Native MCP Core** — Safe Rust framing, strict JSON-RPC validation, deny-first stdio tool policy, exact-command brokering, config validation, legacy trace parsing, and versioned native observation records. Runtime/guest wiring remains separate. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
+- **Boundary Enforcement** — Existing runtime paths retain their current boundary implementation while the native MCP broker is integrated. The Rust library itself does not claim guest installation or direct-launch prevention.
 - **Supply Chain Provenance** — Ed25519 signing for config and policy files ensures they were authored by trusted identities. Multi-signer support with a configurable trust store.
 - **Runtime Supervisor** — Dynamic permission expansion with approval workflows. Agents start restricted and earn broader permissions through supervised interaction (one-time, session-wide, or pattern-based grants).
 - **VM Hardening** — Defense-in-depth sysctl lockdown, capability dropping, and seccomp profiles covering all 18 [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) scenarios.
@@ -282,7 +282,7 @@ defense in depth against direct API ref mutations or alternate Git clients. Disa
 | `github.branch_protection.username` | string | Username used to expand `{username}` patterns; auto-detected by default |
 | `github.branch_protection.protected_branches` | list | Branch names that push and pull can never target |
 | `github.branch_protection.allowed_branch_patterns` | list | Glob patterns allowed for selected-repository push and pull |
-| `observability.mcp_inspection.enabled` | bool | Enable eBPF MCP call inspection (opt-in) |
+| `observability.mcp_inspection.enabled` | bool | Enable configured MCP observation (current runtime wiring remains provider-specific) |
 
 ## Architecture
 

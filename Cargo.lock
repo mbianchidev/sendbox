@@ -1421,6 +1421,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-exec"
+version = "0.1.0"
+dependencies = [
+ "caps",
+ "getrandom 0.4.3",
+ "libc",
+ "libseccomp",
+ "rlimit",
+ "sendbox-core",
+ "sendbox-policy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "sendbox-guest"
 version = "0.1.0"
 dependencies = [
@@ -1440,21 +1458,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "sendbox-exec"
+name = "sendbox-mcp"
 version = "0.1.0"
 dependencies = [
- "caps",
- "getrandom 0.4.3",
- "libc",
- "libseccomp",
- "rlimit",
- "sendbox-core",
+ "async-trait",
+ "proptest",
+ "sendbox-config",
  "sendbox-policy",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
- "zeroize",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
