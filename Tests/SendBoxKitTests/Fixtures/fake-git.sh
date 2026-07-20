@@ -31,3 +31,4 @@ if [ "$1" = "show-ref" ]; then
   exit $?
 fi
 printf '%s\n' "$*" >> "$FAKE_GIT_LOG"
+exit 0

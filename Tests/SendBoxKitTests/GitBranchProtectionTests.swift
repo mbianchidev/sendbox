@@ -98,7 +98,7 @@ struct GitBranchProtectionTests {
             repositoryRoot: fixture.selectedWorkspace.path
         )
 
-        #expect(result.exitCode == 0, "stderr: \(result.stderr)")
+        try #require(result.exitCode == 0, "stderr: \(result.stderr)")
         let log = try String(contentsOf: fixture.log, encoding: .utf8)
         #expect(log.contains("push origin feature/topic"))
     }
@@ -260,9 +260,7 @@ struct GitBranchProtectionTests {
 
         let fakeGit = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("test-fixtures/git/fake-git.sh")
+            .appendingPathComponent("Fixtures/fake-git.sh")
 
         let policy = GitBranchProtection(
             config: .default,
