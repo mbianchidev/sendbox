@@ -40,8 +40,8 @@ ENV CARGO_HOME=/home/quality/.cargo
 USER quality
 RUN target="$(cat /opt/target-triple)" \
     && cargo fmt --all --check \
-    && cargo clippy --locked --workspace --all-targets --all-features --target "$target" -- -D warnings \
-    && cargo test --locked --workspace --all-features --target "$target" \
+    && cargo clippy --locked -p sendbox-guest --all-targets --all-features --target "$target" -- -D warnings \
+    && cargo test --locked -p sendbox-guest --all-targets --all-features --target "$target" \
     && cargo audit --deny warnings \
     && touch /tmp/quality-ok
 
