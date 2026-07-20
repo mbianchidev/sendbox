@@ -166,7 +166,9 @@ jobs:
           printf '{"dependencies":{"react":"19"}}\n' > "$project/package.json"
           ./target/release/sendbox-rs devcontainer generate --project "$project" --json
           ./target/release/sendbox-rs init --project "$project" --json
-          HOME="$project/home" ./target/release/sendbox-rs completions install --shell fish --json
+          mkdir "$project/home"
+          home="$(cd "$project/home" && pwd -P)"
+          HOME="$home" ./target/release/sendbox-rs completions install --shell fish --json
 
       - name: Check project parser fuzz targets
         run: cargo check --manifest-path fuzz/project/Cargo.toml

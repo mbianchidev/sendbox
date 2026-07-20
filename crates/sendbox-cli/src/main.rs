@@ -688,20 +688,7 @@ fn completions(arguments: CompletionsArgs) -> ExitCode {
 fn install_completions(arguments: CompletionInstallArgs) -> ExitCode {
     let shell = match arguments.shell {
         Some(shell) => shell,
-        None => match CompletionShell::detect() {
-            Ok(shell) => shell,
-            Err(message) => {
-                return emit_diagnostics(
-                    arguments.json,
-                    INVALID_CONFIGURATION_EXIT,
-                    vec![Diagnostic::new(
-                        DiagnosticCode::InvalidValue,
-                        "shell",
-                        message,
-                    )],
-                );
-            }
-        },
+        None => CompletionShell::detect(),
     };
     match shell.install() {
         Ok(path) => {

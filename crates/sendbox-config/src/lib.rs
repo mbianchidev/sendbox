@@ -13,7 +13,7 @@ mod presets;
 
 pub use persistence::{
     AtomicWriteMode, CONFIG_FILE_MODE, LoadedConfiguration, MigrationReport, MigrationResult,
-    atomic_write_file,
+    atomic_write_file, ensure_directory,
 };
 pub use presets::PolicyPreset;
 

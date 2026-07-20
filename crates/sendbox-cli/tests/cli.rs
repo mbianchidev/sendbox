@@ -232,15 +232,16 @@ fn completion_install_uses_stable_path_and_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
     let home = tempdir().unwrap();
+    let canonical_home = home.path().canonicalize().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_sendbox-rs"))
         .args(["completions", "install", "--shell", "fish", "--json"])
-        .env("HOME", home.path())
+        .env("HOME", &canonical_home)
         .env("SHELL", "/bin/fish")
         .output()
         .unwrap();
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    let path = home.path().join(".config/fish/completions/sendbox.fish");
+    let path = canonical_home.join(".config/fish/completions/sendbox.fish");
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["path"], path.display().to_string());
     assert_eq!(result["shell"], "fish");
@@ -262,16 +263,40 @@ fn completion_install_uses_stable_path_and_permissions() {
 #[test]
 fn completion_install_detects_shell_without_spawning_it() {
     let home = tempdir().unwrap();
-    let fake_shell = home.path().join("zsh");
+    let home = home.path().canonicalize().unwrap();
+    let fake_shell = home.join("zsh");
     std::fs::write(&fake_shell, "this is not executable\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_sendbox-rs"))
         .args(["completions", "install", "--json"])
-        .env("HOME", home.path())
+        .env("HOME", &home)
         .env("SHELL", &fake_shell)
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(home.path().join(".zsh/completions/_sendbox").exists());
+    assert!(home.join(".zsh/completions/_sendbox").exists());
+}
+
+#[test]
+fn completion_detection_falls_back_to_zsh_and_explicit_unknown_shell_is_rejected() {
+    let home = tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    let fallback = Command::new(env!("CARGO_BIN_EXE_sendbox-rs"))
+        .args(["completions", "install", "--json"])
+        .env("HOME", &home)
+        .env("SHELL", "/bin/tcsh")
+        .output()
+        .unwrap();
+    assert!(fallback.status.success());
+    assert!(home.join(".zsh/completions/_sendbox").exists());
+
+    let unknown = run(&["completions", "install", "--shell", "powershell", "--json"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(unknown.stdout.is_empty());
+    assert!(
+        String::from_utf8(unknown.stderr)
+            .unwrap()
+            .contains("invalid value 'powershell'")
+    );
 }
 
 #[test]

@@ -13,7 +13,7 @@ experimental name into scripts or completion files.
 | `policy show` | Shows the default or configured policy as stable text or deterministic JSON. Configuration input uses strict decoding and policy-only validation. |
 | `policy validate` | Retains full sandbox validation, deterministic JSON, diagnostics, and exit `2` for invalid configuration. |
 | `completions print` | Generates bash, zsh, or fish output directly from the clap command tree. |
-| `completions install` | Detects `SHELL` or accepts `--shell`, writes to stable per-shell paths with atomic replacement, mode `0644`, and directory mode `0755`. It never launches a shell or respawns the CLI. |
+| `completions install` | Detects `SHELL` or accepts `--shell`, falls back to zsh when detection is unavailable, writes to stable per-shell paths with atomic replacement, mode `0644`, and directory mode `0755`. It never launches a shell or respawns the CLI. |
 | `analyze` / `devcontainer generate` | Retains the existing native project-analysis subset. |
 
 Exit `2` is reserved for invalid input/configuration, `3` for project analysis
@@ -30,10 +30,11 @@ optional values, preserves explicit empty collections, and includes documented
 defaults. Migration reports distinguish schema changes from formatting
 canonicalization.
 
-Writes validate first, create a temporary file in the destination directory,
-set the final mode, sync content, atomically create or replace the destination,
-and sync the parent directory. `init` uses no-clobber creation; explicit
-migration callers may request replacement.
+Writes validate first, open every destination-directory component without
+following symlinks, create a temporary file through the opened directory, set
+the final mode, sync content, and atomically create or replace the destination.
+`init` uses a no-replace rename so a concurrent creator wins without being
+modified; explicit migration callers may request replacement.
 
 ## Deferred command groups
 

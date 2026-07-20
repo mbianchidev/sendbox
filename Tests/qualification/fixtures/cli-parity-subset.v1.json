@@ -38,6 +38,7 @@
   },
   "completions": {
     "shells": ["bash", "zsh", "fish"],
+    "detection": "SHELL basename with zsh fallback; explicit unsupported --shell is an exit-2 usage error",
     "generator": "clap command tree with command name sendbox",
     "self_spawn": false,
     "shell_spawn": false,
@@ -48,7 +49,8 @@
     },
     "file_mode_octal": "0644",
     "directory_mode_octal": "0755",
-    "install_mode": "secure_atomic_replace"
+    "install_mode": "secure atomic replacement without following symlinked directory components",
+    "race_behavior": "init no-clobber loses destination-creation races without changing the winner"
   },
   "evidence": [
     "crates/sendbox-cli/tests/cli.rs",

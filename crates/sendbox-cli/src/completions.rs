@@ -1,11 +1,10 @@
 use std::env;
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
-use sendbox_config::{AtomicWriteMode, atomic_write_file};
+use sendbox_config::{AtomicWriteMode, atomic_write_file, ensure_directory};
 
 const COMPLETION_FILE_MODE: u32 = 0o644;
 const COMPLETION_DIRECTORY_MODE: u32 = 0o755;
@@ -18,21 +17,19 @@ pub(crate) enum CompletionShell {
 }
 
 impl CompletionShell {
-    pub(crate) fn detect() -> Result<Self, String> {
-        let shell = env::var_os("SHELL")
-            .ok_or_else(|| "SHELL is not set; pass --shell bash|zsh|fish".to_owned())?;
+    pub(crate) fn detect() -> Self {
+        let Some(shell) = env::var_os("SHELL") else {
+            return Self::Zsh;
+        };
         let name = Path::new(&shell)
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or_default();
         match name {
-            "bash" => Ok(Self::Bash),
-            "zsh" => Ok(Self::Zsh),
-            "fish" => Ok(Self::Fish),
-            _ => Err(format!(
-                "unsupported shell '{}'; pass --shell bash|zsh|fish",
-                shell.to_string_lossy()
-            )),
+            "bash" => Self::Bash,
+            "zsh" => Self::Zsh,
+            "fish" => Self::Fish,
+            _ => Self::Zsh,
         }
     }
 
@@ -53,8 +50,7 @@ impl CompletionShell {
     fn install_in(self, home: &Path) -> io::Result<PathBuf> {
         let path = self.install_path(home);
         let parent = path.parent().expect("completion path always has a parent");
-        fs::create_dir_all(parent)?;
-        set_directory_mode(parent, COMPLETION_DIRECTORY_MODE)?;
+        ensure_directory(parent, COMPLETION_DIRECTORY_MODE)?;
         atomic_write_file(
             &path,
             &self.generate(),
@@ -91,18 +87,6 @@ impl fmt::Display for CompletionShell {
     }
 }
 
-#[cfg(unix)]
-fn set_directory_mode(path: &Path, mode: u32) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-}
-
-#[cfg(not(unix))]
-fn set_directory_mode(_path: &Path, _mode: u32) -> io::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -134,7 +118,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let home = tempdir().unwrap();
-        let path = CompletionShell::Zsh.install_in(home.path()).unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let path = CompletionShell::Zsh.install_in(&home).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o644
@@ -147,5 +132,20 @@ mod tests {
                 & 0o777,
             0o755
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_completion_directories() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let external = external.path().canonicalize().unwrap();
+        symlink(&external, home.join(".config")).unwrap();
+
+        assert!(CompletionShell::Fish.install_in(&home).is_err());
+        assert!(!external.join("fish/completions/sendbox.fish").exists());
     }
 }

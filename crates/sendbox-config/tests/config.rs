@@ -162,9 +162,61 @@ fn migration_accepts_implicit_and_explicit_v1_and_rejects_future_versions() {
 }
 
 #[test]
+fn migration_canonicalizes_comments_quotes_multiline_paths_and_unicode() {
+    let yaml = r#"
+# accepted input comments are intentionally not persisted
+name: "café sandbox"
+project_path: "/tmp/quoted path/日本"
+resources:
+  cpus: 2
+  memory_mb: 2048
+  disk_size_mb: 8192
+policy:
+  commands:
+    default_action: deny
+    allowlist:
+      - |-
+        printf "line one"
+        printf "line two"
+      - "echo: value # literal"
+    denylist: []
+    log_blocked: true
+  network:
+    default_action: deny
+    allowed_domains: ["例え.テスト"]
+    blocked_domains: []
+    allow_dns: true
+secrets: ["TOKEN_é"]
+github:
+  forward_auth: true
+  forward_copilot_auth: true
+"#;
+
+    let migrated = SandboxConfiguration::migrate(yaml).unwrap();
+    assert_eq!(migrated.configuration.name, "café sandbox");
+    assert_eq!(
+        migrated.configuration.project_path,
+        PathBuf::from("/tmp/quoted path/日本")
+    );
+    assert_eq!(
+        migrated.configuration.policy.commands.allowlist[0],
+        "printf \"line one\"\nprintf \"line two\""
+    );
+    assert_eq!(
+        migrated.configuration.policy.commands.allowlist[1],
+        "echo: value # literal"
+    );
+    assert!(!migrated.yaml.contains("accepted input comments"));
+    assert_eq!(
+        SandboxConfiguration::parse(&migrated.yaml).unwrap(),
+        migrated.configuration
+    );
+}
+
+#[test]
 fn secure_atomic_write_refuses_existing_files_and_replaces_explicitly() {
     let directory = tempdir().unwrap();
-    let path = directory.path().join("config.yaml");
+    let path = directory.path().canonicalize().unwrap().join("config.yaml");
     let mut config = SandboxConfiguration::for_project(
         PathBuf::from("/projects/one"),
         PolicyPreset::Default,
@@ -189,7 +241,7 @@ fn configuration_files_are_private() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempdir().unwrap();
-    let path = directory.path().join("config.yaml");
+    let path = directory.path().canonicalize().unwrap().join("config.yaml");
     SandboxConfiguration::for_project(
         PathBuf::from("/projects/private"),
         PolicyPreset::Strict,
@@ -207,7 +259,7 @@ fn configuration_files_are_private() {
 #[test]
 fn invalid_configuration_is_not_written() {
     let directory = tempdir().unwrap();
-    let path = directory.path().join("config.yaml");
+    let path = directory.path().canonicalize().unwrap().join("config.yaml");
     let mut config = SandboxConfiguration::for_project(
         PathBuf::from("/projects/invalid"),
         PolicyPreset::Default,

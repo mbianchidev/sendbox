@@ -44,7 +44,14 @@
       "file_mode_octal": "0600",
       "validate_before_write": true
     },
-    "roundtrip": ["golden fixture coverage", "property-generated valid configurations", "fuzz/config yaml_roundtrip"]
+    "roundtrip": [
+      "golden fixture coverage",
+      "comments accepted then omitted by canonical output",
+      "quoted and multiline scalars",
+      "Unicode names, paths, domains, and secret references",
+      "property-generated valid configurations",
+      "fuzz/config yaml_roundtrip"
+    ]
   },
   "errors": [
     {"case": "unknown_field", "code": "invalid_yaml", "exit": 2},
@@ -52,5 +59,10 @@
     {"case": "zero_resource", "code": "invalid_value", "exit": 2},
     {"case": "hyperlight_with_boundaries", "code": "incompatible_configuration", "exit": 2},
     {"case": "branch_protection_without_boundaries", "code": "incompatible_configuration", "exit": 2}
+  ],
+  "filesystem_failures": [
+    "symlinked parent component is rejected",
+    "destination creation race preserves the winning file",
+    "existing init configuration remains unchanged"
   ]
 }
