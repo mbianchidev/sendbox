@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "inventory_version": "1.1.1",
+  "inventory_version": "1.2.0",
   "generated_from": "origin/main@02f6d08 + PR #27",
   "entries": [
     {"id":"module.agent-runner","category":"source_module","name":"Agent runner","disposition":"redesign","rationale":"Replace lifecycle orchestration with typed Rust agent/runtime contracts.","evidence":["Sources/SendBoxKit/Agent/AgentRunner.swift#AgentRunner"],"target_crate":"sendbox-agent","target_phase":4,"conformance":{"status":"specified","fixture_ids":["runtime.contracts"],"compatibility_note":"Preserve observable lifecycle semantics, not the Swift orchestration structure."}},

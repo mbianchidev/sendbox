@@ -315,11 +315,12 @@ or Copilot.
 
 The Rust workspace contains shared domain/error types, strict configuration and
 policy validation, native project analysis, runtime and credential primitives,
-and the production Linux execution broker. See the architecture documents for
+and production Linux execution and egress enforcement. See the architecture documents for
 [project analysis](docs/architecture/native-project-analysis.md),
 [runtime core](docs/architecture/runtime-core.md),
 [secrets](docs/architecture/secrets-and-credential-broker.md), and
-[execution brokerage](docs/architecture/execution-broker.md).
+[execution brokerage](docs/architecture/execution-broker.md), plus
+[egress enforcement](docs/architecture/egress-enforcement.md).
 
 See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
 The isolated Rust proof for Apple's official CLI is documented in
