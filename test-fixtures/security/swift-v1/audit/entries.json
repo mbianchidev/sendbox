@@ -1,0 +1,27 @@
+[
+  {
+    "action": "execute",
+    "category": "command",
+    "details": {
+      "cwd": "/workspace",
+      "exit_code": "0"
+    },
+    "hash": "6debf4f9bdd17742981ca03d9770704907594ae8ed3c4d4f0d82131aadb08749",
+    "id": "11111111-1111-1111-1111-111111111111",
+    "outcome": "allowed",
+    "session_id": "legacy-session",
+    "subject": "echo hello",
+    "timestamp": "2025-01-02T03:04:05Z"
+  },
+  {
+    "action": "connect",
+    "category": "network",
+    "details": null,
+    "hash": "0ec4abde4d12830788db864548476a630cdc2d9009bb5ebbe6aef51fd3db29a2",
+    "id": "22222222-2222-2222-2222-222222222222",
+    "outcome": "denied",
+    "session_id": "legacy-session",
+    "subject": "example.com:443",
+    "timestamp": "2025-01-02T03:04:06Z"
+  }
+]

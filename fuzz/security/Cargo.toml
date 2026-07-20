@@ -1,0 +1,36 @@
+[package]
+name = "sendbox-security-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+sendbox-security = { path = "../../crates/sendbox-security" }
+
+[[bin]]
+name = "audit_decode"
+path = "fuzz_targets/audit_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provenance_decode"
+path = "fuzz_targets/provenance_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_decode"
+path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

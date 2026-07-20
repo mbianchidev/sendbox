@@ -7,8 +7,9 @@ members = [
     "crates/sendbox-policy",
     "crates/sendbox-project",
     "crates/sendbox-protocol",
-    "crates/sendbox-secrets",
     "crates/sendbox-runtime",
+    "crates/sendbox-security",
+    "crates/sendbox-secrets",
     "crates/sendbox-testkit",
     "guest/sendbox-guest",
 ]
@@ -23,10 +24,11 @@ repository = "https://github.com/mbianchidev/sendbox"
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+base64 = "0.22.1"
 cap-std = "4.0.2"
-clap = { version = "4.6.2", features = ["derive"] }
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
-ed25519-dalek = "3.0.0"
+clap = { version = "4.6.2", features = ["derive"] }
+ed25519-dalek = "2.2.0"
 getrandom = "0.4.3"
 hickory-proto = "0.26.1"
 http = "1.4.0"
@@ -46,6 +48,7 @@ sha2 = "0.11.0"
 socket2 = { version = "0.6.5", features = ["all"] }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
+time = { version = "0.3.47", features = ["formatting", "parsing", "serde"] }
 tokio = { version = "1.53.0", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = { version = "0.7.16", features = ["rt"] }
 toml = "1.1.3"

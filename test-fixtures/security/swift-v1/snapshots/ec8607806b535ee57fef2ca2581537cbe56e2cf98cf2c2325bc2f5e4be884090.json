@@ -1,0 +1,16 @@
+{
+  "files": [
+    {
+      "content_hash": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+      "modified_at": "2025-01-02T03:04:05Z",
+      "permissions": 420,
+      "relative_path": "README.txt",
+      "size": 6
+    }
+  ],
+  "id": "ec8607806b535ee57fef2ca2581537cbe56e2cf98cf2c2325bc2f5e4be884090",
+  "session_name": "legacy-session",
+  "timestamp": "2025-01-02T03:04:05Z",
+  "total_size": 6,
+  "workspace_path": "/tmp/workspace"
+}
