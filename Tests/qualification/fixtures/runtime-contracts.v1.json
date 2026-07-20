@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "operations": ["availability", "pull_image", "create", "start", "stop", "remove", "status", "exec", "logs", "stream_io", "signal", "cleanup"],
+  "requirements": {
+    "missing_runtime": "unqualified_or_validation_error_never_pass",
+    "unsupported_capability": "reject_before_create",
+    "cleanup": "idempotent",
+    "service_start": "never_automatic_in_baseline_capture",
+    "vendor_overhead": "fixed_adapter_baseline_not_attributed_to_rust"
+  }
+}
+

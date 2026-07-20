@@ -1,0 +1,19 @@
+{
+  // This URL must not be treated as a comment.
+  "image": "registry.example/dev//image:latest",
+  "features": {
+    "ghcr.io/example/feature:1": {},
+  },
+  "customizations": {
+    "vscode": {
+      /* Existing and generated extensions are merged. */
+      "extensions": ["example.existing",],
+      "settings": {
+        "example.url": "https://example.test/a//b",
+      },
+    },
+  },
+  "containerEnv": {
+    "EXISTING": "true",
+  },
+}

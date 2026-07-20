@@ -1,0 +1,56 @@
+name: Qualification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tools/sendbox-qualification/**"
+      - "Tests/qualification/**"
+      - "docs/qualification.md"
+      - "crates/**"
+      - ".github/workflows/qualification.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "tools/sendbox-qualification/**"
+      - "Tests/qualification/**"
+      - "docs/qualification.md"
+      - "crates/**"
+      - ".github/workflows/qualification.yaml"
+
+concurrency:
+  group: qualification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate qualification data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path tools/sendbox-qualification/Cargo.toml --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --manifest-path tools/sendbox-qualification/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --manifest-path tools/sendbox-qualification/Cargo.toml --all-features
+
+      - name: Validate inventory, conformance, and benchmark specification
+        run: cargo run --locked --manifest-path tools/sendbox-qualification/Cargo.toml -- validate
+
+      - name: Build Rust CLI for startup smoke
+        run: cargo build --locked --release -p sendbox-cli
+
+      - name: Run stable benchmark smoke
+        run: |
+          cargo run --locked --manifest-path tools/sendbox-qualification/Cargo.toml -- \
+            benchmark --profile smoke --rust-binary target/release/sendbox-rs \
+            > qualification-smoke.json
+          jq -e '
+            .schema_version == 1 and
+            .profile == "smoke" and
+            ([.workloads[] | select(.status == "failed")] | length) == 0
+          ' qualification-smoke.json
