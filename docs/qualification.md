@@ -8,7 +8,7 @@ product dependencies.
 ## Inventory gate
 
 `inventory.v1.json` is the countable migration scope. It covers all current
-Swift source modules, CLI commands, configuration sections/keys/defaults,
+Swift, Rust, and bridge source modules, CLI commands, configuration sections/keys/defaults,
 runtime operations and capabilities, security modules, persisted formats,
 setup/completion/release surfaces, and top-level documented claims.
 

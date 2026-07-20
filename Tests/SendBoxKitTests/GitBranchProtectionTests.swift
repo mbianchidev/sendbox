@@ -121,7 +121,7 @@ struct GitBranchProtectionTests {
             currentDirectory: otherRepository
         )
 
-        #expect(result.exitCode == 0)
+        #expect(result.exitCode == 0, "stderr: \(result.stderr)")
         let log = try String(contentsOf: fixture.log, encoding: .utf8)
         #expect(log.contains("pull origin main"))
     }
