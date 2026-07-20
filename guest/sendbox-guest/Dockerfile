@@ -43,7 +43,7 @@ RUN target="$(cat /opt/target-triple)" \
     && cargo clippy --locked --workspace --all-targets --all-features --target "$target" -- -D warnings \
     && cargo test --locked --workspace --all-features --target "$target" \
     && cargo audit --deny warnings \
-    && touch /quality-ok
+    && touch /tmp/quality-ok
 
 FROM source AS release
 RUN target="$(cat /opt/target-triple)" \
