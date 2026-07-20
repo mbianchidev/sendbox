@@ -7,6 +7,8 @@ on:
       - "tools/sendbox-qualification/**"
       - "Tests/qualification/**"
       - "docs/qualification.md"
+      - "Sources/**"
+      - "copilot-bridge/src/**"
       - "crates/**"
       - ".github/workflows/qualification.yaml"
   pull_request:
@@ -15,6 +17,8 @@ on:
       - "tools/sendbox-qualification/**"
       - "Tests/qualification/**"
       - "docs/qualification.md"
+      - "Sources/**"
+      - "copilot-bridge/src/**"
       - "crates/**"
       - ".github/workflows/qualification.yaml"
 

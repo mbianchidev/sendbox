@@ -22,6 +22,20 @@ SendBox has two runtime providers. Both give the workload a dedicated Linux kern
 
 The detailed SandboxEscapeBench analysis below describes the Apple provider. The Kata provider relies on Kata's VM boundary and the security configuration of containerd, the Kata shim, and the selected hypervisor; SendBox does not claim architectural immunity from vulnerabilities in those host components.
 
+### Production execution mediation
+
+The Rust [`sendbox-exec`](architecture/execution-broker.md) component implements
+ADR-001's top-level semantic execution boundary. A trusted pre-untrusted-input
+bootstrap denies direct agent `execve` and `execveat`. Admitted commands are
+resolved with retained `openat2` descriptors, executed with `execveat`, placed
+atomically in supervisor-owned cgroup v2 leaves with `clone3`, and cleaned with
+`cgroup.kill` plus pidfd reaping.
+
+This does not claim recursive semantic authorization of descendant commands.
+Descendants inherit syscall, capability, resource, environment, and cgroup
+containment, while their own argv remains outside the semantic policy boundary.
+The VM boundary remains the primary containment layer.
+
 ---
 
 ## SandboxEscapeBench Coverage — Apple Provider

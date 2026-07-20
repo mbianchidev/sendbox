@@ -313,12 +313,14 @@ The **copilot-bridge** is a temporary Node.js migration bridge. New project
 analysis and devcontainer generation are native Rust and do not require Node.js
 or Copilot.
 
-The experimental Rust workspace contains shared domain/error types, strict
-configuration decoding, pure policy validation, native bounded project analysis,
-and deterministic devcontainer generation. It does not contain runtime adapters
-or enforcement. See
-[docs/architecture/native-project-analysis.md](docs/architecture/native-project-analysis.md)
-for compatibility, limits, and merge behavior.
+The Rust workspace contains shared domain/error types, strict configuration and
+policy validation, native project analysis, runtime and credential primitives,
+and production Linux execution and egress enforcement. See the architecture documents for
+[project analysis](docs/architecture/native-project-analysis.md),
+[runtime core](docs/architecture/runtime-core.md),
+[secrets](docs/architecture/secrets-and-credential-broker.md), and
+[execution brokerage](docs/architecture/execution-broker.md), plus
+[egress enforcement](docs/architecture/egress-enforcement.md).
 
 See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
 The isolated Rust proof for Apple's official CLI is documented in
