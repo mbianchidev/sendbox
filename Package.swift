@@ -45,7 +45,8 @@ let package = Package(
             dependencies: [
                 "SendBoxKit",
                 .product(name: "Testing", package: "swift-testing"),
-            ]
+            ],
+            exclude: ["Fixtures"]
         ),
     ]
 )

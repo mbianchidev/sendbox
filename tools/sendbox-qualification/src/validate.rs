@@ -193,50 +193,40 @@ fn validate_source_coverage(
     evidence_paths: &BTreeSet<String>,
     errors: &mut Vec<String>,
 ) {
+    let mut source_directories = BTreeSet::new();
     for relative_root in ["Sources", "copilot-bridge/src"] {
         let directory = root.join(relative_root);
-        if !directory.exists() {
-            continue;
+        if directory.is_dir() {
+            source_directories.insert(directory);
         }
-        let mut files = Vec::new();
+    }
+    if let Ok(entries) = fs::read_dir(root.join("crates")) {
+        for entry in entries.flatten() {
+            let source_directory = entry.path().join("src");
+            if source_directory.is_dir() {
+                source_directories.insert(source_directory);
+            }
+        }
+    }
+
+    let mut files = BTreeSet::new();
+    for directory in source_directories {
         collect_source_files(&directory, &mut files);
-        for file in files {
-            let Ok(relative) = file.strip_prefix(root) else {
-                continue;
-            };
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            if !evidence_paths.contains(&relative) {
-                errors.push(format!(
-                    "source module is not represented in the inventory: {relative}"
-                ));
-            }
-        }
-        let crates = root.join("crates");
-        if let Ok(entries) = fs::read_dir(crates) {
-            for entry in entries.flatten() {
-                let source_directory = entry.path().join("src");
-                if !source_directory.is_dir() {
-                    continue;
-                }
-                let mut files = Vec::new();
-                collect_source_files(&source_directory, &mut files);
-                for file in files {
-                    let Ok(relative) = file.strip_prefix(root) else {
-                        continue;
-                    };
-                    let relative = relative.to_string_lossy().replace('\\', "/");
-                    if !evidence_paths.contains(&relative) {
-                        errors.push(format!(
-                            "source module is not represented in the inventory: {relative}"
-                        ));
-                    }
-                }
-            }
+    }
+    for file in files {
+        let Ok(relative) = file.strip_prefix(root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if !evidence_paths.contains(&relative) {
+            errors.push(format!(
+                "source module is not represented in the inventory: {relative}"
+            ));
         }
     }
 }
 
-fn collect_source_files(directory: &Path, files: &mut Vec<std::path::PathBuf>) {
+fn collect_source_files(directory: &Path, files: &mut BTreeSet<std::path::PathBuf>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
@@ -248,7 +238,7 @@ fn collect_source_files(directory: &Path, files: &mut Vec<std::path::PathBuf>) {
             path.extension().and_then(|extension| extension.to_str()),
             Some("swift" | "rs" | "ts")
         ) {
-            files.push(path);
+            files.insert(path);
         }
     }
 }
@@ -384,6 +374,46 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("inventory must contain"))
+        );
+    }
+
+    #[test]
+    fn source_coverage_checks_each_file_once() {
+        let root = std::env::temp_dir().join(format!(
+            "sendbox-qualification-source-coverage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let swift_source = root.join("Sources/Example.swift");
+        let rust_source = root.join("crates/example/src/lib.rs");
+        fs::create_dir_all(swift_source.parent().expect("Swift source parent"))
+            .expect("create Swift source directory");
+        fs::create_dir_all(rust_source.parent().expect("Rust source parent"))
+            .expect("create Rust source directory");
+        fs::write(&swift_source, "").expect("write Swift source");
+        fs::write(&rust_source, "").expect("write Rust source");
+
+        let mut errors = Vec::new();
+        validate_source_coverage(&root, &BTreeSet::new(), &mut errors);
+
+        fs::remove_dir_all(&root).expect("remove source fixture");
+        assert_eq!(errors.len(), 2);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.contains("crates/example/src/lib.rs"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.contains("Sources/Example.swift"))
+                .count(),
+            1
         );
     }
 
