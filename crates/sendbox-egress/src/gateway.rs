@@ -36,6 +36,8 @@ pub struct GatewayListeners {
 }
 
 impl GatewayListeners {
+    const EPHEMERAL_DNS_BIND_ATTEMPTS: usize = 32;
+
     /// Binds the CONNECT listener always and the DNS listeners only when
     /// `dns_listen` is `Some` (i.e. the policy permits DNS). The DNS UDP and
     /// TCP sockets bind the same resolved address/port.
@@ -45,10 +47,7 @@ impl GatewayListeners {
     ) -> io::Result<Self> {
         let (dns_udp, dns_tcp, dns_addr) = match dns_listen {
             Some(addr) => {
-                let udp = UdpSocket::bind(addr).await?;
-                let resolved = udp.local_addr()?;
-                // Bind TCP on the exact resolved address so both share a port.
-                let tcp = TcpListener::bind(resolved).await?;
+                let (udp, tcp, resolved) = Self::bind_dns_pair(addr).await?;
                 (Some(udp), Some(tcp), Some(resolved))
             }
             None => (None, None, None),
@@ -62,6 +61,34 @@ impl GatewayListeners {
             dns_addr,
             connect_addr,
         })
+    }
+
+    async fn bind_dns_pair(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, SocketAddr)> {
+        let attempts = if addr.port() == 0 {
+            Self::EPHEMERAL_DNS_BIND_ATTEMPTS
+        } else {
+            1
+        };
+
+        for _ in 0..attempts {
+            let udp = UdpSocket::bind(addr).await?;
+            let resolved = udp.local_addr()?;
+            match TcpListener::bind(resolved).await {
+                Ok(tcp) => return Ok((udp, tcp, resolved)),
+                Err(error) if addr.port() == 0 && error.kind() == io::ErrorKind::AddrInUse => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "could not allocate a shared ephemeral DNS UDP/TCP port after {} attempts",
+                Self::EPHEMERAL_DNS_BIND_ATTEMPTS
+            ),
+        ))
     }
 
     #[must_use]
