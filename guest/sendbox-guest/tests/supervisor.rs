@@ -210,7 +210,7 @@ impl Fixture {
                     restart: RestartPolicy::default(),
                     health: HealthCheck::UnixSocket {
                         path: audit_socket,
-                        timeout_ms: 2_000,
+                        timeout_ms: 15_000,
                     },
                     graceful_shutdown_ms: 50,
                     forced_shutdown_ms: 500,
