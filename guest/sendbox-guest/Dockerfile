@@ -34,6 +34,10 @@ ENV RUSTFLAGS="-Dwarnings --remap-path-prefix=/workspace=."
 
 FROM source AS quality
 COPY --from=audit-tool /usr/local/cargo/bin/cargo-audit /usr/local/cargo/bin/cargo-audit
+RUN adduser -D -u 10001 quality \
+    && chown -R quality:quality /workspace
+ENV CARGO_HOME=/home/quality/.cargo
+USER quality
 RUN target="$(cat /opt/target-triple)" \
     && cargo fmt --all --check \
     && cargo clippy --locked --workspace --all-targets --all-features --target "$target" -- -D warnings \
