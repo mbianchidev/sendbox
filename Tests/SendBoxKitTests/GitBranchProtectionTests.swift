@@ -296,7 +296,7 @@ struct GitBranchProtectionTests {
             printf '%s\\n' "$*" >> "$FAKE_GIT_LOG"
             exit 0
             """
-        try Data(fakeGitScript.utf8).write(to: fakeGit)
+        try Data(fakeGitScript.utf8).write(to: fakeGit, options: .atomic)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755],
             ofItemAtPath: fakeGit.path
