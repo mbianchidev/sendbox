@@ -160,7 +160,7 @@ impl Fixture {
         if fixture_mode == "crash" {
             args.extend([
                 "--crash-after-ms".to_owned(),
-                if mode == "partial" { "1" } else { "100" }.to_owned(),
+                if mode == "partial" { "1" } else { "2000" }.to_owned(),
             ]);
         }
         if spawn_child {
