@@ -30,6 +30,14 @@ fn loads_current_example_configuration() {
         1_048_576
     );
     assert!(config.github.branch_protection.enabled);
+    // The example predates the egress extensions: its network block carries
+    // no networks/ports/dns keys, so they must resolve to serde defaults.
+    assert!(config.policy.network.allowed_networks.is_empty());
+    assert!(config.policy.network.allowed_ports.is_empty());
+    assert_eq!(
+        config.policy.network.dns,
+        sendbox_policy::DnsPolicy::default()
+    );
 }
 
 #[test]
