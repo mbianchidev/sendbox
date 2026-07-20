@@ -47,6 +47,9 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component clippy,rustfmt
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libseccomp-dev pkg-config
+
       - name: Check formatting
         run: cargo +${{ env.RUST_VERSION }} fmt --all -- --check
 
