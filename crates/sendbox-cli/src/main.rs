@@ -366,6 +366,15 @@ fn canonical_project(path: &Path) -> Result<PathBuf, Diagnostic> {
             "project path is not a directory",
         ));
     }
+    fs::read_dir(&canonical).map_err(|error| {
+        Diagnostic::new(
+            DiagnosticCode::InvalidPath,
+            canonical.display().to_string(),
+            format!(
+                "project directory must be readable and searchable for secure configuration writes: {error}"
+            ),
+        )
+    })?;
     Ok(canonical)
 }
 

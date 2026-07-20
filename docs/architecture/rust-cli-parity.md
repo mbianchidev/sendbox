@@ -9,7 +9,7 @@ experimental name into scripts or completion files.
 
 | Surface | Rust behavior |
 |---|---|
-| `init` | Resolves an existing project directory, selects a policy preset and runtime, validates deterministic v1 YAML, creates `.sendbox.yaml` atomically with mode `0600`, and never overwrites an existing file. |
+| `init` | Resolves an existing readable/searchable project directory, selects a policy preset and runtime, validates deterministic v1 YAML, creates `.sendbox.yaml` atomically with mode `0600`, and never overwrites an existing file. |
 | `policy show` | Shows the default or configured policy as stable text or deterministic JSON. Configuration input uses strict decoding and policy-only validation. |
 | `policy validate` | Retains full sandbox validation, deterministic JSON, diagnostics, and exit `2` for invalid configuration. |
 | `completions print` | Generates bash, zsh, or fish output directly from the clap command tree. |
@@ -34,7 +34,10 @@ Writes validate first, open every destination-directory component without
 following symlinks, create a temporary file through the opened directory, set
 the final mode, sync content, and atomically create or replace the destination.
 `init` uses a no-replace rename so a concurrent creator wins without being
-modified; explicit migration callers may request replacement.
+modified; explicit migration callers may request replacement. Descriptor-based
+traversal requires read and search permission on existing destination
+directories. Completion setup applies `0755` only to directories it creates and
+preserves stricter modes on directories that already exist.
 
 ## Deferred command groups
 

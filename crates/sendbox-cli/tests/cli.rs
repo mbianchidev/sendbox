@@ -127,6 +127,33 @@ fn init_rejects_invalid_project_paths_with_stable_exit() {
     assert_eq!(result["diagnostics"][0]["code"], "invalid_path");
 }
 
+#[cfg(unix)]
+#[test]
+fn init_rejects_unreadable_project_directories_before_writing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempdir().unwrap();
+    std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+    let output = run(&[
+        "init",
+        "--project",
+        project.path().to_str().unwrap(),
+        "--json",
+    ]);
+    std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["diagnostics"][0]["code"], "invalid_path");
+    assert!(
+        result["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("readable and searchable")
+    );
+    assert!(!project.path().join(".sendbox.yaml").exists());
+}
+
 #[test]
 fn hyperlight_init_produces_a_valid_compatible_configuration() {
     let project = tempdir().unwrap();

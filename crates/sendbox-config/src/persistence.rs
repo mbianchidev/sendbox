@@ -155,7 +155,6 @@ pub fn atomic_write_file(
 
 pub fn ensure_directory(path: &Path, mode: u32) -> io::Result<()> {
     let directory = open_directory_no_symlinks(path, Some(mode))?;
-    fchmod(&directory, mode_from(mode)).map_err(io::Error::from)?;
     fsync(&directory).map_err(io::Error::from)
 }
 
@@ -218,8 +217,7 @@ fn open_directory_no_symlinks(path: &Path, create_mode: Option<u32>) -> io::Resu
     } else {
         open(".", flags, Mode::empty()).map_err(io::Error::from)?
     };
-    let mut components = path.components().peekable();
-    while let Some(component) = components.next() {
+    for component in path.components() {
         let name = match component {
             Component::RootDir | Component::CurDir => continue,
             Component::Normal(name) => name,
@@ -230,9 +228,8 @@ fn open_directory_no_symlinks(path: &Path, create_mode: Option<u32>) -> io::Resu
                 ));
             }
         };
-        let is_leaf = components.peek().is_none();
-        let next = match openat(&current, name, flags, Mode::empty()) {
-            Ok(next) => next,
+        let (next, created) = match openat(&current, name, flags, Mode::empty()) {
+            Ok(next) => (next, false),
             Err(error) if error == rustix::io::Errno::NOENT && create_mode.is_some() => {
                 let Some(mode) = create_mode else {
                     return Err(io::Error::new(
@@ -241,11 +238,14 @@ fn open_directory_no_symlinks(path: &Path, create_mode: Option<u32>) -> io::Resu
                     ));
                 };
                 mkdirat(&current, name, mode_from(mode)).map_err(io::Error::from)?;
-                openat(&current, name, flags, Mode::empty()).map_err(io::Error::from)?
+                (
+                    openat(&current, name, flags, Mode::empty()).map_err(io::Error::from)?,
+                    true,
+                )
             }
             Err(error) => return Err(io::Error::from(error)),
         };
-        if is_leaf && let Some(mode) = create_mode {
+        if created && let Some(mode) = create_mode {
             fchmod(&next, mode_from(mode)).map_err(io::Error::from)?;
         }
         current = next;
@@ -364,5 +364,24 @@ mod tests {
 
         assert!(ensure_directory(&root.join("linked/child"), 0o755).is_err());
         assert!(!external.join("child").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_stricter_existing_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let existing = root.join("completions");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o700)).unwrap();
+
+        ensure_directory(&existing, 0o755).unwrap();
+
+        assert_eq!(
+            fs::metadata(existing).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 }

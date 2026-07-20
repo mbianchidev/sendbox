@@ -14,7 +14,7 @@
   },
   "init": {
     "config_name": ".sendbox.yaml",
-    "project_path": "existing directory resolved to an absolute canonical path",
+    "project_path": "existing readable/searchable directory resolved to an absolute canonical path",
     "policy_presets": ["default", "permissive", "strict"],
     "runtime_selections": ["auto", "apple", "kata", "hyperlight"],
     "create_mode": "atomic_no_clobber",
@@ -48,7 +48,7 @@
       "fish": "~/.config/fish/completions/sendbox.fish"
     },
     "file_mode_octal": "0644",
-    "directory_mode_octal": "0755",
+    "directory_mode_octal": "0755 for newly created directories; stricter existing modes are preserved",
     "install_mode": "secure atomic replacement without following symlinked directory components",
     "race_behavior": "init no-clobber loses destination-creation races without changing the winner"
   },
