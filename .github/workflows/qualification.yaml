@@ -7,11 +7,7 @@ on:
       - "tools/sendbox-qualification/**"
       - "Tests/qualification/**"
       - "docs/qualification.md"
-      - "crates/sendbox-core/**"
-      - "crates/sendbox-config/**"
-      - "crates/sendbox-policy/**"
-      - "crates/sendbox-protocol/**"
-      - "crates/sendbox-cli/**"
+      - "crates/**"
       - ".github/workflows/qualification.yaml"
   pull_request:
     branches: [main]
@@ -19,11 +15,7 @@ on:
       - "tools/sendbox-qualification/**"
       - "Tests/qualification/**"
       - "docs/qualification.md"
-      - "crates/sendbox-core/**"
-      - "crates/sendbox-config/**"
-      - "crates/sendbox-policy/**"
-      - "crates/sendbox-protocol/**"
-      - "crates/sendbox-cli/**"
+      - "crates/**"
       - ".github/workflows/qualification.yaml"
 
 concurrency:
