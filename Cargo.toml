@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/sendbox-cli",
+    "crates/sendbox-agent",
     "crates/sendbox-config",
     "crates/sendbox-core",
     "crates/sendbox-egress",

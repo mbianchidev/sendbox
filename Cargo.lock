@@ -1368,6 +1368,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
+name = "sendbox-agent"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "sendbox-config",
+ "sendbox-core",
+ "sendbox-protocol",
+ "sendbox-runtime",
+ "sendbox-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "sendbox-cli"
 version = "0.1.0"
 dependencies = [
@@ -1421,6 +1439,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-exec"
+version = "0.1.0"
+dependencies = [
+ "caps",
+ "getrandom 0.4.3",
+ "libc",
+ "libseccomp",
+ "rlimit",
+ "sendbox-core",
+ "sendbox-policy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "sendbox-guest"
 version = "0.1.0"
 dependencies = [
@@ -1436,24 +1472,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "zeroize",
-]
-
-[[package]]
-name = "sendbox-exec"
-version = "0.1.0"
-dependencies = [
- "caps",
- "getrandom 0.4.3",
- "libc",
- "libseccomp",
- "rlimit",
- "sendbox-core",
- "sendbox-policy",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
  "zeroize",
 ]
 
@@ -1506,9 +1524,11 @@ version = "0.1.0"
 dependencies = [
  "nix",
  "proptest",
+ "sendbox-core",
  "sendbox-protocol",
  "thiserror",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
