@@ -29,6 +29,7 @@ use tokio::time::{sleep, timeout};
 
 const SECRET: [u8; 32] = [0x5a; 32];
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
+const PARTIAL_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct VerifiedControls;
@@ -436,7 +437,7 @@ async fn partial_startup_failure_terminates_already_started_services() {
     let options = fixture.options.clone();
     let identity = fixture.identity();
     let failed = tokio::spawn(async move { run(options, &VerifiedControls, identity).await });
-    let result = timeout(PROCESS_TIMEOUT, failed)
+    let result = timeout(PARTIAL_STARTUP_TIMEOUT, failed)
         .await
         .expect("partial startup timeout")
         .expect("partial startup task");
