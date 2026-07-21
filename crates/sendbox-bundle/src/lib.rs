@@ -5,19 +5,21 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rustix::process::{getgid, getuid};
 use sendbox_guest::manifest::{
     ArtifactExpectation, ArtifactKind, ArtifactManifest, MANIFEST_DOMAIN, MANIFEST_SCHEMA_VERSION,
-    SignedManifestEnvelope, VerifiedManifest, encode_hex, verify_manifest_for_architecture,
+    MAX_ARTIFACTS, MAX_MANIFEST_BYTES, SignedManifestEnvelope, VerifiedManifest, decode_hex,
+    encode_hex, verify_file_expectation, verify_manifest_for_architecture,
 };
 use sendbox_guest::secure_fs::open_directory_no_symlinks;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 const MAX_KEY_BYTES: usize = 129;
+const RELEASE_METADATA_DOMAIN: &str = "dev.sendbox.guest.release-metadata.v1";
 
 #[derive(Debug, Error)]
 pub enum BundleError {
@@ -64,6 +66,8 @@ pub struct StageOptions<'a> {
     pub host_version: &'a str,
     pub guest_version: &'a str,
     pub minimum_kernel: &'a str,
+    pub btf_archive_sha256: &'a str,
+    pub vmlinux_header_sha256: &'a str,
     pub uid: u32,
     pub gid: u32,
 }
@@ -87,6 +91,7 @@ pub struct StageReport {
     pub artifact_count: usize,
     pub manifest_path: PathBuf,
     pub detached_signature_path: PathBuf,
+    pub release_metadata_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,11 +114,41 @@ struct BundleMetadata<'a> {
     host_version: &'a str,
     guest_version: &'a str,
     bpf_programs: [&'a str; 2],
+    rust_version: &'static str,
+    clang_version: &'static str,
+    bpftool_version: &'static str,
+    libbpf_rs_version: &'static str,
+    libbpf_version: &'static str,
+    libseccomp_version: &'static str,
+    btf_source_commit: &'static str,
+    btf_archive_sha256: &'a str,
+    vmlinux_header_sha256: &'a str,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum InventoryKind {
+    GuestBinary,
+    ServiceBinary,
+    BpfObject,
+    Metadata,
+}
+
+impl InventoryKind {
+    fn manifest_kind(self) -> Option<ArtifactKind> {
+        match self {
+            Self::GuestBinary => Some(ArtifactKind::GuestBinary),
+            Self::ServiceBinary => Some(ArtifactKind::ServiceBinary),
+            Self::BpfObject => Some(ArtifactKind::BpfObject),
+            Self::Metadata => None,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct InventoryEntry {
-    kind: ArtifactKind,
+    kind: InventoryKind,
     path: PathBuf,
     sha256: String,
     mode: u32,
@@ -121,11 +156,22 @@ struct InventoryEntry {
     gid: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Inventory {
     schema_version: u8,
-    architecture: &'static str,
+    domain: String,
+    trust_root_id: String,
+    release_sequence: u64,
+    architecture: String,
     artifacts: Vec<InventoryEntry>,
+}
+
+#[derive(Serialize)]
+struct VerificationReport {
+    schema_version: u8,
+    status: &'static str,
+    checks: [&'static str; 8],
 }
 
 #[derive(Serialize)]
@@ -173,7 +219,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         options.guest_binary,
         options.output,
         Path::new("bin/sendbox-guest"),
-        ArtifactKind::GuestBinary,
+        InventoryKind::GuestBinary,
         0o500,
         options.uid,
         options.gid,
@@ -182,7 +228,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         options.exec_launcher,
         options.output,
         Path::new("bin/sendbox-exec-launcher"),
-        ArtifactKind::ServiceBinary,
+        InventoryKind::ServiceBinary,
         0o500,
         options.uid,
         options.gid,
@@ -191,7 +237,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         options.bpf_object,
         options.output,
         Path::new("lib/sendbox/observe.bpf.o"),
-        ArtifactKind::BpfObject,
+        InventoryKind::BpfObject,
         0o400,
         options.uid,
         options.gid,
@@ -208,11 +254,43 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         host_version: options.host_version,
         guest_version: options.guest_version,
         bpf_programs: ["observe_exec", "observe_sys_enter"],
+        rust_version: "1.93.1",
+        clang_version: "21.1.2",
+        bpftool_version: "6.19.14",
+        libbpf_rs_version: "0.26.2",
+        libbpf_version: "1.7.0",
+        libseccomp_version: "2.6.0",
+        btf_source_commit: "abbcdfab668b9a346a24cb0829f1cfbb80bc51db",
+        btf_archive_sha256: options.btf_archive_sha256,
+        vmlinux_header_sha256: options.vmlinux_header_sha256,
     };
     inventory.push(stage_generated(
         options.output,
         Path::new("share/sendbox/bundle-metadata.json"),
         &metadata,
+        0o400,
+        options.uid,
+        options.gid,
+    )?);
+
+    let verification = VerificationReport {
+        schema_version: 1,
+        status: "verified_at_build",
+        checks: [
+            "guest_static_elf",
+            "launcher_static_elf",
+            "bpf_abi_assertions",
+            "bpf_core_relocations",
+            "artifact_sha256",
+            "artifact_mode_owner",
+            "manifest_ed25519",
+            "architecture_and_rollback",
+        ],
+    };
+    inventory.push(stage_generated(
+        options.output,
+        Path::new("share/sendbox/verification-report.json"),
+        &verification,
         0o400,
         options.uid,
         options.gid,
@@ -230,7 +308,10 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
 
     let primary_inventory = Inventory {
         schema_version: 1,
-        architecture: options.architecture.as_str(),
+        domain: RELEASE_METADATA_DOMAIN.to_owned(),
+        trust_root_id: options.trust_root_id.to_owned(),
+        release_sequence: options.release_sequence,
+        architecture: options.architecture.as_str().to_owned(),
         artifacts: inventory.clone(),
     };
     inventory.push(stage_generated(
@@ -253,13 +334,15 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         architecture: options.architecture.as_str().to_owned(),
         artifacts: inventory
             .iter()
-            .map(|entry| ArtifactExpectation {
-                kind: entry.kind,
-                path: entry.path.clone(),
-                sha256: entry.sha256.clone(),
-                mode: entry.mode,
-                uid: entry.uid,
-                gid: entry.gid,
+            .filter_map(|entry| {
+                entry.kind.manifest_kind().map(|kind| ArtifactExpectation {
+                    kind,
+                    path: entry.path.clone(),
+                    sha256: entry.sha256.clone(),
+                    mode: entry.mode,
+                    uid: entry.uid,
+                    gid: entry.gid,
+                })
             })
             .collect(),
     };
@@ -275,6 +358,20 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
     write_json(&manifest_path, &envelope, 0o400)?;
     let signature_path = options.output.join("manifest.sig");
     write_bytes(&signature_path, signature_hex.as_bytes(), 0o400)?;
+    let release_payload = serde_json::to_string(&primary_inventory)?;
+    let release_signature = signing_key.sign(release_payload.as_bytes());
+    let release_signature_hex = encode_hex(&release_signature.to_bytes());
+    let release_envelope = SignedManifestEnvelope {
+        payload: release_payload,
+        signature: release_signature_hex.clone(),
+    };
+    let release_metadata_path = options.output.join("release-metadata.json");
+    write_json(&release_metadata_path, &release_envelope, 0o400)?;
+    write_bytes(
+        &options.output.join("release-metadata.sig"),
+        release_signature_hex.as_bytes(),
+        0o400,
+    )?;
 
     Ok(StageReport {
         schema_version: 1,
@@ -283,6 +380,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         artifact_count: manifest.artifacts.len(),
         manifest_path,
         detached_signature_path: signature_path,
+        release_metadata_path,
     })
 }
 
@@ -310,6 +408,7 @@ pub fn verify_bundle(options: &VerifyOptions<'_>) -> Result<VerifyReport, Bundle
         options.minimum_release_sequence,
     )?;
     verify_detached_signature(&root, &verified)?;
+    verify_release_metadata(&descriptor, &root, &public_key, options, &verified)?;
     Ok(VerifyReport {
         schema_version: 1,
         architecture: verified.manifest.architecture,
@@ -338,6 +437,8 @@ fn validate_stage_options(options: &StageOptions<'_>) -> Result<(), BundleError>
             "minimum accepted sequence exceeds release sequence".to_owned(),
         ));
     }
+    validate_sha256(options.btf_archive_sha256, "BTF archive")?;
+    validate_sha256(options.vmlinux_header_sha256, "vmlinux header")?;
     let current_uid = getuid().as_raw();
     let current_gid = getgid().as_raw();
     if options.uid != current_uid || options.gid != current_gid {
@@ -347,6 +448,16 @@ fn validate_stage_options(options: &StageOptions<'_>) -> Result<(), BundleError>
         )));
     }
     Ok(())
+}
+
+fn validate_sha256(value: &str, subject: &str) -> Result<(), BundleError> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(BundleError::InvalidInput(format!(
+            "{subject} SHA-256 must contain 64 hexadecimal characters"
+        )))
+    }
 }
 
 fn prepare_output(output: &Path) -> Result<(), BundleError> {
@@ -384,7 +495,7 @@ fn stage_source(
     source: &Path,
     root: &Path,
     relative: &Path,
-    kind: ArtifactKind,
+    kind: InventoryKind,
     mode: u32,
     uid: u32,
     gid: u32,
@@ -430,7 +541,7 @@ fn stage_generated<T: Serialize>(
     let destination = root.join(relative);
     write_json(&destination, value, mode)?;
     inventory_entry(
-        ArtifactKind::Metadata,
+        InventoryKind::Metadata,
         relative,
         &destination,
         mode,
@@ -440,7 +551,7 @@ fn stage_generated<T: Serialize>(
 }
 
 fn inventory_entry(
-    kind: ArtifactKind,
+    kind: InventoryKind,
     relative: &Path,
     destination: &Path,
     mode: u32,
@@ -596,6 +707,109 @@ fn verify_detached_signature(root: &Path, verified: &VerifiedManifest) -> Result
     Ok(())
 }
 
+fn verify_release_metadata(
+    descriptor: &std::os::fd::OwnedFd,
+    root: &Path,
+    public_key: &[u8; 32],
+    options: &VerifyOptions<'_>,
+    verified: &VerifiedManifest,
+) -> Result<(), BundleError> {
+    let envelope_bytes =
+        fs::read(root.join("release-metadata.json")).map_err(|source| BundleError::Io {
+            context: "reading signed release metadata",
+            source,
+        })?;
+    if envelope_bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(BundleError::InvalidInput(
+            "signed release metadata is too large".to_owned(),
+        ));
+    }
+    let envelope: SignedManifestEnvelope = serde_json::from_slice(&envelope_bytes)?;
+    let signature_bytes = decode_hex(&envelope.signature, 64)?;
+    let signature = Signature::from_slice(&signature_bytes).map_err(|error| {
+        BundleError::InvalidInput(format!("invalid release signature: {error}"))
+    })?;
+    let verifying_key = VerifyingKey::from_bytes(public_key)
+        .map_err(|error| BundleError::InvalidInput(format!("invalid public key: {error}")))?;
+    verifying_key
+        .verify(envelope.payload.as_bytes(), &signature)
+        .map_err(|_| BundleError::InvalidInput("release metadata signature failed".to_owned()))?;
+    let inventory: Inventory = serde_json::from_str(&envelope.payload)?;
+    if inventory.schema_version != 1
+        || inventory.domain != RELEASE_METADATA_DOMAIN
+        || inventory.trust_root_id != options.trust_root_id
+        || inventory.release_sequence != verified.manifest.release_sequence
+        || inventory.architecture != options.architecture.as_str()
+        || inventory.artifacts.is_empty()
+        || inventory.artifacts.len() > MAX_ARTIFACTS
+    {
+        return Err(BundleError::InvalidInput(
+            "release metadata identity or bounds mismatch".to_owned(),
+        ));
+    }
+    let inventory_bytes =
+        fs::read(root.join("share/sendbox/inventory.json")).map_err(|source| BundleError::Io {
+            context: "reading release inventory",
+            source,
+        })?;
+    if inventory_bytes != envelope.payload.as_bytes() {
+        return Err(BundleError::InvalidInput(
+            "release inventory does not match signed metadata".to_owned(),
+        ));
+    }
+    let detached = fs::read_to_string(root.join("release-metadata.sig")).map_err(|source| {
+        BundleError::Io {
+            context: "reading detached release metadata signature",
+            source,
+        }
+    })?;
+    if detached.trim() != envelope.signature {
+        return Err(BundleError::InvalidInput(
+            "detached release metadata signature mismatch".to_owned(),
+        ));
+    }
+    for entry in &inventory.artifacts {
+        if entry.sha256.len() != 64
+            || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || entry.mode & !0o7777 != 0
+        {
+            return Err(BundleError::InvalidInput(format!(
+                "invalid release inventory entry: {}",
+                entry.path.display()
+            )));
+        }
+        verify_file_expectation(
+            descriptor,
+            &entry.path,
+            &entry.sha256,
+            entry.mode,
+            entry.uid,
+            entry.gid,
+        )?;
+    }
+    for artifact in &verified.manifest.artifacts {
+        let expected_kind = match artifact.kind {
+            ArtifactKind::GuestBinary => InventoryKind::GuestBinary,
+            ArtifactKind::ServiceBinary => InventoryKind::ServiceBinary,
+            ArtifactKind::BpfObject => InventoryKind::BpfObject,
+        };
+        if !inventory.artifacts.iter().any(|entry| {
+            entry.kind == expected_kind
+                && entry.path == artifact.path
+                && entry.sha256 == artifact.sha256
+                && entry.mode == artifact.mode
+                && entry.uid == artifact.uid
+                && entry.gid == artifact.gid
+        }) {
+            return Err(BundleError::InvalidInput(format!(
+                "signed inventory is missing manifest artifact {}",
+                artifact.path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub mod fuzzing {
     use sendbox_guest::manifest::{ArtifactManifest, MAX_MANIFEST_BYTES, SignedManifestEnvelope};
 
@@ -669,6 +883,8 @@ mod tests {
             host_version: "0.1.0",
             guest_version: "0.1.0",
             minimum_kernel: "5.8.0",
+            btf_archive_sha256: "1111111111111111111111111111111111111111111111111111111111111111",
+            vmlinux_header_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
             uid: getuid().as_raw(),
             gid: getgid().as_raw(),
         })
@@ -693,9 +909,15 @@ mod tests {
         let fixture = new_fixture();
         let root = stage(&fixture);
         let report = verify(&fixture, &root).expect("verify");
-        assert_eq!(report.artifact_count, 6);
+        assert_eq!(report.artifact_count, 3);
         assert!(root.join("share/sendbox/inventory.json").is_file());
         assert!(root.join("share/sendbox/sbom.spdx.json").is_file());
+        assert!(
+            root.join("share/sendbox/verification-report.json")
+                .is_file()
+        );
+        assert!(root.join("release-metadata.json").is_file());
+        assert!(root.join("release-metadata.sig").is_file());
     }
 
     #[test]
@@ -706,6 +928,14 @@ mod tests {
         fs::remove_file(&guest).expect("remove guest");
         fs::write(&guest, b"tamper").expect("tamper");
         fs::set_permissions(&guest, fs::Permissions::from_mode(0o500)).expect("restore mode");
+        assert!(verify(&fixture, &root).is_err());
+
+        let fixture = new_fixture();
+        let root = stage(&fixture);
+        let sbom = root.join("share/sendbox/sbom.spdx.json");
+        fs::set_permissions(&sbom, fs::Permissions::from_mode(0o600)).expect("writable sbom");
+        fs::write(&sbom, b"tampered sbom").expect("tamper sbom");
+        fs::set_permissions(&sbom, fs::Permissions::from_mode(0o400)).expect("restore mode");
         assert!(verify(&fixture, &root).is_err());
 
         let fixture = new_fixture();
@@ -762,6 +992,8 @@ mod tests {
             host_version: "0.1.0",
             guest_version: "0.1.0",
             minimum_kernel: "5.8.0",
+            btf_archive_sha256: "1111111111111111111111111111111111111111111111111111111111111111",
+            vmlinux_header_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
             uid: getuid().as_raw(),
             gid: getgid().as_raw(),
         })

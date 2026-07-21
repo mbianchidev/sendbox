@@ -41,6 +41,10 @@ enum Command {
         guest_version: String,
         #[arg(long, default_value = "5.8.0")]
         minimum_kernel: String,
+        #[arg(long)]
+        btf_archive_sha256: String,
+        #[arg(long)]
+        vmlinux_header_sha256: String,
         #[arg(long, default_value_t = 0)]
         uid: u32,
         #[arg(long, default_value_t = 0)]
@@ -110,6 +114,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             host_version,
             guest_version,
             minimum_kernel,
+            btf_archive_sha256,
+            vmlinux_header_sha256,
             uid,
             gid,
         } => serde_json::to_string(&stage_bundle(&StageOptions {
@@ -125,6 +131,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             host_version: &host_version,
             guest_version: &guest_version,
             minimum_kernel: &minimum_kernel,
+            btf_archive_sha256: &btf_archive_sha256,
+            vmlinux_header_sha256: &vmlinux_header_sha256,
             uid,
             gid,
         })?)?,

@@ -11,8 +11,11 @@ publish = false
 serde.workspace = true
 thiserror.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 libbpf-rs.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+libbpf-rs = { workspace = true, features = ["static"] }
 
 [dev-dependencies]
 proptest.workspace = true

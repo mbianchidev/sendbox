@@ -30,12 +30,20 @@ through a file. The tool never creates a signing key, writes the private key
 into the bundle, or provides a production key-custody mechanism. Docker accepts
 the key only as the required BuildKit secret `release_signing_key`.
 
-The signed envelope is exactly the schema verified by
-`sendbox_guest::manifest`. A matching detached `manifest.sig` is emitted for
-release systems that store signatures separately. `release-public.key` in
-exported build artifacts is informational and useful for CI; it is not a trust
-anchor. Runtime adapters must provision the expected public key and
-`trust_root_id` through an independent trusted channel.
+The guest artifact envelope remains exactly schema v1 verified by
+`sendbox_guest::manifest`; its artifact-kind enum is unchanged and contains
+only guest, service, and BPF objects. A matching detached `manifest.sig` is
+emitted for release systems that store signatures separately.
+
+Inventory, SBOM, build-input metadata, and the deterministic verification
+report are covered by the separately versioned
+`dev.sendbox.guest.release-metadata.v1` envelope and detached signature. This
+avoids silently extending the guest manifest v1 wire contract.
+The signer receives the verified BTF archive digest and the freshly generated
+`vmlinux.h` digest from the build stages; it does not infer or hardcode them.
+`release-public.key` in exported build artifacts is informational and useful
+for CI; it is not a trust anchor. Runtime adapters must provision the expected
+public key and `trust_root_id` through an independent trusted channel.
 
 Release sequence, minimum accepted sequence, host version, guest version,
 architecture, SHA-256 digest, mode, uid, gid, regular-file type, and single-link

@@ -109,9 +109,13 @@ jobs:
             sendbox-guest-rootfs.tar.sha256 \
             manifest.json \
             manifest.sig \
+            release-metadata.json \
+            release-metadata.sig \
             release-public.key \
             inventory.json \
             sbom.spdx.json \
+            verification-report.json \
+            btf-archive.sha256 \
             vmlinux.sha256 \
             core-relocation.sha256 \
             sendbox-guest.static.txt \

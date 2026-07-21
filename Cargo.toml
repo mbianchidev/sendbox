@@ -41,7 +41,7 @@ hmac = { version = "0.13.0", features = ["zeroize"] }
 ipnet = "2.11.0"
 jsonc-parser = { version = "0.33.0", features = ["serde"] }
 libc = "0.2.177"
-libbpf-rs = { version = "0.26.2", features = ["static"] }
+libbpf-rs = "0.26.2"
 libseccomp = "0.4.0"
 minicbor = { version = "2.2.2", features = ["std"] }
 proptest = "1.11.0"

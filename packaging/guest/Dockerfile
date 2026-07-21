@@ -48,6 +48,7 @@ RUN case "$TARGETARCH" in \
         "https://raw.githubusercontent.com/aquasecurity/btfhub-archive/abbcdfab668b9a346a24cb0829f1cfbb80bc51db/ubuntu/20.04/$btf_arch/5.8.0-63-generic.btf.tar.xz" \
         -o /tmp/vmlinux.btf.tar.xz \
     && echo "$btf_sha  /tmp/vmlinux.btf.tar.xz" | sha256sum -c - \
+    && printf '%s\n' "$btf_sha" >/opt/btf-archive.digest \
     && tar -xJf /tmp/vmlinux.btf.tar.xz -C /tmp \
     && bpftool btf dump file /tmp/5.8.0-63-generic.btf format c \
         >"/opt/vmlinux/$btf_arch/vmlinux.h" \
@@ -56,6 +57,7 @@ RUN case "$TARGETARCH" in \
     && printf '%s\n' "$rust_arch" >/opt/rust-architecture \
     && printf '%s\n' "$btf_arch" >/opt/btf-architecture \
     && sha256sum "/opt/vmlinux/$btf_arch/vmlinux.h" >/opt/vmlinux.sha256 \
+    && cut -d ' ' -f 1 /opt/vmlinux.sha256 >/opt/vmlinux-header.digest \
     && rm -f /tmp/vmlinux.btf.tar.xz /tmp/5.8.0-63-generic.btf
 
 FROM toolchain AS libseccomp
@@ -86,7 +88,7 @@ COPY guest guest
 COPY native native
 COPY test-fixtures test-fixtures
 COPY packaging/guest packaging/guest
-RUN chmod +x guest/sendbox-guest/scripts/verify-static.sh packaging/guest/verify-bpf.sh
+RUN chmod +x packaging/guest/verify-bpf.sh packaging/guest/verify-static.sh
 
 ENV CARGO_INCREMENTAL=0
 ENV LIBBPF_SYS_EXTRA_CFLAGS="-Wno-error=deprecated-declarations"
@@ -122,6 +124,7 @@ RUN arch="$(cat /opt/btf-architecture)" \
     && test -s /out/min-core.btf \
     && sha256sum /out/min-core.btf >/out/core-relocation.sha256 \
     && rm /out/min-core.btf \
+    && cp /opt/btf-archive.digest /out/btf-archive.sha256 \
     && cp /opt/vmlinux.sha256 /out/
 
 FROM source AS quality
@@ -153,9 +156,9 @@ RUN target="$(cat /opt/target-triple)" \
     && cp "target/$target/release/sendbox-guest" /release/ \
     && cp "target/$target/release/sendbox-exec-launcher" /release/ \
     && cp "target/$target/release/sendbox-bundle" /release/ \
-    && guest/sendbox-guest/scripts/verify-static.sh \
+    && packaging/guest/verify-static.sh \
         /release/sendbox-guest /release/sendbox-guest.static.txt \
-    && guest/sendbox-guest/scripts/verify-static.sh \
+    && packaging/guest/verify-static.sh \
         /release/sendbox-exec-launcher /release/sendbox-exec-launcher.static.txt
 
 FROM release AS bundle
@@ -181,6 +184,8 @@ RUN --mount=type=secret,id=release_signing_key,required=true \
         --minimum-accepted-sequence "$MINIMUM_ACCEPTED_SEQUENCE" \
         --host-version "$HOST_VERSION" \
         --guest-version "$GUEST_VERSION" \
+        --btf-archive-sha256 "$(cat /opt/btf-archive.digest)" \
+        --vmlinux-header-sha256 "$(cat /opt/vmlinux-header.digest)" \
         --uid 0 \
         --gid 0 \
     && /release/sendbox-bundle verify \
@@ -206,10 +211,21 @@ RUN mkdir -p /out \
     && cd /out \
     && sha256sum sendbox-guest-rootfs.tar >sendbox-guest-rootfs.tar.sha256 \
     && cp /release/*.static.txt /out/ \
+    && cp /bpf/btf-archive.sha256 /out/ \
     && cp /bpf/vmlinux.sha256 /out/ \
     && cp /bpf/core-relocation.sha256 /out/ \
-    && cp /bundle/manifest.json /bundle/manifest.sig /tmp/release-public.key /out/ \
-    && cp /bundle/share/sendbox/inventory.json /bundle/share/sendbox/sbom.spdx.json /out/
+    && cp \
+        /bundle/manifest.json \
+        /bundle/manifest.sig \
+        /bundle/release-metadata.json \
+        /bundle/release-metadata.sig \
+        /tmp/release-public.key \
+        /out/ \
+    && cp \
+        /bundle/share/sendbox/inventory.json \
+        /bundle/share/sendbox/sbom.spdx.json \
+        /bundle/share/sendbox/verification-report.json \
+        /out/
 
 FROM scratch AS image
 COPY --from=bundle /bundle/ /opt/sendbox/
