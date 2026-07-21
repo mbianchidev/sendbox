@@ -81,11 +81,17 @@ For an interactive runtime preflight and configuration flow:
 
 Kata installation and containerd configuration are documented in [docs/kata-containers.md](docs/kata-containers.md).
 
-### Experimental Rust validator
+### Rust foundation
 
-The parallel Rust foundation builds an experimental `sendbox-rs` binary. In this
-phase it only parses and validates configuration and policy; all sandbox runtime
-execution remains on the production Swift `sendbox` binary.
+The parallel Rust foundation builds an experimental `sendbox-rs` binary. The CLI
+still exposes control-plane operations only; sandbox launch remains on the
+production Swift `sendbox` binary.
+
+The workspace also includes focused production Rust components that are not yet
+wired into `sendbox run`. `sendbox-git` provides typed selected-repository
+push/pull admission and the `sendbox-git-guard` native execution shim for later
+exec-broker/guest integration. See
+[docs/architecture/git-branch-guard.md](docs/architecture/git-branch-guard.md).
 
 The workspace also contains the pre-1.0 `sendbox-protocol` foundation for
 bounded, authenticated host/guest communication. It is transport-neutral and
@@ -252,6 +258,11 @@ allowed. The username is auto-detected from `gh` or can be configured explicitly
 requires `policy.boundaries.enabled`; keep GitHub server-side branch protection enabled as
 defense in depth against direct API ref mutations or alternate Git clients. Disable
 `github.branch_protection.enabled` for non-Git projects.
+
+The native Rust admission engine is implemented independently of the current
+Swift-generated wrapper. It is not yet connected to `sendbox run`, and neither
+implementation replaces hosting-provider rulesets or protects alternate clients
+and direct GitHub API calls.
 
 ### Configuration Reference
 

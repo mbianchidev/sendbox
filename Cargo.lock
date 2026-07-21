@@ -1421,6 +1421,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-exec"
+version = "0.1.0"
+dependencies = [
+ "caps",
+ "getrandom 0.4.3",
+ "libc",
+ "libseccomp",
+ "rlimit",
+ "sendbox-core",
+ "sendbox-policy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "sendbox-git"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "url",
+]
+
+[[package]]
 name = "sendbox-guest"
 version = "0.1.0"
 dependencies = [
@@ -1436,24 +1467,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "zeroize",
-]
-
-[[package]]
-name = "sendbox-exec"
-version = "0.1.0"
-dependencies = [
- "caps",
- "getrandom 0.4.3",
- "libc",
- "libseccomp",
- "rlimit",
- "sendbox-core",
- "sendbox-policy",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
  "zeroize",
 ]
 

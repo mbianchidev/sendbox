@@ -339,6 +339,21 @@ Selected-repository Git operations are guarded before the real git binary execut
 - Uses eBPF to terminate direct execution of the hidden real git binary
 - Does not replace GitHub server-side rulesets, which remain necessary against direct API ref mutation or alternate Git clients
 
+The independent Rust migration component lives in `sendbox-git`. It replaces
+generated Python policy logic with typed repository/workspace identity, bounded
+Git probes, supported argv/refspec parsing, one clean environment for probes and
+final execution, and native process replacement through a pre-verified absolute
+Git binary. It is not yet connected to the runtime path. Ambiguous remotes,
+multiple effective push URLs, shell aliases, broad ref updates, unsafe
+configuration injection, and unsupported transports fail closed for the
+selected repository.
+
+Git admission is not an atomic remote authorization boundary: repository state
+can change between local inspection and Git's own reads, and agents can use
+alternate clients or hosting-provider APIs unless later broker, credential, and
+egress controls prevent that. GitHub rulesets or equivalent server-side branch
+protection are mandatory.
+
 ### Layer 9: Secrets Protection
 
 Secrets management prevents credential exposure:

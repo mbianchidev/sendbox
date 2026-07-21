@@ -5,6 +5,7 @@ members = [
     "crates/sendbox-core",
     "crates/sendbox-egress",
     "crates/sendbox-exec",
+    "crates/sendbox-git",
     "crates/sendbox-policy",
     "crates/sendbox-project",
     "crates/sendbox-protocol",
