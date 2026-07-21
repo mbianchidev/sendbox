@@ -48,6 +48,9 @@ pub enum BrokerAuditEvent {
         peer: SocketAddr,
         reason: &'static str,
     },
+    ListenerFailure {
+        reason: &'static str,
+    },
 }
 
 pub trait AuditSink: Send + Sync {
@@ -166,7 +169,19 @@ async fn run_listener(
         tokio::select! {
             () = cancellation.cancelled() => break,
             accepted = listener.accept() => {
-                let (mut stream, peer) = accepted?;
+                let (mut stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(_) => {
+                        broker.audit.record(BrokerAuditEvent::ListenerFailure {
+                            reason: "listener accept failure",
+                        });
+                        tokio::select! {
+                            () = cancellation.cancelled() => break,
+                            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                        }
+                        continue;
+                    }
+                };
                 let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
                     broker.audit.record(BrokerAuditEvent::Rejected {
                         peer,
@@ -197,10 +212,10 @@ async fn run_listener(
                 });
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
-                if let Err(error) = result {
-                    return Err(CredentialBrokerError::Upstream(format!(
-                        "credential broker connection task failed: {error}"
-                    )));
+                if result.is_err() {
+                    broker.audit.record(BrokerAuditEvent::ListenerFailure {
+                        reason: "connection task failed",
+                    });
                 }
             }
         }
@@ -604,6 +619,30 @@ mod tests {
         }
     }
 
+    struct PanicsOnceTransport {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl UpstreamTransport for PanicsOnceTransport {
+        async fn send(
+            &self,
+            _request: &UpstreamRequest,
+            _limits: &BrokerLimits,
+            _address_policy: &UpstreamAddressPolicy,
+            _cancellation: &CancellationToken,
+        ) -> Result<UpstreamResponse, CredentialBrokerError> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                panic!("injected connection task panic");
+            }
+            Ok(UpstreamResponse::new(
+                StatusCode::OK,
+                vec![],
+                b"recovered".to_vec(),
+            ))
+        }
+    }
+
     fn rule() -> CredentialRule {
         let name = SecretName::new("EXAMPLE_TOKEN").expect("name");
         let policy = CredentialPolicy::new(
@@ -871,6 +910,35 @@ mod tests {
             .await
             .expect("shutdown timeout")
             .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn panicking_connection_task_does_not_stop_listener() {
+        let transport = Arc::new(PanicsOnceTransport {
+            calls: AtomicUsize::new(0),
+        });
+        let broker = CredentialBroker::new(
+            configuration(),
+            Arc::new(StaticSecrets),
+            Arc::clone(&transport) as Arc<dyn UpstreamTransport>,
+            Arc::new(NoopAuditSink),
+        );
+        let (handle, _) = broker.start().await.expect("start");
+        let first = request(
+            &handle,
+            "GET /credentials/api/v1/start HTTP/1.1\r\nHost: localhost:PORT\r\n\r\n",
+        )
+        .await;
+        assert!(first.is_empty());
+        let second = request(
+            &handle,
+            "GET /credentials/api/v1/start HTTP/1.1\r\nHost: localhost:PORT\r\n\r\n",
+        )
+        .await;
+        assert!(second.starts_with(b"HTTP/1.1 200"));
+        assert!(second.ends_with(b"recovered"));
+        assert_eq!(transport.calls.load(Ordering::Relaxed), 2);
+        handle.shutdown().await.expect("shutdown");
     }
 
     #[test]
