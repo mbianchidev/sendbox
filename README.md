@@ -94,9 +94,12 @@ exec-broker/guest integration. See
 [docs/architecture/git-branch-guard.md](docs/architecture/git-branch-guard.md).
 
 The workspace also contains the pre-1.0 `sendbox-protocol` foundation for
-bounded, authenticated host/guest communication. It is transport-neutral and
-does not start VMs or select runtime-specific socket mappings. See
-[docs/architecture/authenticated-guest-protocol.md](docs/architecture/authenticated-guest-protocol.md).
+bounded, authenticated host/guest communication. `sendbox-runtime` now owns the
+transport-neutral channel provisioning contract, and `sendbox-agent` owns the
+pure orchestration state machine; neither starts a concrete vendor VM or selects
+runtime-specific socket mappings. See
+[authenticated guest protocol](docs/architecture/authenticated-guest-protocol.md)
+and [agent orchestration](docs/architecture/agent-orchestration.md).
 
 ```bash
 make rust-build
@@ -329,6 +332,7 @@ policy validation, native project analysis, runtime and credential primitives,
 and production Linux execution and egress enforcement. See the architecture documents for
 [project analysis](docs/architecture/native-project-analysis.md),
 [runtime core](docs/architecture/runtime-core.md),
+[agent orchestration](docs/architecture/agent-orchestration.md),
 [secrets](docs/architecture/secrets-and-credential-broker.md), and
 [execution brokerage](docs/architecture/execution-broker.md), plus
 [egress enforcement](docs/architecture/egress-enforcement.md).

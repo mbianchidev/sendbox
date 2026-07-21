@@ -2,6 +2,7 @@
 
 mod cancellation;
 mod capability;
+mod channel;
 mod cleanup;
 mod clock;
 mod error;
@@ -14,6 +15,12 @@ mod unavailable;
 
 pub use cancellation::CancellationToken;
 pub use capability::{RuntimeCapabilities, RuntimeCapability};
+pub use channel::{
+    BootstrapDelivery, BootstrapMaterial, ChannelLifetime, ChannelOwnership, ControlChannelRequest,
+    ControlEndpointKind, ControlStream, GuestAddress, HostAddress, MAX_READINESS_TIMEOUT,
+    MIN_BOOTSTRAP_BYTES, MIN_READINESS_TIMEOUT, ProvisionedControlChannel,
+    ProvisionedControlChannelDescriptor,
+};
 pub use cleanup::{
     CleanupFailure, CleanupReport, CleanupStep, CleanupTransaction, OperationFailure,
 };
@@ -30,7 +37,8 @@ pub use process::{
     SearchPathResolver, TerminationReason,
 };
 pub use provider::{
-    BoxFuture, CreateRequest, ExecRequest, InitializeRequest, PreflightReport, PreflightRequest,
-    RuntimeHealth, RuntimeProvider, RuntimeSignal, RuntimeStatus, StartRequest, StopRequest,
+    BoxFuture, CreateRequest, ExecPurpose, ExecRequest, InitializeRequest, PreflightReport,
+    PreflightRequest, RuntimeHealth, RuntimeProvider, RuntimeSignal, RuntimeStatus, StartRequest,
+    StopRequest,
 };
 pub use unavailable::UnavailableRuntimeProvider;
