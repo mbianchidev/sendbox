@@ -28,6 +28,15 @@ filter before any untrusted input, plugin, tool, or model-controlled callback.
 Providers that cannot guarantee that ordering cannot claim semantic command
 enforcement.
 
+## Agent/runtime ownership
+
+The host agent reaches this broker through the runtime-owned authenticated guest
+control channel. `sendbox-agent` validates `BrokeredExec` and guest `Exec`
+capabilities before launch and sends the workload over that channel.
+`RuntimeProvider::exec` is reserved for trusted bootstrap and control operations;
+it is not an alternate workload path. Concrete guest wiring and runtime adapter
+mappings remain pending.
+
 ## Typed contract
 
 `ExecutionRequest` carries:

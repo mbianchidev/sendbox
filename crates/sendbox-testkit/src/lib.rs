@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -13,9 +13,11 @@ use std::{
 
 use sendbox_runtime::{
     BoxFuture, CancellationToken, CleanupReport, Clock, CommandArgument, CommandSpec, ContainerId,
-    CreateRequest, ExecRequest, InitializeRequest, LifecycleState, LifecycleStateMachine,
-    LifecycleTransitionError, MonotonicTime, OutputEvent, OutputStream, OutputSubscription,
-    PreflightReport, PreflightRequest, ProcessOutcome, Program, RuntimeCapabilities,
+    ControlChannelRequest, ControlEndpointKind, ControlStream, CreateRequest, ExecPurpose,
+    ExecRequest, GuestAddress, HostAddress, InitializeRequest, LifecycleState,
+    LifecycleStateMachine, LifecycleTransitionError, MonotonicTime, OutputEvent, OutputStream,
+    OutputSubscription, PreflightReport, PreflightRequest, ProcessOutcome, Program,
+    ProvisionedControlChannel, ProvisionedControlChannelDescriptor, RuntimeCapabilities,
     RuntimeCapability, RuntimeError, RuntimeHealth, RuntimeId, RuntimeProvider, RuntimeSignal,
     RuntimeStatus, StartRequest, StopRequest, VecOutputSubscription,
 };
@@ -156,14 +158,26 @@ impl TempResource {
     }
 }
 
-#[derive(Debug)]
 pub struct FakeRuntime {
     runtime_id: RuntimeId,
     capabilities: RuntimeCapabilities,
     lifecycle: LifecycleStateMachine,
     container: Mutex<Option<ContainerId>>,
+    created_container: Mutex<Option<ContainerId>>,
     recorder: CommandRecorder,
     failures: FailureInjector,
+    control_stream: Mutex<Option<Box<dyn ControlStream>>>,
+}
+
+impl fmt::Debug for FakeRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FakeRuntime")
+            .field("runtime_id", &self.runtime_id)
+            .field("capabilities", &self.capabilities)
+            .field("lifecycle", &self.lifecycle)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FakeRuntime {
@@ -173,8 +187,10 @@ impl FakeRuntime {
             capabilities,
             lifecycle: LifecycleStateMachine::default(),
             container: Mutex::new(None),
+            created_container: Mutex::new(None),
             recorder: CommandRecorder::default(),
             failures: FailureInjector::default(),
+            control_stream: Mutex::new(None),
         })
     }
 
@@ -186,6 +202,20 @@ impl FakeRuntime {
     #[must_use]
     pub fn failure_injector(&self) -> FailureInjector {
         self.failures.clone()
+    }
+
+    pub fn set_control_stream(&self, stream: Box<dyn ControlStream>) {
+        *self
+            .control_stream
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(stream);
+    }
+
+    pub fn set_created_container_id(&self, container: ContainerId) {
+        *self
+            .created_container
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(container);
     }
 
     fn before(
@@ -272,11 +302,17 @@ impl RuntimeProvider for FakeRuntime {
                 ));
             }
             self.transition(LifecycleState::Created)?;
+            let container = self
+                .created_container
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+                .unwrap_or(request.container_id);
             *self
                 .container
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) = Some(request.container_id.clone());
-            Ok(request.container_id)
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(container.clone());
+            Ok(container)
         })
     }
 
@@ -290,6 +326,50 @@ impl RuntimeProvider for FakeRuntime {
             self.before("start", Some(container), cancellation)?;
             self.ensure_container(container)?;
             self.transition(LifecycleState::Running)
+        })
+    }
+
+    fn provision_control_channel<'a>(
+        &'a self,
+        request: ControlChannelRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<Box<dyn ProvisionedControlChannel>, RuntimeError>> {
+        Box::pin(async move {
+            self.before(
+                "provision_control_channel",
+                Some(&request.container_id),
+                cancellation,
+            )?;
+            self.ensure_container(&request.container_id)?;
+            request.validate()?;
+            let required = transport_capability(request.endpoint_kind);
+            if !self
+                .capabilities
+                .contains(RuntimeCapability::TransportProvisioning)
+                || !self.capabilities.contains(required)
+            {
+                return Err(RuntimeError::TransportUnavailable {
+                    endpoint: request.endpoint_kind,
+                    reason: "fake runtime does not advertise the requested transport".to_owned(),
+                });
+            }
+            let stream = self
+                .control_stream
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+                .ok_or_else(|| {
+                    RuntimeError::Provider("no fake control stream configured".to_owned())
+                })?;
+            let descriptor = fake_descriptor(&request)?;
+            Ok(Box::new(FakeProvisionedControlChannel {
+                descriptor,
+                stream: Some(stream),
+                cleaned: false,
+                recorder: self.recorder.clone(),
+                failures: self.failures.clone(),
+                container: request.container_id,
+            }) as Box<dyn ProvisionedControlChannel>)
         })
     }
 
@@ -311,12 +391,15 @@ impl RuntimeProvider for FakeRuntime {
     fn exec<'a>(
         &'a self,
         container: &'a ContainerId,
-        _request: ExecRequest,
+        request: ExecRequest,
         cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<ProcessOutcome, RuntimeError>> {
         Box::pin(async move {
             self.before("exec", Some(container), cancellation)?;
             self.ensure_container(container)?;
+            if request.purpose == ExecPurpose::Workload {
+                return Err(RuntimeError::WorkloadExecRequiresGuestBroker);
+            }
             if self.lifecycle.current() != LifecycleState::Running {
                 return Err(RuntimeError::Provider(
                     "fake runtime is not running".to_owned(),
@@ -389,6 +472,100 @@ impl RuntimeProvider for FakeRuntime {
             }
             self.transition(LifecycleState::Cleaned)?;
             Ok(CleanupReport::default())
+        })
+    }
+}
+
+fn transport_capability(kind: ControlEndpointKind) -> RuntimeCapability {
+    match kind {
+        ControlEndpointKind::Vsock => RuntimeCapability::VsockControlChannel,
+        ControlEndpointKind::PublishedUnixSocket => RuntimeCapability::PublishedUnixControlChannel,
+        ControlEndpointKind::InheritedStdio => RuntimeCapability::InheritedStdioControlChannel,
+        ControlEndpointKind::InheritedFileDescriptor => {
+            RuntimeCapability::InheritedFileDescriptorControlChannel
+        }
+        ControlEndpointKind::Unavailable => RuntimeCapability::TransportProvisioning,
+    }
+}
+
+fn fake_descriptor(
+    request: &ControlChannelRequest,
+) -> Result<ProvisionedControlChannelDescriptor, RuntimeError> {
+    let (host_address, guest_address) = match request.endpoint_kind {
+        ControlEndpointKind::Vsock => (
+            HostAddress::Vsock { cid: 2, port: 7000 },
+            GuestAddress::Vsock { cid: 3, port: 7000 },
+        ),
+        ControlEndpointKind::PublishedUnixSocket => (
+            HostAddress::UnixSocket(PathBuf::from("/tmp/sendbox-fake.sock")),
+            GuestAddress::UnixSocket(PathBuf::from("/run/sendbox/control.sock")),
+        ),
+        ControlEndpointKind::InheritedStdio => (HostAddress::Stdio, GuestAddress::Stdio),
+        ControlEndpointKind::InheritedFileDescriptor => (
+            HostAddress::FileDescriptor(3),
+            GuestAddress::FileDescriptor(3),
+        ),
+        ControlEndpointKind::Unavailable => {
+            return Err(RuntimeError::TransportUnavailable {
+                endpoint: request.endpoint_kind,
+                reason: "unavailable endpoint has no descriptor".to_owned(),
+            });
+        }
+    };
+    Ok(ProvisionedControlChannelDescriptor {
+        endpoint_kind: request.endpoint_kind,
+        host_address,
+        guest_address,
+        ownership: request.ownership,
+        lifetime: request.lifetime,
+    })
+}
+
+struct FakeProvisionedControlChannel {
+    descriptor: ProvisionedControlChannelDescriptor,
+    stream: Option<Box<dyn ControlStream>>,
+    cleaned: bool,
+    recorder: CommandRecorder,
+    failures: FailureInjector,
+    container: ContainerId,
+}
+
+impl ProvisionedControlChannel for FakeProvisionedControlChannel {
+    fn descriptor(&self) -> &ProvisionedControlChannelDescriptor {
+        &self.descriptor
+    }
+
+    fn accept<'a>(
+        &'a mut self,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<Box<dyn ControlStream>, RuntimeError>> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(RuntimeError::Cancelled);
+            }
+            self.recorder
+                .record("accept_control_channel", Some(self.container.clone()));
+            self.failures.check("accept_control_channel")?;
+            self.stream
+                .take()
+                .ok_or(RuntimeError::ControlChannelAlreadyAccepted)
+        })
+    }
+
+    fn cleanup<'a>(
+        &'a mut self,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<(), RuntimeError>> {
+        Box::pin(async move {
+            if self.cleaned {
+                return Ok(());
+            }
+            self.recorder
+                .record("cleanup_control_channel", Some(self.container.clone()));
+            self.failures.check("cleanup_control_channel")?;
+            self.stream.take();
+            self.cleaned = true;
+            Ok(())
         })
     }
 }
@@ -497,6 +674,7 @@ pub fn fake_conformance_scenario(
                     "/conformance/fake-program",
                 )))
             },
+            purpose: ExecPurpose::BootstrapControl,
         },
         signal: Some(RuntimeSignal::Interrupt),
     })

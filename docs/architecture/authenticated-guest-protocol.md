@@ -7,7 +7,8 @@ message schemas remain subject to qualification.
 ## Security boundary
 
 Each sandbox session receives a high-entropy bootstrap secret before untrusted
-agent code starts. The runtime-specific provisioning mechanism is outside this
+agent code starts. `sendbox-runtime` owns the transport-neutral provisioning and
+lifecycle contract; concrete runtime endpoint mappings remain outside this
 crate. The secret must be unique per session and available only to the trusted
 host and guest bootstrap processes.
 
