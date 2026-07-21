@@ -92,6 +92,13 @@ bounded, authenticated host/guest communication. It is transport-neutral and
 does not start VMs or select runtime-specific socket mappings. See
 [docs/architecture/authenticated-guest-protocol.md](docs/architecture/authenticated-guest-protocol.md).
 
+The pre-1.0 `sendbox-credentials` production library provides explicit
+loopback credential endpoints and guarded GitHub repository authorization. It
+requires agents to support API base-URL overrides and intentionally does not
+intercept TLS or support CONNECT injection. Runtime/CLI lifecycle wiring is
+deferred. See
+[docs/architecture/secrets-and-credential-broker.md](docs/architecture/secrets-and-credential-broker.md).
+
 ```bash
 make rust-build
 make rust-test

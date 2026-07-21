@@ -13,6 +13,7 @@ use tokio::{
     process::{Child, Command},
     task::JoinHandle,
 };
+use zeroize::Zeroizing;
 
 use crate::{
     CancellationToken, Clock, MonotonicTime, OutputStats, OutputStream, OutputSubscription,
@@ -107,6 +108,7 @@ pub struct ProcessOptions {
     pub read_chunk_bytes: usize,
     pub timeout: Option<Duration>,
     pub termination_grace: Duration,
+    pub publish_output: bool,
 }
 
 impl Default for ProcessOptions {
@@ -118,6 +120,7 @@ impl Default for ProcessOptions {
             read_chunk_bytes: 8 * 1024,
             timeout: None,
             termination_grace: Duration::from_millis(500),
+            publish_output: true,
         }
     }
 }
@@ -332,7 +335,15 @@ impl ProcessRunner {
 
         let stdout_capture = Arc::new(Mutex::new(CaptureBuffer::new(options.stdout_capture_bytes)));
         let stderr_capture = Arc::new(Mutex::new(CaptureBuffer::new(options.stderr_capture_bytes)));
-        let (publisher, subscription) = output_channel(options.output_channel_capacity);
+        let (publisher, subscription) = if options.publish_output {
+            let (publisher, subscription) = output_channel(options.output_channel_capacity);
+            (
+                Some(publisher),
+                Some(Box::new(subscription) as Box<dyn OutputSubscription>),
+            )
+        } else {
+            (None, None)
+        };
         let stdout_task = tokio::spawn(drain_pipe(
             stdout,
             OutputStream::Stdout,
@@ -359,8 +370,8 @@ impl ProcessRunner {
             stderr_capture,
             stdout_task: Some(stdout_task),
             stderr_task: Some(stderr_task),
-            publisher: Some(publisher),
-            subscription: Some(Box::new(subscription)),
+            publisher,
+            subscription,
         })
     }
 }
@@ -512,7 +523,7 @@ impl Drop for RunningProcess {
 
 #[derive(Debug)]
 struct CaptureBuffer {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
     limit: usize,
     total_bytes: u64,
 }
@@ -520,7 +531,7 @@ struct CaptureBuffer {
 impl CaptureBuffer {
     fn new(limit: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(limit.min(64 * 1024)),
+            bytes: Zeroizing::new(Vec::with_capacity(limit.min(64 * 1024))),
             limit,
             total_bytes: 0,
         }
@@ -535,7 +546,7 @@ impl CaptureBuffer {
 
     fn snapshot(&self) -> CapturedOutput {
         CapturedOutput {
-            bytes: self.bytes.clone(),
+            bytes: self.bytes.to_vec(),
             total_bytes: self.total_bytes,
             truncated_bytes: self.total_bytes.saturating_sub(self.bytes.len() as u64),
         }
@@ -546,10 +557,10 @@ async fn drain_pipe(
     mut pipe: impl AsyncRead + Unpin,
     stream: OutputStream,
     capture: Arc<Mutex<CaptureBuffer>>,
-    publisher: OutputPublisher,
+    publisher: Option<OutputPublisher>,
     read_chunk_bytes: usize,
 ) -> Result<(), RuntimeError> {
-    let mut buffer = vec![0; read_chunk_bytes];
+    let mut buffer = Zeroizing::new(vec![0; read_chunk_bytes]);
     loop {
         let read = pipe
             .read(&mut buffer)
@@ -569,7 +580,9 @@ async fn drain_pipe(
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .record(chunk);
-        publisher.publish(stream, chunk.to_vec())?;
+        if let Some(publisher) = &publisher {
+            publisher.publish(stream, chunk.to_vec())?;
+        }
     }
 }
 
