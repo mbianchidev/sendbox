@@ -17,6 +17,11 @@ pub enum RuntimeCapability {
     ///
     /// This capability is deliberately not represented in `sendbox-protocol`.
     TransportProvisioning,
+    BrokeredExec,
+    VsockControlChannel,
+    PublishedUnixControlChannel,
+    InheritedStdioControlChannel,
+    InheritedFileDescriptorControlChannel,
 }
 
 impl RuntimeCapability {
@@ -32,7 +37,12 @@ impl RuntimeCapability {
             Self::Mcp => Some(Capability::Mcp),
             Self::Audit => Some(Capability::Audit),
             Self::Health => Some(Capability::Health),
-            Self::TransportProvisioning => None,
+            Self::TransportProvisioning
+            | Self::BrokeredExec
+            | Self::VsockControlChannel
+            | Self::PublishedUnixControlChannel
+            | Self::InheritedStdioControlChannel
+            | Self::InheritedFileDescriptorControlChannel => None,
         }
     }
 }
@@ -129,7 +139,14 @@ mod tests {
         let mut runtime = RuntimeCapabilities::from_wire(&wire.into());
         assert_eq!(runtime.to_wire(), wire.into());
 
-        runtime.0.insert(RuntimeCapability::TransportProvisioning);
+        runtime.0.extend([
+            RuntimeCapability::TransportProvisioning,
+            RuntimeCapability::BrokeredExec,
+            RuntimeCapability::VsockControlChannel,
+            RuntimeCapability::PublishedUnixControlChannel,
+            RuntimeCapability::InheritedStdioControlChannel,
+            RuntimeCapability::InheritedFileDescriptorControlChannel,
+        ]);
         assert_eq!(runtime.to_wire(), wire.into());
     }
 }
