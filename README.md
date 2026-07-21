@@ -39,14 +39,15 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 | Kata runtime | nerdctl and CNI plugins | Current compatible releases |
 | Hyperlight runtime | `hyperlight-unikraft` and KVM | 0.12 |
 
-Boundary-enabled guest images must include `python3`, `bpftrace`, a C compiler,
-libseccomp development headers, and the Yama LSM with writable
-`kernel.yama.ptrace_scope`. SendBox refuses to launch the agent when any required
-enforcement component is unavailable.
+Production [guest artifact bundles](docs/architecture/guest-artifact-bundles.md)
+provide static-musl guest and execution binaries, strict CO-RE BPF objects,
+signed manifests, inventory, SBOM metadata, deterministic rootfs tarballs, and
+minimal scratch OCI images for Linux x86_64 and arm64. The image contains no
+Python, Node.js, compiler, bpftrace, or development headers.
 
-The isolated [Phase 1 guest BPF spike](docs/guest-bpf-spike.md) documents the
-static-musl Rust/libbpf proof for Linux x86_64 and arm64. It is
-observation-only and is not part of the current enforcement path.
+The production BPF programs are cgroup-scoped observation only. Runtime adapter
+integration is intentionally not wired yet, and these programs do not claim
+exec, syscall, network, or MCP enforcement.
 
 ## Quick Start
 

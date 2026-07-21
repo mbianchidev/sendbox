@@ -1,0 +1,21 @@
+[target.x86_64-unknown-linux-musl]
+linker = "cc"
+rustflags = [
+    "-Dwarnings",
+    "-Lnative=/usr/lib",
+    "-Clink-arg=-Wl,-Bstatic",
+    "-Clink-arg=-lzstd",
+    "-Clink-arg=-static",
+]
+
+[target.aarch64-unknown-linux-musl]
+linker = "cc"
+rustflags = [
+    "-Dwarnings",
+    "-Lnative=/usr/lib",
+    "-Clink-arg=-Wl,-Bstatic",
+    "-Clink-arg=-lzstd",
+    "-Clink-arg=-latomic",
+    "-Clink-arg=-lgcc",
+    "-Clink-arg=-static",
+]

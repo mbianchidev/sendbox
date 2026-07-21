@@ -941,6 +941,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "libbpf-rs"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd8e8db46a2d5967b5b3dba7aba32a875dc38f222395040607045635ec1f9b63"
+dependencies = [
+ "bitflags",
+ "libbpf-sys",
+ "libc",
+ "vsprintf",
+]
+
+[[package]]
+name = "libbpf-sys"
+version = "1.7.0+v1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a109478760b2900aa2a6f2087e9d0de1d9c535b1758602af2845d5d2ccfaed7c"
+dependencies = [
+ "cc",
+ "nix",
+ "pkg-config",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1368,6 +1391,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
+name = "sendbox-bpf"
+version = "0.1.0"
+dependencies = [
+ "libbpf-rs",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "sendbox-bundle"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ed25519-dalek",
+ "rustix",
+ "sendbox-guest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "sendbox-cli"
 version = "0.1.0"
 dependencies = [
@@ -1421,6 +1471,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-exec"
+version = "0.1.0"
+dependencies = [
+ "caps",
+ "getrandom 0.4.3",
+ "libc",
+ "libseccomp",
+ "rlimit",
+ "sendbox-core",
+ "sendbox-policy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "sendbox-guest"
 version = "0.1.0"
 dependencies = [
@@ -1436,24 +1504,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "zeroize",
-]
-
-[[package]]
-name = "sendbox-exec"
-version = "0.1.0"
-dependencies = [
- "caps",
- "getrandom 0.4.3",
- "libc",
- "libseccomp",
- "rlimit",
- "sendbox-core",
- "sendbox-policy",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
  "zeroize",
 ]
 
@@ -2044,6 +2094,16 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vsprintf"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aec2f81b75ca063294776b4f7e8da71d1d5ae81c2b1b149c8d89969230265d63"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "wait-timeout"

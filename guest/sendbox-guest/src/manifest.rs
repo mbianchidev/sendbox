@@ -22,6 +22,7 @@ pub enum ArtifactKind {
     GuestBinary,
     ServiceBinary,
     BpfObject,
+    Metadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +137,29 @@ pub fn verify_manifest(
     expected_guest_version: &str,
     minimum_release_sequence: u64,
 ) -> Result<VerifiedManifest, GuestError> {
+    verify_manifest_for_architecture(
+        root,
+        envelope_path,
+        trust_root,
+        expected_trust_root_id,
+        expected_host_version,
+        expected_guest_version,
+        std::env::consts::ARCH,
+        minimum_release_sequence,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_manifest_for_architecture(
+    root: &OwnedFd,
+    envelope_path: &Path,
+    trust_root: &[u8; 32],
+    expected_trust_root_id: &str,
+    expected_host_version: &str,
+    expected_guest_version: &str,
+    expected_architecture: &str,
+    minimum_release_sequence: u64,
+) -> Result<VerifiedManifest, GuestError> {
     let mut envelope_file =
         open_relative_regular(root, envelope_path, "opening signed manifest")?.file;
     let mut envelope_bytes = Zeroizing::new(Vec::new());
@@ -167,6 +191,7 @@ pub fn verify_manifest(
         expected_trust_root_id,
         expected_host_version,
         expected_guest_version,
+        expected_architecture,
         minimum_release_sequence,
     )?;
 
@@ -201,6 +226,7 @@ fn validate_manifest(
     expected_trust_root_id: &str,
     expected_host_version: &str,
     expected_guest_version: &str,
+    expected_architecture: &str,
     minimum_release_sequence: u64,
 ) -> Result<(), GuestError> {
     if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
@@ -223,11 +249,10 @@ fn validate_manifest(
     if manifest.expected_guest_version != expected_guest_version {
         return Err(GuestError::Manifest("guest version mismatch".to_owned()));
     }
-    if manifest.architecture != std::env::consts::ARCH {
+    if manifest.architecture != expected_architecture {
         return Err(GuestError::Manifest(format!(
             "architecture mismatch: expected {}, got {}",
-            std::env::consts::ARCH,
-            manifest.architecture
+            expected_architecture, manifest.architecture
         )));
     }
     if manifest.minimum_accepted_sequence > manifest.release_sequence
