@@ -84,3 +84,23 @@ manually on prepared hosts using the pinned fixed-adapter definition. A result
 cannot be published while any required workload, reference host field,
 relative C baseline, fixed-adapter baseline, or BPF event rate remains
 `unqualified`.
+
+## Apple runtime qualification
+
+The production Apple entry is `module.rust-apple-runtime`. Its portable gate
+uses the shared runtime conformance suite, a stateful fake `container` CLI,
+exact-argv assertions, bounded stream/output tests, cancellation and failure
+tests, signed-bundle verification, and a real local authenticated Unix-stream
+fixture.
+
+The vendor gate is opt-in only because GitHub-hosted runners do not provide an
+already registered Apple container service or repository trust artifacts. When
+the repository variable `SENDBOX_APPLE_CONTAINER_LIVE=1` configures the
+prepared self-hosted runner, `.github/workflows/apple-runtime.yaml` runs the
+live test without a skip path. The test verifies the pre-existing service,
+creates unique container and guest socket identities, authenticates through the
+official CLI stdio relay, and performs targeted cleanup. It never registers,
+starts, stops, or unregisters the Apple service.
+
+See [Apple runtime adapter](apple-runtime.md) for required variables, the live
+command, transport evidence, and unsupported capabilities.

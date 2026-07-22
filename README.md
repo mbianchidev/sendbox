@@ -33,6 +33,7 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 | Apple runtime | macOS | 26 (Tahoe) |
 | Apple runtime | Hardware | Apple Silicon |
 | Apple runtime | Xcode | 26 |
+| Apple runtime | Official `container` CLI | 0.10.0, service already registered and running |
 | Kata runtime | Linux | Bare metal or nested virtualization |
 | Kata runtime | Kata Containers | 3.28 |
 | Kata runtime | containerd | 1.7 |
@@ -45,9 +46,10 @@ signed manifests, inventory, SBOM metadata, deterministic rootfs tarballs, and
 minimal scratch OCI images for Linux x86_64 and arm64. The image contains no
 Python, Node.js, compiler, bpftrace, or development headers.
 
-The production BPF programs are cgroup-scoped observation only. Runtime adapter
-integration is intentionally not wired yet, and these programs do not claim
-exec, syscall, network, or MCP enforcement.
+The production BPF programs are cgroup-scoped observation only. The Apple
+adapter can mount their signed bundle, but activation remains guest-policy
+driven and these programs do not claim exec, syscall, network, or MCP
+enforcement.
 
 ## Quick Start
 
@@ -89,10 +91,10 @@ phase it only parses and validates configuration and policy; all sandbox runtime
 execution remains on the production Swift `sendbox` binary.
 
 The workspace also contains the pre-1.0 `sendbox-protocol` foundation for
-bounded, authenticated host/guest communication. `sendbox-runtime` now owns the
-transport-neutral channel provisioning contract, and `sendbox-agent` owns the
-pure orchestration state machine; neither starts a concrete vendor VM or selects
-runtime-specific socket mappings. See
+bounded, authenticated host/guest communication. `sendbox-runtime` owns the
+transport-neutral channel provisioning contract, `sendbox-agent` owns
+orchestration, and `sendbox-runtime-apple` implements the official Apple
+`container` 0.10.0 lifecycle on macOS arm64. See
 [authenticated guest protocol](docs/architecture/authenticated-guest-protocol.md)
 and [agent orchestration](docs/architecture/agent-orchestration.md).
 
@@ -328,7 +330,9 @@ and production Linux execution and egress enforcement. See the architecture docu
 [egress enforcement](docs/architecture/egress-enforcement.md).
 
 See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
-The isolated Rust proof for Apple's official CLI is documented in
+The production Apple adapter, qualification command, transport design, and
+limitations are documented in [docs/apple-runtime.md](docs/apple-runtime.md).
+The earlier isolated evidence remains in
 [docs/apple-container-adapter-spike.md](docs/apple-container-adapter-spike.md).
 
 ## Security Model

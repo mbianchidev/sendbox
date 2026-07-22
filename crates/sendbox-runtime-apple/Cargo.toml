@@ -1,0 +1,24 @@
+[package]
+name = "sendbox-runtime-apple"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sendbox-bundle = { path = "../sendbox-bundle" }
+sendbox-runtime = { path = "../sendbox-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "signal"] }
+
+[dev-dependencies]
+sendbox-core = { path = "../sendbox-core" }
+sendbox-protocol = { path = "../sendbox-protocol" }
+sendbox-testkit = { path = "../sendbox-testkit" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

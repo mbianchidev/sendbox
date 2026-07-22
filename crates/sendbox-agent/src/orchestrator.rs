@@ -193,6 +193,7 @@ impl AgentOrchestrator {
             .secrets
             .resolve(plan.bootstrap_reference(), cancellation)
             .await?;
+        let bootstrap_delivery = bootstrap_delivery(plan.endpoint_kind());
         let channel_request = ControlChannelRequest {
             session_id: plan.session_id(),
             container_id: container.clone(),
@@ -200,7 +201,7 @@ impl AgentOrchestrator {
             ownership: ChannelOwnership::RuntimeLifecycle,
             lifetime: ChannelLifetime::UntilRuntimeCleanup,
             readiness_timeout: plan.readiness_timeout(),
-            bootstrap_delivery: BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
+            bootstrap_delivery,
             bootstrap_material: BootstrapMaterial::new(bootstrap.as_bytes().to_vec())?,
         };
         let channel = self
@@ -249,6 +250,7 @@ impl AgentOrchestrator {
                 "guest readiness omitted required capabilities".to_owned(),
             ));
         }
+
         context.guest = Some(guest);
         context.transition(AgentState::GuestReady)?;
 
@@ -424,6 +426,17 @@ impl RunContext {
     }
 }
 
+fn bootstrap_delivery(endpoint: sendbox_runtime::ControlEndpointKind) -> BootstrapDelivery {
+    match endpoint {
+        sendbox_runtime::ControlEndpointKind::InheritedStdio => {
+            BootstrapDelivery::RuntimeInjection {
+                target: "/run/sendbox-bootstrap/bootstrap.json".to_owned(),
+            }
+        }
+        _ => BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
+    }
+}
+
 fn check_cancelled(cancellation: &CancellationToken) -> Result<(), AgentError> {
     if cancellation.is_cancelled() {
         Err(AgentError::Cancelled)
@@ -447,6 +460,7 @@ fn append_runtime_cleanup_failures(report: CleanupReport, failures: &mut Vec<Cle
             error: AgentError::Runtime(failure.error),
         });
     }
+
     if report.remaining > 0 && !had_failures {
         failures.push(CleanupFailure {
             step: "runtime cleanup completion",
@@ -455,5 +469,26 @@ fn append_runtime_cleanup_failures(report: CleanupReport, failures: &mut Vec<Cle
                 report.remaining
             )),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sendbox_runtime::{BootstrapDelivery, ControlEndpointKind};
+
+    use super::bootstrap_delivery;
+
+    #[test]
+    fn inherited_stdio_uses_runtime_injection_and_fd_transport_keeps_fd_three() {
+        assert_eq!(
+            bootstrap_delivery(ControlEndpointKind::InheritedStdio),
+            BootstrapDelivery::RuntimeInjection {
+                target: "/run/sendbox-bootstrap/bootstrap.json".to_owned(),
+            }
+        );
+        assert_eq!(
+            bootstrap_delivery(ControlEndpointKind::InheritedFileDescriptor),
+            BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 }
+        );
     }
 }
