@@ -22,6 +22,8 @@ pub enum ArtifactKind {
     GuestBinary,
     ServiceBinary,
     BpfObject,
+    UnikraftShellKernel,
+    Initrd,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +71,33 @@ struct VerifiedArtifact {
 }
 
 impl VerifiedManifest {
+    pub fn artifact_descriptor(
+        &self,
+        path: &Path,
+        expected_kind: ArtifactKind,
+    ) -> Result<OwnedFd, GuestError> {
+        let artifact = self
+            .verified_artifacts
+            .get(path)
+            .ok_or_else(|| GuestError::Artifact {
+                path: path.display().to_string(),
+                detail: "artifact is not present in the verified manifest".to_owned(),
+            })?;
+        if artifact.kind != expected_kind {
+            return Err(GuestError::Artifact {
+                path: path.display().to_string(),
+                detail: format!(
+                    "artifact kind mismatch: expected {expected_kind:?}, got {:?}",
+                    artifact.kind
+                ),
+            });
+        }
+        artifact
+            .descriptor
+            .try_clone()
+            .map_err(|error| GuestError::io("duplicating verified artifact", error))
+    }
+
     pub fn executable_descriptor(&self, path: &Path) -> Result<OwnedFd, GuestError> {
         let artifact = self
             .verified_artifacts

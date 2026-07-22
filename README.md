@@ -12,7 +12,7 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 - **Command Filtering** — Allowlist or denylist which binaries an agent may execute inside the sandbox.
 - **Network Firewall** — Restrict outbound traffic to specific hosts, ports, or protocols.
 - **Runtime Providers** — Select Apple Containerization, Kata Containers, or Hyperlight through one lifecycle API and `--runtime`.
-- **Hyperlight Execution** — Run commands and MCP servers in one-shot Hyperlight/Unikraft micro-VMs on Linux.
+- **Hyperlight Execution** — The Rust runtime adapter runs verified one-shot commands in Hyperlight/Unikraft micro-VMs on Linux; persistent agent/MCP transport is rejected.
 - **Credential Injection** — Secrets load from macOS Keychain or the protected Linux secret store and are injected without persisting them in the guest filesystem.
 - **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
 - **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
@@ -37,7 +37,7 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 | Kata runtime | Kata Containers | 3.28 |
 | Kata runtime | containerd | 1.7 |
 | Kata runtime | nerdctl and CNI plugins | Current compatible releases |
-| Hyperlight runtime | `hyperlight-unikraft` and KVM | 0.12 |
+| Hyperlight runtime | Operator-pinned `hyperlight-unikraft`, signed Unikraft bundle, and KVM | See [docs/hyperlight.md](docs/hyperlight.md) |
 
 Production [guest artifact bundles](docs/architecture/guest-artifact-bundles.md)
 provide static-musl guest and execution binaries, strict CO-RE BPF objects,

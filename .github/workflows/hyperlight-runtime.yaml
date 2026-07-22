@@ -1,0 +1,100 @@
+name: Hyperlight runtime
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/hyperlight-runtime.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/sendbox-bundle/**"
+      - "crates/sendbox-runtime/**"
+      - "crates/sendbox-runtime-hyperlight/**"
+      - "guest/sendbox-guest/**"
+      - "docs/hyperlight.md"
+      - "docs/qualification.md"
+      - "Tests/qualification/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/hyperlight-runtime.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/sendbox-bundle/**"
+      - "crates/sendbox-runtime/**"
+      - "crates/sendbox-runtime-hyperlight/**"
+      - "guest/sendbox-guest/**"
+      - "docs/hyperlight.md"
+      - "docs/qualification.md"
+      - "Tests/qualification/**"
+  workflow_dispatch:
+    inputs:
+      live:
+        description: Run on a designated self-hosted Linux/KVM/Hyperlight runner
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hyperlight-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Portable quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy -p sendbox-runtime-hyperlight --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test -p sendbox-runtime-hyperlight --all-features
+
+  cross-compile:
+    name: Check Linux aarch64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install target
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Check adapter
+        run: cargo check -p sendbox-runtime-hyperlight --target aarch64-unknown-linux-gnu
+
+  live:
+    name: Designated Linux KVM live launch
+    if: github.event_name == 'workflow_dispatch' && inputs.live
+    runs-on: [self-hosted, linux, kvm, hyperlight]
+    timeout-minutes: 15
+    env:
+      SENDBOX_HYPERLIGHT_LIVE: "1"
+      SENDBOX_HYPERLIGHT_EXECUTABLE: ${{ vars.SENDBOX_HYPERLIGHT_EXECUTABLE }}
+      SENDBOX_HYPERLIGHT_CLI_VERSION: ${{ vars.SENDBOX_HYPERLIGHT_CLI_VERSION }}
+      SENDBOX_HYPERLIGHT_BUNDLE: ${{ vars.SENDBOX_HYPERLIGHT_BUNDLE }}
+      SENDBOX_HYPERLIGHT_PUBLIC_KEY: ${{ vars.SENDBOX_HYPERLIGHT_PUBLIC_KEY }}
+      SENDBOX_HYPERLIGHT_KERNEL: ${{ vars.SENDBOX_HYPERLIGHT_KERNEL }}
+      SENDBOX_HYPERLIGHT_INITRD: ${{ vars.SENDBOX_HYPERLIGHT_INITRD }}
+      SENDBOX_HYPERLIGHT_TRUST_ROOT_ID: ${{ vars.SENDBOX_HYPERLIGHT_TRUST_ROOT_ID }}
+      SENDBOX_HYPERLIGHT_GUEST_VERSION: ${{ vars.SENDBOX_HYPERLIGHT_GUEST_VERSION }}
+      SENDBOX_HYPERLIGHT_MIN_RELEASE: ${{ vars.SENDBOX_HYPERLIGHT_MIN_RELEASE }}
+      SENDBOX_HYPERLIGHT_STATE: ${{ vars.SENDBOX_HYPERLIGHT_STATE }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run designated live gate
+        run: |
+          cargo test -p sendbox-runtime-hyperlight --test live \
+            -- --exact live_hyperlight_launch_when_designated --nocapture

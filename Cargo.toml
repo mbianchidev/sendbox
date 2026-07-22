@@ -12,6 +12,7 @@ members = [
     "crates/sendbox-project",
     "crates/sendbox-protocol",
     "crates/sendbox-runtime",
+    "crates/sendbox-runtime-hyperlight",
     "crates/sendbox-security",
     "crates/sendbox-secrets",
     "crates/sendbox-testkit",
