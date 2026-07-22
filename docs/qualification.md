@@ -18,6 +18,12 @@ crate and phase, and a conformance status. Redesigns also require a
 compatibility note. Validation fails on duplicate IDs, missing evidence,
 unknown fields, missing fixtures, or an unresolved disposition.
 
+The phase 9 security records now include library-level evidence for the
+adapter-neutral session lifecycle, audit anchoring, snapshot rollback, secret
+envelopes, provenance verification, permission grants, and bounded migration
+reports. These entries do not claim host agent, runtime, CLI, MCP, credential
+listener, or guest enforcement integration.
+
 For a PR, changed behavior must update the corresponding inventory and fixture.
 Cutover requires every preserved entry to have a passing implementation test
 and every redesign to have its compatibility note satisfied.

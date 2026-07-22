@@ -1641,6 +1641,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-session-security"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "sendbox-core",
+ "sendbox-secrets",
+ "sendbox-security",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "sendbox-testkit"
 version = "0.1.0"
 dependencies = [
