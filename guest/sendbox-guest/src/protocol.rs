@@ -432,10 +432,13 @@ async fn send_broker_frame(
         .map_err(|error| GuestError::io("writing broker frame terminator", error))
 }
 
-async fn read_broker_frame(
-    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+async fn read_broker_frame<R>(
+    reader: &mut BufReader<R>,
     line: &mut Vec<u8>,
-) -> Result<Option<sendbox_exec::service::ServerFrame>, GuestError> {
+) -> Result<Option<sendbox_exec::service::ServerFrame>, GuestError>
+where
+    R: AsyncRead + Unpin,
+{
     let bytes = reader
         .read_until(b'\n', line)
         .await
@@ -603,12 +606,7 @@ mod tests {
     async fn broker_frame_read_resumes_after_the_read_future_is_cancelled() {
         use tokio::io::AsyncWriteExt;
 
-        let (stream, peer) = std::os::unix::net::UnixStream::pair().expect("Unix pair");
-        stream.set_nonblocking(true).expect("stream nonblocking");
-        peer.set_nonblocking(true).expect("peer nonblocking");
-        let stream = UnixStream::from_std(stream).expect("Tokio stream");
-        let mut peer = UnixStream::from_std(peer).expect("Tokio peer");
-        let (read, _write) = stream.into_split();
+        let (read, mut peer) = tokio::io::duplex(1024);
         let mut reader = BufReader::new(read);
         let mut line = Vec::new();
         let encoded = serde_json::to_vec(&sendbox_exec::service::ServerFrame::ProtocolError {
@@ -621,10 +619,10 @@ mod tests {
             .expect("partial frame");
         tokio::select! {
             biased;
-            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
             result = read_broker_frame(&mut reader, &mut line) => {
                 panic!("partial frame unexpectedly completed: {result:?}");
             }
+            () = tokio::task::yield_now() => {}
         }
         assert_eq!(line, encoded[..split]);
         peer.write_all(&encoded[split..]).await.expect("frame rest");
