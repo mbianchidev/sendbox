@@ -16,8 +16,8 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 - **Credential Injection** — Secrets load from macOS Keychain or the protected Linux secret store and are injected without persisting them in the guest filesystem.
 - **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
 - **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
-- **MCP Inspection (eBPF)** — Observe Model Context Protocol JSON-RPC traffic between the agent and its MCP servers at the kernel boundary. Captures both stdio and HTTP/SSE transports, classifies tool calls, and feeds the audit trail. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
-- **Boundary Enforcement** — Run every agent process under a seccomp-BPF syscall denylist and route stdio MCP servers through a framing-aware tool proxy. eBPF detects direct proxy bypass attempts and records denied syscalls. Enforcement is fail-closed.
+- **Native MCP Core** — Safe Rust framing, strict JSON-RPC validation, deny-first stdio tool policy, exact-command brokering, config validation, legacy trace parsing, and versioned native observation records. Runtime/guest wiring remains separate. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
+- **Boundary Enforcement** — Existing runtime paths retain their current boundary implementation while the native MCP broker is integrated. The Rust library itself does not claim guest installation or direct-launch prevention.
 - **Supply Chain Provenance** — Ed25519 signing for config and policy files ensures they were authored by trusted identities. Multi-signer support with a configurable trust store.
 - **Runtime Supervisor** — Dynamic permission expansion with approval workflows. Agents start restricted and earn broader permissions through supervised interaction (one-time, session-wide, or pattern-based grants).
 - **VM Hardening** — Defense-in-depth sysctl lockdown, capability dropping, and seccomp profiles covering all 18 [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) scenarios.
@@ -39,14 +39,15 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 | Kata runtime | nerdctl and CNI plugins | Current compatible releases |
 | Hyperlight runtime | `hyperlight-unikraft` and KVM | 0.12 |
 
-Boundary-enabled guest images must include `python3`, `bpftrace`, a C compiler,
-libseccomp development headers, and the Yama LSM with writable
-`kernel.yama.ptrace_scope`. SendBox refuses to launch the agent when any required
-enforcement component is unavailable.
+Production [guest artifact bundles](docs/architecture/guest-artifact-bundles.md)
+provide static-musl guest and execution binaries, strict CO-RE BPF objects,
+signed manifests, inventory, SBOM metadata, deterministic rootfs tarballs, and
+minimal scratch OCI images for Linux x86_64 and arm64. The image contains no
+Python, Node.js, compiler, bpftrace, or development headers.
 
-The isolated [Phase 1 guest BPF spike](docs/guest-bpf-spike.md) documents the
-static-musl Rust/libbpf proof for Linux x86_64 and arm64. It is
-observation-only and is not part of the current enforcement path.
+The production BPF programs are cgroup-scoped observation only. Runtime adapter
+integration is intentionally not wired yet, and these programs do not claim
+exec, syscall, network, or MCP enforcement.
 
 ## Quick Start
 
@@ -91,9 +92,12 @@ Sandbox execution, secrets, MCP, boundary, and release installation remain on
 the production Swift `sendbox` binary.
 
 The workspace also contains the pre-1.0 `sendbox-protocol` foundation for
-bounded, authenticated host/guest communication. It is transport-neutral and
-does not start VMs or select runtime-specific socket mappings. See
-[docs/architecture/authenticated-guest-protocol.md](docs/architecture/authenticated-guest-protocol.md).
+bounded, authenticated host/guest communication. `sendbox-runtime` now owns the
+transport-neutral channel provisioning contract, and `sendbox-agent` owns the
+pure orchestration state machine; neither starts a concrete vendor VM or selects
+runtime-specific socket mappings. See
+[authenticated guest protocol](docs/architecture/authenticated-guest-protocol.md)
+and [agent orchestration](docs/architecture/agent-orchestration.md).
 
 ```bash
 make rust-build
@@ -291,7 +295,7 @@ defense in depth against direct API ref mutations or alternate Git clients. Disa
 | `github.branch_protection.username` | string | Username used to expand `{username}` patterns; auto-detected by default |
 | `github.branch_protection.protected_branches` | list | Branch names that push and pull can never target |
 | `github.branch_protection.allowed_branch_patterns` | list | Glob patterns allowed for selected-repository push and pull |
-| `observability.mcp_inspection.enabled` | bool | Enable eBPF MCP call inspection (opt-in) |
+| `observability.mcp_inspection.enabled` | bool | Enable configured MCP observation (current runtime wiring remains provider-specific) |
 
 ## Architecture
 
@@ -324,10 +328,13 @@ or Copilot.
 
 The Rust workspace contains shared domain/error types, strict configuration and
 policy validation, native project analysis, runtime and credential primitives,
-and production Linux execution and egress enforcement. See the architecture documents for
+an adapter-neutral session security lifecycle, and production Linux execution
+and egress enforcement. See the architecture documents for
 [project analysis](docs/architecture/native-project-analysis.md),
 [runtime core](docs/architecture/runtime-core.md),
+[agent orchestration](docs/architecture/agent-orchestration.md),
 [secrets](docs/architecture/secrets-and-credential-broker.md), and
+[session security](docs/architecture/session-security-lifecycle.md),
 [execution brokerage](docs/architecture/execution-broker.md), plus
 [egress enforcement](docs/architecture/egress-enforcement.md).
 

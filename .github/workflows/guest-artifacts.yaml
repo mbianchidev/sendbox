@@ -1,0 +1,199 @@
+name: Production guest BPF and artifacts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".cargo/config.toml"
+      - ".github/workflows/guest-artifacts.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/sendbox-bpf/**"
+      - "crates/sendbox-bundle/**"
+      - "crates/sendbox-exec/**"
+      - "fuzz/bpf/**"
+      - "guest/sendbox-guest/**"
+      - "native/bpf/**"
+      - "packaging/guest/**"
+      - "docs/architecture/guest-artifact-bundles.md"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".cargo/config.toml"
+      - ".github/workflows/guest-artifacts.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/sendbox-bpf/**"
+      - "crates/sendbox-bundle/**"
+      - "crates/sendbox-exec/**"
+      - "fuzz/bpf/**"
+      - "guest/sendbox-guest/**"
+      - "native/bpf/**"
+      - "packaging/guest/**"
+      - "docs/architecture/guest-artifact-bundles.md"
+  workflow_dispatch:
+    inputs:
+      live:
+        description: Run privileged native BPF event tests
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guest-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Strict C, Rust, fuzz, and audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run pinned no-cache quality environment
+        run: |
+          docker build \
+            --no-cache \
+            --platform linux/amd64 \
+            --target quality \
+            -f packaging/guest/Dockerfile \
+            .
+
+  artifacts:
+    name: Reproducible ${{ matrix.architecture }} bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          version: v0.33.0
+          driver-opts: image=moby/buildkit:buildx-stable-1@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Create explicit CI-only signing key
+        run: |
+          printf '77777777777777777777777777777777' >"$RUNNER_TEMP/guest-artifact-ci.key"
+          chmod 0400 "$RUNNER_TEMP/guest-artifact-ci.key"
+
+      - name: Build twice without cache
+        run: |
+          for attempt in first second; do
+            docker buildx build \
+              --no-cache \
+              --platform "linux/${{ matrix.architecture }}" \
+              --target artifact \
+              --secret "id=release_signing_key,src=$RUNNER_TEMP/guest-artifact-ci.key" \
+              --output "type=local,dest=dist/${{ matrix.architecture }}/${attempt}" \
+              -f packaging/guest/Dockerfile \
+              .
+          done
+
+      - name: Verify byte reproducibility and minimal inventory
+        run: |
+          for file in \
+            sendbox-guest-rootfs.tar \
+            sendbox-guest-rootfs.tar.sha256 \
+            manifest.json \
+            manifest.sig \
+            release-metadata.json \
+            release-metadata.sig \
+            release-public.key \
+            inventory.json \
+            sbom.spdx.json \
+            verification-report.json \
+            btf-archive.sha256 \
+            vmlinux.sha256 \
+            core-relocation.sha256 \
+            sendbox-guest.static.txt \
+            sendbox-exec-launcher.static.txt; do
+            cmp \
+              "dist/${{ matrix.architecture }}/first/$file" \
+              "dist/${{ matrix.architecture }}/second/$file"
+          done
+          tar -tf "dist/${{ matrix.architecture }}/first/sendbox-guest-rootfs.tar" \
+            | tee "$RUNNER_TEMP/rootfs-files.txt"
+          if grep -E '(^|/)(python|node|npm|clang|gcc|bpftrace)(/|$)' \
+              "$RUNNER_TEMP/rootfs-files.txt"; then
+            echo "forbidden development tool found in rootfs" >&2
+            exit 1
+          fi
+          cat "dist/${{ matrix.architecture }}/first/sendbox-guest.static.txt"
+          cat "dist/${{ matrix.architecture }}/first/sendbox-exec-launcher.static.txt"
+
+      - name: Build OCI image layout
+        run: |
+          docker buildx build \
+            --no-cache \
+            --platform "linux/${{ matrix.architecture }}" \
+            --target image \
+            --secret "id=release_signing_key,src=$RUNNER_TEMP/guest-artifact-ci.key" \
+            --output "type=oci,dest=dist/${{ matrix.architecture }}/guest-image.oci.tar" \
+            -f packaging/guest/Dockerfile \
+            .
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: guest-artifacts-${{ matrix.architecture }}
+          path: dist/${{ matrix.architecture }}/first/
+          if-no-files-found: error
+
+  live-event:
+    name: Privileged live BPF (${{ matrix.arch }})
+    if: github.event_name == 'workflow_dispatch' && inputs.live
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            platform: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            platform: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install loader build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            clang libelf-dev libzstd-dev make pkg-config zlib1g-dev
+
+      - name: Export architecture-specific BPF object
+        run: |
+          docker build \
+            --no-cache \
+            --platform "linux/${{ matrix.platform }}" \
+            --target bpf \
+            --output "type=local,dest=dist/bpf" \
+            -f packaging/guest/Dockerfile \
+            .
+
+      - name: Compile and run opt-in live event test
+        run: |
+          cargo test -p sendbox-bpf --test live --no-run
+          test_binary="$(
+            find target/debug/deps -maxdepth 1 -type f -perm -111 \
+              -name 'live-*' | sort | head -1
+          )"
+          test -n "$test_binary"
+          sudo env \
+            SENDBOX_BPF_LIVE=1 \
+            SENDBOX_BPF_OBJECT="$PWD/dist/bpf/observe.bpf.o" \
+            "$test_binary" --exact observes_exec_and_syscall_events_when_explicitly_enabled --nocapture

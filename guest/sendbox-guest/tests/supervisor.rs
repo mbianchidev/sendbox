@@ -67,6 +67,7 @@ struct Fixture {
     service_pid: PathBuf,
     child_pid: PathBuf,
     audit_pid: PathBuf,
+    crash_trigger: PathBuf,
     identity: RuntimeIdentity,
 }
 
@@ -146,6 +147,7 @@ impl Fixture {
         let service_pid = temporary.path().join("service.pid");
         let child_pid = temporary.path().join("child.pid");
         let audit_pid = temporary.path().join("audit.pid");
+        let crash_trigger = temporary.path().join("crash.trigger");
         let audit_socket = temporary.path().join("audit.sock");
         let fixture_mode = if mode == "partial" { "crash" } else { mode };
         let mut args = vec![
@@ -158,10 +160,14 @@ impl Fixture {
             service_pid.display().to_string(),
         ];
         if fixture_mode == "crash" {
-            args.extend([
-                "--crash-after-ms".to_owned(),
-                if mode == "partial" { "1" } else { "2000" }.to_owned(),
-            ]);
+            if mode == "partial" {
+                args.extend(["--crash-after-ms".to_owned(), "1".to_owned()]);
+            } else {
+                args.extend([
+                    "--crash-trigger-file".to_owned(),
+                    crash_trigger.display().to_string(),
+                ]);
+            }
         }
         if spawn_child {
             args.extend([
@@ -268,6 +274,7 @@ impl Fixture {
             service_pid,
             child_pid,
             audit_pid,
+            crash_trigger,
             identity,
             _temporary: temporary,
         }
@@ -322,6 +329,7 @@ async fn mandatory_broker_death_revokes_readiness_and_cleans_session() {
     ));
     let service_pid = read_pid(&fixture.service_pid);
     kill_process(service_pid, Signal::KILL).expect("kill mandatory service");
+    wait_for_path_removal_or_exit(&fixture.session_dir.join("ready.json"), &supervisor).await;
     if writer
         .send(&Message::Request(Request {
             request_id: 1,
@@ -399,6 +407,7 @@ async fn mandatory_crash_and_protocol_disconnect_fail_closed() {
     let identity = crash_fixture.identity();
     let mut crashed = tokio::spawn(async move { run(options, &VerifiedControls, identity).await });
     crash_fixture.wait_ready(&mut crashed).await;
+    fs::write(&crash_fixture.crash_trigger, []).expect("trigger fixture crash");
     let result = timeout(PROCESS_TIMEOUT, crashed)
         .await
         .expect("crash timeout")
@@ -474,6 +483,20 @@ async fn wait_for_path_or_exit(
             panic!("timed out waiting for {}; state={state:?}", path.display());
         }
     }
+}
+
+async fn wait_for_path_removal_or_exit(
+    path: &Path,
+    supervisor: &tokio::task::JoinHandle<Result<(), GuestError>>,
+) {
+    timeout(PROCESS_TIMEOUT, async {
+        while path.exists() && !supervisor.is_finished() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("readiness revocation timeout");
+    assert!(!path.exists(), "readiness was not revoked");
 }
 
 fn read_pid(path: &Path) -> Pid {

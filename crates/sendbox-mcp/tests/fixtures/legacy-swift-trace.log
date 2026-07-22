@@ -1,0 +1,4 @@
+SENDBOX_MCP	100	42	node	stdio	spawn	node mcp-server-filesystem /workspaces
+SENDBOX_MCP	110	42	node	stdio	to_server	{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/private/project"}}}
+SENDBOX_MCP	120	42	node	stdio	from_server	{"jsonrpc":"2.0","id":1,"result":{"content":"secret"}}
+SENDBOX_MCP	130	42	node	stdio	to_server	event: message\ndata: {"jsonrpc":"2.0","method":"notifications/initialized"}
