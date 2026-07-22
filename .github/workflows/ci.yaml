@@ -155,6 +155,9 @@ jobs:
       - name: Compile security fuzz targets
         run: cargo check --manifest-path fuzz/security/Cargo.toml --bins
 
+      - name: Compile MCP fuzz targets
+        run: cargo check --manifest-path fuzz/mcp/Cargo.toml --bins
+
       - name: Compile BPF and bundle fuzz targets
         run: cargo check --manifest-path fuzz/bpf/Cargo.toml --bins
 

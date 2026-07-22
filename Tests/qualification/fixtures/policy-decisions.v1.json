@@ -12,6 +12,5 @@
     {"id": "repository-public", "selected": "acme/app", "requested": "other/public", "decision": "allow"},
     {"id": "protected-branch", "branch": "main", "decision": "deny"}
   ],
-  "implementation_status": "specified_until_pure_rust_decision_apis_exist"
+  "implementation_status": "mcp_cases_implemented_by_sendbox_mcp; remaining areas retain their recorded status"
 }
-

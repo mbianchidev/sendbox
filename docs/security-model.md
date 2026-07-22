@@ -300,24 +300,26 @@ program and, when supported by the kernel, the seccomp audit log.
 
 ### Layer 5: MCP Tool Boundary
 
-Application-semantic tool decisions are enforced by a framing-aware stdio
-proxy, not by matching truncated payloads in kernel probes:
+The native `sendbox-mcp` library defines the framing-aware stdio authorization
+boundary. Runtime/guest installation is not part of this PR, so these guarantees
+apply when a runtime wires client stdio through the broker:
 
-- Complete newline-framed JSON-RPC messages are parsed before forwarding.
+- Complete bounded newline or `Content-Length` JSON-RPC messages are parsed
+  before forwarding.
 - `tools/call` names use denylist-first glob matching, then allowlist/default action.
 - Denied requests receive JSON-RPC error `-32001`; denied notifications are dropped.
-- A root-owned policy daemon launches only exact absolute commands listed in
-  `allowed_server_commands`; the untrusted client cannot create a trusted subtree.
-- Forking package/shell wrappers are rejected; policies identify the final
-  interpreter or native server process directly.
-- The daemon double-forks away from the agent, Yama `ptrace_scope=2` is required,
-  and cross-process memory/descriptor syscalls are denied.
-- eBPF trusts only the daemon's direct launcher child and terminates configured
-  MCP server commands launched directly outside it.
-- Proxy, policy, logs, and eBPF processes remain root-owned while the agent runs
-  as a non-root UID.
-- Remote HTTP/SSE MCP is unsupported in boundary mode because generic TLS
-  uprobes cannot enforce policy across TLS implementations or fragmented records.
+- An injected launcher receives only an exact approved absolute executable and
+  argv vector; shells, package runners, inherited environment variables, and
+  project-defined `env`/`cwd` overrides are rejected.
+- Child death, malformed frames, output saturation, cancellation, and cleanup
+  failure are fail-closed outcomes.
+- Legacy bpftrace records remain readable, while the new versioned observation
+  format is designed for a future native C/libbpf metadata producer.
+- Remote HTTP/SSE MCP remains observation-only and is never presented as
+  authorization.
+
+Runtime controls that prevent direct unbrokered server launch remain future
+integration work and are not claimed by `sendbox-mcp`.
 
 ### Layer 6: Network Firewall
 
@@ -418,7 +420,7 @@ These are threats SendBox is designed to defend against:
 | Agent attempts cloud metadata access | `route_localnet` disabled and metadata endpoints must remain outside the network allowlist |
 | Agent attempts to intercept network traffic | `CAP_NET_RAW` dropped; separate virtual NIC |
 | Agent attempts to load malicious kernel modules | `kernel.modules_disabled=1`; `CAP_SYS_MODULE` dropped; seccomp blocks `init_module` |
-| Agent attempts a disallowed MCP tool call | Framing-aware stdio proxy returns a policy error; eBPF terminates direct proxy bypasses |
+| Agent attempts a disallowed MCP tool call | When runtime wiring routes stdio through `sendbox-mcp`, the broker returns `-32001` or drops a denied notification before server delivery |
 | Agent attempts to push or pull a protected selected-repository branch | Root-installed git policy validates current and remote refs; eBPF terminates direct real-git execution |
 
 ### Out of Scope
@@ -435,6 +437,7 @@ These threats are not addressed by SendBox:
 | Supply chain attacks on the base VM image | Image provenance and signing are the user's responsibility |
 | Zero-day hypervisor escapes | No software sandbox can eliminate hypervisor zero-day risk |
 | Remote HTTP/SSE MCP authorization | Boundary mode intentionally supports stdio MCP only; HTTP/SSE remains audit-only |
+| Preventing direct MCP server launch before runtime integration | `sendbox-mcp` provides the broker and validator library; guest/runtime mediation is separate work |
 | Direct GitHub API/GraphQL ref mutation or alternate Git clients | The bundled-git guard cannot constrain arbitrary bearer-token API calls or independently installed clients; use GitHub server-side rulesets |
 
 ---
