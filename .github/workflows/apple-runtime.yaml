@@ -1,0 +1,75 @@
+name: Apple runtime
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/sendbox-runtime-apple/**"
+      - "crates/sendbox-runtime/**"
+      - "crates/sendbox-agent/**"
+      - "crates/sendbox-bundle/**"
+      - "guest/sendbox-guest/**"
+      - "docs/apple-runtime.md"
+      - ".github/workflows/apple-runtime.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/sendbox-runtime-apple/**"
+      - "crates/sendbox-runtime/**"
+      - "crates/sendbox-agent/**"
+      - "crates/sendbox-bundle/**"
+      - "guest/sendbox-guest/**"
+      - "docs/apple-runtime.md"
+      - ".github/workflows/apple-runtime.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable:
+    name: Portable tests and macOS compile
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.93.1 --profile minimal --component clippy,rustfmt
+      - name: Format
+        run: cargo +1.93.1 fmt --all -- --check
+      - name: Clippy
+        run: cargo +1.93.1 clippy -p sendbox-runtime-apple -p sendbox-guest -p sendbox-agent --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo +1.93.1 test -p sendbox-runtime-apple -p sendbox-guest -p sendbox-agent --all-features
+
+  live:
+    name: Prepared macOS arm64 live gate
+    if: ${{ vars.SENDBOX_APPLE_CONTAINER_LIVE == '1' }}
+    runs-on: [self-hosted, macOS, ARM64, sendbox-apple-container]
+    env:
+      SENDBOX_APPLE_CONTAINER_LIVE: "1"
+      SENDBOX_APPLE_CONTAINER_BUNDLE: ${{ vars.SENDBOX_APPLE_CONTAINER_BUNDLE }}
+      SENDBOX_APPLE_CONTAINER_PUBLIC_KEY: ${{ vars.SENDBOX_APPLE_CONTAINER_PUBLIC_KEY }}
+      SENDBOX_APPLE_CONTAINER_TRUST_ROOT_ID: ${{ vars.SENDBOX_APPLE_CONTAINER_TRUST_ROOT_ID }}
+      SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE: ${{ vars.SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE }}
+      SENDBOX_APPLE_CONTAINER_LIVE_IMAGE: ${{ vars.SENDBOX_APPLE_CONTAINER_LIVE_IMAGE }}
+      SENDBOX_APPLE_CONTAINER_EXECUTABLE: ${{ vars.SENDBOX_APPLE_CONTAINER_EXECUTABLE }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.93.1 --profile minimal
+      - name: Verify service is already running
+        run: |
+          test "$("${SENDBOX_APPLE_CONTAINER_EXECUTABLE:-/usr/local/bin/container}" system status --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')" = running
+      - name: Run non-skipping live qualification
+        run: cargo +1.93.1 test -p sendbox-runtime-apple --test live -- --nocapture

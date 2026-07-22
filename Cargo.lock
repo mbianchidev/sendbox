@@ -1582,6 +1582,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-runtime-apple"
+version = "0.1.0"
+dependencies = [
+ "sendbox-bundle",
+ "sendbox-core",
+ "sendbox-protocol",
+ "sendbox-runtime",
+ "sendbox-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "sendbox-secrets"
 version = "0.1.0"
 dependencies = [
