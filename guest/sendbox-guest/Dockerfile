@@ -9,6 +9,7 @@ RUN apk add --no-cache \
         file=5.46-r2 \
         g++=15.2.0-r2 \
         gperf=3.3-r0 \
+        linux-headers=6.16.12-r0 \
         make=4.4.1-r3 \
         pkgconf=2.5.1-r0 \
         musl-dev=1.2.5-r23
