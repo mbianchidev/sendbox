@@ -72,6 +72,8 @@ struct ServiceRunArgs {
     child_pid_file: Option<PathBuf>,
     #[arg(long, default_value_t = 25)]
     crash_after_ms: u64,
+    #[arg(long)]
+    crash_trigger_file: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     spawn_child: bool,
 }
@@ -177,7 +179,13 @@ async fn service_run(args: ServiceRunArgs) -> Result<(), GuestError> {
 
     match args.mode {
         FixtureMode::Crash => {
-            sleep(Duration::from_millis(args.crash_after_ms)).await;
+            if let Some(path) = args.crash_trigger_file {
+                while tokio::fs::metadata(&path).await.is_err() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            } else {
+                sleep(Duration::from_millis(args.crash_after_ms)).await;
+            }
             Err(GuestError::Service {
                 service: "fixture".to_owned(),
                 detail: "intentional crash".to_owned(),
