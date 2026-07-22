@@ -7,13 +7,17 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = ["execution-broker"]
+execution-broker = ["dep:sendbox-exec", "dep:sendbox-policy"]
+
 [dependencies]
 clap.workspace = true
 ed25519-dalek.workspace = true
 rustix.workspace = true
 sendbox-core = { path = "../../crates/sendbox-core" }
-sendbox-exec = { path = "../../crates/sendbox-exec" }
-sendbox-policy = { path = "../../crates/sendbox-policy" }
+sendbox-exec = { path = "../../crates/sendbox-exec", optional = true }
+sendbox-policy = { path = "../../crates/sendbox-policy", optional = true }
 sendbox-protocol = { path = "../../crates/sendbox-protocol" }
 serde.workspace = true
 serde_json.workspace = true
