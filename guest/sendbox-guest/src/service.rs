@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+#[cfg(target_os = "macos")]
+use rustix::process::{WaitId, WaitIdOptions, waitid};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
@@ -238,7 +240,17 @@ impl ReadinessGate {
                     .and_then(|(_, suffix)| suffix.trim_start().chars().next());
                 !matches!(state, Some('Z' | 'X') | None)
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            {
+                matches!(
+                    waitid(
+                        WaitId::Pid(group),
+                        WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT | WaitIdOptions::EXITED,
+                    ),
+                    Ok(None)
+                )
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 true
             }
