@@ -1,0 +1,23 @@
+[package]
+name = "sendbox-session-security"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sendbox-core = { path = "../sendbox-core" }
+sendbox-security = { path = "../sendbox-security" }
+sendbox-secrets = { path = "../sendbox-secrets" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

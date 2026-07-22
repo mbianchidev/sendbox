@@ -39,14 +39,15 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 | Kata runtime | nerdctl and CNI plugins | Current compatible releases |
 | Hyperlight runtime | `hyperlight-unikraft` and KVM | 0.12 |
 
-Boundary-enabled guest images must include `python3`, `bpftrace`, a C compiler,
-libseccomp development headers, and the Yama LSM with writable
-`kernel.yama.ptrace_scope`. SendBox refuses to launch the agent when any required
-enforcement component is unavailable.
+Production [guest artifact bundles](docs/architecture/guest-artifact-bundles.md)
+provide static-musl guest and execution binaries, strict CO-RE BPF objects,
+signed manifests, inventory, SBOM metadata, deterministic rootfs tarballs, and
+minimal scratch OCI images for Linux x86_64 and arm64. The image contains no
+Python, Node.js, compiler, bpftrace, or development headers.
 
-The isolated [Phase 1 guest BPF spike](docs/guest-bpf-spike.md) documents the
-static-musl Rust/libbpf proof for Linux x86_64 and arm64. It is
-observation-only and is not part of the current enforcement path.
+The production BPF programs are cgroup-scoped observation only. Runtime adapter
+integration is intentionally not wired yet, and these programs do not claim
+exec, syscall, network, or MCP enforcement.
 
 ## Quick Start
 
@@ -88,9 +89,12 @@ phase it only parses and validates configuration and policy; all sandbox runtime
 execution remains on the production Swift `sendbox` binary.
 
 The workspace also contains the pre-1.0 `sendbox-protocol` foundation for
-bounded, authenticated host/guest communication. It is transport-neutral and
-does not start VMs or select runtime-specific socket mappings. See
-[docs/architecture/authenticated-guest-protocol.md](docs/architecture/authenticated-guest-protocol.md).
+bounded, authenticated host/guest communication. `sendbox-runtime` now owns the
+transport-neutral channel provisioning contract, and `sendbox-agent` owns the
+pure orchestration state machine; neither starts a concrete vendor VM or selects
+runtime-specific socket mappings. See
+[authenticated guest protocol](docs/architecture/authenticated-guest-protocol.md)
+and [agent orchestration](docs/architecture/agent-orchestration.md).
 
 ```bash
 make rust-build
@@ -315,10 +319,13 @@ or Copilot.
 
 The Rust workspace contains shared domain/error types, strict configuration and
 policy validation, native project analysis, runtime and credential primitives,
-and production Linux execution and egress enforcement. See the architecture documents for
+an adapter-neutral session security lifecycle, and production Linux execution
+and egress enforcement. See the architecture documents for
 [project analysis](docs/architecture/native-project-analysis.md),
 [runtime core](docs/architecture/runtime-core.md),
+[agent orchestration](docs/architecture/agent-orchestration.md),
 [secrets](docs/architecture/secrets-and-credential-broker.md), and
+[session security](docs/architecture/session-security-lifecycle.md),
 [execution brokerage](docs/architecture/execution-broker.md), plus
 [egress enforcement](docs/architecture/egress-enforcement.md).
 

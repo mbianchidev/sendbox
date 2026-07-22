@@ -131,7 +131,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libseccomp-dev pkg-config
+          sudo apt-get install --yes --no-install-recommends \
+            clang \
+            libelf-dev \
+            libseccomp-dev \
+            libzstd-dev \
+            make \
+            pkg-config \
+            zlib1g-dev
 
       - name: Rust version
         run: rustc --version --verbose
@@ -150,6 +157,9 @@ jobs:
 
       - name: Compile MCP fuzz targets
         run: cargo check --manifest-path fuzz/mcp/Cargo.toml --bins
+
+      - name: Compile BPF and bundle fuzz targets
+        run: cargo check --manifest-path fuzz/bpf/Cargo.toml --bins
 
       - name: Build (debug)
         run: cargo build --workspace

@@ -7,9 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+sendbox-core = { path = "../sendbox-core" }
 sendbox-protocol = { path = "../sendbox-protocol" }
 thiserror.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.1", default-features = false, features = ["process", "signal"] }

@@ -36,6 +36,18 @@ Descendants inherit syscall, capability, resource, environment, and cgroup
 containment, while their own argv remains outside the semantic policy boundary.
 The VM boundary remains the primary containment layer.
 
+### Production guest artifacts and BPF observation
+
+Production static guest binaries, the execution launcher, CO-RE BPF objects,
+inventory, and SBOM metadata are packaged in reproducible signed bundles. The
+signing key remains external to the repository and build image, and runtime
+trust-root provisioning remains a separate integration responsibility. See
+[Production guest BPF and artifact bundles](architecture/guest-artifact-bundles.md).
+
+The current BPF programs are cgroup-scoped observation only. They cannot permit
+or deny exec, syscall, network, or MCP actions and are not part of the semantic
+execution enforcement boundary.
+
 ---
 
 ## SandboxEscapeBench Coverage — Apple Provider

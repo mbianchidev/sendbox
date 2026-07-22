@@ -1,0 +1,25 @@
+[package]
+name = "sendbox-bpf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+libbpf-rs.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+libbpf-rs = { workspace = true, features = ["static"] }
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "sendbox-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sendbox-config = { path = "../sendbox-config" }
+sendbox-core = { path = "../sendbox-core" }
+sendbox-protocol = { path = "../sendbox-protocol" }
+sendbox-runtime = { path = "../sendbox-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+sendbox-testkit = { path = "../sendbox-testkit" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+
+[lints]
+workspace = true
