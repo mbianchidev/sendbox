@@ -48,7 +48,16 @@ jobs:
         run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component clippy,rustfmt
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libseccomp-dev pkg-config
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            clang \
+            libelf-dev \
+            libseccomp-dev \
+            libzstd-dev \
+            make \
+            pkg-config \
+            zlib1g-dev
 
       - name: Check formatting
         run: cargo +${{ env.RUST_VERSION }} fmt --all -- --check
