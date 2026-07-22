@@ -49,6 +49,11 @@ native exit preservation. The broader `policy.decisions` fixture remains
 specified until every command, network, MCP, and repository decision slice has
 a pure Rust implementation.
 
+`mcp.contracts` records the native framing, JSON-RPC, policy, exact-command,
+project-validation, legacy-trace, versioned-observation, redaction, backpressure,
+and cancellation contracts. It deliberately excludes guest/runtime integration
+and remote HTTP authorization.
+
 The comparison runner invokes binaries directly, never through a shell. It
 normalizes declared paths and JSON fields, enforces a timeout and combined
 output cap, and emits deterministic JSON. Missing binaries, timeouts, and

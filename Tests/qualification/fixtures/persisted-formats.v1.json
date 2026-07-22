@@ -8,7 +8,8 @@
     {"id": "provenance-signature-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-provenance-v1", "migration": "explicit_verification_lifetime"},
     {"id": "provenance-trust-store-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-provenance-v1", "migration": "explicit_dry_run"},
     {"id": "secret-record-cbor", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-plaintext-record", "migration": "store_authorized_only"},
-    {"id": "supervisor-grant-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-codable-observation", "migration": "explicit_dry_run_with_broadening_ack"}
+    {"id": "supervisor-grant-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-codable-observation", "migration": "explicit_dry_run_with_broadening_ack"},
+    {"id": "mcp-observation-event-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "SENDBOX_MCP TSV"}
   ],
   "swift_samples": "legacy readers remain bounded and explicit; Swift grants are observational imports only"
 }

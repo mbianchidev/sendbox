@@ -19,5 +19,5 @@
     {"id": "git-broad-push", "argv": ["push", "--mirror", "origin"], "decision": "deny"},
     {"id": "git-protected-delete", "argv": ["push", "--delete", "origin", "main"], "decision": "deny"}
   ],
-  "implementation_status": "git_branch_guard_implemented_other_policy_slices_specified"
+  "implementation_status": "git_branch_guard_and_mcp_cases_implemented; remaining areas retain their recorded status"
 }

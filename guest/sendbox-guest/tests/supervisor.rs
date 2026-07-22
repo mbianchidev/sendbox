@@ -329,7 +329,7 @@ async fn mandatory_broker_death_revokes_readiness_and_cleans_session() {
     ));
     let service_pid = read_pid(&fixture.service_pid);
     kill_process(service_pid, Signal::KILL).expect("kill mandatory service");
-    wait_for_path_removal_or_exit(&fixture.session_dir.join("ready.json"), &mut supervisor).await;
+    wait_for_path_removal_or_exit(&fixture.session_dir.join("ready.json"), &supervisor).await;
     if writer
         .send(&Message::Request(Request {
             request_id: 1,
@@ -487,30 +487,16 @@ async fn wait_for_path_or_exit(
 
 async fn wait_for_path_removal_or_exit(
     path: &Path,
-    supervisor: &mut tokio::task::JoinHandle<Result<(), GuestError>>,
+    supervisor: &tokio::task::JoinHandle<Result<(), GuestError>>,
 ) {
-    if timeout(PROCESS_TIMEOUT, async {
-        while path.exists() {
-            assert!(
-                !supervisor.is_finished(),
-                "supervisor exited before {} was removed",
-                path.display()
-            );
+    timeout(PROCESS_TIMEOUT, async {
+        while path.exists() && !supervisor.is_finished() {
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .is_err()
-    {
-        let state = path
-            .parent()
-            .map(|parent| fs::read_to_string(parent.join("state.json")))
-            .transpose();
-        panic!(
-            "timed out waiting for {} removal; state={state:?}",
-            path.display()
-        );
-    }
+    .expect("readiness revocation timeout");
+    assert!(!path.exists(), "readiness was not revoked");
 }
 
 fn read_pid(path: &Path) -> Pid {

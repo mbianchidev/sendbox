@@ -158,6 +158,9 @@ jobs:
       - name: Compile Git guard fuzz targets
         run: cargo check --manifest-path fuzz/git/Cargo.toml --bins
 
+      - name: Compile MCP fuzz targets
+        run: cargo check --manifest-path fuzz/mcp/Cargo.toml --bins
+
       - name: Compile BPF and bundle fuzz targets
         run: cargo check --manifest-path fuzz/bpf/Cargo.toml --bins
 
