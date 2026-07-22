@@ -27,8 +27,8 @@ pub use api::{
     AdmissionDisposition, CancellationId, CleanupFailure, CleanupReport, CleanupStatus,
     CleanupStep, ContainmentProfile, CorrelationId, DescriptorPath, EnvironmentEntry,
     ExecutionDecision, ExecutionEvent, ExecutionRequest, ExecutionResult, ExecutionTimeout,
-    ExitStatus, FileIdentity, LaunchFailure, RelativePath, ResourceLimits, RootId, SemanticScope,
-    SessionAuthentication, StandardInput, StreamKind, TerminalState,
+    ExecutionUser, ExitStatus, FileIdentity, LaunchFailure, RelativePath, ResourceLimits, RootId,
+    SemanticScope, SessionAuthentication, StandardInput, StreamKind, TerminalState,
 };
 pub use broker::{
     Broker, CancellationCause, CancellationFlag, EventSink, ExecutionBackend, RequestLimits,

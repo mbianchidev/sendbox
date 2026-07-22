@@ -1,11 +1,41 @@
 # Kata Containers Runtime
 
+## Experimental Rust vertical slice
+
+The Rust CLI now exposes one deliberately thin command:
+
+```bash
+sendbox-rs run \
+  --config /absolute/path/.sendbox.yaml \
+  --runtime kata \
+  --image registry.example/workload@sha256:<digest> \
+  --bundle /absolute/path/to/verified-bundle \
+  --trust-root /absolute/path/to/release-public.key \
+  --trust-root-id external-release-root \
+  --minimum-release-sequence 1 \
+  -- /usr/bin/printf '%s\n' hello
+```
+
+The command after `--` is an exact argv vector. The guest executable and working
+directory must be absolute; no shell parses or joins the arguments. `--json`
+emits deterministic `output`, `result`, and `error` records. Binary output is
+hex encoded. The process exit code is propagated when broker cleanup is
+complete; cancellation uses 130.
+
+The workload image must be digest-pinned. The bundle and trust-root paths are
+host paths, and the project path in the configuration must be absolute and
+owned by a non-root uid/gid. The bundle must contain the signed static
+`bin/sendbox-guest` and `bin/sendbox-exec-launcher` artifacts produced by
+`packaging/guest/Dockerfile`.
+
+This command never invokes or falls back to Swift.
+
 SendBox can run sandboxes on Linux through [Kata Containers](https://katacontainers.io/), using `nerdctl` to create each workload with the Kata containerd shim. The agent runs in a dedicated hardware-virtualized guest rather than sharing the host kernel.
 
 ## Requirements
 
 - Linux on bare metal or a VM with nested virtualization
-- Swift 6.2 or newer
+- Rust 1.93.1
 - Kata Containers 3.28 or newer
 - containerd 1.7 or newer
 - CNI plugins
@@ -61,11 +91,13 @@ runtime:
     # configuration_path: /etc/kata-containers/configuration.toml
 ```
 
-Run with the configured provider or override it from the CLI:
+The historical Swift command remains outside this slice. Use the explicit Rust
+command and all trust inputs shown above:
 
 ```bash
-sendbox run --config .sendbox.yaml
-sendbox run --config .sendbox.yaml --runtime kata
+sendbox-rs run --config .sendbox.yaml --runtime kata \
+  --image "$IMAGE_DIGEST" --bundle "$BUNDLE" --trust-root "$TRUST_ROOT" \
+  -- /usr/bin/true
 ```
 
 `runtime.provider: auto` selects Apple Containerization on supported macOS hosts and Kata Containers on Linux.
@@ -123,4 +155,20 @@ Use an absolute `configuration_path` that exists on the containerd host. Check t
 journalctl -t kata
 ```
 
-Hosted GitHub Actions runners do not expose nested virtualization, so CI validates Linux compilation and runtime command generation rather than booting a live Kata VM.
+Hosted GitHub Actions runners do not expose nested virtualization. Normal CI
+compiles Linux and runs the fake-nerdctl/authenticated-channel conformance tests.
+Live qualification is a separate required self-hosted gate:
+
+```bash
+cargo build --workspace --release
+SENDBOX_KATA_LIVE=1 \
+SENDBOX_KATA_CONFIG=/absolute/path/.sendbox.yaml \
+SENDBOX_KATA_IMAGE=registry.example/workload@sha256:<digest> \
+SENDBOX_KATA_BUNDLE=/absolute/path/to/bundle \
+SENDBOX_KATA_TRUST_ROOT=/absolute/path/to/release-public.key \
+./scripts/qualify-kata-live.sh
+```
+
+The script fails when any input, KVM, containerd, Kata, readiness, brokered
+execution, exit propagation, or cleanup proof is missing. It never reports a
+successful skip.

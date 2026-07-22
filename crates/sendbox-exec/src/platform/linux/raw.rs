@@ -15,7 +15,7 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::api::{ExitStatus, FileIdentity};
+use crate::api::{ExecutionUser, ExitStatus, FileIdentity};
 use crate::error::{KernelPrimitive, PlatformError, UnsupportedKernel};
 
 const RESOLVE_NO_XDEV: u64 = 0x01;
@@ -69,6 +69,8 @@ struct ChildExec<'a> {
     cwd_fd: RawFd,
     argv: &'a [*mut libc::c_char],
     environment: &'a [*mut libc::c_char],
+    run_as: Option<ExecutionUser>,
+    capability_last: u32,
     child_filter: &'a [libc::sock_filter],
     close_fds: &'a [RawFd],
     null_fd: RawFd,
@@ -168,6 +170,7 @@ pub(crate) fn clone3_exec(
     cwd_fd: RawFd,
     argv: &[CString],
     environment: &[CString],
+    run_as: Option<ExecutionUser>,
 ) -> Result<SpawnedProcess, PlatformError> {
     if argv.is_empty() {
         return Err(PlatformError::io(
@@ -185,6 +188,7 @@ pub(crate) fn clone3_exec(
         .collect();
     environment_pointers.push(std::ptr::null_mut());
     let child_filter = child_clone3_filter()?;
+    let capability_last = read_capability_last()?;
 
     let stdout_pipe = create_pipe()?;
     let stderr_pipe = create_pipe()?;
@@ -265,6 +269,8 @@ pub(crate) fn clone3_exec(
             cwd_fd,
             argv: &argv_pointers,
             environment: &environment_pointers,
+            run_as,
+            capability_last,
             child_filter: &child_filter,
             close_fds: &close_fds,
             null_fd,
@@ -604,6 +610,16 @@ unsafe fn install_child_seccomp(filter: &[libc::sock_filter]) -> libc::c_long {
     }
 }
 
+fn read_capability_last() -> Result<u32, PlatformError> {
+    std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .map_err(|source| PlatformError::io("read kernel capability ceiling", source))?
+        .trim()
+        .parse()
+        .map_err(|error| {
+            PlatformError::SecuritySetup(format!("parse kernel capability ceiling: {error}"))
+        })
+}
+
 fn child_exec(context: ChildExec<'_>) -> ! {
     // SAFETY: only async-signal-safe syscalls are used in this post-clone
     // branch. All pointers and descriptors were prepared before clone3.
@@ -618,9 +634,23 @@ fn child_exec(context: ChildExec<'_>) -> ! {
         {
             child_fail(context.error_pipe[1], CHILD_STAGE_SETUP);
         }
+        if let Some(user) = context.run_as {
+            for capability in 0..=context.capability_last {
+                if libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) != 0 {
+                    child_fail(context.error_pipe[1], CHILD_STAGE_SETUP);
+                }
+            }
+            if libc::setgroups(0, std::ptr::null()) != 0
+                || libc::setresgid(user.gid, user.gid, user.gid) != 0
+                || libc::setresuid(user.uid, user.uid, user.uid) != 0
+            {
+                child_fail(context.error_pipe[1], CHILD_STAGE_SETUP);
+            }
+        }
         if install_child_seccomp(context.child_filter) != 0 {
             child_fail(context.error_pipe[1], CHILD_STAGE_SECCOMP);
         }
+
         libc::close(context.stdout_pipe[1]);
         libc::close(context.stderr_pipe[1]);
         libc::close(context.null_fd);

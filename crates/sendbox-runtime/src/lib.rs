@@ -38,7 +38,7 @@ pub use process::{
 };
 pub use provider::{
     BoxFuture, CreateRequest, ExecPurpose, ExecRequest, InitializeRequest, PreflightReport,
-    PreflightRequest, RuntimeHealth, RuntimeProvider, RuntimeSignal, RuntimeStatus, StartRequest,
-    StopRequest,
+    PreflightRequest, RuntimeEnvironment, RuntimeHealth, RuntimeLabel, RuntimeMount,
+    RuntimeProvider, RuntimeResources, RuntimeSignal, RuntimeStatus, StartRequest, StopRequest,
 };
 pub use unavailable::UnavailableRuntimeProvider;

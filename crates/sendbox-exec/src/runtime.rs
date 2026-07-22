@@ -169,6 +169,32 @@ impl RuntimeDirectory {
             source,
         })
     }
+
+    pub fn cleanup(self, listener: AuthenticatedUnixListener) -> Result<(), RuntimeError> {
+        if listener.local_path() != self.socket_path() {
+            return Err(RuntimeError::StalePath(listener.local_path().to_path_buf()));
+        }
+        drop(listener);
+        for path in [self.socket_path(), self.credentials_path()] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => return Err(RuntimeError::Io { path, source }),
+            }
+        }
+        self.remove()
+    }
+
+    pub fn cleanup_after_listener_drop(self) -> Result<(), RuntimeError> {
+        for path in [self.socket_path(), self.credentials_path()] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => return Err(RuntimeError::Io { path, source }),
+            }
+        }
+        self.remove()
+    }
 }
 
 /// Listener that authenticates every accepted connection with `SO_PEERCRED`.

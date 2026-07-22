@@ -484,6 +484,7 @@ fn transport_capability(kind: ControlEndpointKind) -> RuntimeCapability {
         ControlEndpointKind::InheritedFileDescriptor => {
             RuntimeCapability::InheritedFileDescriptorControlChannel
         }
+        ControlEndpointKind::RuntimeExecStdio => RuntimeCapability::RuntimeExecStdioControlChannel,
         ControlEndpointKind::Unavailable => RuntimeCapability::TransportProvisioning,
     }
 }
@@ -504,6 +505,10 @@ fn fake_descriptor(
         ControlEndpointKind::InheritedFileDescriptor => (
             HostAddress::FileDescriptor(3),
             GuestAddress::FileDescriptor(3),
+        ),
+        ControlEndpointKind::RuntimeExecStdio => (
+            HostAddress::Stdio,
+            GuestAddress::RuntimeDefined("fake-runtime-exec-stdio".to_owned()),
         ),
         ControlEndpointKind::Unavailable => {
             return Err(RuntimeError::TransportUnavailable {
@@ -663,6 +668,16 @@ pub fn fake_conformance_scenario(
         create: CreateRequest {
             container_id: ContainerId::new("conformance-container")?,
             image: "fake:image".to_owned(),
+            hostname: "conformance-container".to_owned(),
+            resources: sendbox_runtime::RuntimeResources {
+                cpus: 1,
+                memory_bytes: 256 * 1024 * 1024,
+            },
+            mounts: Vec::new(),
+            environment: Vec::new(),
+            working_directory: PathBuf::from("/"),
+            dns_servers: Vec::new(),
+            labels: Vec::new(),
         },
         start: StartRequest {
             attach_standard_streams: true,

@@ -10,12 +10,13 @@ use tokio::net::UnixListener;
 use crate::GuestError;
 use crate::audit::AuditLog;
 use crate::bootstrap::ImmutableBootstrapSource;
+use crate::broker;
 use crate::manifest::{VerifiedManifest, verify_manifest};
 use crate::platform::PlatformControls;
 use crate::protocol::{handshake_config, serve_authenticated};
 use crate::runtime::{ReadinessSnapshot, RuntimeIdentity, RuntimeSession};
 use crate::secure_fs::{leaf_name, open_directory_no_symlinks, validate_regular_metadata};
-use crate::service::ServiceManager;
+use crate::service::{ServiceId, ServiceManager};
 use crate::state::{StartupState, StartupStateMachine};
 
 #[derive(Debug, Clone)]
@@ -34,7 +35,9 @@ pub async fn run<P: PlatformControls>(
 ) -> Result<(), GuestError> {
     let audit = Arc::new(Mutex::new(AuditLog::default()));
     let state = Arc::new(Mutex::new(StartupStateMachine::default()));
-    let bootstrap =
+    prepare_private_root(&options.replay_root, identity)?;
+    wait_for_bootstrap(&options.bootstrap_file).await?;
+    let mut bootstrap =
         ImmutableBootstrapSource::new(options.bootstrap_file, identity.uid, identity.gid)
             .consume(&options.replay_root)?;
     transition(&state, &audit, StartupState::BootstrapConsumed)?;
@@ -60,8 +63,30 @@ pub async fn run<P: PlatformControls>(
     runtime.write_state(StartupState::RuntimePrepared)?;
     transition(&state, &audit, StartupState::RuntimePrepared)?;
 
+    let broker_client = bootstrap
+        .execution_broker
+        .take()
+        .map(|configuration| {
+            broker::prepare(bootstrap.session_id, runtime.session_dir(), configuration)
+        })
+        .transpose()?;
+    if let Some((_, service)) = &broker_client {
+        if bootstrap
+            .services
+            .iter()
+            .any(|existing| existing.id == service.id)
+        {
+            return Err(GuestError::Runtime(
+                "execution broker service was configured more than once".to_owned(),
+            ));
+        }
+
+        bootstrap.services.push(service.clone());
+        if !bootstrap.required_services.contains(&ServiceId::Exec) {
+            bootstrap.required_services.push(ServiceId::Exec);
+        }
+    }
     let controls = platform.apply_and_verify(&bootstrap.required_controls)?;
-    transition_and_write(&state, &audit, &runtime, StartupState::ControlsVerified)?;
 
     let mut services = ServiceManager::new(
         options.artifact_root,
@@ -75,6 +100,8 @@ pub async fn run<P: PlatformControls>(
         fail_and_cleanup(&state, &audit, &runtime, &mut services).await?;
         return Err(error);
     }
+    let controls = platform.lockdown_and_verify(controls)?;
+    transition_and_write(&state, &audit, &runtime, StartupState::ControlsVerified)?;
 
     transition_and_write(&state, &audit, &runtime, StartupState::SelfTesting)?;
     platform.self_test(&controls)?;
@@ -87,6 +114,32 @@ pub async fn run<P: PlatformControls>(
         return Err(GuestError::Runtime(
             "mandatory service self-test failed".to_owned(),
         ));
+    }
+
+    fn prepare_private_root(path: &Path, identity: RuntimeIdentity) -> Result<(), GuestError> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        if !path.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)
+                .map_err(|error| GuestError::io("creating private guest root", error))?;
+        }
+        let metadata = path
+            .symlink_metadata()
+            .map_err(|error| GuestError::io("inspecting private guest root", error))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != identity.uid
+            || metadata.gid() != identity.gid
+        {
+            return Err(GuestError::Runtime(format!(
+                "{} is not owned by the guest runtime identity",
+                path.display()
+            )));
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| GuestError::io("setting private guest root mode", error))
     }
 
     let listener = UnixListener::bind(runtime.socket_path())
@@ -123,6 +176,7 @@ pub async fn run<P: PlatformControls>(
                     Arc::clone(&service_readiness),
                     Arc::clone(&runtime),
                     readiness,
+                    broker_client.as_ref().map(|(client, _)| client.clone()),
                 ) => protocol,
                 failure = services.wait_for_mandatory_failure() => Err(failure),
             }
@@ -142,6 +196,21 @@ pub async fn run<P: PlatformControls>(
     }
     shutdown(&state, &audit, &runtime, &mut services).await?;
     result
+}
+
+async fn wait_for_bootstrap(path: &Path) -> Result<(), GuestError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if tokio::fs::symlink_metadata(path).await.is_ok() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(GuestError::Bootstrap(
+                "timed out waiting for runtime-injected bootstrap".to_owned(),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 fn read_trust_root(path: &Path, identity: RuntimeIdentity) -> Result<[u8; 32], GuestError> {

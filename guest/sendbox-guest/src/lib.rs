@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod bootstrap;
+pub mod broker;
 pub mod error;
 pub mod manifest;
 pub mod platform;

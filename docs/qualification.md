@@ -78,9 +78,23 @@ cargo run --manifest-path tools/sendbox-qualification/Cargo.toml -- \
   --rust-binary target/release/sendbox-rs
 ```
 
-The harness never starts Apple container services, containerd, Kata,
-Hyperlight, guest services, or BPF programs. Vendor baselines must be run
-manually on prepared hosts using the pinned fixed-adapter definition. A result
-cannot be published while any required workload, reference host field,
-relative C baseline, fixed-adapter baseline, or BPF event rate remains
+The portable harness never starts Apple container services, containerd, Kata,
+Hyperlight, guest services, or BPF programs. The experimental Rust Kata slice
+adds a separate, non-skipping self-hosted gate:
+
+```bash
+SENDBOX_KATA_LIVE=1 \
+SENDBOX_KATA_CONFIG=/absolute/config.yaml \
+SENDBOX_KATA_IMAGE=registry/workload@sha256:<digest> \
+SENDBOX_KATA_BUNDLE=/absolute/bundle \
+SENDBOX_KATA_TRUST_ROOT=/absolute/release-public.key \
+./scripts/qualify-kata-live.sh
+```
+
+`.github/workflows/kata-live.yaml` requires a runner labeled
+`self-hosted, linux, x64, kvm, kata`. Missing inputs or prerequisites fail; they
+are never reported as a successful skip. Vendor baselines must still be run on
+prepared hosts using the pinned fixed-adapter definition. A result cannot be
+published while any required workload, reference host field, relative C
+baseline, fixed-adapter baseline, BPF event rate, or live Kata evidence remains
 `unqualified`.

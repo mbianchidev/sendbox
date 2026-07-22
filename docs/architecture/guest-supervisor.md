@@ -2,8 +2,8 @@
 
 Status: **production foundation**. This document defines the trust, bootstrap,
 readiness, service, and fail-closed semantics implemented by
-`guest/sendbox-guest`. Runtime adapters and the exec, MCP, DNS, egress, audit, and
-BPF service implementations are intentionally outside this foundation.
+`guest/sendbox-guest`. The Kata slice integrates the production exec broker;
+MCP, DNS, egress, audit, and BPF service implementations remain outside it.
 
 ## Process and command model
 
@@ -16,6 +16,8 @@ BPF service implementations are intentionally outside this foundation.
   protocol remains authoritative to a remote host.
 - `service-run` is hidden and exists only for deterministic process-supervision
   qualification.
+- `inject-bootstrap` and `tunnel` are hidden runtime-only Kata controls.
+- `exec-broker` is the mandatory one-session production broker service.
 
 Typed service identifiers reserve `exec`, `mcp`, `dns`, `egress`, `audit`, and
 `bpf`. Reserving an identifier does not claim that its service is implemented.
@@ -76,8 +78,8 @@ The only valid startup sequence is:
 2. `bootstrap_consumed`
 3. `manifest_verified`
 4. `runtime_prepared`
-5. `controls_verified`
-6. `services_starting`
+5. `services_starting`
+6. `controls_verified`
 7. `self_testing`
 8. `ready`
 9. optionally `agent_launch_permitted`
@@ -106,9 +108,12 @@ sequence, verified control reports, service health, and deterministic audit
 events. Mandatory-service liveness is rechecked after the handshake and before
 every authenticated health or launch response. `agent.launch` is authorized once
 and only while the local state is
-`ready`; this foundation returns `executed = false` because production execution
-brokering is a separate scope. No marker, handshake, health response, or launch
-response reports success for a control that was not verified.
+`ready`. With a configured Kata broker, `agent.launch` decodes operational
+schema v1, maps absolute paths to retained broker roots, forwards the exact argv,
+streams sequenced output, forwards cancellation, and returns a typed terminal
+result only after broker cleanup evidence is available. Without a configured
+broker it is rejected. No marker, handshake, health response, or launch response
+reports success for a control that was not verified.
 
 ## Service supervision and failure behavior
 
@@ -140,16 +145,15 @@ garbage.
 ## Platform-control boundary
 
 Privilege drop, capabilities, and seccomp are represented by the injected
-`PlatformControls` trait. The production foundation adapter reports them as
-unavailable. If bootstrap marks any unavailable control required, startup fails.
-Tests inject a deterministic adapter that can verify requested controls without
-privilege. This separation permits unprivileged qualification without pretending
-that Linux controls are armed.
+`PlatformControls` trait. The production Linux adapter requires root identity,
+prepares and verifies the delegated cgroup v2 parent, starts the mandatory broker,
+then installs and verifies the NNP/TSYNC direct-exec filter before readiness.
+The launcher drops brokered workloads to the non-root project uid/gid and applies
+the production capability, rlimit, cgroup, pidfd, and command seccomp controls.
+Tests retain a deterministic unprivileged adapter.
 
-Remaining Linux integration must implement and live-test dedicated UID/GID
-transitions, capability sets, `no_new_privs`, architecture-specific seccomp
-profiles, cgroups, mounts, rlimits, sysctls, nftables, and BPF attachment. Those
-implementations must preserve the readiness gates above.
+Egress/nftables, BPF attachment, secrets, MCP, and audit integration remain
+unimplemented for this slice and cannot be requested as completed features.
 
 ## Static delivery
 

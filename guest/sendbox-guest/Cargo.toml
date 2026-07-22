@@ -12,6 +12,8 @@ clap.workspace = true
 ed25519-dalek.workspace = true
 rustix.workspace = true
 sendbox-core = { path = "../../crates/sendbox-core" }
+sendbox-exec = { path = "../../crates/sendbox-exec" }
+sendbox-policy = { path = "../../crates/sendbox-policy" }
 sendbox-protocol = { path = "../../crates/sendbox-protocol" }
 serde.workspace = true
 serde_json.workspace = true
