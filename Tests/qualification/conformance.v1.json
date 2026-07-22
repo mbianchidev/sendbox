@@ -56,6 +56,17 @@
       "command": null
     },
     {
+      "id": "mcp.contracts",
+      "area": "mcp",
+      "description": "Bounded framing, strict JSON-RPC, deny-first stdio policy, exact command brokering, config validation, and versioned observation contracts.",
+      "oracle": "intended_behavior",
+      "status": "implemented",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/mcp.v1.json",
+      "swift_observation": null,
+      "command": null
+    },
+    {
       "id": "protocol.contracts",
       "area": "protocol",
       "description": "Canonical bounded protocol encoding, authentication, and failure contracts.",
@@ -69,9 +80,9 @@
     {
       "id": "runtime.contracts",
       "area": "runtime",
-      "description": "Lifecycle, streaming, cancellation, capability, and cleanup contracts.",
+      "description": "Lifecycle, control-channel provisioning, brokered agent orchestration, streaming, cancellation, capability, and cleanup contracts.",
       "oracle": "intended_behavior",
-      "status": "specified",
+      "status": "implemented",
       "negative_case": false,
       "data_path": "Tests/qualification/fixtures/runtime-contracts.v1.json",
       "swift_observation": null,
@@ -82,7 +93,7 @@
       "area": "formats",
       "description": "Versioned audit, snapshot, provenance, grants, config, and protocol samples.",
       "oracle": "intended_behavior",
-      "status": "specified",
+      "status": "implemented",
       "negative_case": false,
       "data_path": "Tests/qualification/fixtures/persisted-formats.v1.json",
       "swift_observation": null,

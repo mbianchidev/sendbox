@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+sendbox-core = { path = "../sendbox-core" }
 sendbox-protocol = { path = "../sendbox-protocol" }
 thiserror.workspace = true
 tokio.workspace = true

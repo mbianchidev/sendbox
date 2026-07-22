@@ -136,6 +136,29 @@ pub fn verify_manifest(
     expected_guest_version: &str,
     minimum_release_sequence: u64,
 ) -> Result<VerifiedManifest, GuestError> {
+    verify_manifest_for_architecture(
+        root,
+        envelope_path,
+        trust_root,
+        expected_trust_root_id,
+        expected_host_version,
+        expected_guest_version,
+        std::env::consts::ARCH,
+        minimum_release_sequence,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_manifest_for_architecture(
+    root: &OwnedFd,
+    envelope_path: &Path,
+    trust_root: &[u8; 32],
+    expected_trust_root_id: &str,
+    expected_host_version: &str,
+    expected_guest_version: &str,
+    expected_architecture: &str,
+    minimum_release_sequence: u64,
+) -> Result<VerifiedManifest, GuestError> {
     let mut envelope_file =
         open_relative_regular(root, envelope_path, "opening signed manifest")?.file;
     let mut envelope_bytes = Zeroizing::new(Vec::new());
@@ -167,6 +190,7 @@ pub fn verify_manifest(
         expected_trust_root_id,
         expected_host_version,
         expected_guest_version,
+        expected_architecture,
         minimum_release_sequence,
     )?;
 
@@ -201,6 +225,7 @@ fn validate_manifest(
     expected_trust_root_id: &str,
     expected_host_version: &str,
     expected_guest_version: &str,
+    expected_architecture: &str,
     minimum_release_sequence: u64,
 ) -> Result<(), GuestError> {
     if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
@@ -223,11 +248,10 @@ fn validate_manifest(
     if manifest.expected_guest_version != expected_guest_version {
         return Err(GuestError::Manifest("guest version mismatch".to_owned()));
     }
-    if manifest.architecture != std::env::consts::ARCH {
+    if manifest.architecture != expected_architecture {
         return Err(GuestError::Manifest(format!(
             "architecture mismatch: expected {}, got {}",
-            std::env::consts::ARCH,
-            manifest.architecture
+            expected_architecture, manifest.architecture
         )));
     }
     if manifest.minimum_accepted_sequence > manifest.release_sequence
@@ -263,17 +287,36 @@ fn validate_manifest(
 }
 
 fn verify_artifact(root: &OwnedFd, artifact: &ArtifactExpectation) -> Result<OwnedFd, GuestError> {
-    let mut opened = open_relative_regular(root, &artifact.path, "opening artifact")?;
+    verify_file_expectation(
+        root,
+        &artifact.path,
+        &artifact.sha256,
+        artifact.mode,
+        artifact.uid,
+        artifact.gid,
+    )
+}
+
+pub fn verify_file_expectation(
+    root: &OwnedFd,
+    path: &Path,
+    sha256: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<OwnedFd, GuestError> {
+    validate_relative_path(path)?;
+    let mut opened = open_relative_regular(root, path, "opening artifact")?;
     #[allow(clippy::useless_conversion)] // st_mode is u16 on macOS and u32 on Linux.
     let actual_mode = u32::from(opened.stat.st_mode & 0o7777);
-    if actual_mode != artifact.mode {
-        return Err(artifact_error(artifact, "mode mismatch"));
+    if actual_mode != mode {
+        return Err(file_error(path, "mode mismatch"));
     }
-    if opened.stat.st_uid != artifact.uid || opened.stat.st_gid != artifact.gid {
-        return Err(artifact_error(artifact, "owner mismatch"));
+    if opened.stat.st_uid != uid || opened.stat.st_gid != gid {
+        return Err(file_error(path, "owner mismatch"));
     }
     if opened.stat.st_nlink != 1 {
-        return Err(artifact_error(artifact, "hard-linked artifact rejected"));
+        return Err(file_error(path, "hard-linked artifact rejected"));
     }
 
     let mut hasher = Sha256::new();
@@ -289,15 +332,15 @@ fn verify_artifact(root: &OwnedFd, artifact: &ArtifactExpectation) -> Result<Own
         hasher.update(&buffer[..read]);
     }
     let actual = encode_hex(&hasher.finalize());
-    if actual != artifact.sha256.to_ascii_lowercase() {
-        return Err(artifact_error(artifact, "digest mismatch"));
+    if actual != sha256.to_ascii_lowercase() {
+        return Err(file_error(path, "digest mismatch"));
     }
     Ok(OwnedFd::from(opened.file))
 }
 
-fn artifact_error(artifact: &ArtifactExpectation, detail: &str) -> GuestError {
+fn file_error(path: &Path, detail: &str) -> GuestError {
     GuestError::Artifact {
-        path: artifact.path.display().to_string(),
+        path: path.display().to_string(),
         detail: detail.to_owned(),
     }
 }
@@ -458,5 +501,10 @@ mod tests {
         fs::remove_file(&artifact).expect("remove symlink");
         fs::hard_link(&target, &artifact).expect("hard link");
         assert!(verify(&temporary, &signing_key, &manifest, 1).is_err());
+    }
+
+    #[test]
+    fn manifest_v1_rejects_unversioned_artifact_kinds() {
+        assert!(serde_json::from_str::<ArtifactKind>(r#""metadata""#).is_err());
     }
 }

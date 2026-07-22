@@ -428,21 +428,23 @@ pub(crate) fn verify_direct_execveat_denied(fd: RawFd) -> Result<(), PlatformErr
     let empty = c"";
     let argv = [empty.as_ptr().cast_mut(), std::ptr::null_mut()];
     let environment = [std::ptr::null_mut()];
-    // SAFETY: fd is a live executable descriptor and pointers are valid.
-    let result = unsafe {
-        libc::execveat(
-            fd,
-            empty.as_ptr(),
-            argv.as_ptr(),
-            environment.as_ptr(),
-            libc::AT_EMPTY_PATH,
-        )
-    };
-    require_eperm(result as libc::c_long, "libc execveat")?;
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: fd is a live executable descriptor and pointers are valid.
+        let result = unsafe {
+            libc::execveat(
+                fd,
+                empty.as_ptr(),
+                argv.as_ptr(),
+                environment.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        require_eperm(result as libc::c_long, "libc execveat")?;
+    }
     // SAFETY: same valid ABI data through the raw syscall entry point.
     let result = unsafe {
-        libc::syscall(
-            libc::SYS_execveat,
+        raw_execveat(
             fd,
             empty.as_ptr(),
             argv.as_ptr(),
@@ -626,7 +628,7 @@ fn child_exec(context: ChildExec<'_>) -> ! {
         for fd in context.close_fds {
             libc::close(*fd);
         }
-        libc::execveat(
+        raw_execveat(
             context.executable_fd,
             c"".as_ptr(),
             context.argv.as_ptr(),
@@ -635,6 +637,18 @@ fn child_exec(context: ChildExec<'_>) -> ! {
         );
         child_fail(context.error_pipe[1], CHILD_STAGE_EXEC);
     }
+}
+
+unsafe fn raw_execveat(
+    fd: RawFd,
+    path: *const libc::c_char,
+    argv: *const *mut libc::c_char,
+    environment: *const *mut libc::c_char,
+    flags: libc::c_int,
+) -> libc::c_long {
+    // SAFETY: callers provide the exact execveat ABI and keep all pointed-to
+    // values live for the duration of the syscall.
+    unsafe { libc::syscall(libc::SYS_execveat, fd, path, argv, environment, flags) }
 }
 
 unsafe fn child_fail(error_fd: RawFd, stage: u8) -> ! {

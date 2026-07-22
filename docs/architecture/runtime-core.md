@@ -18,9 +18,10 @@ The provider lifecycle is:
 2. `preflight` validates required capabilities before resource creation.
 3. `create` creates a stopped container or VM.
 4. `start` starts its supervised workload.
-5. `status`, `exec`, and `attach` observe or interact with it.
-6. `signal` and `stop` terminate work.
-7. `cleanup` compensates all resources.
+5. `provision_control_channel` creates a lifecycle-owned host/guest endpoint.
+6. `status`, bootstrap/control `exec`, and `attach` interact with it.
+7. `signal` and `stop` terminate work.
+8. `cleanup` compensates all resources.
 
 Every asynchronous method returns an explicit `Send` boxed future and receives an
 explicit `CancellationToken`. Providers are `Send + Sync`. Calls for different
@@ -61,11 +62,36 @@ Runtime capabilities map explicitly to the authenticated protocol:
 | Audit | 8 |
 | Health | 9 |
 
-`TransportProvisioning` is runtime-local. It describes whether an adapter can
-provision its selected host/guest transport and is deliberately filtered out of
+`TransportProvisioning`, `BrokeredExec`, and the vsock, published Unix socket,
+inherited stdio, and inherited file-descriptor transport capabilities are
+runtime-local. They are deliberately filtered out of
 `sendbox_protocol::CapabilitySet`. `sendbox-runtime` depends on
 `sendbox-protocol` for this mapping; the protocol crate has no runtime dependency,
 so the layering is acyclic.
+
+## Host/guest control channel
+
+`ControlChannelRequest` binds one session and container to a typed endpoint kind,
+runtime lifecycle ownership, a bounded readiness timeout, and redacted bootstrap
+material delivery. Bootstrap material may use a pre-opened descriptor above
+stderr or an adapter-owned injection target; argv and environment delivery are
+not part of the contract.
+
+`ProvisionedControlChannel` is a single-accept object-safe async handle. It
+returns the stream through the runtime lifecycle rather than a global path or
+registry, and explicit cleanup is idempotent. The contract models vsock,
+published Unix sockets, inherited stdio, inherited descriptors, and explicit
+unavailability. It does not define Apple, Kata, Hyperlight, or other vendor
+mappings.
+
+The readiness deadline covers channel acceptance and authenticated protocol
+readiness. Expiry is distinct from cancellation. Protocol frame limits provide
+bounded allocation and I/O after acceptance.
+
+`RuntimeProvider::exec` is restricted to trusted bootstrap and control work.
+When `BrokeredExec` is required, agent workload launch must use the authenticated
+guest channel. A runtime adapter must not reinterpret workload execution as
+host-side runtime exec.
 
 An unavailable platform implementation uses `UnavailableRuntimeProvider`. It
 advertises no capabilities and returns a structured unavailable error rather

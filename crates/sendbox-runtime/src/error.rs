@@ -2,7 +2,7 @@ use std::{fmt, io, path::PathBuf};
 
 use thiserror::Error;
 
-use crate::{LifecycleState, RuntimeId};
+use crate::{ControlEndpointKind, LifecycleState, RuntimeId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentifierKind {
@@ -42,6 +42,17 @@ pub enum RuntimeError {
     DuplicateTransition { state: LifecycleState },
     #[error("required runtime capabilities are unavailable: {missing}")]
     MissingCapabilities { missing: String },
+    #[error("invalid control channel request: {reason}")]
+    InvalidControlChannel { reason: String },
+    #[error("control transport {endpoint:?} is unavailable: {reason}")]
+    TransportUnavailable {
+        endpoint: ControlEndpointKind,
+        reason: String,
+    },
+    #[error("the provisioned control channel has already accepted its stream")]
+    ControlChannelAlreadyAccepted,
+    #[error("runtime exec is restricted to bootstrap and control operations")]
+    WorkloadExecRequiresGuestBroker,
     #[error("invalid command: {reason}")]
     InvalidCommand { reason: String },
     #[error("program `{name}` could not be resolved")]

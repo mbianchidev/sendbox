@@ -1,8 +1,9 @@
 use std::{future::Future, path::PathBuf, pin::Pin, time::Duration};
 
 use crate::{
-    CancellationToken, CommandSpec, ContainerId, LifecycleState, OutputSubscription,
-    ProcessOutcome, RuntimeCapabilities, RuntimeError, RuntimeId,
+    CancellationToken, CommandSpec, ContainerId, ControlChannelRequest, LifecycleState,
+    OutputSubscription, ProcessOutcome, ProvisionedControlChannel, RuntimeCapabilities,
+    RuntimeError, RuntimeId,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -44,6 +45,13 @@ pub struct StartRequest {
 #[derive(Debug, Clone)]
 pub struct ExecRequest {
     pub command: CommandSpec,
+    pub purpose: ExecPurpose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecPurpose {
+    BootstrapControl,
+    Workload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +130,18 @@ pub trait RuntimeProvider: Send + Sync {
         request: StartRequest,
         cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), RuntimeError>>;
+
+    fn provision_control_channel<'a>(
+        &'a self,
+        _request: ControlChannelRequest,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<Box<dyn ProvisionedControlChannel>, RuntimeError>> {
+        Box::pin(async {
+            Err(RuntimeError::MissingCapabilities {
+                missing: "transport provisioning".to_owned(),
+            })
+        })
+    }
 
     fn status<'a>(
         &'a self,
