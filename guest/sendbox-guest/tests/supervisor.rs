@@ -329,6 +329,7 @@ async fn mandatory_broker_death_revokes_readiness_and_cleans_session() {
     ));
     let service_pid = read_pid(&fixture.service_pid);
     kill_process(service_pid, Signal::KILL).expect("kill mandatory service");
+    wait_for_path_removal_or_exit(&fixture.session_dir.join("ready.json"), &supervisor).await;
     if writer
         .send(&Message::Request(Request {
             request_id: 1,
@@ -482,6 +483,20 @@ async fn wait_for_path_or_exit(
             panic!("timed out waiting for {}; state={state:?}", path.display());
         }
     }
+}
+
+async fn wait_for_path_removal_or_exit(
+    path: &Path,
+    supervisor: &tokio::task::JoinHandle<Result<(), GuestError>>,
+) {
+    timeout(PROCESS_TIMEOUT, async {
+        while path.exists() && !supervisor.is_finished() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("readiness revocation timeout");
+    assert!(!path.exists(), "readiness was not revoked");
 }
 
 fn read_pid(path: &Path) -> Pid {
