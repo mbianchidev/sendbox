@@ -29,6 +29,42 @@ fn prints_version() {
 }
 
 #[test]
+fn experimental_run_rejects_relative_guest_commands_deterministically() {
+    let temporary = tempdir().unwrap();
+    let config = temporary.path().join("sandbox.yaml");
+    let source = std::fs::read_to_string(workspace_root().join("config/example-sandbox.yaml"))
+        .unwrap()
+        .replace("secrets:\n  - NPM_TOKEN\n  - DATABASE_URL", "secrets: []");
+    std::fs::write(&config, source).unwrap();
+    let output = run(&[
+        "run",
+        "--config",
+        config.to_str().unwrap(),
+        "--runtime",
+        "kata",
+        "--image",
+        "example.invalid/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--bundle",
+        ".",
+        "--trust-root",
+        "Cargo.toml",
+        "--json",
+        "--",
+        "echo",
+        "hello",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).expect("JSON error");
+    assert_eq!(result["event"], "error");
+    assert_eq!(result["exit_code"], 2);
+    assert_eq!(
+        result["message"],
+        "experimental Kata command must use an absolute guest executable path"
+    );
+}
+
+#[test]
 fn validates_the_current_example() {
     let output = run(&[
         "policy",

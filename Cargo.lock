@@ -1440,12 +1440,18 @@ name = "sendbox-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "getrandom 0.4.3",
+ "sendbox-agent",
  "sendbox-config",
  "sendbox-core",
+ "sendbox-policy",
  "sendbox-project",
+ "sendbox-runtime",
+ "sendbox-runtime-kata",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1515,6 +1521,8 @@ dependencies = [
  "proptest",
  "rustix",
  "sendbox-core",
+ "sendbox-exec",
+ "sendbox-policy",
  "sendbox-protocol",
  "serde",
  "serde_json",
@@ -1577,6 +1585,24 @@ dependencies = [
  "sendbox-core",
  "sendbox-protocol",
  "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "sendbox-runtime-kata"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "sendbox-bundle",
+ "sendbox-core",
+ "sendbox-policy",
+ "sendbox-runtime",
+ "sendbox-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "zeroize",
 ]

@@ -1,30 +1,25 @@
 [package]
-name = "sendbox-cli"
+name = "sendbox-runtime-kata"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "sendbox-rs"
-path = "src/main.rs"
-
 [dependencies]
-clap.workspace = true
 getrandom.workspace = true
-sendbox-agent = { path = "../sendbox-agent" }
-sendbox-config = { path = "../sendbox-config" }
+sendbox-bundle = { path = "../sendbox-bundle" }
 sendbox-core = { path = "../sendbox-core" }
 sendbox-policy = { path = "../sendbox-policy" }
-sendbox-project = { path = "../sendbox-project" }
 sendbox-runtime = { path = "../sendbox-runtime" }
-sendbox-runtime-kata = { path = "../sendbox-runtime-kata" }
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-std", "rt", "signal", "sync"] }
+tokio = { workspace = true, features = ["fs", "process", "rt", "sync"] }
+zeroize.workspace = true
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
+sendbox-testkit = { path = "../sendbox-testkit" }
 tempfile.workspace = true
 
 [lints]

@@ -243,6 +243,7 @@ pub struct ContainmentProfile {
     pub cpu_max: Option<String>,
     pub additional_denied_syscalls: Vec<String>,
     pub rlimits: ResourceLimits,
+    pub run_as: Option<ExecutionUser>,
 }
 
 impl Default for ContainmentProfile {
@@ -254,8 +255,16 @@ impl Default for ContainmentProfile {
             cpu_max: None,
             additional_denied_syscalls: Vec::new(),
             rlimits: ResourceLimits::default(),
+            run_as: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionUser {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// A complete top-level broker request.

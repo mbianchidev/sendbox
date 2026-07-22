@@ -361,7 +361,13 @@ fn run(
     if let Err(error) = raw::set_child_subreaper()
         .and_then(|()| raw::set_no_new_privs())
         .and_then(|()| rlimits::apply(&request.containment.rlimits))
-        .and_then(|()| capabilities::drop_all())
+        .and_then(|()| {
+            if request.containment.run_as.is_none() {
+                capabilities::drop_all()
+            } else {
+                Ok(())
+            }
+        })
         .and_then(|()| {
             seccomp::install(seccomp::Profile::Command {
                 additional_denied_syscalls: &request.containment.additional_denied_syscalls,
@@ -385,6 +391,7 @@ fn run(
         resolved.cwd_fd.as_raw_fd(),
         &argv,
         &environment,
+        request.containment.run_as,
     ) {
         Ok(process) => process,
         Err(error) => return launch_error(error, leaf.remove_unlaunched()),

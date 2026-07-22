@@ -16,6 +16,7 @@ pub enum ControlEndpointKind {
     PublishedUnixSocket,
     InheritedStdio,
     InheritedFileDescriptor,
+    RuntimeExecStdio,
     Unavailable,
 }
 
@@ -197,6 +198,7 @@ mod tests {
             ControlEndpointKind::PublishedUnixSocket,
             ControlEndpointKind::InheritedStdio,
             ControlEndpointKind::InheritedFileDescriptor,
+            ControlEndpointKind::RuntimeExecStdio,
         ] {
             request(kind).validate().expect("valid request");
         }

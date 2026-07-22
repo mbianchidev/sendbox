@@ -3,8 +3,9 @@ use std::sync::Arc;
 use sendbox_protocol::{Capability, CapabilitySet};
 use sendbox_runtime::{
     BootstrapDelivery, BootstrapMaterial, CancellationToken, ChannelLifetime, ChannelOwnership,
-    CleanupReport, ControlChannelRequest, CreateRequest, InitializeRequest, PreflightRequest,
-    ProvisionedControlChannel, RuntimeProvider, StartRequest, StopRequest,
+    CleanupReport, ControlChannelRequest, ControlEndpointKind, CreateRequest, InitializeRequest,
+    PreflightRequest, ProvisionedControlChannel, RuntimeEnvironment, RuntimeLabel, RuntimeMount,
+    RuntimeProvider, StartRequest, StopRequest,
 };
 
 use crate::{
@@ -170,6 +171,40 @@ impl AgentOrchestrator {
                 CreateRequest {
                     container_id: plan.container_id().clone(),
                     image: plan.image().to_owned(),
+                    hostname: runtime_hostname(plan.container_id().as_str()),
+                    resources: plan.resources(),
+                    mounts: std::iter::once(RuntimeMount {
+                        source: plan.workspace().host_path.clone(),
+                        destination: plan.workspace().guest_path.clone(),
+                        writable: plan.workspace().writable,
+                    })
+                    .chain(plan.mounts().iter().map(|mount| RuntimeMount {
+                        source: mount.source.clone(),
+                        destination: mount.destination.clone(),
+                        writable: mount.writable,
+                    }))
+                    .collect(),
+                    environment: plan
+                        .environment()
+                        .iter()
+                        .map(|entry| RuntimeEnvironment {
+                            name: entry.name.clone(),
+                            value: entry.value.clone(),
+                            sensitive: false,
+                        })
+                        .collect(),
+                    working_directory: plan.command().working_directory.clone().into(),
+                    dns_servers: Vec::new(),
+                    labels: vec![
+                        RuntimeLabel {
+                            name: "dev.sendbox.managed".to_owned(),
+                            value: "true".to_owned(),
+                        },
+                        RuntimeLabel {
+                            name: "dev.sendbox.session".to_owned(),
+                            value: plan.session_id().to_string(),
+                        },
+                    ],
                 },
                 cancellation,
             )
@@ -200,7 +235,12 @@ impl AgentOrchestrator {
             ownership: ChannelOwnership::RuntimeLifecycle,
             lifetime: ChannelLifetime::UntilRuntimeCleanup,
             readiness_timeout: plan.readiness_timeout(),
-            bootstrap_delivery: BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
+            bootstrap_delivery: match plan.endpoint_kind() {
+                ControlEndpointKind::RuntimeExecStdio => BootstrapDelivery::RuntimeInjection {
+                    target: "/run/sendbox-bootstrap/bootstrap.json".to_owned(),
+                },
+                _ => BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
+            },
             bootstrap_material: BootstrapMaterial::new(bootstrap.as_bytes().to_vec())?,
         };
         let channel = self
@@ -447,6 +487,7 @@ fn append_runtime_cleanup_failures(report: CleanupReport, failures: &mut Vec<Cle
             error: AgentError::Runtime(failure.error),
         });
     }
+
     if report.remaining > 0 && !had_failures {
         failures.push(CleanupFailure {
             step: "runtime cleanup completion",
@@ -456,4 +497,18 @@ fn append_runtime_cleanup_failures(report: CleanupReport, failures: &mut Vec<Cle
             )),
         });
     }
+}
+
+fn runtime_hostname(container_id: &str) -> String {
+    container_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(63)
+        .collect()
 }
