@@ -13,6 +13,7 @@ members = [
     "crates/sendbox-protocol",
     "crates/sendbox-runtime",
     "crates/sendbox-security",
+    "crates/sendbox-session-security",
     "crates/sendbox-secrets",
     "crates/sendbox-testkit",
     "guest/sendbox-guest",
