@@ -1598,6 +1598,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-runtime-hyperlight"
+version = "0.1.0"
+dependencies = [
+ "cap-std",
+ "ed25519-dalek",
+ "ipnet",
+ "rustix",
+ "sendbox-bundle",
+ "sendbox-egress",
+ "sendbox-guest",
+ "sendbox-runtime",
+ "sendbox-testkit",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "sendbox-secrets"
 version = "0.1.0"
 dependencies = [

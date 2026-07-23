@@ -102,6 +102,12 @@ pub struct VerifyReport {
     pub artifact_count: usize,
 }
 
+#[derive(Debug)]
+pub struct VerifiedBundle {
+    pub report: VerifyReport,
+    pub manifest: VerifiedManifest,
+}
+
 #[derive(Serialize)]
 struct BundleMetadata<'a> {
     schema_version: u8,
@@ -131,6 +137,8 @@ enum InventoryKind {
     GuestBinary,
     ServiceBinary,
     BpfObject,
+    UnikraftShellKernel,
+    Initrd,
     Metadata,
 }
 
@@ -140,6 +148,8 @@ impl InventoryKind {
             Self::GuestBinary => Some(ArtifactKind::GuestBinary),
             Self::ServiceBinary => Some(ArtifactKind::ServiceBinary),
             Self::BpfObject => Some(ArtifactKind::BpfObject),
+            Self::UnikraftShellKernel => Some(ArtifactKind::UnikraftShellKernel),
+            Self::Initrd => Some(ArtifactKind::Initrd),
             Self::Metadata => None,
         }
     }
@@ -385,6 +395,10 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
 }
 
 pub fn verify_bundle(options: &VerifyOptions<'_>) -> Result<VerifyReport, BundleError> {
+    Ok(verify_bundle_artifacts(options)?.report)
+}
+
+pub fn verify_bundle_artifacts(options: &VerifyOptions<'_>) -> Result<VerifiedBundle, BundleError> {
     let root = if options.root.is_absolute() {
         options.root.to_path_buf()
     } else {
@@ -409,11 +423,14 @@ pub fn verify_bundle(options: &VerifyOptions<'_>) -> Result<VerifyReport, Bundle
     )?;
     verify_detached_signature(&root, &verified)?;
     verify_release_metadata(&descriptor, &root, &public_key, options, &verified)?;
-    Ok(VerifyReport {
-        schema_version: 1,
-        architecture: verified.manifest.architecture,
-        release_sequence: verified.manifest.release_sequence,
-        artifact_count: verified.manifest.artifacts.len(),
+    Ok(VerifiedBundle {
+        report: VerifyReport {
+            schema_version: 1,
+            architecture: verified.manifest.architecture.clone(),
+            release_sequence: verified.manifest.release_sequence,
+            artifact_count: verified.manifest.artifacts.len(),
+        },
+        manifest: verified,
     })
 }
 
@@ -792,6 +809,8 @@ fn verify_release_metadata(
             ArtifactKind::GuestBinary => InventoryKind::GuestBinary,
             ArtifactKind::ServiceBinary => InventoryKind::ServiceBinary,
             ArtifactKind::BpfObject => InventoryKind::BpfObject,
+            ArtifactKind::UnikraftShellKernel => InventoryKind::UnikraftShellKernel,
+            ArtifactKind::Initrd => InventoryKind::Initrd,
         };
         if !inventory.artifacts.iter().any(|entry| {
             entry.kind == expected_kind

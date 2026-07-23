@@ -25,7 +25,7 @@
         "kata": {"status": "unqualified", "value": null, "reason": "Pinned Kata version awaits fixed-adapter capture."},
         "containerd": {"status": "unqualified", "value": null, "reason": "Pinned containerd version awaits ADR-006."},
         "nerdctl": {"status": "unqualified", "value": null, "reason": "Pinned nerdctl version awaits ADR-006."},
-        "hyperlight": {"status": "unqualified", "value": null, "reason": "Pinned Hyperlight version awaits capability qualification."}
+        "hyperlight": {"status": "unqualified", "value": null, "reason": "The adapter requires an exact pinned hyperlight-unikraft CLI version; the reference version awaits the designated live host."}
       }
     },
     {
@@ -71,7 +71,7 @@
     {"id": "guest.bootstrap", "path": "guest bootstrap to signed readiness", "availability": "unqualified", "unqualified_reason": "Production guest bootstrap does not exist.", "workload_sizes": [1], "adapter_baseline": "guest-bootstrap-fixed"},
     {"id": "runtime.apple.lifecycle", "path": "create-ready, exec, stop, cleanup", "availability": "unqualified", "unqualified_reason": "Reference host, vendor version, image, and fixed adapter are not qualified.", "workload_sizes": [1, 10, 100], "adapter_baseline": "apple-fixed-adapter"},
     {"id": "runtime.kata.lifecycle", "path": "create-ready, exec, stop, cleanup", "availability": "unqualified", "unqualified_reason": "Reference host, vendor versions, image, and fixed adapter are not qualified.", "workload_sizes": [1, 10, 100], "adapter_baseline": "kata-fixed-adapter"},
-    {"id": "runtime.hyperlight.lifecycle", "path": "create-ready, exec, stop, cleanup", "availability": "unqualified", "unqualified_reason": "Reference host, vendor version, rootfs, and fixed adapter are not qualified.", "workload_sizes": [1, 10, 100], "adapter_baseline": "hyperlight-fixed-adapter"}
+    {"id": "runtime.hyperlight.lifecycle", "path": "create logical handle, one-shot exec, stop, cleanup", "availability": "unqualified", "unqualified_reason": "The portable adapter contract is implemented; the Linux KVM reference host, pinned CLI, and signed Unikraft bundle are not qualified.", "workload_sizes": [1, 10, 100], "adapter_baseline": "hyperlight-fixed-adapter"}
   ],
   "thresholds": [
     {"id": "cli-help-p50", "workload_id": "cli.startup.help", "metric": "p50", "comparator": "less_than_or_equal", "value": 10.0, "unit": "milliseconds", "relative_to": null, "owner": "Rust rewrite qualification"},
@@ -100,7 +100,7 @@
   "fixed_adapter_baselines": [
     {"id": "apple-fixed-adapter", "runtime": "apple", "definition": "Pinned language-neutral harness issuing identical Apple container lifecycle calls with identical image, mounts, networking, logging, and guest policy services held constant or disabled.", "status": "unqualified", "unqualified_reason": "ADR-003 and reference host are pending."},
     {"id": "kata-fixed-adapter", "runtime": "kata", "definition": "Pinned language-neutral harness issuing identical nerdctl/containerd/Kata lifecycle calls with identical image, kernel, mounts, networking, logging, and guest policy services held constant or disabled.", "status": "unqualified", "unqualified_reason": "ADR-006 and reference host are pending."},
-    {"id": "hyperlight-fixed-adapter", "runtime": "hyperlight", "definition": "Pinned language-neutral harness issuing identical Hyperlight lifecycle calls with identical kernel, rootfs, mounts, networking, logging, and guest policy services held constant or disabled.", "status": "unqualified", "unqualified_reason": "Capability matrix and reference host are pending."}
+    {"id": "hyperlight-fixed-adapter", "runtime": "hyperlight", "definition": "Pinned language-neutral harness issuing the one-shot hyperlight-unikraft argv with an identical signed kernel/initrd bundle, memory, stack, fresh read-only mount copies, exact network entries, captured output, and unsupported broker/eBPF/seccomp/environment features disabled.", "status": "unqualified", "unqualified_reason": "The adapter definition is frozen; a designated Linux KVM reference host and signed release bundle are pending."}
   ],
   "minimum_supported_bpf_event_rate": {
     "status": "unqualified",
