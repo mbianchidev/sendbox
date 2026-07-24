@@ -1916,6 +1916,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-git"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "url",
+]
+
+[[package]]
 name = "sendbox-guest"
 version = "0.1.0"
 dependencies = [
