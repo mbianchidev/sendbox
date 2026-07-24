@@ -36,6 +36,22 @@ Descendants inherit syscall, capability, resource, environment, and cgroup
 containment, while their own argv remains outside the semantic policy boundary.
 The VM boundary remains the primary containment layer.
 
+### Production credential mediation
+
+The Rust [`sendbox-credentials`](architecture/secrets-and-credential-broker.md)
+library exposes explicit per-rule loopback HTTP endpoints instead of pretending
+to transparently proxy TLS. It strictly parses one bounded HTTP/1.1 request,
+validates the exact configured upstream host, method, and path, injects the
+credential only after validation, and performs a certificate-verifying HTTPS
+request with DNS addresses pinned between authorization and connect.
+
+CONNECT injection, TLS interception, wildcard binds, cross-target redirects,
+ambiguous HTTP framing, and unapproved restricted DNS answers are rejected.
+GitHub repository tokens use a separate metadata and repository-scope
+authorization path; cross-organization non-public scope is always denied and a
+token is retrieved only after complete pagination succeeds. Runtime lifecycle
+wiring is not part of this library yet.
+
 ### Production guest artifacts and BPF observation
 
 Production static guest binaries, the execution launcher, CO-RE BPF objects,

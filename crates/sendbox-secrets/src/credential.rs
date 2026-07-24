@@ -12,11 +12,17 @@ const MAX_BROKER_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 pub const GUARDED_GITHUB_CREDENTIALS: &[&str] = &[
     "GH_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
     "GITHUB_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
     "GITHUB_PAT",
     "GITHUB_OAUTH_TOKEN",
     "GITHUB_APP_PRIVATE_KEY",
     "GIT_ASKPASS",
+    "GIT_ASKPASS_REQUIRE",
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "GIT_SSH",
     "GIT_SSH_COMMAND",
     "SSH_AUTH_SOCK",
 ];
@@ -261,6 +267,26 @@ impl CredentialPolicy {
         }
     }
 
+    #[must_use]
+    pub fn target_host(&self) -> &str {
+        &self.target_host
+    }
+
+    #[must_use]
+    pub fn path_prefix(&self) -> &str {
+        &self.path_prefix
+    }
+
+    #[must_use]
+    pub const fn max_request_body_bytes(&self) -> usize {
+        self.max_request_body_bytes
+    }
+
+    #[must_use]
+    pub const fn max_response_body_bytes(&self) -> usize {
+        self.max_response_body_bytes
+    }
+
     pub fn authorize_redirect(&self, from: &Url, to: &Url) -> Result<(), CredentialPolicyError> {
         match self.redirect_policy {
             RedirectPolicy::Deny => Err(CredentialPolicyError::RedirectDenied),
@@ -296,6 +322,7 @@ impl CredentialPolicy {
             return Err(CredentialPolicyError::UserInfoForbidden);
         }
         if url.host_str() != Some(self.target_host.as_str())
+            || url.port_or_known_default() != Some(443)
             || !url.path().starts_with(&self.path_prefix)
         {
             return Err(CredentialPolicyError::TargetMismatch);
@@ -506,6 +533,7 @@ mod tests {
             "https://api.example.com./v1/messages",
             "https://user@api.example.com/v1/messages",
             "https://api.example.com/other",
+            "https://api.example.com:444/v1/messages",
         ] {
             assert!(
                 policy
