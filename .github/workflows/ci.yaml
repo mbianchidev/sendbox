@@ -177,13 +177,22 @@ jobs:
           ./target/release/sendbox-rs --version
           ./target/release/sendbox-rs policy validate --config config/example-sandbox.yaml
           ./target/release/sendbox-rs policy validate --config config/example-sandbox.yaml --json
+          ./target/release/sendbox-rs policy show --json
+          ./target/release/sendbox-rs completions print --shell bash >/dev/null
           ./target/release/sendbox-rs analyze --project crates/sendbox-project/tests/fixtures/node-ts --json
           project="$(mktemp -d)"
           printf '{"dependencies":{"react":"19"}}\n' > "$project/package.json"
           ./target/release/sendbox-rs devcontainer generate --project "$project" --json
+          ./target/release/sendbox-rs init --project "$project" --json
+          mkdir "$project/home"
+          home="$(cd "$project/home" && pwd -P)"
+          HOME="$home" ./target/release/sendbox-rs completions install --shell fish --json
 
       - name: Check project parser fuzz targets
         run: cargo check --manifest-path fuzz/project/Cargo.toml
+
+      - name: Check configuration fuzz target
+        run: cargo check --manifest-path fuzz/config/Cargo.toml
 
   rust-audit:
     name: Rust Dependency Audit (${{ matrix.os }})

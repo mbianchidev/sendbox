@@ -82,11 +82,14 @@ For an interactive runtime preflight and configuration flow:
 
 Kata installation and containerd configuration are documented in [docs/kata-containers.md](docs/kata-containers.md).
 
-### Experimental Rust validator
+### Experimental Rust CLI subset
 
-The parallel Rust foundation builds an experimental `sendbox-rs` binary. In this
-phase it only parses and validates configuration and policy; all sandbox runtime
-execution remains on the production Swift `sendbox` binary.
+The parallel Rust foundation builds an experimental `sendbox-rs` binary whose
+command name and generated completions are `sendbox`. The Rust CLI currently
+supports configuration initialization, policy show/validation, native project
+analysis, devcontainer generation, and bash/zsh/fish completion print/install.
+Sandbox execution, secrets, MCP, boundary, and release installation remain on
+the production Swift `sendbox` binary.
 
 The workspace also contains the pre-1.0 `sendbox-protocol` foundation for
 bounded, authenticated host/guest communication. `sendbox-runtime` now owns the
@@ -107,13 +110,19 @@ deferred. See
 make rust-build
 make rust-test
 ./target/debug/sendbox-rs --version
+./target/debug/sendbox-rs init --project .
+./target/debug/sendbox-rs policy show --json
 ./target/debug/sendbox-rs policy validate --config config/example-sandbox.yaml
 ./target/debug/sendbox-rs policy validate --config config/example-sandbox.yaml --json
+./target/debug/sendbox-rs completions print --shell zsh
 ```
 
-The JSON form is deterministic and intended for future Swift/Rust differential
-tests. Invalid configuration returns exit status `2`; text diagnostics are
-written to stderr, while `--json` always writes its result to stdout.
+Rust-generated configuration uses deterministic snake_case YAML, validates
+before writing, is created atomically with mode `0600`, and refuses to overwrite
+an existing `.sendbox.yaml`. JSON results are deterministic. Invalid input or
+configuration returns `2`; analysis failures return `3`; write failures and
+no-overwrite refusals return `4`. Text diagnostics use stderr, while `--json`
+failures use stdout only.
 
 ### Running Unsigned macOS Releases
 
@@ -354,6 +363,11 @@ SendBox follows a **deny-by-default** security posture:
 
 ## CLI Reference
 
+The table below is the intended complete `sendbox` surface. The experimental
+Rust binary currently implements `init`, `analyze`, `devcontainer`, `policy`,
+and `completions`. `run`, `secrets`, `mcp`, and `boundary` remain Swift-only
+until their runtime/security dependencies are cut over.
+
 ```
 USAGE: sendbox <subcommand> [options]
 
@@ -383,6 +397,13 @@ sendbox analyze --project . --output .devcontainer/
 
 # Validate a sandbox configuration's policy
 sendbox policy validate --config sendbox.yaml
+
+# Show the effective policy as deterministic JSON
+sendbox policy show --config sendbox.yaml --json
+
+# Print or install generated shell completions
+sendbox completions print --shell zsh
+sendbox completions install --shell fish
 
 # Experimental native analysis with automation JSON
 cargo run -p sendbox-cli -- analyze --project . --json
