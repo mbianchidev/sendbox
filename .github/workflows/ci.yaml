@@ -157,6 +157,11 @@ jobs:
 
       - name: Compile Git guard fuzz targets
         run: cargo check --manifest-path fuzz/git/Cargo.toml --bins
+        
+      - name: Compile secrets and credential fuzz targets
+        run: |
+          cargo check --manifest-path fuzz/secrets/Cargo.toml --bins
+          cargo check --manifest-path fuzz/credentials/Cargo.toml --bins
 
       - name: Compile MCP fuzz targets
         run: cargo check --manifest-path fuzz/mcp/Cargo.toml --bins

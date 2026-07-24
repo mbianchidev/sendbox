@@ -102,6 +102,13 @@ runtime-specific socket mappings. See
 [authenticated guest protocol](docs/architecture/authenticated-guest-protocol.md)
 and [agent orchestration](docs/architecture/agent-orchestration.md).
 
+The pre-1.0 `sendbox-credentials` production library provides explicit
+loopback credential endpoints and guarded GitHub repository authorization. It
+requires agents to support API base-URL overrides and intentionally does not
+intercept TLS or support CONNECT injection. Runtime/CLI lifecycle wiring is
+deferred. See
+[docs/architecture/secrets-and-credential-broker.md](docs/architecture/secrets-and-credential-broker.md).
+
 ```bash
 make rust-build
 make rust-test

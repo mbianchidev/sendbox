@@ -6,6 +6,7 @@ members = [
     "crates/sendbox-agent",
     "crates/sendbox-config",
     "crates/sendbox-core",
+    "crates/sendbox-credentials",
     "crates/sendbox-egress",
     "crates/sendbox-exec",
     "crates/sendbox-git",
@@ -49,6 +50,7 @@ libbpf-rs = "0.26.2"
 libseccomp = "0.4.0"
 minicbor = { version = "2.2.2", features = ["std"] }
 proptest = "1.11.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rustix = { version = "1.1.4", features = ["fs", "process", "std"] }
 rlimit = "0.11.0"
 roxmltree = "0.21.1"

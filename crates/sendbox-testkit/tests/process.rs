@@ -246,6 +246,28 @@ async fn capture_caps_report_exact_truncation_while_still_draining() {
     assert_eq!(outcome.stderr.truncated_bytes, 8192 - 113);
 }
 
+#[tokio::test]
+async fn capture_only_process_does_not_publish_output_events() {
+    let mut process = runner()
+        .spawn(
+            fixture_command("saturate", ["1".to_owned(), "64".to_owned()]),
+            ProcessOptions {
+                publish_output: false,
+                ..ProcessOptions::default()
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("spawn");
+    assert!(process.take_output_subscription().is_none());
+    let outcome = process
+        .wait(&CancellationToken::new())
+        .await
+        .expect("capture-only process");
+    assert_eq!(outcome.stdout.total_bytes, 64);
+    assert_eq!(outcome.stderr.total_bytes, 64);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_client_observes_monotonic_events_and_explicit_loss() {
     let mut process = runner()
