@@ -10,7 +10,14 @@
     {"id": "mcp-exact-command", "argv": ["/usr/bin/node", "/srv/mcp-server.js"], "decision": "allow"},
     {"id": "repository-cross-org-private", "selected": "acme/app", "requested": "other/secret", "decision": "deny"},
     {"id": "repository-public", "selected": "acme/app", "requested": "other/public", "decision": "allow"},
-    {"id": "protected-branch", "branch": "main", "decision": "deny"}
+    {"id": "protected-branch", "branch": "main", "decision": "deny"},
+    {"id": "git-protected-overrides-allow", "protected": ["main"], "allowed": ["*"], "branch": "main", "decision": "deny"},
+    {"id": "git-selected-clone-elsewhere", "selected": "github.com/acme/project", "remote": "git@github.com:acme/project.git", "workspace_matches": false, "branch": "main", "decision": "deny"},
+    {"id": "git-other-repository-pass-through", "selected": "github.com/acme/project", "remote": "https://github.com/open-source/library.git", "branch": "main", "decision": "allow"},
+    {"id": "git-ambiguous-push-urls", "push_urls": ["https://github.com/acme/project.git", "https://github.com/other/project.git"], "decision": "deny"},
+    {"id": "git-shell-alias", "alias": "!git push origin main", "decision": "deny"},
+    {"id": "git-broad-push", "argv": ["push", "--mirror", "origin"], "decision": "deny"},
+    {"id": "git-protected-delete", "argv": ["push", "--delete", "origin", "main"], "decision": "deny"}
   ],
-  "implementation_status": "mcp_cases_implemented_by_sendbox_mcp; remaining areas retain their recorded status"
+  "implementation_status": "git_branch_guard_and_mcp_cases_implemented; remaining areas retain their recorded status"
 }

@@ -9,6 +9,7 @@ members = [
     "crates/sendbox-credentials",
     "crates/sendbox-egress",
     "crates/sendbox-exec",
+    "crates/sendbox-git",
     "crates/sendbox-mcp",
     "crates/sendbox-policy",
     "crates/sendbox-project",
