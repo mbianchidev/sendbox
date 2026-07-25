@@ -91,6 +91,12 @@ analysis, devcontainer generation, and bash/zsh/fish completion print/install.
 Sandbox execution, secrets, MCP, boundary, and release installation remain on
 the production Swift `sendbox` binary.
 
+The workspace also includes focused production Rust components that are not yet
+wired into `sendbox run`. `sendbox-git` provides typed selected-repository
+push/pull admission and the `sendbox-git-guard` native execution shim for later
+exec-broker/guest integration. See
+[docs/architecture/git-branch-guard.md](docs/architecture/git-branch-guard.md).
+
 The workspace also contains the pre-1.0 `sendbox-protocol` foundation for
 bounded, authenticated host/guest communication. `sendbox-runtime` now owns the
 transport-neutral channel provisioning contract, and `sendbox-agent` owns the
@@ -98,6 +104,13 @@ pure orchestration state machine; neither starts a concrete vendor VM or selects
 runtime-specific socket mappings. See
 [authenticated guest protocol](docs/architecture/authenticated-guest-protocol.md)
 and [agent orchestration](docs/architecture/agent-orchestration.md).
+
+The pre-1.0 `sendbox-credentials` production library provides explicit
+loopback credential endpoints and guarded GitHub repository authorization. It
+requires agents to support API base-URL overrides and intentionally does not
+intercept TLS or support CONNECT injection. Runtime/CLI lifecycle wiring is
+deferred. See
+[docs/architecture/secrets-and-credential-broker.md](docs/architecture/secrets-and-credential-broker.md).
 
 ```bash
 make rust-build
@@ -265,6 +278,11 @@ allowed. The username is auto-detected from `gh` or can be configured explicitly
 requires `policy.boundaries.enabled`; keep GitHub server-side branch protection enabled as
 defense in depth against direct API ref mutations or alternate Git clients. Disable
 `github.branch_protection.enabled` for non-Git projects.
+
+The native Rust admission engine is implemented independently of the current
+Swift-generated wrapper. It is not yet connected to `sendbox run`, and neither
+implementation replaces hosting-provider rulesets or protects alternate clients
+and direct GitHub API calls.
 
 ### Configuration Reference
 

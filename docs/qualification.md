@@ -41,6 +41,14 @@ setup/release behavior, and known-defect negative cases. Existing config and
 protocol fixtures remain the executable implementation tests where available;
 qualification fixtures define the cross-implementation contract.
 
+The native Git guard implements the protected-branch policy slice with typed
+Rust decisions and real-Git integration tests. Its evidence covers
+repository/workspace identity, aliases, options, remote rewrites, refspecs,
+timeouts, output limits, environment/config injection, trusted binary paths, and
+native exit preservation. The broader `policy.decisions` fixture remains
+specified until every command, network, MCP, and repository decision slice has
+a pure Rust implementation.
+
 `mcp.contracts` records the native framing, JSON-RPC, policy, exact-command,
 project-validation, legacy-trace, versioned-observation, redaction, backpressure,
 and cancellation contracts. It deliberately excludes guest/runtime integration
