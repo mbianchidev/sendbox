@@ -1,0 +1,29 @@
+[package]
+name = "sendbox-git-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+sendbox-git = { path = "../../crates/sendbox-git" }
+
+[[bin]]
+name = "argv_alias"
+path = "fuzz_targets/argv_alias.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "remote_refspec"
+path = "fuzz_targets/remote_refspec.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
