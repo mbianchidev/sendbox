@@ -1,0 +1,31 @@
+[package]
+name = "sendbox-credentials"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded credential broker and guarded GitHub repository authentication."
+
+[dependencies]
+async-trait.workspace = true
+http.workspace = true
+reqwest.workspace = true
+sendbox-config = { path = "../sendbox-config" }
+sendbox-egress = { path = "../sendbox-egress" }
+sendbox-runtime = { path = "../sendbox-runtime" }
+sendbox-secrets = { path = "../sendbox-secrets" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

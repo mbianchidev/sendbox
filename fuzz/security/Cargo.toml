@@ -9,7 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
+sendbox-secrets = { path = "../../crates/sendbox-secrets" }
 sendbox-security = { path = "../../crates/sendbox-security" }
+sendbox-session-security = { path = "../../crates/sendbox-session-security" }
 
 [[bin]]
 name = "audit_decode"
@@ -28,6 +30,34 @@ bench = false
 [[bin]]
 name = "snapshot_decode"
 path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_supervisor_decode"
+path = "fuzz_targets/session_supervisor_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_migration_decode"
+path = "fuzz_targets/session_migration_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "secret_envelope_decode"
+path = "fuzz_targets/secret_envelope_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "secret_record_decode"
+path = "fuzz_targets/secret_record_decode.rs"
 test = false
 doc = false
 bench = false
