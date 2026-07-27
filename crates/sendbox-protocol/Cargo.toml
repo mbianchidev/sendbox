@@ -12,6 +12,7 @@ hkdf.workspace = true
 hmac.workspace = true
 minicbor.workspace = true
 sendbox-core = { path = "../sendbox-core" }
+serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -19,7 +20,6 @@ zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

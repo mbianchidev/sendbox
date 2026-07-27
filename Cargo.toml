@@ -15,6 +15,7 @@ members = [
     "crates/sendbox-project",
     "crates/sendbox-protocol",
     "crates/sendbox-runtime",
+    "crates/sendbox-runtime-kata",
     "crates/sendbox-security",
     "crates/sendbox-session-security",
     "crates/sendbox-secrets",

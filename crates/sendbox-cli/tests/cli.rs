@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use sendbox_config::SandboxConfiguration;
+use sendbox_policy::{Action, DnsPolicy};
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -41,16 +42,109 @@ fn root_help_uses_the_final_command_name_and_only_implemented_surfaces() {
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Usage: sendbox <COMMAND>"));
-    for command in ["analyze", "completions", "devcontainer", "init", "policy"] {
+    for command in [
+        "analyze",
+        "completions",
+        "devcontainer",
+        "init",
+        "policy",
+        "run",
+    ] {
         assert!(stdout.contains(command));
     }
-    for deferred in ["run", "secret", "mcp", "boundary"] {
+    for deferred in ["secret", "mcp", "boundary"] {
         assert!(
             !stdout
                 .lines()
                 .any(|line| line.trim_start().starts_with(deferred))
         );
     }
+}
+
+#[test]
+fn experimental_run_rejects_relative_guest_commands_deterministically() {
+    let temporary = tempdir().unwrap();
+    let config = temporary.path().join("sandbox.yaml");
+    let source = std::fs::read_to_string(workspace_root().join("config/example-sandbox.yaml"))
+        .unwrap()
+        .replace("secrets:\n  - NPM_TOKEN\n  - DATABASE_URL", "secrets: []");
+    std::fs::write(&config, source).unwrap();
+    let output = run(&[
+        "run",
+        "--config",
+        config.to_str().unwrap(),
+        "--runtime",
+        "kata",
+        "--image",
+        "example.invalid/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--bundle",
+        ".",
+        "--trust-root",
+        "Cargo.toml",
+        "--json",
+        "--",
+        "echo",
+        "hello",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).expect("JSON error");
+    assert_eq!(result["event"], "error");
+    assert_eq!(result["exit_code"], 2);
+    assert_eq!(
+        result["message"],
+        "experimental Kata command must use an absolute guest executable path"
+    );
+}
+
+#[test]
+fn experimental_run_rejects_unwired_git_guard_before_launch() {
+    let temporary = tempdir().unwrap();
+    let config = temporary.path().join("sandbox.yaml");
+    let mut configuration =
+        SandboxConfiguration::load(workspace_root().join("config/example-sandbox.yaml")).unwrap();
+    configuration.secrets.clear();
+    configuration.github.forward_auth = false;
+    configuration.github.forward_copilot_auth = false;
+    configuration.github.allow_private_repository_access = false;
+    configuration.github.ssh_key_path = None;
+    make_network_permissive(&mut configuration);
+    std::fs::write(&config, serde_json::to_vec(&configuration).unwrap()).unwrap();
+    let output = run(&[
+        "run",
+        "--config",
+        config.to_str().unwrap(),
+        "--runtime",
+        "kata",
+        "--image",
+        "example.invalid/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--bundle",
+        ".",
+        "--trust-root",
+        "Cargo.toml",
+        "--json",
+        "--",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["message"],
+        "experimental Kata run does not wire the native Git branch guard"
+    );
+}
+
+fn make_network_permissive(configuration: &mut SandboxConfiguration) {
+    let network = &mut configuration.policy.network;
+    network.default_action = Action::Allow;
+    network.allowed_domains.clear();
+    network.blocked_domains.clear();
+    network.allowed_networks.clear();
+    network.blocked_networks.clear();
+    network.allowed_ports.clear();
+    network.allow_dns = true;
+    network.max_connections = None;
+    network.dns = DnsPolicy::default();
 }
 
 #[test]
@@ -249,6 +343,7 @@ fn completion_scripts_are_generated_from_the_sendbox_command_tree() {
         assert!(script.contains("completions"), "{shell}");
         assert!(script.contains("policy"), "{shell}");
         assert!(script.contains("init"), "{shell}");
+        assert!(script.contains("run"), "{shell}");
         assert!(!script.contains("sendbox-rs"), "{shell}");
     }
 }

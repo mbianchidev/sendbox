@@ -35,6 +35,39 @@ impl PreflightReport {
 pub struct CreateRequest {
     pub container_id: ContainerId,
     pub image: String,
+    pub hostname: String,
+    pub resources: RuntimeResources,
+    pub mounts: Vec<RuntimeMount>,
+    pub environment: Vec<RuntimeEnvironment>,
+    pub working_directory: PathBuf,
+    pub dns_servers: Vec<String>,
+    pub labels: Vec<RuntimeLabel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeResources {
+    pub cpus: u32,
+    pub memory_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeMount {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub writable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeEnvironment {
+    pub name: String,
+    pub value: String,
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeLabel {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Default)]

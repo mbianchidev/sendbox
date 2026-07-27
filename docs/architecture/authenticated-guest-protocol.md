@@ -53,8 +53,12 @@ Message kinds are:
 9. protocol error
 
 Capabilities are typed identifiers for lifecycle, exec, streamed I/O, signals,
-mounts, network, MCP, audit, and health. Their operational payload schemas are
-not frozen by this foundation.
+mounts, network, MCP, audit, and health. Authenticated framing remains version
+1. The first operational schema is separately versioned by
+`OPERATION_SCHEMA_VERSION = 1`: `agent.launch` carries an exact program,
+argument vector, absolute working directory, bounded environment, and timeout;
+its terminal response carries exit/signal or a typed cancellation/failure state
+plus broker cleanup completion. Existing protocol vectors are unchanged.
 
 ## Handshake
 

@@ -22,6 +22,7 @@ pub enum RuntimeCapability {
     PublishedUnixControlChannel,
     InheritedStdioControlChannel,
     InheritedFileDescriptorControlChannel,
+    RuntimeExecStdioControlChannel,
 }
 
 impl RuntimeCapability {
@@ -42,7 +43,8 @@ impl RuntimeCapability {
             | Self::VsockControlChannel
             | Self::PublishedUnixControlChannel
             | Self::InheritedStdioControlChannel
-            | Self::InheritedFileDescriptorControlChannel => None,
+            | Self::InheritedFileDescriptorControlChannel
+            | Self::RuntimeExecStdioControlChannel => None,
         }
     }
 }
@@ -146,6 +148,7 @@ mod tests {
             RuntimeCapability::PublishedUnixControlChannel,
             RuntimeCapability::InheritedStdioControlChannel,
             RuntimeCapability::InheritedFileDescriptorControlChannel,
+            RuntimeCapability::RuntimeExecStdioControlChannel,
         ]);
         assert_eq!(runtime.to_wire(), wire.into());
     }
