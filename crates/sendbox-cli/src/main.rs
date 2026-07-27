@@ -199,19 +199,6 @@ async fn run(arguments: RunArgs) -> ExitCode {
         );
         return ExitCode::from(INVALID_CONFIGURATION_EXIT);
     }
-    if !configuration.secrets.is_empty()
-        || configuration
-            .observability
-            .as_ref()
-            .is_some_and(|value| value.mcp_inspection.enabled)
-    {
-        emit_run_error(
-            arguments.json,
-            INVALID_CONFIGURATION_EXIT,
-            "experimental Kata run does not provide secrets or MCP inspection",
-        );
-        return ExitCode::from(INVALID_CONFIGURATION_EXIT);
-    }
     let Some(program) = arguments.command.first() else {
         emit_run_error(
             arguments.json,
@@ -226,6 +213,10 @@ async fn run(arguments: RunArgs) -> ExitCode {
             INVALID_CONFIGURATION_EXIT,
             "experimental Kata command must use an absolute guest executable path",
         );
+        return ExitCode::from(INVALID_CONFIGURATION_EXIT);
+    }
+    if let Some(error) = unavailable_run_feature(&configuration) {
+        emit_run_error(arguments.json, INVALID_CONFIGURATION_EXIT, error);
         return ExitCode::from(INVALID_CONFIGURATION_EXIT);
     }
     let kata = configuration
@@ -703,6 +694,7 @@ fn project_identity(path: &Path) -> Result<(u32, u32), String> {
                     .to_owned(),
             );
         }
+
         Ok((metadata.uid(), metadata.gid()))
     }
     #[cfg(not(unix))]
@@ -710,6 +702,43 @@ fn project_identity(path: &Path) -> Result<(u32, u32), String> {
         let _ = path;
         Err("experimental Kata workloads require a Unix host".to_owned())
     }
+}
+
+fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'static str> {
+    if !configuration.secrets.is_empty() {
+        return Some("experimental Kata run does not provide secret injection");
+    }
+    if configuration
+        .observability
+        .as_ref()
+        .is_some_and(|value| value.mcp_inspection.enabled)
+    {
+        return Some("experimental Kata run does not wire the native MCP subsystem");
+    }
+    if configuration.github.forward_auth
+        || configuration.github.forward_copilot_auth
+        || configuration.github.allow_private_repository_access
+        || configuration.github.ssh_key_path.is_some()
+    {
+        return Some("experimental Kata run does not wire the credential broker");
+    }
+    if configuration.github.branch_protection.enabled {
+        return Some("experimental Kata run does not wire the native Git branch guard");
+    }
+    let network = &configuration.policy.network;
+    if network.default_action != sendbox_policy::Action::Allow
+        || !network.allowed_domains.is_empty()
+        || !network.blocked_domains.is_empty()
+        || !network.allowed_networks.is_empty()
+        || !network.blocked_networks.is_empty()
+        || !network.allowed_ports.is_empty()
+        || !network.allow_dns
+        || network.max_connections.is_some()
+        || network.dns != sendbox_policy::DnsPolicy::default()
+    {
+        return Some("experimental Kata run does not wire production egress enforcement");
+    }
+    None
 }
 
 fn emit_run_error(json: bool, exit_code: u8, message: &str) {

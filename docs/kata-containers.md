@@ -30,6 +30,13 @@ owned by a non-root uid/gid. The bundle must contain the signed static
 
 This command never invokes or falls back to Swift.
 
+The command also fails before image pull or VM launch when the configuration
+requests currently unwired integrations: secret injection, GitHub/Copilot/SSH
+credential forwarding, private-repository credentials, native Git branch
+protection, MCP inspection, or restrictive DNS/egress policy. Those production
+subsystems exist in Rust but are not silently enabled by this first Kata run
+slice.
+
 SendBox can run sandboxes on Linux through [Kata Containers](https://katacontainers.io/), using `nerdctl` to create each workload with the Kata containerd shim. The agent runs in a dedicated hardware-virtualized guest rather than sharing the host kernel.
 
 ## Requirements
