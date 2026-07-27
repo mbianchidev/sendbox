@@ -34,6 +34,20 @@
       }
     },
     {
+      "id": "cli.parity-subset",
+      "area": "cli",
+      "description": "Runtime-independent Rust CLI parity for root help, init, policy show, and completion print/install.",
+      "oracle": "intended_behavior",
+      "status": "implemented",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/cli-parity-subset.v1.json",
+      "swift_observation": {
+        "evidence_path": "Sources/sendbox/SendBox.swift",
+        "note": "Swift command names, presets, and install paths are retained where safe; Rust adds strict validation, JSON, stable exits, and direct clap generation."
+      },
+      "command": null
+    },
+    {
       "id": "config.contracts",
       "area": "config",
       "description": "Canonical defaults, strict decoding, validation errors, and compatibility behavior.",
@@ -52,6 +66,17 @@
       "status": "specified",
       "negative_case": false,
       "data_path": "Tests/qualification/fixtures/policy-decisions.v1.json",
+      "swift_observation": null,
+      "command": null
+    },
+    {
+      "id": "mcp.contracts",
+      "area": "mcp",
+      "description": "Bounded framing, strict JSON-RPC, deny-first stdio policy, exact command brokering, config validation, and versioned observation contracts.",
+      "oracle": "intended_behavior",
+      "status": "implemented",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/mcp.v1.json",
       "swift_observation": null,
       "command": null
     },
@@ -82,7 +107,7 @@
       "area": "formats",
       "description": "Versioned audit, snapshot, provenance, grants, config, and protocol samples.",
       "oracle": "intended_behavior",
-      "status": "specified",
+      "status": "implemented",
       "negative_case": false,
       "data_path": "Tests/qualification/fixtures/persisted-formats.v1.json",
       "swift_observation": null,

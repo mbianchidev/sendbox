@@ -29,6 +29,11 @@ are rejected. Verified kernel and initrd descriptors are copied into a fresh
 private invocation directory, so execution does not reopen an unverified
 artifact pathname.
 
+The provider configuration is immutable across containers. `CreateRequest`
+must therefore request one vCPU, the configured memory and working directory,
+and no hostname, per-container mounts, environment, DNS servers, or labels.
+Unsupported intent is rejected during `create` rather than silently ignored.
+
 ## Lifecycle and execution
 
 `create` creates a logical handle. `start` either marks that handle running or

@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::GuestError;
+use crate::broker::ExecutionBrokerBootstrap;
 use crate::manifest::encode_hex;
 use crate::platform::ControlKind;
 use crate::secure_fs::{
@@ -35,6 +36,7 @@ pub struct BootstrapMaterial {
     pub required_controls: Vec<ControlKind>,
     pub required_services: Vec<ServiceId>,
     pub services: Vec<ServiceSpec>,
+    pub execution_broker: Option<ExecutionBrokerBootstrap>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +56,8 @@ struct BootstrapWire {
     required_services: Vec<ServiceId>,
     #[serde(default)]
     services: Vec<ServiceSpec>,
+    #[serde(default)]
+    execution_broker: Option<ExecutionBrokerBootstrap>,
 }
 
 struct SecretBytes(Zeroizing<[u8; 32]>);
@@ -227,6 +231,7 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapMaterial, GuestError> {
         required_controls: wire.required_controls,
         required_services: wire.required_services,
         services: wire.services,
+        execution_broker: wire.execution_broker,
     })
 }
 

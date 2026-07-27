@@ -2,8 +2,8 @@ use std::{path::PathBuf, time::Duration};
 
 use sendbox_runtime::{
     CancellationToken, CommandArgument, CommandSpec, ContainerId, CreateRequest, ExecPurpose,
-    ExecRequest, InitializeRequest, PreflightRequest, Program, RuntimeProvider, StartRequest,
-    StopRequest,
+    ExecRequest, InitializeRequest, PreflightRequest, Program, RuntimeProvider, RuntimeResources,
+    StartRequest, StopRequest,
 };
 use sendbox_runtime_hyperlight::{
     HyperlightConfiguration, HyperlightNetworkConfiguration, HyperlightRuntime,
@@ -72,6 +72,16 @@ async fn live_hyperlight_launch_when_designated() {
             CreateRequest {
                 container_id: id.clone(),
                 image: bundle.display().to_string(),
+                hostname: String::new(),
+                resources: RuntimeResources {
+                    cpus: 1,
+                    memory_bytes: 64 * 1024 * 1024,
+                },
+                mounts: Vec::new(),
+                environment: Vec::new(),
+                working_directory: PathBuf::from("/"),
+                dns_servers: Vec::new(),
+                labels: Vec::new(),
             },
             &cancellation,
         )

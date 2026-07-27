@@ -3,8 +3,9 @@ use std::sync::Arc;
 use sendbox_protocol::{Capability, CapabilitySet};
 use sendbox_runtime::{
     BootstrapDelivery, BootstrapMaterial, CancellationToken, ChannelLifetime, ChannelOwnership,
-    CleanupReport, ControlChannelRequest, CreateRequest, InitializeRequest, PreflightRequest,
-    ProvisionedControlChannel, RuntimeProvider, StartRequest, StopRequest,
+    CleanupReport, ControlChannelRequest, ControlEndpointKind, CreateRequest, InitializeRequest,
+    PreflightRequest, ProvisionedControlChannel, RUNTIME_INJECTED_BOOTSTRAP_TARGET,
+    RuntimeEnvironment, RuntimeLabel, RuntimeMount, RuntimeProvider, StartRequest, StopRequest,
 };
 
 use crate::{
@@ -170,6 +171,40 @@ impl AgentOrchestrator {
                 CreateRequest {
                     container_id: plan.container_id().clone(),
                     image: plan.image().to_owned(),
+                    hostname: runtime_hostname(plan.container_id().as_str()),
+                    resources: plan.resources(),
+                    mounts: std::iter::once(RuntimeMount {
+                        source: plan.workspace().host_path.clone(),
+                        destination: plan.workspace().guest_path.clone(),
+                        writable: plan.workspace().writable,
+                    })
+                    .chain(plan.mounts().iter().map(|mount| RuntimeMount {
+                        source: mount.source.clone(),
+                        destination: mount.destination.clone(),
+                        writable: mount.writable,
+                    }))
+                    .collect(),
+                    environment: plan
+                        .environment()
+                        .iter()
+                        .map(|entry| RuntimeEnvironment {
+                            name: entry.name.clone(),
+                            value: entry.value.clone(),
+                            sensitive: false,
+                        })
+                        .collect(),
+                    working_directory: plan.command().working_directory.clone().into(),
+                    dns_servers: Vec::new(),
+                    labels: vec![
+                        RuntimeLabel {
+                            name: "dev.sendbox.managed".to_owned(),
+                            value: "true".to_owned(),
+                        },
+                        RuntimeLabel {
+                            name: "dev.sendbox.session".to_owned(),
+                            value: plan.session_id().to_string(),
+                        },
+                    ],
                 },
                 cancellation,
             )
@@ -200,7 +235,7 @@ impl AgentOrchestrator {
             ownership: ChannelOwnership::RuntimeLifecycle,
             lifetime: ChannelLifetime::UntilRuntimeCleanup,
             readiness_timeout: plan.readiness_timeout(),
-            bootstrap_delivery: BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
+            bootstrap_delivery: bootstrap_delivery(plan.endpoint_kind()),
             bootstrap_material: BootstrapMaterial::new(bootstrap.as_bytes().to_vec())?,
         };
         let channel = self
@@ -447,6 +482,7 @@ fn append_runtime_cleanup_failures(report: CleanupReport, failures: &mut Vec<Cle
             error: AgentError::Runtime(failure.error),
         });
     }
+
     if report.remaining > 0 && !had_failures {
         failures.push(CleanupFailure {
             step: "runtime cleanup completion",
@@ -455,5 +491,42 @@ fn append_runtime_cleanup_failures(report: CleanupReport, failures: &mut Vec<Cle
                 report.remaining
             )),
         });
+    }
+}
+
+fn runtime_hostname(container_id: &str) -> String {
+    container_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(63)
+        .collect()
+}
+
+fn bootstrap_delivery(endpoint: ControlEndpointKind) -> BootstrapDelivery {
+    match endpoint {
+        ControlEndpointKind::RuntimeExecStdio => BootstrapDelivery::RuntimeInjection {
+            target: RUNTIME_INJECTED_BOOTSTRAP_TARGET.to_owned(),
+        },
+        _ => BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_exec_transport_uses_the_shared_injection_target() {
+        assert!(matches!(
+            bootstrap_delivery(ControlEndpointKind::RuntimeExecStdio),
+            BootstrapDelivery::RuntimeInjection { target }
+                if target == RUNTIME_INJECTED_BOOTSTRAP_TARGET
+        ));
     }
 }

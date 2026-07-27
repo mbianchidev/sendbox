@@ -18,6 +18,12 @@ crate and phase, and a conformance status. Redesigns also require a
 compatibility note. Validation fails on duplicate IDs, missing evidence,
 unknown fields, missing fixtures, or an unresolved disposition.
 
+The phase 9 security records now include library-level evidence for the
+adapter-neutral session lifecycle, audit anchoring, snapshot rollback, secret
+envelopes, provenance verification, permission grants, and bounded migration
+reports. These entries do not claim host agent, runtime, CLI, MCP, credential
+listener, or guest enforcement integration.
+
 For a PR, changed behavior must update the corresponding inventory and fixture.
 Cutover requires every preserved entry to have a passing implementation test
 and every redesign to have its compatibility note satisfied.
@@ -34,6 +40,19 @@ decisions, protocol contracts, runtime capabilities, persisted formats,
 setup/release behavior, and known-defect negative cases. Existing config and
 protocol fixtures remain the executable implementation tests where available;
 qualification fixtures define the cross-implementation contract.
+
+The native Git guard implements the protected-branch policy slice with typed
+Rust decisions and real-Git integration tests. Its evidence covers
+repository/workspace identity, aliases, options, remote rewrites, refspecs,
+timeouts, output limits, environment/config injection, trusted binary paths, and
+native exit preservation. The broader `policy.decisions` fixture remains
+specified until every command, network, MCP, and repository decision slice has
+a pure Rust implementation.
+
+`mcp.contracts` records the native framing, JSON-RPC, policy, exact-command,
+project-validation, legacy-trace, versioned-observation, redaction, backpressure,
+and cancellation contracts. It deliberately excludes guest/runtime integration
+and remote HTTP authorization.
 
 The comparison runner invokes binaries directly, never through a shell. It
 normalizes declared paths and JSON fields, enforces a timeout and combined
@@ -78,11 +97,25 @@ cargo run --manifest-path tools/sendbox-qualification/Cargo.toml -- \
   --rust-binary target/release/sendbox-rs
 ```
 
-The harness never starts Apple container services, containerd, Kata,
-Hyperlight, guest services, or BPF programs. Vendor baselines must be run
-manually on prepared hosts using the pinned fixed-adapter definition. A result
-cannot be published while any required workload, reference host field,
-relative C baseline, fixed-adapter baseline, or BPF event rate remains
+The portable harness never starts Apple container services, containerd, Kata,
+Hyperlight, guest services, or BPF programs. The experimental Rust Kata slice
+adds a separate, non-skipping self-hosted gate:
+
+```bash
+SENDBOX_KATA_LIVE=1 \
+SENDBOX_KATA_CONFIG=/absolute/config.yaml \
+SENDBOX_KATA_IMAGE=registry/workload@sha256:<digest> \
+SENDBOX_KATA_BUNDLE=/absolute/bundle \
+SENDBOX_KATA_TRUST_ROOT=/absolute/release-public.key \
+./scripts/qualify-kata-live.sh
+```
+
+`.github/workflows/kata-live.yaml` requires a runner labeled
+`self-hosted, linux, x64, kvm, kata`. Missing inputs or prerequisites fail; they
+are never reported as a successful skip. Vendor baselines must still be run on
+prepared hosts using the pinned fixed-adapter definition. A result cannot be
+published while any required workload, reference host field, relative C
+baseline, fixed-adapter baseline, BPF event rate, or live Kata evidence remains
 `unqualified`.
 
 ## Hyperlight runtime qualification

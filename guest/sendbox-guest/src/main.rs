@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use sendbox_guest::GuestError;
-use sendbox_guest::platform::UnavailablePlatformControls;
+use sendbox_guest::platform::LinuxPlatformControls;
 use sendbox_guest::runtime::RuntimeIdentity;
 use sendbox_guest::supervisor::{SupervisorOptions, run};
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::process::Command;
@@ -36,6 +37,12 @@ enum Commands {
     Health(HealthArgs),
     #[command(hide = true)]
     ServiceRun(ServiceRunArgs),
+    #[command(hide = true)]
+    ExecBroker(ExecBrokerArgs),
+    #[command(hide = true)]
+    Tunnel(TunnelArgs),
+    #[command(hide = true)]
+    InjectBootstrap(InjectBootstrapArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -78,6 +85,28 @@ struct ServiceRunArgs {
     spawn_child: bool,
 }
 
+#[derive(Debug, Args)]
+struct ExecBrokerArgs {
+    #[arg(long)]
+    config: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct TunnelArgs {
+    #[arg(long)]
+    socket: PathBuf,
+    #[arg(long, default_value_t = 30_000)]
+    connect_timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
+struct InjectBootstrapArgs {
+    #[arg(long)]
+    bootstrap_target: PathBuf,
+    #[arg(long)]
+    trust_root_target: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum FixtureMode {
     Healthy,
@@ -85,7 +114,7 @@ enum FixtureMode {
     IgnoreTerm,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match execute(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -97,7 +126,7 @@ async fn main() -> ExitCode {
 }
 
 async fn execute(cli: Cli) -> Result<(), GuestError> {
-    match cli.command {
+    return match cli.command {
         Commands::Bootstrap(args) | Commands::Supervisor(args) => {
             run(
                 SupervisorOptions {
@@ -107,7 +136,7 @@ async fn execute(cli: Cli) -> Result<(), GuestError> {
                     runtime_root: args.runtime_root,
                     replay_root: args.replay_root,
                 },
-                &UnavailablePlatformControls,
+                &LinuxPlatformControls::new(PathBuf::from("/sys/fs/cgroup/sendbox")),
                 RuntimeIdentity::root(),
             )
             .await
@@ -120,6 +149,104 @@ async fn execute(cli: Cli) -> Result<(), GuestError> {
             Ok(())
         }
         Commands::ServiceRun(args) => service_run(args).await,
+        Commands::ExecBroker(args) => sendbox_guest::broker::run(args.config).await,
+        Commands::Tunnel(args) => tunnel(args).await,
+        Commands::InjectBootstrap(args) => inject_bootstrap(args).await,
+    };
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct InjectionEnvelope {
+        bootstrap: Vec<u8>,
+        trust_root: Vec<u8>,
+    }
+
+    async fn inject_bootstrap(args: InjectBootstrapArgs) -> Result<(), GuestError> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use zeroize::Zeroize;
+
+        if args.bootstrap_target.parent() != args.trust_root_target.parent()
+            || !args.bootstrap_target.is_absolute()
+        {
+            return Err(GuestError::Bootstrap(
+                "injected bootstrap paths must share one absolute parent".to_owned(),
+            ));
+        }
+        let parent = args
+            .bootstrap_target
+            .parent()
+            .expect("absolute injection path has a parent");
+        if !parent.exists() {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(parent)
+                .map_err(|error| GuestError::io("creating bootstrap injection directory", error))?;
+        }
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| GuestError::io("setting bootstrap injection directory mode", error))?;
+        let mut encoded = Vec::new();
+        tokio::io::stdin()
+            .take(128 * 1024)
+            .read_to_end(&mut encoded)
+            .await
+            .map_err(|error| GuestError::io("reading injected bootstrap", error))?;
+        let mut envelope: InjectionEnvelope =
+            serde_json::from_slice(&encoded).map_err(|error| {
+                GuestError::Bootstrap(format!("decode injection envelope: {error}"))
+            })?;
+        encoded.zeroize();
+        if envelope.trust_root.len() != 32 {
+            envelope.bootstrap.zeroize();
+            envelope.trust_root.zeroize();
+            return Err(GuestError::Bootstrap(
+                "injected trust root must contain exactly 32 bytes".to_owned(),
+            ));
+        }
+        write_injected(&args.bootstrap_target, &envelope.bootstrap, 0o400)?;
+        write_injected(&args.trust_root_target, &envelope.trust_root, 0o444)?;
+        envelope.bootstrap.zeroize();
+        envelope.trust_root.zeroize();
+        Ok(())
+    }
+
+    fn write_injected(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<(), GuestError> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(mode)
+            .open(path)
+            .map_err(|error| GuestError::io("creating injected file", error))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| GuestError::io("writing injected file", error))
+    }
+
+    async fn tunnel(args: TunnelArgs) -> Result<(), GuestError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(args.connect_timeout_ms);
+        let stream = loop {
+            match tokio::net::UnixStream::connect(&args.socket).await {
+                Ok(stream) => break stream,
+                Err(error) if tokio::time::Instant::now() < deadline => {
+                    let _ = error;
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(GuestError::io("connecting guest control socket", error)),
+            }
+        };
+        let (mut guest_read, mut guest_write) = stream.into_split();
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+        tokio::select! {
+            result = tokio::io::copy(&mut stdin, &mut guest_write) => {
+                result.map_err(|error| GuestError::io("tunneling host input", error))?;
+            }
+            result = tokio::io::copy(&mut guest_read, &mut stdout) => {
+                result.map_err(|error| GuestError::io("tunneling guest output", error))?;
+            }
+        }
+        Ok(())
     }
 }
 

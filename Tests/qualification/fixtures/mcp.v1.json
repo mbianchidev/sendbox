@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "framing": {
+    "supported": ["newline", "content_length"],
+    "auto_detection": "first_frame_locked",
+    "oversize": "fail_closed_before_body_allocation",
+    "batch_json_rpc": "rejected"
+  },
+  "tool_policy": {
+    "order": ["denylist", "allowlist", "default_action"],
+    "missing_tool": "terminate",
+    "denied_request_error": -32001,
+    "denied_notification": "drop"
+  },
+  "launch": {
+    "command_match": "exact_executable_and_argv",
+    "shells_and_package_runners": "rejected",
+    "inherited_environment": "cleared",
+    "project_env_and_cwd": "rejected"
+  },
+  "failure_semantics": {
+    "child_death": "fail_closed",
+    "output_saturation": "fail_closed",
+    "cancellation": "kill_and_bounded_reap"
+  },
+  "observation": {
+    "legacy_marker": "SENDBOX_MCP",
+    "native_marker": "SENDBOX_MCP_EVENT",
+    "native_schema_version": 1,
+    "http_authorization": false,
+    "runtime_integration": false
+  }
+}

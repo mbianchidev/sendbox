@@ -7,7 +7,9 @@ use std::{
 use sendbox_config::SandboxConfiguration;
 use sendbox_core::SessionId;
 use sendbox_protocol::{Capability, CapabilitySet};
-use sendbox_runtime::{ContainerId, ControlEndpointKind, RuntimeCapabilities, RuntimeCapability};
+use sendbox_runtime::{
+    ContainerId, ControlEndpointKind, RuntimeCapabilities, RuntimeCapability, RuntimeResources,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::AgentError;
@@ -87,6 +89,7 @@ pub struct RunPlan {
     bootstrap_reference: SecretReference,
     endpoint_kind: ControlEndpointKind,
     readiness_timeout: Duration,
+    resources: RuntimeResources,
     required_runtime_capabilities: RuntimeCapabilities,
     required_guest_capabilities: CapabilitySet,
 }
@@ -144,6 +147,19 @@ impl RunPlan {
             bootstrap_reference: request.bootstrap_reference,
             endpoint_kind,
             readiness_timeout: request.readiness_timeout,
+            resources: RuntimeResources {
+                cpus: u32::try_from(configuration.resources.cpus).map_err(|_| {
+                    AgentError::InvalidPlan("resource CPU count is out of range".to_owned())
+                })?,
+                memory_bytes: u64::try_from(configuration.resources.memory_mb)
+                    .map_err(|_| {
+                        AgentError::InvalidPlan("resource memory is out of range".to_owned())
+                    })?
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| {
+                        AgentError::InvalidPlan("resource memory is out of range".to_owned())
+                    })?,
+            },
             required_runtime_capabilities,
             required_guest_capabilities: CapabilitySet::from([
                 Capability::Exec,
@@ -214,6 +230,11 @@ impl RunPlan {
     }
 
     #[must_use]
+    pub const fn resources(&self) -> RuntimeResources {
+        self.resources
+    }
+
+    #[must_use]
     pub const fn required_runtime_capabilities(&self) -> &RuntimeCapabilities {
         &self.required_runtime_capabilities
     }
@@ -274,6 +295,10 @@ fn validate_request(
 fn select_endpoint(available: &RuntimeCapabilities) -> Result<ControlEndpointKind, AgentError> {
     [
         (
+            RuntimeCapability::RuntimeExecStdioControlChannel,
+            ControlEndpointKind::RuntimeExecStdio,
+        ),
+        (
             RuntimeCapability::VsockControlChannel,
             ControlEndpointKind::Vsock,
         ),
@@ -305,6 +330,7 @@ const fn endpoint_capability(endpoint: ControlEndpointKind) -> RuntimeCapability
         ControlEndpointKind::InheritedFileDescriptor => {
             RuntimeCapability::InheritedFileDescriptorControlChannel
         }
+        ControlEndpointKind::RuntimeExecStdio => RuntimeCapability::RuntimeExecStdioControlChannel,
         ControlEndpointKind::Unavailable => RuntimeCapability::TransportProvisioning,
     }
 }

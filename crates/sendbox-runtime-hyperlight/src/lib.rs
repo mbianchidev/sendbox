@@ -849,6 +849,7 @@ impl RuntimeProvider for HyperlightRuntime {
                     self.configuration.bundle_root.display()
                 )));
             }
+            validate_create_request(&request, &self.configuration)?;
             let artifacts = self.load_artifacts()?;
             let mut containers = self.containers.lock().await;
             if containers.contains_key(&request.container_id) {
@@ -1359,6 +1360,56 @@ fn validate_configuration(configuration: &HyperlightConfiguration) -> Result<(),
     if !configuration.listen_ports.is_empty() && network.is_empty() {
         return Err(invalid(
             "listen ports require an explicit Hyperlight network policy",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_create_request(
+    request: &sendbox_runtime::CreateRequest,
+    configuration: &HyperlightConfiguration,
+) -> Result<(), RuntimeError> {
+    if !request.hostname.is_empty() {
+        return Err(invalid(
+            "hyperlight-unikraft does not support guest hostname injection",
+        ));
+    }
+    if request.resources.cpus != 1 {
+        return Err(invalid(
+            "hyperlight-unikraft supports only one fixed virtual CPU",
+        ));
+    }
+    let expected_memory_bytes = configuration.memory_mib * 1024 * 1024;
+    if request.resources.memory_bytes != expected_memory_bytes {
+        return Err(invalid(format!(
+            "Hyperlight memory must match the configured {} MiB",
+            configuration.memory_mib
+        )));
+    }
+    if !request.mounts.is_empty() {
+        return Err(invalid(
+            "per-container Hyperlight mounts are unsupported; configure immutable mounts on the provider",
+        ));
+    }
+    if !request.environment.is_empty() {
+        return Err(invalid(
+            "hyperlight-unikraft does not support guest environment injection",
+        ));
+    }
+    if request.working_directory != configuration.working_directory {
+        return Err(invalid(format!(
+            "Hyperlight working directory must match the configured `{}`",
+            configuration.working_directory.display()
+        )));
+    }
+    if !request.dns_servers.is_empty() {
+        return Err(invalid(
+            "per-container DNS servers are unsupported; configure Hyperlight network policy on the provider",
+        ));
+    }
+    if !request.labels.is_empty() {
+        return Err(invalid(
+            "hyperlight-unikraft does not support runtime labels",
         ));
     }
     Ok(())

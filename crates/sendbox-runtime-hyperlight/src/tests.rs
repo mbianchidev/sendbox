@@ -14,7 +14,8 @@ use sendbox_guest::manifest::{
 use sendbox_runtime::{
     CancellationToken, CommandArgument, CommandSpec, ContainerId, CreateRequest, ExecPurpose,
     ExecRequest, InitializeRequest, LifecycleState, PreflightRequest, Program, RuntimeCapabilities,
-    RuntimeCapability, RuntimeId, RuntimeProvider, StartRequest, StopRequest, TerminationReason,
+    RuntimeCapability, RuntimeEnvironment, RuntimeId, RuntimeLabel, RuntimeMount, RuntimeProvider,
+    RuntimeResources, StartRequest, StopRequest, TerminationReason,
 };
 use sendbox_testkit::{RuntimeConformanceScenario, run_runtime_conformance};
 use serde_json::json;
@@ -24,8 +25,8 @@ use tempfile::TempDir;
 use super::{
     AuthenticatedLaunchRequest, HyperlightConfiguration, HyperlightMount,
     HyperlightNetworkConfiguration, HyperlightNetworkMode, HyperlightRuntime, network_arguments,
-    shell_command, validate_mount_staging_separation, validate_mounts, validate_trusted_file,
-    verify_kvm_device,
+    shell_command, validate_create_request, validate_mount_staging_separation, validate_mounts,
+    validate_trusted_file, verify_kvm_device,
 };
 
 struct Fixture {
@@ -126,13 +127,7 @@ impl Fixture {
             .expect("preflight");
         let id = ContainerId::new("hyperlight-test").expect("ID");
         self.runtime
-            .create(
-                CreateRequest {
-                    container_id: id.clone(),
-                    image: self.bundle.display().to_string(),
-                },
-                &cancellation,
-            )
+            .create(self.create_request(id.clone()), &cancellation)
             .await
             .expect("create");
         self.runtime
@@ -146,6 +141,23 @@ impl Fixture {
             .await
             .expect("start");
         id
+    }
+
+    fn create_request(&self, container_id: ContainerId) -> CreateRequest {
+        CreateRequest {
+            container_id,
+            image: self.bundle.display().to_string(),
+            hostname: String::new(),
+            resources: RuntimeResources {
+                cpus: 1,
+                memory_bytes: 64 * 1024 * 1024,
+            },
+            mounts: Vec::new(),
+            environment: Vec::new(),
+            working_directory: PathBuf::from("/work"),
+            dns_servers: Vec::new(),
+            labels: Vec::new(),
+        }
     }
 
     fn temporary_path(&self) -> &Path {
@@ -406,6 +418,57 @@ fn writable_mounts_fail_closed() {
         }])
         .is_err()
     );
+}
+
+#[test]
+fn create_request_rejects_unmapped_runtime_intent() {
+    let fixture = Fixture::new(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'hyperlight-unikraft 0.test'; fi\n",
+        deny_network(),
+    );
+    let baseline = fixture.create_request(ContainerId::new("create-request").expect("ID"));
+    assert!(validate_create_request(&baseline, &fixture.runtime.configuration).is_ok());
+
+    let mut hostname = baseline.clone();
+    hostname.hostname = "guest".to_owned();
+    let mut cpus = baseline.clone();
+    cpus.resources.cpus = 2;
+    let mut memory = baseline.clone();
+    memory.resources.memory_bytes += 1024 * 1024;
+    let mut mounts = baseline.clone();
+    mounts.mounts.push(RuntimeMount {
+        source: fixture.readonly_source.clone(),
+        destination: PathBuf::from("/work/request"),
+        writable: false,
+    });
+    let mut environment = baseline.clone();
+    environment.environment.push(RuntimeEnvironment {
+        name: "TOKEN".to_owned(),
+        value: "secret".to_owned(),
+        sensitive: true,
+    });
+    let mut working_directory = baseline.clone();
+    working_directory.working_directory = PathBuf::from("/other");
+    let mut dns = baseline.clone();
+    dns.dns_servers.push("1.1.1.1".to_owned());
+    let mut labels = baseline;
+    labels.labels.push(RuntimeLabel {
+        name: "dev.sendbox.test".to_owned(),
+        value: "true".to_owned(),
+    });
+
+    for request in [
+        hostname,
+        cpus,
+        memory,
+        mounts,
+        environment,
+        working_directory,
+        dns,
+        labels,
+    ] {
+        assert!(validate_create_request(&request, &fixture.runtime.configuration).is_err());
+    }
 }
 
 #[test]
@@ -710,10 +773,7 @@ async fn shared_runtime_conformance_passes_for_one_shot_subset() {
             initialize: InitializeRequest {
                 state_directory: fixture.state.clone(),
             },
-            create: CreateRequest {
-                container_id: ContainerId::new("conformance-hyperlight").expect("ID"),
-                image: fixture.bundle.display().to_string(),
-            },
+            create: fixture.create_request(ContainerId::new("conformance-hyperlight").expect("ID")),
             start: StartRequest {
                 attach_standard_streams: false,
             },

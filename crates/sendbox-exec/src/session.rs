@@ -114,6 +114,15 @@ impl BrokerSession {
     }
 
     #[must_use]
+    pub fn from_material(id: SessionId, authentication: SessionAuthentication) -> Self {
+        Self {
+            id,
+            token: Zeroizing::new(*authentication.as_bytes()),
+            correlations: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    #[must_use]
     pub const fn id(&self) -> SessionId {
         self.id
     }

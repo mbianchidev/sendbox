@@ -16,8 +16,8 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 - **Credential Injection** — Secrets load from macOS Keychain or the protected Linux secret store and are injected without persisting them in the guest filesystem.
 - **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
 - **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
-- **MCP Inspection (eBPF)** — Observe Model Context Protocol JSON-RPC traffic between the agent and its MCP servers at the kernel boundary. Captures both stdio and HTTP/SSE transports, classifies tool calls, and feeds the audit trail. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
-- **Boundary Enforcement** — Run every agent process under a seccomp-BPF syscall denylist and route stdio MCP servers through a framing-aware tool proxy. eBPF detects direct proxy bypass attempts and records denied syscalls. Enforcement is fail-closed.
+- **Native MCP Core** — Safe Rust framing, strict JSON-RPC validation, deny-first stdio tool policy, exact-command brokering, config validation, legacy trace parsing, and versioned native observation records. Runtime/guest wiring remains separate. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
+- **Boundary Enforcement** — Existing runtime paths retain their current boundary implementation while the native MCP broker is integrated. The Rust library itself does not claim guest installation or direct-launch prevention.
 - **Supply Chain Provenance** — Ed25519 signing for config and policy files ensures they were authored by trusted identities. Multi-signer support with a configurable trust store.
 - **Runtime Supervisor** — Dynamic permission expansion with approval workflows. Agents start restricted and earn broader permissions through supervised interaction (one-time, session-wide, or pattern-based grants).
 - **VM Hardening** — Defense-in-depth sysctl lockdown, capability dropping, and seccomp profiles covering all 18 [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) scenarios.
@@ -82,11 +82,20 @@ For an interactive runtime preflight and configuration flow:
 
 Kata installation and containerd configuration are documented in [docs/kata-containers.md](docs/kata-containers.md).
 
-### Experimental Rust validator
+### Experimental Rust CLI subset
 
-The parallel Rust foundation builds an experimental `sendbox-rs` binary. In this
-phase it only parses and validates configuration and policy; all sandbox runtime
-execution remains on the production Swift `sendbox` binary.
+The parallel Rust foundation builds an experimental `sendbox-rs` binary whose
+command name and generated completions are `sendbox`. The Rust CLI currently
+supports configuration initialization, policy show/validation, native project
+analysis, devcontainer generation, and bash/zsh/fish completion print/install.
+Sandbox execution, secrets, MCP, boundary, and release installation remain on
+the production Swift `sendbox` binary.
+
+The workspace also includes focused production Rust components that are not yet
+wired into `sendbox run`. `sendbox-git` provides typed selected-repository
+push/pull admission and the `sendbox-git-guard` native execution shim for later
+exec-broker/guest integration. See
+[docs/architecture/git-branch-guard.md](docs/architecture/git-branch-guard.md).
 
 The workspace also contains the pre-1.0 `sendbox-protocol` foundation for
 bounded, authenticated host/guest communication. `sendbox-runtime` now owns the
@@ -96,17 +105,30 @@ runtime-specific socket mappings. See
 [authenticated guest protocol](docs/architecture/authenticated-guest-protocol.md)
 and [agent orchestration](docs/architecture/agent-orchestration.md).
 
+The pre-1.0 `sendbox-credentials` production library provides explicit
+loopback credential endpoints and guarded GitHub repository authorization. It
+requires agents to support API base-URL overrides and intentionally does not
+intercept TLS or support CONNECT injection. Runtime/CLI lifecycle wiring is
+deferred. See
+[docs/architecture/secrets-and-credential-broker.md](docs/architecture/secrets-and-credential-broker.md).
+
 ```bash
 make rust-build
 make rust-test
 ./target/debug/sendbox-rs --version
+./target/debug/sendbox-rs init --project .
+./target/debug/sendbox-rs policy show --json
 ./target/debug/sendbox-rs policy validate --config config/example-sandbox.yaml
 ./target/debug/sendbox-rs policy validate --config config/example-sandbox.yaml --json
+./target/debug/sendbox-rs completions print --shell zsh
 ```
 
-The JSON form is deterministic and intended for future Swift/Rust differential
-tests. Invalid configuration returns exit status `2`; text diagnostics are
-written to stderr, while `--json` always writes its result to stdout.
+Rust-generated configuration uses deterministic snake_case YAML, validates
+before writing, is created atomically with mode `0600`, and refuses to overwrite
+an existing `.sendbox.yaml`. JSON results are deterministic. Invalid input or
+configuration returns `2`; analysis failures return `3`; write failures and
+no-overwrite refusals return `4`. Text diagnostics use stderr, while `--json`
+failures use stdout only.
 
 ### Running Unsigned macOS Releases
 
@@ -257,6 +279,11 @@ requires `policy.boundaries.enabled`; keep GitHub server-side branch protection 
 defense in depth against direct API ref mutations or alternate Git clients. Disable
 `github.branch_protection.enabled` for non-Git projects.
 
+The native Rust admission engine is implemented independently of the current
+Swift-generated wrapper. It is not yet connected to `sendbox run`, and neither
+implementation replaces hosting-provider rulesets or protects alternate clients
+and direct GitHub API calls.
+
 ### Configuration Reference
 
 | Section | Key | Description |
@@ -286,7 +313,7 @@ defense in depth against direct API ref mutations or alternate Git clients. Disa
 | `github.branch_protection.username` | string | Username used to expand `{username}` patterns; auto-detected by default |
 | `github.branch_protection.protected_branches` | list | Branch names that push and pull can never target |
 | `github.branch_protection.allowed_branch_patterns` | list | Glob patterns allowed for selected-repository push and pull |
-| `observability.mcp_inspection.enabled` | bool | Enable eBPF MCP call inspection (opt-in) |
+| `observability.mcp_inspection.enabled` | bool | Enable configured MCP observation (current runtime wiring remains provider-specific) |
 
 ## Architecture
 
@@ -319,11 +346,13 @@ or Copilot.
 
 The Rust workspace contains shared domain/error types, strict configuration and
 policy validation, native project analysis, runtime and credential primitives,
-and production Linux execution and egress enforcement. See the architecture documents for
+an adapter-neutral session security lifecycle, and production Linux execution
+and egress enforcement. See the architecture documents for
 [project analysis](docs/architecture/native-project-analysis.md),
 [runtime core](docs/architecture/runtime-core.md),
 [agent orchestration](docs/architecture/agent-orchestration.md),
 [secrets](docs/architecture/secrets-and-credential-broker.md), and
+[session security](docs/architecture/session-security-lifecycle.md),
 [execution brokerage](docs/architecture/execution-broker.md), plus
 [egress enforcement](docs/architecture/egress-enforcement.md).
 
@@ -344,6 +373,11 @@ SendBox follows a **deny-by-default** security posture:
 7. **Branches** — A root-installed git guard and eBPF bypass detector restrict selected-repository pushes and pulls to configured feature branch patterns.
 
 ## CLI Reference
+
+The table below is the intended complete `sendbox` surface. The experimental
+Rust binary currently implements `init`, `analyze`, `devcontainer`, `policy`,
+and `completions`. `run`, `secrets`, `mcp`, and `boundary` remain Swift-only
+until their runtime/security dependencies are cut over.
 
 ```
 USAGE: sendbox <subcommand> [options]
@@ -374,6 +408,13 @@ sendbox analyze --project . --output .devcontainer/
 
 # Validate a sandbox configuration's policy
 sendbox policy validate --config sendbox.yaml
+
+# Show the effective policy as deterministic JSON
+sendbox policy show --config sendbox.yaml --json
+
+# Print or install generated shell completions
+sendbox completions print --shell zsh
+sendbox completions install --shell fish
 
 # Experimental native analysis with automation JSON
 cargo run -p sendbox-cli -- analyze --project . --json
