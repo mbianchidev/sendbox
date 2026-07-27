@@ -1,3 +1,4 @@
+use sendbox_core::glob_matches;
 use serde::{Deserialize, Serialize};
 
 use crate::{GuardError, Operation};
@@ -175,38 +176,6 @@ fn valid_github_login(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-}
-
-fn glob_matches(value: &str, pattern: &str) -> bool {
-    let value = value.chars().collect::<Vec<_>>();
-    let pattern = pattern.chars().collect::<Vec<_>>();
-    let mut value_index = 0;
-    let mut pattern_index = 0;
-    let mut star_value = None;
-    let mut star_pattern = None;
-    while value_index < value.len() {
-        if pattern_index < pattern.len()
-            && (pattern[pattern_index] == '?' || pattern[pattern_index] == value[value_index])
-        {
-            value_index += 1;
-            pattern_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
-            star_pattern = Some(pattern_index);
-            star_value = Some(value_index);
-            pattern_index += 1;
-        } else if let (Some(pattern_star), Some(value_star)) = (star_pattern, star_value) {
-            let next_value = value_star + 1;
-            star_value = Some(next_value);
-            value_index = next_value;
-            pattern_index = pattern_star + 1;
-        } else {
-            return false;
-        }
-    }
-    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
-        pattern_index += 1;
-    }
-    pattern_index == pattern.len()
 }
 
 #[cfg(test)]

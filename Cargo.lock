@@ -1966,6 +1966,7 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "rustix",
+ "sendbox-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -2002,6 +2003,7 @@ dependencies = [
  "async-trait",
  "proptest",
  "sendbox-config",
+ "sendbox-core",
  "sendbox-policy",
  "serde",
  "serde_json",

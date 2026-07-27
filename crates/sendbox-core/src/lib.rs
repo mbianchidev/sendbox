@@ -4,6 +4,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+mod glob;
+
+pub use glob::glob_matches;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 

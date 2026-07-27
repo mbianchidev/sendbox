@@ -1,3 +1,4 @@
+pub use sendbox_core::glob_matches;
 use sendbox_policy::{Action, ToolCallPolicy};
 
 use crate::jsonrpc::{IdPresence, MessageKind, ValidatedMessage, denial_response};
@@ -130,43 +131,6 @@ fn denied(tool: &str, matched_rule: Option<String>, reason: impl Into<String>) -
         matched_rule,
         reason: Some(reason.into()),
     }
-}
-
-#[must_use]
-pub fn glob_matches(value: &str, pattern: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let value = value.chars().collect::<Vec<_>>();
-    let pattern = pattern.chars().collect::<Vec<_>>();
-    let (mut value_index, mut pattern_index) = (0usize, 0usize);
-    let (mut star_value_index, mut star_pattern_index) = (None, None);
-
-    while value_index < value.len() {
-        if pattern_index < pattern.len()
-            && (pattern[pattern_index] == '?' || pattern[pattern_index] == value[value_index])
-        {
-            value_index += 1;
-            pattern_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
-            star_pattern_index = Some(pattern_index);
-            star_value_index = Some(value_index);
-            pattern_index += 1;
-        } else if let (Some(star_pattern), Some(star_value)) =
-            (star_pattern_index, star_value_index)
-        {
-            pattern_index = star_pattern + 1;
-            let next_value = star_value + 1;
-            star_value_index = Some(next_value);
-            value_index = next_value;
-        } else {
-            return false;
-        }
-    }
-    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
-        pattern_index += 1;
-    }
-    pattern_index == pattern.len()
 }
 
 #[cfg(test)]
