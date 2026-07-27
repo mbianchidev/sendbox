@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/sendbox-boundary",
     "crates/sendbox-bpf",
     "crates/sendbox-bootstrap",
     "crates/sendbox-bundle",
