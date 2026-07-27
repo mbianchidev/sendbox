@@ -316,6 +316,15 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
         let mut handshake = GuestHandshake::new(configuration);
         let connection = handshake.establish(guest).await.expect("guest handshake");
         let (mut reader, mut writer) = connection.into_parts();
+        writer
+            .send(&Message::Event(Event {
+                stream_id: 0,
+                kind: EventKind::Lifecycle,
+                payload: br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true}]}"#
+                    .to_vec(),
+            }))
+            .await
+            .expect("readiness");
         let message = reader.receive().await.expect("launch request");
         let Message::Request(Request {
             request_id,
@@ -327,7 +336,7 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
         };
         assert_eq!(operation, "agent.launch");
         assert!(
-            payload
+            !payload
                 .windows(b"TOKEN".len())
                 .any(|window| window == b"TOKEN")
         );
@@ -343,7 +352,15 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             .send(&Message::Response(Response {
                 request_id,
                 status: ResponseStatus::Ok,
-                payload: serde_json::to_vec(&GuestTerminal::Exited { code: 0 }).expect("terminal"),
+                payload: serde_json::to_vec(&sendbox_protocol::TerminalResultV1 {
+                    schema_version: sendbox_protocol::OPERATION_SCHEMA_VERSION,
+                    terminal: sendbox_protocol::TerminalStateV1::Exited {
+                        exit_code: Some(0),
+                        signal: None,
+                    },
+                    cleanup_complete: true,
+                })
+                .expect("terminal"),
             }))
             .await
             .expect("terminal response");
@@ -618,10 +635,20 @@ async fn protocol_connector_authenticates_over_unix_stream() {
             BootstrapSecret::new([7; 32]).expect("bootstrap"),
         )
         .expect("config");
-        GuestHandshake::new(configuration)
+        let connection = GuestHandshake::new(configuration)
             .establish(stream)
             .await
-            .expect("guest handshake")
+            .expect("guest handshake");
+        let (_reader, mut writer) = connection.into_parts();
+        writer
+            .send(&Message::Event(Event {
+                stream_id: 0,
+                kind: EventKind::Lifecycle,
+                payload: br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true}]}"#
+                    .to_vec(),
+            }))
+            .await
+            .expect("readiness");
     });
     let stream = UnixStream::connect(&socket_path).await.expect("connect");
     let session = ProtocolGuestConnector
@@ -648,7 +675,7 @@ async fn protocol_connector_authenticates_over_unix_stream() {
         .expect("host handshake");
     assert!(session.negotiated_capabilities().contains(Capability::Exec));
     drop(session);
-    let _ = guest_task.await.expect("guest task");
+    guest_task.await.expect("guest task");
 }
 
 #[tokio::test]

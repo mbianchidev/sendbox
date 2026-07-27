@@ -19,7 +19,7 @@ pub use channel::{
     BootstrapDelivery, BootstrapMaterial, ChannelLifetime, ChannelOwnership, ControlChannelRequest,
     ControlEndpointKind, ControlStream, GuestAddress, HostAddress, MAX_READINESS_TIMEOUT,
     MIN_BOOTSTRAP_BYTES, MIN_READINESS_TIMEOUT, ProvisionedControlChannel,
-    ProvisionedControlChannelDescriptor,
+    ProvisionedControlChannelDescriptor, RUNTIME_INJECTED_BOOTSTRAP_TARGET,
 };
 pub use cleanup::{
     CleanupFailure, CleanupReport, CleanupStep, CleanupTransaction, OperationFailure,
@@ -38,7 +38,7 @@ pub use process::{
 };
 pub use provider::{
     BoxFuture, CreateRequest, ExecPurpose, ExecRequest, InitializeRequest, PreflightReport,
-    PreflightRequest, RuntimeHealth, RuntimeProvider, RuntimeSignal, RuntimeStatus, StartRequest,
-    StopRequest,
+    PreflightRequest, RuntimeEnvironment, RuntimeHealth, RuntimeLabel, RuntimeMount,
+    RuntimeProvider, RuntimeResources, RuntimeSignal, RuntimeStatus, StartRequest, StopRequest,
 };
 pub use unavailable::UnavailableRuntimeProvider;

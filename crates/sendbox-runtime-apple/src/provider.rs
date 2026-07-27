@@ -1139,7 +1139,7 @@ mod tests {
     use sendbox_bundle::{Architecture, StageOptions, stage_bundle, write_public_key};
     use sendbox_runtime::{
         CommandArgument, CommandSpec, CreateRequest, ExecPurpose, ExecRequest, InitializeRequest,
-        Program, StartRequest,
+        Program, RuntimeResources, StartRequest,
     };
     use sendbox_testkit::{RuntimeConformanceScenario, run_runtime_conformance};
 
@@ -1245,6 +1245,23 @@ esac
         )
     }
 
+    fn create_request(container_id: &str, image: &str) -> CreateRequest {
+        CreateRequest {
+            container_id: ContainerId::new(container_id).expect("id"),
+            image: image.to_owned(),
+            hostname: container_id.to_owned(),
+            resources: RuntimeResources {
+                cpus: 2,
+                memory_bytes: 512 * 1024 * 1024,
+            },
+            mounts: Vec::new(),
+            environment: Vec::new(),
+            working_directory: PathBuf::from("/workspace"),
+            dns_servers: Vec::new(),
+            labels: Vec::new(),
+        }
+    }
+
     #[tokio::test]
     async fn fake_cli_passes_shared_runtime_conformance() {
         let (temporary, runtime) = fixture_runtime();
@@ -1253,10 +1270,7 @@ esac
             initialize: InitializeRequest {
                 state_directory: state,
             },
-            create: CreateRequest {
-                container_id: ContainerId::new("apple-conformance").expect("id"),
-                image: "fixture:image".to_owned(),
-            },
+            create: create_request("apple-conformance", "fixture:image"),
             start: StartRequest::default(),
             exec: ExecRequest {
                 command: CommandSpec {
@@ -1287,10 +1301,7 @@ esac
             .expect("initialize");
         let id = runtime
             .create(
-                CreateRequest {
-                    container_id: ContainerId::new("apple-workload").expect("id"),
-                    image: "fixture:image".to_owned(),
-                },
+                create_request("apple-workload", "fixture:image"),
                 &cancellation,
             )
             .await
@@ -1335,10 +1346,7 @@ esac
         let task = tokio::spawn(async move {
             task_runtime
                 .create(
-                    CreateRequest {
-                        container_id: ContainerId::new("apple-cancel").expect("id"),
-                        image: "slow:image".to_owned(),
-                    },
+                    create_request("apple-cancel", "slow:image"),
                     &task_cancellation,
                 )
                 .await
@@ -1367,22 +1375,13 @@ esac
             .expect("initialize");
         assert!(
             runtime
-                .create(
-                    CreateRequest {
-                        container_id: ContainerId::new("apple-failure").expect("id"),
-                        image: "fail:image".to_owned(),
-                    },
-                    &cancellation,
-                )
+                .create(create_request("apple-failure", "fail:image"), &cancellation,)
                 .await
                 .is_err()
         );
         let id = runtime
             .create(
-                CreateRequest {
-                    container_id: ContainerId::new("apple-output").expect("id"),
-                    image: "fixture:image".to_owned(),
-                },
+                create_request("apple-output", "fixture:image"),
                 &cancellation,
             )
             .await
@@ -1426,10 +1425,7 @@ esac
             .expect("initialize");
         let error = runtime
             .create(
-                CreateRequest {
-                    container_id: ContainerId::new("apple-rollback").expect("id"),
-                    image: "fixture:image".to_owned(),
-                },
+                create_request("apple-rollback", "fixture:image"),
                 &cancellation,
             )
             .await

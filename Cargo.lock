@@ -301,6 +301,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db8b397918185f0161ff3d6fcaa9e4bfc09b8367caf6e1d4a2848e5477ed027b"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1828,23 +1837,33 @@ name = "sendbox-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "clap_complete",
+ "getrandom 0.4.3",
+ "sendbox-agent",
  "sendbox-config",
  "sendbox-core",
+ "sendbox-policy",
  "sendbox-project",
+ "sendbox-runtime",
+ "sendbox-runtime-kata",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
 name = "sendbox-config"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "rustix",
  "sendbox-core",
  "sendbox-policy",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "tempfile",
  "thiserror",
 ]
 
@@ -1937,6 +1956,8 @@ dependencies = [
  "proptest",
  "rustix",
  "sendbox-core",
+ "sendbox-exec",
+ "sendbox-policy",
  "sendbox-protocol",
  "serde",
  "serde_json",
@@ -2032,6 +2053,24 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "sendbox-runtime-kata"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "sendbox-bundle",
+ "sendbox-core",
+ "sendbox-policy",
+ "sendbox-runtime",
+ "sendbox-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

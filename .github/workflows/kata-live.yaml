@@ -1,0 +1,38 @@
+name: Kata live qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: Absolute config path on the self-hosted runner
+        required: true
+        type: string
+      image:
+        description: Digest-pinned workload image
+        required: true
+        type: string
+      bundle:
+        description: Absolute signed bundle path on the runner
+        required: true
+        type: string
+      trust_root:
+        description: Absolute trust-root path on the runner
+        required: true
+        type: string
+
+jobs:
+  kata-live:
+    runs-on: [self-hosted, linux, x64, kvm, kata]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Build release Rust workspace
+        run: cargo build --workspace --release
+      - name: Run live Kata vertical slice
+        env:
+          SENDBOX_KATA_LIVE: "1"
+          SENDBOX_KATA_CONFIG: ${{ inputs.config }}
+          SENDBOX_KATA_IMAGE: ${{ inputs.image }}
+          SENDBOX_KATA_BUNDLE: ${{ inputs.bundle }}
+          SENDBOX_KATA_TRUST_ROOT: ${{ inputs.trust_root }}
+        run: ./scripts/qualify-kata-live.sh

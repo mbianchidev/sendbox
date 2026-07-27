@@ -9,6 +9,7 @@ use crate::{BoxFuture, CancellationToken, ContainerId, RuntimeError};
 pub const MIN_READINESS_TIMEOUT: Duration = Duration::from_millis(10);
 pub const MAX_READINESS_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MIN_BOOTSTRAP_BYTES: usize = 32;
+pub const RUNTIME_INJECTED_BOOTSTRAP_TARGET: &str = "/run/sendbox-injected/bootstrap.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ControlEndpointKind {
@@ -16,6 +17,7 @@ pub enum ControlEndpointKind {
     PublishedUnixSocket,
     InheritedStdio,
     InheritedFileDescriptor,
+    RuntimeExecStdio,
     Unavailable,
 }
 
@@ -197,6 +199,7 @@ mod tests {
             ControlEndpointKind::PublishedUnixSocket,
             ControlEndpointKind::InheritedStdio,
             ControlEndpointKind::InheritedFileDescriptor,
+            ControlEndpointKind::RuntimeExecStdio,
         ] {
             request(kind).validate().expect("valid request");
         }

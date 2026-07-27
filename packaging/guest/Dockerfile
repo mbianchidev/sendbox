@@ -79,6 +79,7 @@ RUN cargo install cargo-audit --version 0.22.2 --locked
 
 FROM toolchain AS source
 WORKDIR /workspace
+COPY --from=libseccomp /opt/libseccomp /opt/libseccomp
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY .cargo .cargo
 COPY crates crates
@@ -91,7 +92,10 @@ COPY packaging/guest packaging/guest
 RUN chmod +x packaging/guest/verify-bpf.sh packaging/guest/verify-static.sh
 
 ENV CARGO_INCREMENTAL=0
+ENV LIBSECCOMP_STATIC=1
 ENV LIBBPF_SYS_EXTRA_CFLAGS="-Wno-error=deprecated-declarations"
+ENV PKG_CONFIG_ALL_STATIC=1
+ENV PKG_CONFIG_PATH=/opt/libseccomp/lib/pkgconfig
 ENV SOURCE_DATE_EPOCH=0
 
 FROM source AS bpf

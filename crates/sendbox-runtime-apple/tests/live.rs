@@ -101,6 +101,16 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
                 CreateRequest {
                     container_id: container_id.clone(),
                     image,
+                    hostname: container_id.as_str().to_owned(),
+                    resources: sendbox_runtime::RuntimeResources {
+                        cpus: 2,
+                        memory_bytes: 512 * 1024 * 1024,
+                    },
+                    mounts: Vec::new(),
+                    environment: Vec::new(),
+                    working_directory: "/workspace".into(),
+                    dns_servers: Vec::new(),
+                    labels: Vec::new(),
                 },
                 &cancellation,
             )

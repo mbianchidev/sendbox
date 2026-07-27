@@ -97,11 +97,11 @@ const fn is_allowed(from: StartupState, to: StartupState) -> bool {
             StartupState::RuntimePrepared
         ) | (
             StartupState::RuntimePrepared,
-            StartupState::ControlsVerified
-        ) | (
-            StartupState::ControlsVerified,
             StartupState::ServicesStarting
-        ) | (StartupState::ServicesStarting, StartupState::SelfTesting)
+        ) | (
+            StartupState::ServicesStarting,
+            StartupState::ControlsVerified
+        ) | (StartupState::ControlsVerified, StartupState::SelfTesting)
             | (StartupState::SelfTesting, StartupState::Ready)
             | (StartupState::Ready, StartupState::AgentLaunchPermitted)
             | (StartupState::Ready, StartupState::ShuttingDown)
@@ -127,8 +127,8 @@ mod tests {
             StartupState::BootstrapConsumed,
             StartupState::ManifestVerified,
             StartupState::RuntimePrepared,
-            StartupState::ControlsVerified,
             StartupState::ServicesStarting,
+            StartupState::ControlsVerified,
             StartupState::SelfTesting,
             StartupState::Ready,
             StartupState::AgentLaunchPermitted,

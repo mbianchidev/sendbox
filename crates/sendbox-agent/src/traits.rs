@@ -89,6 +89,7 @@ impl fmt::Debug for GuestLaunchRequest<'_> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GuestTerminal {
     Exited { code: i32 },
+    Signaled { signal: i32 },
     Cancelled,
     Failed { message: String },
 }

@@ -3,8 +3,9 @@ use std::sync::Arc;
 use sendbox_protocol::{Capability, CapabilitySet};
 use sendbox_runtime::{
     BootstrapDelivery, BootstrapMaterial, CancellationToken, ChannelLifetime, ChannelOwnership,
-    CleanupReport, ControlChannelRequest, CreateRequest, InitializeRequest, PreflightRequest,
-    ProvisionedControlChannel, RuntimeProvider, StartRequest, StopRequest,
+    CleanupReport, ControlChannelRequest, ControlEndpointKind, CreateRequest, InitializeRequest,
+    PreflightRequest, ProvisionedControlChannel, RUNTIME_INJECTED_BOOTSTRAP_TARGET,
+    RuntimeEnvironment, RuntimeLabel, RuntimeMount, RuntimeProvider, StartRequest, StopRequest,
 };
 
 use crate::{
@@ -170,6 +171,40 @@ impl AgentOrchestrator {
                 CreateRequest {
                     container_id: plan.container_id().clone(),
                     image: plan.image().to_owned(),
+                    hostname: runtime_hostname(plan.container_id().as_str()),
+                    resources: plan.resources(),
+                    mounts: std::iter::once(RuntimeMount {
+                        source: plan.workspace().host_path.clone(),
+                        destination: plan.workspace().guest_path.clone(),
+                        writable: plan.workspace().writable,
+                    })
+                    .chain(plan.mounts().iter().map(|mount| RuntimeMount {
+                        source: mount.source.clone(),
+                        destination: mount.destination.clone(),
+                        writable: mount.writable,
+                    }))
+                    .collect(),
+                    environment: plan
+                        .environment()
+                        .iter()
+                        .map(|entry| RuntimeEnvironment {
+                            name: entry.name.clone(),
+                            value: entry.value.clone(),
+                            sensitive: false,
+                        })
+                        .collect(),
+                    working_directory: plan.command().working_directory.clone().into(),
+                    dns_servers: Vec::new(),
+                    labels: vec![
+                        RuntimeLabel {
+                            name: "dev.sendbox.managed".to_owned(),
+                            value: "true".to_owned(),
+                        },
+                        RuntimeLabel {
+                            name: "dev.sendbox.session".to_owned(),
+                            value: plan.session_id().to_string(),
+                        },
+                    ],
                 },
                 cancellation,
             )
@@ -193,7 +228,6 @@ impl AgentOrchestrator {
             .secrets
             .resolve(plan.bootstrap_reference(), cancellation)
             .await?;
-        let bootstrap_delivery = bootstrap_delivery(plan.endpoint_kind());
         let channel_request = ControlChannelRequest {
             session_id: plan.session_id(),
             container_id: container.clone(),
@@ -201,7 +235,7 @@ impl AgentOrchestrator {
             ownership: ChannelOwnership::RuntimeLifecycle,
             lifetime: ChannelLifetime::UntilRuntimeCleanup,
             readiness_timeout: plan.readiness_timeout(),
-            bootstrap_delivery,
+            bootstrap_delivery: bootstrap_delivery(plan.endpoint_kind()),
             bootstrap_material: BootstrapMaterial::new(bootstrap.as_bytes().to_vec())?,
         };
         let channel = self
@@ -250,7 +284,6 @@ impl AgentOrchestrator {
                 "guest readiness omitted required capabilities".to_owned(),
             ));
         }
-
         context.guest = Some(guest);
         context.transition(AgentState::GuestReady)?;
 
@@ -426,17 +459,6 @@ impl RunContext {
     }
 }
 
-fn bootstrap_delivery(endpoint: sendbox_runtime::ControlEndpointKind) -> BootstrapDelivery {
-    match endpoint {
-        sendbox_runtime::ControlEndpointKind::InheritedStdio => {
-            BootstrapDelivery::RuntimeInjection {
-                target: "/run/sendbox-bootstrap/bootstrap.json".to_owned(),
-            }
-        }
-        _ => BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
-    }
-}
-
 fn check_cancelled(cancellation: &CancellationToken) -> Result<(), AgentError> {
     if cancellation.is_cancelled() {
         Err(AgentError::Cancelled)
@@ -472,20 +494,47 @@ fn append_runtime_cleanup_failures(report: CleanupReport, failures: &mut Vec<Cle
     }
 }
 
+fn runtime_hostname(container_id: &str) -> String {
+    container_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(63)
+        .collect()
+}
+
+fn bootstrap_delivery(endpoint: ControlEndpointKind) -> BootstrapDelivery {
+    match endpoint {
+        ControlEndpointKind::InheritedStdio | ControlEndpointKind::RuntimeExecStdio => {
+            BootstrapDelivery::RuntimeInjection {
+                target: RUNTIME_INJECTED_BOOTSTRAP_TARGET.to_owned(),
+            }
+        }
+        _ => BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use sendbox_runtime::{BootstrapDelivery, ControlEndpointKind};
-
-    use super::bootstrap_delivery;
+    use super::*;
 
     #[test]
-    fn inherited_stdio_uses_runtime_injection_and_fd_transport_keeps_fd_three() {
-        assert_eq!(
-            bootstrap_delivery(ControlEndpointKind::InheritedStdio),
-            BootstrapDelivery::RuntimeInjection {
-                target: "/run/sendbox-bootstrap/bootstrap.json".to_owned(),
-            }
-        );
+    fn stdio_transports_use_the_shared_injection_target() {
+        for endpoint in [
+            ControlEndpointKind::InheritedStdio,
+            ControlEndpointKind::RuntimeExecStdio,
+        ] {
+            assert!(matches!(
+                bootstrap_delivery(endpoint),
+                BootstrapDelivery::RuntimeInjection { target }
+                    if target == RUNTIME_INJECTED_BOOTSTRAP_TARGET
+            ));
+        }
         assert_eq!(
             bootstrap_delivery(ControlEndpointKind::InheritedFileDescriptor),
             BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 }
