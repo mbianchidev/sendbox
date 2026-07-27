@@ -1,0 +1,22 @@
+[package]
+name = "sendbox-config-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+sendbox-config = { path = "../../crates/sendbox-config" }
+
+[[bin]]
+name = "yaml_roundtrip"
+path = "fuzz_targets/yaml_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

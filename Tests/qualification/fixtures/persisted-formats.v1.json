@@ -3,11 +3,13 @@
   "formats": [
     {"id": "sandbox-config-yaml", "current_version": 1, "reader_required": true, "writer_required": true},
     {"id": "protocol-cbor", "current_version": 1, "reader_required": true, "writer_required": true},
-    {"id": "audit-export-json", "current_version": "unversioned_swift", "migration": "required_before_phase_9"},
-    {"id": "snapshot-manifest-json", "current_version": "unversioned_swift", "migration": "required_before_phase_9"},
-    {"id": "provenance-signature-json", "current_version": "unversioned_swift", "migration": "required_before_phase_9"},
-    {"id": "supervisor-grant-json", "current_version": "unversioned_swift", "migration": "required_before_phase_9"}
+    {"id": "audit-export-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-audit-v1", "migration": "explicit_dry_run"},
+    {"id": "snapshot-manifest-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-snapshot-v1", "migration": "explicit_dry_run"},
+    {"id": "provenance-signature-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-provenance-v1", "migration": "explicit_verification_lifetime"},
+    {"id": "provenance-trust-store-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-provenance-v1", "migration": "explicit_dry_run"},
+    {"id": "secret-record-cbor", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-plaintext-record", "migration": "store_authorized_only"},
+    {"id": "supervisor-grant-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "swift-codable-observation", "migration": "explicit_dry_run_with_broadening_ack"},
+    {"id": "mcp-observation-event-json", "current_version": 1, "reader_required": true, "writer_required": true, "legacy_reader": "SENDBOX_MCP TSV"}
   ],
-  "swift_samples": "observation_only_until_versioned_fixtures_are_captured"
+  "swift_samples": "legacy readers remain bounded and explicit; Swift grants are observational imports only"
 }
-

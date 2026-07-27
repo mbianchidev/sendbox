@@ -1,0 +1,3 @@
+SENDBOX_MCP_EVENT	{"schema_version":1,"timestamp_nanos":100,"process_id":7,"command":"node","transport":"stdio","direction":"spawn","payload":"/usr/bin/node /srv/mcp-server.js"}
+SENDBOX_MCP_EVENT	{"schema_version":1,"timestamp_nanos":110,"process_id":7,"command":"node","transport":"stdio","direction":"to_server","payload":"{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"tools/call\",\"params\":{\"name\":\"delete_file\",\"arguments\":{\"path\":\"/private/project\"}}}"}
+SENDBOX_MCP_EVENT	{"schema_version":1,"timestamp_nanos":120,"process_id":7,"command":"node","transport":"stdio","direction":"from_server","payload":"{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"error\":{\"code\":-32001,\"message\":\"denied /private/project\"}}"}

@@ -7,7 +7,8 @@
     {"id": "no-silent-security-degradation", "must_reject": "mandatory boundary becoming observability-only"},
     {"id": "no-missing-runtime-pass", "must_reject": "missing vendor binary treated as a successful benchmark"},
     {"id": "no-runtime-autostart", "must_reject": "baseline capture starting containerd, Apple container service, or Hyperlight"},
-    {"id": "no-swift-oracle-by-default", "must_reject": "untested Swift behavior copied without an explicit preserve decision"}
+    {"id": "no-swift-oracle-by-default", "must_reject": "untested Swift behavior copied without an explicit preserve decision"},
+    {"id": "no-universal-git-client-claim", "must_reject": "claiming a Git argv guard blocks alternate clients or hosting-provider APIs"},
+    {"id": "no-atomic-git-admission-claim", "must_reject": "claiming local Git probe decisions are atomic with remote ref updates"}
   ]
 }
-

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+clap_complete.workspace = true
 getrandom.workspace = true
 sendbox-agent = { path = "../sendbox-agent" }
 sendbox-config = { path = "../sendbox-config" }
