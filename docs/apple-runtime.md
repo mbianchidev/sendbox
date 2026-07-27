@@ -43,8 +43,10 @@ replacement, ownership, cancellation, or bidirectional semantics. The
 production adapter therefore **does not advertise published Unix sockets**.
 It uses another official CLI surface:
 
-1. `container exec --interactive` injects the bounded bootstrap bytes into a
-   root-created, mode `0400` guest file.
+1. The provider combines the per-session secret with the signed trust metadata,
+   hardening requirements, and broker policy in the shared typed guest-bootstrap
+   schema, then `container exec --interactive` installs it as a root-created,
+   mode `0400` guest file.
 2. A detached bootstrap/control exec starts the verified guest supervisor.
 3. A second interactive exec runs the signed `stdio-bridge`, which connects to
    the session-unique guest Unix socket and relays raw stdin/stdout.

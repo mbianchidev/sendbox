@@ -8,7 +8,12 @@ use std::{
     time::Duration,
 };
 
+use sendbox_bootstrap::{
+    BootstrapDocumentConfiguration, ExecutionBrokerConfiguration, REQUIRED_RUNTIME_CONTROLS,
+    encode_bootstrap_document,
+};
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
+use sendbox_policy::{Action, CommandPolicy};
 use sendbox_runtime::{
     BootstrapDelivery, BoxFuture, CancellationToken, CleanupFailure, CleanupReport, ContainerId,
     ControlChannelRequest, ControlEndpointKind, CreateRequest, ExecPurpose, ExecRequest,
@@ -34,6 +39,10 @@ use crate::{
 pub const APPLE_RUNTIME_ID: &str = "apple-container";
 const SUPPORTED_VERSION: &str = "0.10.0";
 const BOOTSTRAP_TARGET: &str = "/run/sendbox-bootstrap/bootstrap.json";
+const BUNDLE_LAUNCHER: &str = "bin/sendbox-exec-launcher";
+const GUEST_BUNDLE_ROOT: &str = "/opt/sendbox";
+const GUEST_BROKER_RUNTIME: &str = "/run/sendbox-broker";
+const GUEST_CGROUP_PARENT: &str = "/sys/fs/cgroup/sendbox";
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -46,6 +55,9 @@ pub struct AppleRuntimeConfiguration {
     pub host_version: String,
     pub guest_version: String,
     pub minimum_release_sequence: u64,
+    pub command_policy: CommandPolicy,
+    pub workload_uid: u32,
+    pub workload_gid: u32,
     pub launch: AppleLaunchConfiguration,
     pub command_timeout: Duration,
     pub output_limit_bytes: usize,
@@ -63,6 +75,7 @@ impl AppleRuntimeConfiguration {
         trust_root_id: impl Into<String>,
         host_version: impl Into<String>,
         guest_version: impl Into<String>,
+        minimum_release_sequence: u64,
     ) -> Self {
         Self {
             executable: None,
@@ -71,7 +84,15 @@ impl AppleRuntimeConfiguration {
             trust_root_id: trust_root_id.into(),
             host_version: host_version.into(),
             guest_version: guest_version.into(),
-            minimum_release_sequence: 0,
+            minimum_release_sequence,
+            command_policy: CommandPolicy {
+                default_action: Action::Deny,
+                allowlist: Vec::new(),
+                denylist: Vec::new(),
+                log_blocked: true,
+            },
+            workload_uid: 65_534,
+            workload_gid: 65_534,
             launch: AppleLaunchConfiguration::default(),
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             output_limit_bytes: DEFAULT_OUTPUT_LIMIT,
@@ -91,9 +112,12 @@ impl AppleRuntimeConfiguration {
         if self.trust_root_id.is_empty()
             || self.host_version.is_empty()
             || self.guest_version.is_empty()
+            || self.minimum_release_sequence == 0
+            || self.workload_uid == 0
+            || self.workload_gid == 0
         {
             return Err(provider_error(
-                "Apple trust-root ID and host/guest versions must be non-empty",
+                "Apple trust metadata and non-root workload identity must be configured",
             ));
         }
         if self.command_timeout.is_zero() || self.output_limit_bytes == 0 {
@@ -117,6 +141,7 @@ impl ProgramResolver for AbsoluteOnlyResolver {
 
 struct ContainerRecord {
     lifecycle: LifecycleState,
+    request: CreateRequest,
     host_state_directory: PathBuf,
     log_process: Option<RunningProcess>,
     channel_provisioned: bool,
@@ -464,6 +489,53 @@ impl AppleRuntime {
         }
         Ok(())
     }
+
+    fn bootstrap_document(
+        &self,
+        channel: &ControlChannelRequest,
+        create: &CreateRequest,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, RuntimeError> {
+        let workspace = create
+            .mounts
+            .iter()
+            .filter(|mount| {
+                mount.writable && create.working_directory.starts_with(&mount.destination)
+            })
+            .max_by_key(|mount| mount.destination.components().count())
+            .ok_or_else(|| {
+                provider_error(
+                    "Apple authenticated run requires a writable mount containing the working directory",
+                )
+            })?;
+        encode_bootstrap_document(
+            BootstrapDocumentConfiguration {
+                session_id: channel.session_id,
+                host_version: self.configuration.host_version.clone(),
+                trust_root_id: self.configuration.trust_root_id.clone(),
+                manifest_path: PathBuf::from("manifest.json"),
+                minimum_release_sequence: self.configuration.minimum_release_sequence,
+                required_controls: REQUIRED_RUNTIME_CONTROLS.to_vec(),
+                required_services: Vec::new(),
+                services: Vec::new(),
+                execution_broker: Some(ExecutionBrokerConfiguration {
+                    runtime_parent: PathBuf::from(GUEST_BROKER_RUNTIME),
+                    socket_path: PathBuf::from(format!(
+                        "{GUEST_BROKER_RUNTIME}/{}/s",
+                        channel.session_id
+                    )),
+                    launcher_path: PathBuf::from(format!("{GUEST_BUNDLE_ROOT}/{BUNDLE_LAUNCHER}")),
+                    cgroup_parent: PathBuf::from(GUEST_CGROUP_PARENT),
+                    workspace_root: workspace.destination.clone(),
+                    system_root: PathBuf::from("/"),
+                    workload_uid: self.configuration.workload_uid,
+                    workload_gid: self.configuration.workload_gid,
+                    command_policy: self.configuration.command_policy.clone(),
+                }),
+            },
+            channel.bootstrap_material.as_bytes(),
+        )
+        .map_err(|error| provider_error(format!("encode Apple guest bootstrap: {error}")))
+    }
 }
 
 impl RuntimeProvider for AppleRuntime {
@@ -535,6 +607,7 @@ impl RuntimeProvider for AppleRuntime {
             prepare_state_directory(&container_state)?;
             let record = Arc::new(tokio::sync::Mutex::new(ContainerRecord {
                 lifecycle: LifecycleState::Initialized,
+                request: request.clone(),
                 host_state_directory: container_state.clone(),
                 log_process: None,
                 channel_provisioned: false,
@@ -648,12 +721,9 @@ impl RuntimeProvider for AppleRuntime {
                     reason: "Apple control channel was already provisioned".to_owned(),
                 });
             }
-            self.inject_bootstrap(
-                &request.container_id,
-                request.bootstrap_material.as_bytes(),
-                cancellation,
-            )
-            .await?;
+            let bootstrap = self.bootstrap_document(&request, &record.request)?;
+            self.inject_bootstrap(&request.container_id, bootstrap.as_ref(), cancellation)
+                .await?;
             self.run_checked(
                 self.commands.supervisor(&request.container_id),
                 cancellation,
@@ -1139,10 +1209,14 @@ mod tests {
     };
 
     use super::*;
+    use sendbox_bootstrap::decode_bootstrap_document;
     use sendbox_bundle::{Architecture, StageOptions, stage_bundle, write_public_key};
+    use sendbox_core::SessionId;
     use sendbox_runtime::{
-        CommandArgument, CommandSpec, CreateRequest, ExecPurpose, ExecRequest, InitializeRequest,
-        Program, RuntimeEnvironment, RuntimeLabel, RuntimeMount, RuntimeResources, StartRequest,
+        BootstrapDelivery, BootstrapMaterial, ChannelLifetime, ChannelOwnership, CommandArgument,
+        CommandSpec, ControlChannelRequest, ControlEndpointKind, CreateRequest, ExecPurpose,
+        ExecRequest, InitializeRequest, Program, RuntimeEnvironment, RuntimeLabel, RuntimeMount,
+        RuntimeResources, StartRequest,
     };
     use sendbox_testkit::{RuntimeConformanceScenario, run_runtime_conformance};
 
@@ -1237,9 +1311,8 @@ esac
         .expect("bundle");
 
         let mut configuration =
-            AppleRuntimeConfiguration::new(bundle, public_key, "fixture-root", "0.1.0", "0.1.0");
+            AppleRuntimeConfiguration::new(bundle, public_key, "fixture-root", "0.1.0", "0.1.0", 7);
         configuration.executable = Some(executable);
-        configuration.minimum_release_sequence = 7;
         configuration.allow_non_apple_host = true;
         configuration.allow_untrusted_executable = true;
         configuration.allow_untrusted_public_key = true;
@@ -1265,6 +1338,48 @@ esac
             dns_servers: Vec::new(),
             labels: Vec::new(),
         }
+    }
+
+    #[test]
+    fn apple_provider_builds_the_shared_guest_bootstrap_document() {
+        let (temporary, runtime) = fixture_runtime();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let mut create = create_request("apple-bootstrap", "fixture:image");
+        create.working_directory = PathBuf::from("/project/subdirectory");
+        create.mounts.push(RuntimeMount {
+            source: workspace,
+            destination: PathBuf::from("/project"),
+            writable: true,
+        });
+        let channel = ControlChannelRequest {
+            session_id: SessionId::from_bytes([8; 16]),
+            container_id: create.container_id.clone(),
+            endpoint_kind: ControlEndpointKind::InheritedStdio,
+            ownership: ChannelOwnership::RuntimeLifecycle,
+            lifetime: ChannelLifetime::UntilRuntimeCleanup,
+            readiness_timeout: Duration::from_secs(30),
+            bootstrap_delivery: BootstrapDelivery::RuntimeInjection {
+                target: BOOTSTRAP_TARGET.to_owned(),
+            },
+            bootstrap_material: BootstrapMaterial::new(vec![9; 32]).expect("bootstrap secret"),
+        };
+
+        let encoded = runtime
+            .bootstrap_document(&channel, &create)
+            .expect("Apple bootstrap document");
+        let decoded = decode_bootstrap_document(&encoded).expect("shared guest schema");
+
+        assert_eq!(decoded.session_id, channel.session_id);
+        assert_eq!(
+            decoded.bootstrap_secret.expose_for_key_derivation(),
+            &[9; 32]
+        );
+        assert_eq!(decoded.required_controls, REQUIRED_RUNTIME_CONTROLS);
+        let broker = decoded.execution_broker.expect("execution broker");
+        assert_eq!(broker.workspace_root, Path::new("/project"));
+        assert_eq!(broker.workload_uid, runtime.configuration.workload_uid);
+        assert_eq!(broker.command_policy, runtime.configuration.command_policy);
     }
 
     #[tokio::test]

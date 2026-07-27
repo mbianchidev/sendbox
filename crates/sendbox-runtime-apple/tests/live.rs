@@ -12,7 +12,7 @@ use sendbox_protocol::{
 use sendbox_runtime::{
     BootstrapDelivery, BootstrapMaterial, CancellationToken, ChannelLifetime, ChannelOwnership,
     ContainerId, ControlChannelRequest, ControlEndpointKind, CreateRequest, InitializeRequest,
-    PreflightRequest, RuntimeProvider, StartRequest, StopRequest,
+    PreflightRequest, RuntimeMount, RuntimeProvider, StartRequest, StopRequest,
 };
 use sendbox_runtime_apple::{AppleRuntime, AppleRuntimeConfiguration};
 
@@ -27,17 +27,17 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
     let public_key = required_path("SENDBOX_APPLE_CONTAINER_PUBLIC_KEY");
     let trust_root_id = required("SENDBOX_APPLE_CONTAINER_TRUST_ROOT_ID");
     let image = required("SENDBOX_APPLE_CONTAINER_LIVE_IMAGE");
+    let minimum_release_sequence = required("SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE")
+        .parse()
+        .expect("minimum release sequence must be an integer");
     let mut configuration = AppleRuntimeConfiguration::new(
         bundle,
         public_key,
         trust_root_id.clone(),
         env!("CARGO_PKG_VERSION"),
         env!("CARGO_PKG_VERSION"),
+        minimum_release_sequence,
     );
-    configuration.minimum_release_sequence =
-        required("SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE")
-            .parse()
-            .expect("minimum release sequence must be an integer");
     if let Ok(executable) = std::env::var("SENDBOX_APPLE_CONTAINER_EXECUTABLE") {
         configuration.executable = Some(PathBuf::from(executable));
     }
@@ -76,22 +76,6 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
     session_bytes[..4].copy_from_slice(&std::process::id().to_le_bytes());
     let session_id = SessionId::from_bytes(session_bytes);
     let secret = [0x6d_u8; 32];
-    let bootstrap = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
-        "session_id": session_id,
-        "bootstrap_nonce": vec![0x37_u8; 32],
-        "bootstrap_secret": secret,
-        "host_version": env!("CARGO_PKG_VERSION"),
-        "trust_root_id": trust_root_id,
-        "manifest_path": "manifest.json",
-        "minimum_release_sequence": required("SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE")
-            .parse::<u64>()
-            .expect("minimum release sequence"),
-        "required_controls": [],
-        "required_services": [],
-        "services": []
-    }))
-    .expect("bootstrap");
 
     let mut created = false;
     let mut channel = None;
@@ -106,7 +90,11 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
                         cpus: 2,
                         memory_bytes: 512 * 1024 * 1024,
                     },
-                    mounts: Vec::new(),
+                    mounts: vec![RuntimeMount {
+                        source: temporary.path().to_path_buf(),
+                        destination: PathBuf::from("/workspace"),
+                        writable: true,
+                    }],
                     environment: Vec::new(),
                     working_directory: "/workspace".into(),
                     dns_servers: Vec::new(),
@@ -131,7 +119,7 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
                     bootstrap_delivery: BootstrapDelivery::RuntimeInjection {
                         target: "/run/sendbox-bootstrap/bootstrap.json".to_owned(),
                     },
-                    bootstrap_material: BootstrapMaterial::new(bootstrap)?,
+                    bootstrap_material: BootstrapMaterial::new(secret.to_vec())?,
                 },
                 &cancellation,
             )

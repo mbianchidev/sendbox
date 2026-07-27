@@ -8,11 +8,14 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+sendbox-bootstrap = { path = "../sendbox-bootstrap" }
 sendbox-bundle = { path = "../sendbox-bundle" }
+sendbox-policy = { path = "../sendbox-policy" }
 sendbox-runtime = { path = "../sendbox-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "signal"] }
+zeroize.workspace = true
 
 [dev-dependencies]
 sendbox-core = { path = "../sendbox-core" }

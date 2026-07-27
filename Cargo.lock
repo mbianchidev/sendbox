@@ -1829,6 +1829,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "sendbox-core",
+ "sendbox-policy",
+ "sendbox-protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "sendbox-bpf"
 version = "0.1.0"
 dependencies = [
@@ -1982,6 +1996,7 @@ dependencies = [
  "ed25519-dalek",
  "proptest",
  "rustix",
+ "sendbox-bootstrap",
  "sendbox-core",
  "sendbox-exec",
  "sendbox-policy",
@@ -2073,8 +2088,10 @@ dependencies = [
 name = "sendbox-runtime-apple"
 version = "0.1.0"
 dependencies = [
+ "sendbox-bootstrap",
  "sendbox-bundle",
  "sendbox-core",
+ "sendbox-policy",
  "sendbox-protocol",
  "sendbox-runtime",
  "sendbox-testkit",
@@ -2082,6 +2099,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2108,7 +2126,7 @@ name = "sendbox-runtime-kata"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
- "getrandom 0.4.3",
+ "sendbox-bootstrap",
  "sendbox-bundle",
  "sendbox-core",
  "sendbox-policy",

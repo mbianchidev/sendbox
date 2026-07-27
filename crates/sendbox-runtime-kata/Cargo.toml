@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-getrandom.workspace = true
+sendbox-bootstrap = { path = "../sendbox-bootstrap" }
 sendbox-bundle = { path = "../sendbox-bundle" }
 sendbox-core = { path = "../sendbox-core" }
 sendbox-policy = { path = "../sendbox-policy" }

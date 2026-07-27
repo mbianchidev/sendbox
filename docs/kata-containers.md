@@ -124,6 +124,9 @@ sendbox-rs run --config .sendbox.yaml --runtime kata \
 
 ## Runtime behavior
 
+- Kata and Apple encode the same typed inner guest-bootstrap document. Kata wraps
+  that document with its provider-specific trust-root injection envelope before
+  delivering both files to the VM.
 - CPU, memory, hostname, DNS, working directory, image, command, and bind mounts map to `nerdctl run`.
 - `disk_size_mb` is delegated to the configured containerd snapshotter because nerdctl does not expose a portable per-container writable-layer quota.
 - Single-line environment values are written to a mode `0600` temporary env file, passed with `--env-file`, and deleted immediately after container creation. Multi-line values are inherited by key through the nerdctl client environment, so secret values never appear in argv.

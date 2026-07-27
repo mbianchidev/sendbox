@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use sendbox_bootstrap::{
+    BootstrapDocumentConfiguration, ExecutionBrokerConfiguration, REQUIRED_RUNTIME_CONTROLS,
+    encode_bootstrap_document,
+};
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
 use sendbox_policy::CommandPolicy;
 use sendbox_runtime::{
@@ -972,49 +976,41 @@ fn bootstrap_payload(
     secret: &[u8],
     trust_root: &[u8],
 ) -> Result<Vec<u8>, RuntimeError> {
-    let mut nonce = [0_u8; 32];
-    let mut authentication = [0_u8; 32];
-    getrandom::fill(&mut nonce)
-        .map_err(|error| RuntimeError::Provider(format!("generate bootstrap nonce: {error}")))?;
-    getrandom::fill(&mut authentication).map_err(|error| {
-        RuntimeError::Provider(format!("generate broker authentication: {error}"))
-    })?;
     let workspace = create
         .mounts
         .iter()
         .find(|mount| mount.destination == Path::new("/workspace"))
         .ok_or_else(|| RuntimeError::Provider("Kata run requires a /workspace mount".to_owned()))?;
-    let bootstrap = serde_json::json!({
-        "schema_version": 1,
-        "session_id": channel.session_id,
-        "bootstrap_nonce": nonce,
-        "bootstrap_secret": secret,
-        "host_version": env!("CARGO_PKG_VERSION"),
-        "trust_root_id": configuration.trust_root_id,
-        "manifest_path": "manifest.json",
-        "minimum_release_sequence": configuration.minimum_release_sequence,
-        "required_controls": ["privilege_drop", "capabilities", "seccomp"],
-        "required_services": [],
-        "services": [],
-        "execution_broker": {
-            "authentication": authentication,
-            "runtime_parent": GUEST_BROKER_RUNTIME,
-            "socket_path": format!("{GUEST_BROKER_RUNTIME}/{}/s", channel.session_id),
-            "launcher_path": format!("{GUEST_BUNDLE_ROOT}/{BUNDLE_LAUNCHER}"),
-            "cgroup_parent": GUEST_CGROUP_PARENT,
-            "workspace_root": workspace.destination,
-            "system_root": "/",
-            "workload_uid": configuration.workload_uid,
-            "workload_gid": configuration.workload_gid,
-            "command_policy": configuration.command_policy,
-        }
-    });
-    let bootstrap = Zeroizing::new(
-        serde_json::to_vec(&bootstrap)
-            .map_err(|error| RuntimeError::Provider(format!("encode bootstrap: {error}")))?,
-    );
+    let bootstrap = encode_bootstrap_document(
+        BootstrapDocumentConfiguration {
+            session_id: channel.session_id,
+            host_version: env!("CARGO_PKG_VERSION").to_owned(),
+            trust_root_id: configuration.trust_root_id.clone(),
+            manifest_path: PathBuf::from("manifest.json"),
+            minimum_release_sequence: configuration.minimum_release_sequence,
+            required_controls: REQUIRED_RUNTIME_CONTROLS.to_vec(),
+            required_services: Vec::new(),
+            services: Vec::new(),
+            execution_broker: Some(ExecutionBrokerConfiguration {
+                runtime_parent: PathBuf::from(GUEST_BROKER_RUNTIME),
+                socket_path: PathBuf::from(format!(
+                    "{GUEST_BROKER_RUNTIME}/{}/s",
+                    channel.session_id
+                )),
+                launcher_path: PathBuf::from(format!("{GUEST_BUNDLE_ROOT}/{BUNDLE_LAUNCHER}")),
+                cgroup_parent: PathBuf::from(GUEST_CGROUP_PARENT),
+                workspace_root: workspace.destination.clone(),
+                system_root: PathBuf::from("/"),
+                workload_uid: configuration.workload_uid,
+                workload_gid: configuration.workload_gid,
+                command_policy: configuration.command_policy.clone(),
+            }),
+        },
+        secret,
+    )
+    .map_err(|error| RuntimeError::Provider(format!("encode bootstrap: {error}")))?;
     serde_json::to_vec(&BootstrapEnvelope {
-        bootstrap: &bootstrap,
+        bootstrap: bootstrap.as_ref(),
         trust_root,
     })
     .map_err(|error| RuntimeError::Provider(format!("encode bootstrap injection: {error}")))
@@ -1334,10 +1330,13 @@ fn spawn_stderr_capture(stderr: ChildStderr) -> JoinHandle<Vec<u8>> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use sendbox_bootstrap::decode_bootstrap_document;
+    use sendbox_core::SessionId;
     use sendbox_policy::Action;
     use sendbox_runtime::{
-        CreateRequest, InitializeRequest, RuntimeEnvironment, RuntimeLabel, RuntimeMount,
-        RuntimeProvider, RuntimeResources, StartRequest, StopRequest,
+        BootstrapDelivery, BootstrapMaterial, ChannelLifetime, ChannelOwnership, CreateRequest,
+        InitializeRequest, RuntimeEnvironment, RuntimeLabel, RuntimeMount, RuntimeProvider,
+        RuntimeResources, StartRequest, StopRequest,
     };
     use tempfile::tempdir;
 
@@ -1396,6 +1395,58 @@ mod tests {
                 value: "exact value".to_owned(),
             }],
         }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DecodedBootstrapEnvelope {
+        bootstrap: Vec<u8>,
+        trust_root: Vec<u8>,
+    }
+
+    #[test]
+    fn kata_wraps_the_shared_guest_bootstrap_document() {
+        let temporary = tempdir().expect("temporary");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let configuration = configuration(
+            &temporary.path().join("nerdctl"),
+            &temporary.path().join("bundle"),
+            &temporary.path().join("trust.key"),
+        );
+        let create = request(&workspace);
+        let channel = ControlChannelRequest {
+            session_id: SessionId::from_bytes([6; 16]),
+            container_id: create.container_id.clone(),
+            endpoint_kind: ControlEndpointKind::RuntimeExecStdio,
+            ownership: ChannelOwnership::RuntimeLifecycle,
+            lifetime: ChannelLifetime::UntilRuntimeCleanup,
+            readiness_timeout: Duration::from_secs(30),
+            bootstrap_delivery: BootstrapDelivery::RuntimeInjection {
+                target: GUEST_BOOTSTRAP.to_owned(),
+            },
+            bootstrap_material: BootstrapMaterial::new(vec![9; 32]).expect("bootstrap secret"),
+        };
+
+        let payload = bootstrap_payload(&configuration, &channel, &create, &[9; 32], &[7; 32])
+            .expect("Kata bootstrap envelope");
+        let envelope: DecodedBootstrapEnvelope =
+            serde_json::from_slice(&payload).expect("bootstrap envelope JSON");
+        assert_eq!(envelope.trust_root, vec![7; 32]);
+        let decoded =
+            decode_bootstrap_document(&envelope.bootstrap).expect("shared guest bootstrap schema");
+        assert_eq!(decoded.session_id, channel.session_id);
+        assert_eq!(
+            decoded.bootstrap_secret.expose_for_key_derivation(),
+            &[9; 32]
+        );
+        assert_eq!(decoded.required_controls, REQUIRED_RUNTIME_CONTROLS);
+        assert_eq!(
+            decoded
+                .execution_broker
+                .expect("execution broker")
+                .workspace_root,
+            Path::new("/workspace")
+        );
     }
 
     #[tokio::test]

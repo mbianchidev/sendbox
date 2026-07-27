@@ -13,7 +13,8 @@ use std::time::Duration;
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 #[cfg(target_os = "macos")]
 use rustix::process::{WaitId, WaitIdOptions, waitid};
-use serde::{Deserialize, Serialize};
+pub use sendbox_bootstrap::{HealthCheck, RestartPolicy, ServiceId, ServiceSpec};
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
@@ -23,106 +24,11 @@ use crate::GuestError;
 use crate::audit::AuditLog;
 use crate::manifest::VerifiedManifest;
 
-const DEFAULT_LOG_BYTES: usize = 64 * 1024;
 type ValidatedServices = (
     BTreeMap<ServiceId, ServiceSpec>,
     Vec<ServiceId>,
     BTreeMap<ServiceId, OwnedFd>,
 );
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceId {
-    Exec,
-    Mcp,
-    Dns,
-    Egress,
-    Audit,
-    Bpf,
-}
-
-impl ServiceId {
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Exec => "exec",
-            Self::Mcp => "mcp",
-            Self::Dns => "dns",
-            Self::Egress => "egress",
-            Self::Audit => "audit",
-            Self::Bpf => "bpf",
-        }
-    }
-}
-
-impl std::fmt::Display for ServiceId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RestartPolicy {
-    #[serde(default)]
-    pub max_restarts: u32,
-    #[serde(default = "default_backoff_ms")]
-    pub backoff_ms: u64,
-}
-
-impl Default for RestartPolicy {
-    fn default() -> Self {
-        Self {
-            max_restarts: 0,
-            backoff_ms: default_backoff_ms(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HealthCheck {
-    ProcessAlive {
-        #[serde(default = "default_health_delay_ms")]
-        delay_ms: u64,
-    },
-    UnixSocket {
-        path: PathBuf,
-        #[serde(default = "default_health_timeout_ms")]
-        timeout_ms: u64,
-    },
-}
-
-impl Default for HealthCheck {
-    fn default() -> Self {
-        Self::ProcessAlive {
-            delay_ms: default_health_delay_ms(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServiceSpec {
-    pub id: ServiceId,
-    #[serde(default)]
-    pub dependencies: Vec<ServiceId>,
-    pub executable: PathBuf,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default = "default_true")]
-    pub mandatory: bool,
-    #[serde(default)]
-    pub restart: RestartPolicy,
-    #[serde(default)]
-    pub health: HealthCheck,
-    #[serde(default = "default_grace_ms")]
-    pub graceful_shutdown_ms: u64,
-    #[serde(default = "default_kill_ms")]
-    pub forced_shutdown_ms: u64,
-    #[serde(default = "default_log_bytes")]
-    pub max_log_bytes: usize,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServiceHealth {
@@ -692,34 +598,6 @@ async fn drain_log(mut reader: impl AsyncRead + Unpin, output: Arc<Mutex<Bounded
                 .push(&buffer[..read]),
         }
     }
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-const fn default_backoff_ms() -> u64 {
-    25
-}
-
-const fn default_health_delay_ms() -> u64 {
-    50
-}
-
-const fn default_health_timeout_ms() -> u64 {
-    1_000
-}
-
-const fn default_grace_ms() -> u64 {
-    500
-}
-
-const fn default_kill_ms() -> u64 {
-    500
-}
-
-const fn default_log_bytes() -> usize {
-    DEFAULT_LOG_BYTES
 }
 
 #[cfg(test)]
