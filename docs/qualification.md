@@ -137,3 +137,19 @@ starts, stops, or unregisters the Apple service.
 
 See [Apple runtime adapter](apple-runtime.md) for required variables, the live
 command, transport evidence, and unsupported capabilities.
+
+## Hyperlight runtime qualification
+
+`module.hyperlight-runtime` and `claim.hyperlight` are implemented by
+`crates/sendbox-runtime-hyperlight`. Ordinary qualification validates the
+portable lifecycle subset, exact argv construction, signed bundle verification,
+network rejection rules, fresh read-only staging, cancellation, output, and
+cleanup. It does not claim a persistent guest broker, stdio forwarding, eBPF or
+seccomp guest bootstrap, OCI support, environment injection, DNS budgets,
+connection limits, or wildcard/CIDR enforcement.
+
+The vendor gate is opt-in because it requires a prepared Linux KVM host, a
+root-owned pinned `hyperlight-unikraft`, and a signed Unikraft bundle. When
+designated with `SENDBOX_HYPERLIGHT_LIVE=1`, missing prerequisites fail the
+test rather than producing a success-shaped skip. The complete command and
+required variables are documented in [the Hyperlight guide](hyperlight.md).

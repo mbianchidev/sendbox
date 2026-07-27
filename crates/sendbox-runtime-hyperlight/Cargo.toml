@@ -1,0 +1,29 @@
+[package]
+name = "sendbox-runtime-hyperlight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+cap-std.workspace = true
+ipnet.workspace = true
+sendbox-bundle = { path = "../sendbox-bundle" }
+sendbox-egress = { path = "../sendbox-egress" }
+sendbox-guest = { path = "../../guest/sendbox-guest" }
+sendbox-runtime = { path = "../sendbox-runtime" }
+sha2.workspace = true
+tokio.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+sendbox-testkit = { path = "../sendbox-testkit" }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -16,6 +16,7 @@ members = [
     "crates/sendbox-protocol",
     "crates/sendbox-runtime",
     "crates/sendbox-runtime-apple",
+    "crates/sendbox-runtime-hyperlight",
     "crates/sendbox-runtime-kata",
     "crates/sendbox-security",
     "crates/sendbox-session-security",
