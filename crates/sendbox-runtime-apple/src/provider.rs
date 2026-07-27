@@ -510,6 +510,7 @@ impl AppleRuntime {
         encode_bootstrap_document(
             BootstrapDocumentConfiguration {
                 session_id: channel.session_id,
+                boundary_plan_digest: channel.boundary_plan_digest,
                 host_version: self.configuration.host_version.clone(),
                 trust_root_id: self.configuration.trust_root_id.clone(),
                 manifest_path: PathBuf::from("manifest.json"),
@@ -721,6 +722,7 @@ impl RuntimeProvider for AppleRuntime {
                     reason: "Apple control channel was already provisioned".to_owned(),
                 });
             }
+            request.validate_create_binding(&record.request)?;
             let bootstrap = self.bootstrap_document(&request, &record.request)?;
             self.inject_bootstrap(&request.container_id, bootstrap.as_ref(), cancellation)
                 .await?;
@@ -1211,7 +1213,7 @@ mod tests {
     use super::*;
     use sendbox_bootstrap::decode_bootstrap_document;
     use sendbox_bundle::{Architecture, StageOptions, stage_bundle, write_public_key};
-    use sendbox_core::SessionId;
+    use sendbox_core::{BoundaryPlanDigest, SessionId};
     use sendbox_runtime::{
         BootstrapDelivery, BootstrapMaterial, ChannelLifetime, ChannelOwnership, CommandArgument,
         CommandSpec, ControlChannelRequest, ControlEndpointKind, CreateRequest, ExecPurpose,
@@ -1325,7 +1327,9 @@ esac
 
     fn create_request(container_id: &str, image: &str) -> CreateRequest {
         CreateRequest {
+            session_id: SessionId::from_bytes([7; 16]),
             container_id: ContainerId::new(container_id).expect("id"),
+            boundary_plan_digest: BoundaryPlanDigest::from_bytes([0x83; 32]),
             image: image.to_owned(),
             hostname: container_id.to_owned(),
             resources: RuntimeResources {
@@ -1353,8 +1357,9 @@ esac
             writable: true,
         });
         let channel = ControlChannelRequest {
-            session_id: SessionId::from_bytes([8; 16]),
+            session_id: create.session_id,
             container_id: create.container_id.clone(),
+            boundary_plan_digest: create.boundary_plan_digest,
             endpoint_kind: ControlEndpointKind::InheritedStdio,
             ownership: ChannelOwnership::RuntimeLifecycle,
             lifetime: ChannelLifetime::UntilRuntimeCleanup,
@@ -1371,6 +1376,7 @@ esac
         let decoded = decode_bootstrap_document(&encoded).expect("shared guest schema");
 
         assert_eq!(decoded.session_id, channel.session_id);
+        assert_eq!(decoded.boundary_plan_digest, channel.boundary_plan_digest);
         assert_eq!(
             decoded.bootstrap_secret.expose_for_key_derivation(),
             &[9; 32]

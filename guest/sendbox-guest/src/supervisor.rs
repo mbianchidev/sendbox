@@ -170,8 +170,13 @@ pub async fn run<P: PlatformControls>(
             let secret_decryptor = crate::protocol::GuestSecretDecryptor::new(
                 bootstrap.session_id,
                 bootstrap.bootstrap_secret.expose_for_key_derivation(),
+                bootstrap.boundary_plan_digest,
             )?;
-            let config = handshake_config(bootstrap.session_id, bootstrap.bootstrap_secret)?;
+            let config = handshake_config(
+                bootstrap.session_id,
+                bootstrap.bootstrap_secret,
+                bootstrap.boundary_plan_digest,
+            )?;
             tokio::select! {
                 protocol = serve_authenticated(
                     stream,

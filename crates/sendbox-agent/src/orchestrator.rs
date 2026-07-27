@@ -4,8 +4,8 @@ use sendbox_protocol::agent_host_capabilities;
 use sendbox_runtime::{
     BootstrapDelivery, BootstrapMaterial, CancellationToken, ChannelLifetime, ChannelOwnership,
     CleanupReport, ControlChannelRequest, ControlEndpointKind, CreateRequest, InitializeRequest,
-    PreflightRequest, ProvisionedControlChannel, RUNTIME_INJECTED_BOOTSTRAP_TARGET,
-    RuntimeEnvironment, RuntimeLabel, RuntimeMount, RuntimeProvider, StartRequest, StopRequest,
+    PreflightRequest, ProvisionedControlChannel, RUNTIME_INJECTED_BOOTSTRAP_TARGET, RuntimeLabel,
+    RuntimeMount, RuntimeProvider, StartRequest, StopRequest,
 };
 
 use crate::{
@@ -106,6 +106,18 @@ impl AgentOrchestrator {
         plan: &RunPlan,
         cancellation: &CancellationToken,
     ) -> Result<AgentReport, RunFailure> {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| RunFailure {
+                primary: AgentError::InvalidPlan(format!("read system time: {error}")),
+                cleanup: Vec::new(),
+            })?
+            .as_secs();
+        plan.reverify_boundary(now_unix)
+            .map_err(|primary| RunFailure {
+                primary,
+                cleanup: Vec::new(),
+            })?;
         let mut context = RunContext::new(plan);
         let result = self.run_primary(plan, cancellation, &mut context).await;
         let cleanup = self.cleanup(cancellation, &mut context).await;
@@ -169,7 +181,9 @@ impl AgentOrchestrator {
             .runtime
             .create(
                 CreateRequest {
+                    session_id: plan.session_id(),
                     container_id: plan.container_id().clone(),
+                    boundary_plan_digest: plan.boundary_plan_digest(),
                     image: plan.image().to_owned(),
                     hostname: runtime_hostname(plan.container_id().as_str()),
                     resources: plan.resources(),
@@ -184,15 +198,7 @@ impl AgentOrchestrator {
                         writable: mount.writable,
                     }))
                     .collect(),
-                    environment: plan
-                        .environment()
-                        .iter()
-                        .map(|entry| RuntimeEnvironment {
-                            name: entry.name.clone(),
-                            value: entry.value.clone(),
-                            sensitive: false,
-                        })
-                        .collect(),
+                    environment: Vec::new(),
                     working_directory: plan.command().working_directory.clone().into(),
                     dns_servers: Vec::new(),
                     labels: vec![
@@ -231,6 +237,7 @@ impl AgentOrchestrator {
         let channel_request = ControlChannelRequest {
             session_id: plan.session_id(),
             container_id: container.clone(),
+            boundary_plan_digest: plan.boundary_plan_digest(),
             endpoint_kind: plan.endpoint_kind(),
             ownership: ChannelOwnership::RuntimeLifecycle,
             lifetime: ChannelLifetime::UntilRuntimeCleanup,
@@ -262,6 +269,7 @@ impl AgentOrchestrator {
                 stream,
                 GuestConnectionConfiguration {
                     session_id: plan.session_id(),
+                    boundary_plan_digest: plan.boundary_plan_digest(),
                     capabilities: agent_host_capabilities(),
                     required_capabilities: plan.required_guest_capabilities().clone(),
                     bootstrap_secret: bootstrap.as_bytes().to_vec(),

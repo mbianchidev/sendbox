@@ -7,6 +7,7 @@ use std::{
 
 use ed25519_dalek::{Signer, SigningKey};
 use sendbox_bundle::Architecture;
+use sendbox_core::BoundaryPlanDigest;
 use sendbox_guest::manifest::{
     ArtifactExpectation, ArtifactKind, ArtifactManifest, MANIFEST_DOMAIN, MANIFEST_SCHEMA_VERSION,
     SignedManifestEnvelope, encode_hex,
@@ -145,7 +146,9 @@ impl Fixture {
 
     fn create_request(&self, container_id: ContainerId) -> CreateRequest {
         CreateRequest {
+            session_id: sendbox_core::SessionId::from_bytes([0x80; 16]),
             container_id,
+            boundary_plan_digest: BoundaryPlanDigest::from_bytes([0x81; 32]),
             image: self.bundle.display().to_string(),
             hostname: String::new(),
             resources: RuntimeResources {
@@ -179,9 +182,11 @@ fn exact_official_argv_and_minimal_host_environment() {
     let artifacts = runtime.load_artifacts().expect("artifacts");
     let directory = fixture.temporary_path().join("argv-container");
     fs::create_dir(&directory).expect("container directory");
+    let request = fixture.create_request(ContainerId::new("argv-container").expect("container"));
     let container = std::sync::Arc::new(super::Container {
         lifecycle: sendbox_runtime::LifecycleStateMachine::new(LifecycleState::Running),
         operation: tokio::sync::Mutex::new(()),
+        request,
         artifacts,
         directory: directory.clone(),
         directory_handle: test_directory_handle(&directory),
@@ -248,9 +253,11 @@ fn every_read_only_mount_stage_is_fresh() {
     let artifacts = fixture.runtime.load_artifacts().expect("artifacts");
     let directory = fixture.temporary_path().join("mount-container");
     fs::create_dir(&directory).expect("container directory");
+    let request = fixture.create_request(ContainerId::new("mount-container").expect("container"));
     let container = std::sync::Arc::new(super::Container {
         lifecycle: sendbox_runtime::LifecycleStateMachine::new(LifecycleState::Running),
         operation: tokio::sync::Mutex::new(()),
+        request,
         artifacts,
         directory: directory.clone(),
         directory_handle: test_directory_handle(&directory),
@@ -692,6 +699,8 @@ async fn authenticated_launch_stages_secret_without_environment_support() {
         .execute_authenticated_once(
             &id,
             AuthenticatedLaunchRequest {
+                session_id: sendbox_core::SessionId::from_bytes([0x80; 16]),
+                boundary_plan_digest: BoundaryPlanDigest::from_bytes([0x81; 32]),
                 command: CommandSpec {
                     current_directory: Some(PathBuf::from("/work")),
                     ..CommandSpec::new(Program::Absolute(PathBuf::from("/sendbox-guest")))
@@ -719,6 +728,8 @@ async fn authenticated_port_without_network_fails_closed() {
         .execute_authenticated_once(
             &id,
             AuthenticatedLaunchRequest {
+                session_id: sendbox_core::SessionId::from_bytes([0x80; 16]),
+                boundary_plan_digest: BoundaryPlanDigest::from_bytes([0x81; 32]),
                 command: command("server", &[]),
                 bootstrap_material: sendbox_runtime::BootstrapMaterial::new([9; 32])
                     .expect("bootstrap"),
@@ -733,6 +744,32 @@ async fn authenticated_port_without_network_fails_closed() {
             .to_string()
             .contains("explicit Hyperlight network policy")
     );
+}
+
+#[tokio::test]
+async fn authenticated_launch_rejects_boundary_drift() {
+    let fixture = Fixture::new(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'hyperlight-unikraft 0.test'; exit 0; fi\nexit 0\n",
+        deny_network(),
+    );
+    let id = fixture.running().await;
+    let error = fixture
+        .runtime
+        .execute_authenticated_once(
+            &id,
+            AuthenticatedLaunchRequest {
+                session_id: sendbox_core::SessionId::from_bytes([0x80; 16]),
+                boundary_plan_digest: BoundaryPlanDigest::from_bytes([0xff; 32]),
+                command: command("server", &[]),
+                bootstrap_material: sendbox_runtime::BootstrapMaterial::new([9; 32])
+                    .expect("bootstrap"),
+                listen_ports: Vec::new(),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("boundary drift");
+    assert!(error.to_string().contains("boundary plan"));
 }
 
 #[tokio::test]

@@ -1,31 +1,30 @@
 [package]
-name = "sendbox-agent"
+name = "sendbox-host"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-repository.workspace = true
+publish = false
 
 [dependencies]
+getrandom = "0.3.4"
+rustix.workspace = true
+sendbox-agent = { path = "../sendbox-agent" }
 sendbox-boundary = { path = "../sendbox-boundary" }
+sendbox-bundle = { path = "../sendbox-bundle" }
 sendbox-config = { path = "../sendbox-config" }
 sendbox-core = { path = "../sendbox-core" }
-sendbox-protocol = { path = "../sendbox-protocol" }
 sendbox-runtime = { path = "../sendbox-runtime" }
+sendbox-runtime-apple = { path = "../sendbox-runtime-apple" }
+sendbox-runtime-hyperlight = { path = "../sendbox-runtime-hyperlight" }
+sendbox-runtime-kata = { path = "../sendbox-runtime-kata" }
 sendbox-secrets = { path = "../sendbox-secrets" }
+sendbox-security = { path = "../sendbox-security" }
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
-
-[dev-dependencies]
-proptest.workspace = true
-sendbox-security = { path = "../sendbox-security" }
-sendbox-testkit = { path = "../sendbox-testkit" }
-tempfile.workspace = true
-tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
 
 [lints]
 workspace = true

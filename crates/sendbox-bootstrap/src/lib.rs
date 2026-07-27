@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_policy::CommandPolicy;
 use sendbox_protocol::BootstrapSecret;
 use serde::de::{SeqAccess, Visitor};
@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 1;
+pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 2;
 pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 pub const REQUIRED_RUNTIME_CONTROLS: [ControlKind; 3] = [
     ControlKind::PrivilegeDrop,
@@ -163,6 +163,7 @@ pub struct ExecutionBrokerBootstrap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapDocumentConfiguration {
     pub session_id: SessionId,
+    pub boundary_plan_digest: BoundaryPlanDigest,
     pub host_version: String,
     pub trust_root_id: String,
     pub manifest_path: PathBuf,
@@ -175,6 +176,7 @@ pub struct BootstrapDocumentConfiguration {
 
 pub struct BootstrapDocument {
     pub session_id: SessionId,
+    pub boundary_plan_digest: BoundaryPlanDigest,
     pub bootstrap_nonce: [u8; 32],
     pub bootstrap_secret: BootstrapSecret,
     pub host_version: String,
@@ -204,6 +206,7 @@ pub enum BootstrapError {
 struct BootstrapWire {
     schema_version: u32,
     session_id: SessionId,
+    boundary_plan_digest: BoundaryPlanDigest,
     bootstrap_nonce: [u8; 32],
     bootstrap_secret: SecretBytes,
     host_version: String,
@@ -304,6 +307,7 @@ pub fn encode_bootstrap_document(
     let wire = BootstrapWire {
         schema_version: BOOTSTRAP_SCHEMA_VERSION,
         session_id: configuration.session_id,
+        boundary_plan_digest: configuration.boundary_plan_digest,
         bootstrap_nonce,
         bootstrap_secret: SecretBytes::from_slice(bootstrap_secret)?,
         host_version: configuration.host_version,
@@ -389,6 +393,7 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         .map_err(|_| BootstrapError::Invalid("bootstrap secret is invalid".to_owned()))?;
     Ok(BootstrapDocument {
         session_id: wire.session_id,
+        boundary_plan_digest: wire.boundary_plan_digest,
         bootstrap_nonce: wire.bootstrap_nonce,
         bootstrap_secret,
         host_version: wire.host_version,
@@ -482,6 +487,7 @@ mod tests {
     fn configuration() -> BootstrapDocumentConfiguration {
         BootstrapDocumentConfiguration {
             session_id: SessionId::from_bytes([7; 16]),
+            boundary_plan_digest: BoundaryPlanDigest::from_bytes([8; 32]),
             host_version: "0.1.0".to_owned(),
             trust_root_id: "root-v1".to_owned(),
             manifest_path: PathBuf::from("manifest.json"),
@@ -517,6 +523,10 @@ mod tests {
         let decoded = decode_bootstrap_document(&encoded).expect("decode bootstrap");
 
         assert_eq!(decoded.session_id, SessionId::from_bytes([7; 16]));
+        assert_eq!(
+            decoded.boundary_plan_digest,
+            BoundaryPlanDigest::from_bytes([8; 32])
+        );
         assert_eq!(
             decoded.bootstrap_secret.expose_for_key_derivation(),
             &[9; 32]

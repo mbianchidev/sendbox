@@ -1,7 +1,7 @@
 use std::fmt;
 
 use getrandom::fill;
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use zeroize::Zeroizing;
 
@@ -51,6 +51,7 @@ pub struct HandshakeConfig {
     pub required_capabilities: CapabilitySet,
     pub limits: FrameLimits,
     pub bootstrap_secret: BootstrapSecret,
+    pub boundary_plan_digest: BoundaryPlanDigest,
 }
 
 impl HandshakeConfig {
@@ -61,8 +62,9 @@ impl HandshakeConfig {
         required_capabilities: CapabilitySet,
         limits: FrameLimits,
         bootstrap_secret: BootstrapSecret,
+        boundary_plan_digest: BoundaryPlanDigest,
     ) -> Result<Self, ProtocolError> {
-        if !versions.is_valid() {
+        if !versions.is_valid() || versions.minimum < crate::PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedVersion {
                 minimum: versions.minimum,
                 maximum: versions.maximum,
@@ -78,6 +80,7 @@ impl HandshakeConfig {
             required_capabilities,
             limits,
             bootstrap_secret,
+            boundary_plan_digest,
         })
     }
 }
@@ -179,6 +182,8 @@ impl HostHandshake {
         let negotiation_core = encode_negotiation_core(&negotiation)?;
         let (keys, transcript_hash) = SessionKeys::derive(
             self.config.bootstrap_secret.expose(),
+            negotiation.selected_version,
+            self.config.boundary_plan_digest,
             &hello_bytes,
             &negotiation_core,
         )?;
@@ -315,6 +320,8 @@ impl GuestHandshake {
         let negotiation_core = encode_negotiation_core(&negotiation)?;
         let (keys, transcript_hash) = SessionKeys::derive(
             self.config.bootstrap_secret.expose(),
+            selected_version,
+            self.config.boundary_plan_digest,
             &hello_bytes,
             &negotiation_core,
         )?;
@@ -581,6 +588,7 @@ mod tests {
         capabilities: CapabilitySet,
         required: CapabilitySet,
         secret: [u8; 32],
+        boundary_plan_digest: BoundaryPlanDigest,
     ) -> HandshakeConfig {
         HandshakeConfig::new(
             SessionId::from_bytes(session),
@@ -589,6 +597,7 @@ mod tests {
             required,
             FrameLimits::new(32 * 1024).expect("limits"),
             BootstrapSecret::new(secret).expect("secret"),
+            boundary_plan_digest,
         )
         .expect("config")
     }
@@ -609,17 +618,19 @@ mod tests {
         let (host_stream, guest_stream) = tokio::io::duplex(16 * 1024);
         let mut host = HostHandshake::new(config(
             session,
-            VersionRange::new(1, 3),
+            VersionRange::new(2, 3),
             standard_capabilities(),
             [Capability::Lifecycle].into(),
             SECRET,
+            BoundaryPlanDigest::from_bytes([0x41; 32]),
         ));
         let mut guest = GuestHandshake::new(config(
             session,
-            VersionRange::new(1, 2),
+            VersionRange::new(2, 2),
             [Capability::Lifecycle, Capability::Health, Capability::Audit].into(),
             [Capability::Health].into(),
             SECRET,
+            BoundaryPlanDigest::from_bytes([0x41; 32]),
         ));
         let (host_result, guest_result) =
             tokio::join!(host.establish(host_stream), guest.establish(guest_stream));
@@ -641,6 +652,7 @@ mod tests {
             standard_capabilities(),
             CapabilitySet::default(),
             SECRET,
+            BoundaryPlanDigest::from_bytes([0x42; 32]),
         ));
         let mut guest = GuestHandshake::new(config(
             session,
@@ -648,6 +660,7 @@ mod tests {
             standard_capabilities(),
             CapabilitySet::default(),
             [0x99; 32],
+            BoundaryPlanDigest::from_bytes([0x42; 32]),
         ));
         let (host_result, guest_result) =
             tokio::join!(host.establish(host_stream), guest.establish(guest_stream));
@@ -692,6 +705,7 @@ mod tests {
                 standard_capabilities(),
                 CapabilitySet::default(),
                 SECRET,
+                BoundaryPlanDigest::from_bytes([0x43; 32]),
             ),
             config(
                 [2; 16],
@@ -699,6 +713,7 @@ mod tests {
                 standard_capabilities(),
                 CapabilitySet::default(),
                 SECRET,
+                BoundaryPlanDigest::from_bytes([0x43; 32]),
             ),
         )
         .await;
@@ -708,17 +723,19 @@ mod tests {
         let (host, guest) = run(
             config(
                 [1; 16],
-                VersionRange::new(1, 1),
-                standard_capabilities(),
-                CapabilitySet::default(),
-                SECRET,
-            ),
-            config(
-                [1; 16],
                 VersionRange::new(2, 2),
                 standard_capabilities(),
                 CapabilitySet::default(),
                 SECRET,
+                BoundaryPlanDigest::from_bytes([0x44; 32]),
+            ),
+            config(
+                [1; 16],
+                VersionRange::new(3, 3),
+                standard_capabilities(),
+                CapabilitySet::default(),
+                SECRET,
+                BoundaryPlanDigest::from_bytes([0x44; 32]),
             ),
         )
         .await;
@@ -735,6 +752,7 @@ mod tests {
                 [Capability::Exec].into(),
                 CapabilitySet::default(),
                 SECRET,
+                BoundaryPlanDigest::from_bytes([0x45; 32]),
             ),
             config(
                 [1; 16],
@@ -742,6 +760,7 @@ mod tests {
                 [Capability::Health].into(),
                 CapabilitySet::default(),
                 SECRET,
+                BoundaryPlanDigest::from_bytes([0x45; 32]),
             ),
         )
         .await;
@@ -777,6 +796,7 @@ mod tests {
             standard_capabilities(),
             CapabilitySet::default(),
             SECRET,
+            BoundaryPlanDigest::from_bytes([0x46; 32]),
         ));
         assert!(matches!(
             guest.establish(guest_stream).await,
@@ -798,6 +818,7 @@ mod tests {
             [Capability::Health].into(),
             FrameLimits::default(),
             BootstrapSecret::new(SECRET).expect("secret"),
+            BoundaryPlanDigest::from_bytes([0x47; 32]),
         );
         assert!(matches!(
             missing,
@@ -811,11 +832,54 @@ mod tests {
             CapabilitySet::default(),
             FrameLimits::default(),
             BootstrapSecret::new(SECRET).expect("secret"),
+            BoundaryPlanDigest::from_bytes([0x47; 32]),
         );
         assert!(matches!(
             invalid,
             Err(ProtocolError::UnsupportedVersion { .. })
         ));
-        assert_eq!(PROTOCOL_VERSION, 1);
+        let legacy = HandshakeConfig::new(
+            SessionId::from_bytes([1; 16]),
+            VersionRange::new(1, 1),
+            standard_capabilities(),
+            CapabilitySet::default(),
+            FrameLimits::default(),
+            BootstrapSecret::new(SECRET).expect("secret"),
+            BoundaryPlanDigest::from_bytes([0x47; 32]),
+        );
+        assert!(matches!(
+            legacy,
+            Err(ProtocolError::UnsupportedVersion { .. })
+        ));
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    #[tokio::test]
+    async fn boundary_plan_digest_mismatch_fails_authentication() {
+        let session = [8; 16];
+        let (host_stream, guest_stream) = tokio::io::duplex(16 * 1024);
+        let mut host = HostHandshake::new(config(
+            session,
+            VersionRange::default(),
+            standard_capabilities(),
+            CapabilitySet::default(),
+            SECRET,
+            BoundaryPlanDigest::from_bytes([0x51; 32]),
+        ));
+        let mut guest = GuestHandshake::new(config(
+            session,
+            VersionRange::default(),
+            standard_capabilities(),
+            CapabilitySet::default(),
+            SECRET,
+            BoundaryPlanDigest::from_bytes([0x52; 32]),
+        ));
+        let (host_result, guest_result) =
+            tokio::join!(host.establish(host_stream), guest.establish(guest_stream));
+        assert!(matches!(
+            host_result,
+            Err(ProtocolError::AuthenticationFailed)
+        ));
+        assert!(guest_result.is_err());
     }
 }

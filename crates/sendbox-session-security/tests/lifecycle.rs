@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_secrets::{
     CredentialPolicy, EnvelopeBinding, EnvelopeCipher, RecipientRole, RecordVersion, Secret,
     SecretMetadata, SecretName, SecretStore, SecretStoreError, SecretValue, SessionKeyMaterial,
@@ -213,6 +213,7 @@ fn secret_request() -> SecretEnvelopeRequest {
             sequence: 7,
             expires_at_unix_ms: 10_000,
             policy_digest: [3; 32],
+            boundary_plan_digest: BoundaryPlanDigest::from_bytes([4; 32]),
         },
     }
 }

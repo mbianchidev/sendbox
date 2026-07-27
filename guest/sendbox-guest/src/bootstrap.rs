@@ -121,7 +121,7 @@ impl Drop for ConsumedBootstrap {
 
 pub fn replay_key(session_id: SessionId, nonce: &[u8; 32]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"sendbox guest bootstrap replay v1");
+    hasher.update(b"sendbox guest bootstrap replay v2");
     hasher.update(session_id.as_bytes());
     hasher.update(nonce);
     encode_hex(&hasher.finalize())
@@ -178,6 +178,7 @@ mod tests {
     use crate::secure_fs::secure_tempdir;
     use rustix::process::{getgid, getuid};
     use sendbox_bootstrap::{BootstrapDocumentConfiguration, encode_bootstrap_document};
+    use sendbox_core::BoundaryPlanDigest;
 
     fn identity() -> (u32, u32) {
         (getuid().as_raw(), getgid().as_raw())
@@ -187,6 +188,7 @@ mod tests {
         let encoded = encode_bootstrap_document(
             BootstrapDocumentConfiguration {
                 session_id: SessionId::from_bytes([1; 16]),
+                boundary_plan_digest: BoundaryPlanDigest::from_bytes([2; 32]),
                 host_version: "0.1.0".to_owned(),
                 trust_root_id: "root-v1".to_owned(),
                 manifest_path: PathBuf::from("manifest.json"),

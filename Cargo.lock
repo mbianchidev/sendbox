@@ -1813,11 +1813,13 @@ name = "sendbox-agent"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "sendbox-boundary",
  "sendbox-config",
  "sendbox-core",
  "sendbox-protocol",
  "sendbox-runtime",
  "sendbox-secrets",
+ "sendbox-security",
  "sendbox-testkit",
  "serde",
  "serde_json",
@@ -1888,16 +1890,15 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "clap_complete",
- "getrandom 0.4.3",
  "rpassword",
  "sendbox-agent",
  "sendbox-config",
  "sendbox-core",
+ "sendbox-host",
  "sendbox-mcp",
  "sendbox-policy",
  "sendbox-project",
  "sendbox-runtime",
- "sendbox-runtime-kata",
  "sendbox-secrets",
  "serde",
  "serde_json",
@@ -2025,6 +2026,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-host"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "rustix",
+ "sendbox-agent",
+ "sendbox-boundary",
+ "sendbox-bundle",
+ "sendbox-config",
+ "sendbox-core",
+ "sendbox-runtime",
+ "sendbox-runtime-apple",
+ "sendbox-runtime-hyperlight",
+ "sendbox-runtime-kata",
+ "sendbox-secrets",
+ "sendbox-security",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "sendbox-mcp"
 version = "0.1.0"
 dependencies = [
@@ -2124,6 +2149,7 @@ dependencies = [
  "ipnet",
  "rustix",
  "sendbox-bundle",
+ "sendbox-core",
  "sendbox-egress",
  "sendbox-guest",
  "sendbox-runtime",
@@ -2219,6 +2245,7 @@ version = "0.1.0"
 dependencies = [
  "nix",
  "proptest",
+ "sendbox-core",
  "sendbox-runtime",
  "tempfile",
  "tokio",

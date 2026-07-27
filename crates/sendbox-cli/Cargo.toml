@@ -13,16 +13,15 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 clap_complete.workspace = true
-getrandom.workspace = true
 rpassword.workspace = true
 sendbox-agent = { path = "../sendbox-agent" }
 sendbox-config = { path = "../sendbox-config" }
 sendbox-core = { path = "../sendbox-core" }
+sendbox-host = { path = "../sendbox-host" }
 sendbox-mcp = { path = "../sendbox-mcp" }
 sendbox-policy = { path = "../sendbox-policy" }
 sendbox-project = { path = "../sendbox-project" }
 sendbox-runtime = { path = "../sendbox-runtime" }
-sendbox-runtime-kata = { path = "../sendbox-runtime-kata" }
 sendbox-secrets = { path = "../sendbox-secrets" }
 serde.workspace = true
 serde_json.workspace = true

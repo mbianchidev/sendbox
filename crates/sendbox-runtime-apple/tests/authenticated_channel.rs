@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_protocol::{
     BootstrapSecret, Capability, FrameLimits, GuestHandshake, HandshakeConfig, HostHandshake,
     Message, VersionRange,
@@ -21,6 +21,7 @@ fn configuration(session_id: SessionId) -> HandshakeConfig {
         [Capability::Lifecycle, Capability::Health].into(),
         FrameLimits::default(),
         BootstrapSecret::new([0x5a; 32]).expect("secret"),
+        BoundaryPlanDigest::from_bytes([0x87; 32]),
     )
     .expect("handshake config")
 }

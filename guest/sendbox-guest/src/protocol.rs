@@ -2,9 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use sendbox_protocol::{
     AGENT_LAUNCH_OPERATION, BootstrapSecret, CloseCode, Event, EventKind, FrameLimits,
-    GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV1, LaunchRequestV1, Message,
+    GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, LaunchRequestV2, Message,
     OPERATION_SCHEMA_VERSION, ProtocolErrorCode, ProtocolErrorMessage, Request, Response,
-    ResponseStatus, TerminalResultV1, TerminalStateV1, VersionRange, agent_guest_capabilities,
+    ResponseStatus, TerminalResultV2, TerminalStateV1, VersionRange, agent_guest_capabilities,
     agent_guest_required_capabilities,
 };
 use sendbox_secrets::{
@@ -24,6 +24,7 @@ use crate::state::{StartupState, StartupStateMachine};
 pub fn handshake_config(
     session_id: sendbox_core::SessionId,
     bootstrap_secret: BootstrapSecret,
+    boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
 ) -> Result<HandshakeConfig, GuestError> {
     HandshakeConfig::new(
         session_id,
@@ -32,12 +33,14 @@ pub fn handshake_config(
         agent_guest_required_capabilities(),
         FrameLimits::default(),
         bootstrap_secret,
+        boundary_plan_digest,
     )
     .map_err(GuestError::from)
 }
 
 pub(crate) struct GuestSecretDecryptor {
     session_id: sendbox_core::SessionId,
+    boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     cipher: EnvelopeCipher,
     replay_guard: ReplayGuard,
 }
@@ -46,6 +49,7 @@ impl GuestSecretDecryptor {
     pub(crate) fn new(
         session_id: sendbox_core::SessionId,
         material: &[u8],
+        boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     ) -> Result<Self, GuestError> {
         let material = SessionKeyMaterial::new(material.to_vec())
             .map_err(|error| GuestError::Protocol(format!("prepare secret key: {error}")))?;
@@ -54,6 +58,7 @@ impl GuestSecretDecryptor {
         })?;
         Ok(Self {
             session_id,
+            boundary_plan_digest,
             cipher,
             replay_guard: ReplayGuard::default(),
         })
@@ -170,7 +175,7 @@ fn handle_request(
     let (status, payload) = match request.operation.as_str() {
         "health" if service_readiness.verified_live() => (
             ResponseStatus::Ok,
-            serde_json::to_vec(&HealthResponseV1 {
+            serde_json::to_vec(&HealthResponseV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 ready: true,
                 broker_live: true,
@@ -180,7 +185,7 @@ fn handle_request(
         ),
         "health" => (
             ResponseStatus::Rejected,
-            serde_json::to_vec(&HealthResponseV1 {
+            serde_json::to_vec(&HealthResponseV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 ready: false,
                 broker_live: false,
@@ -225,13 +230,21 @@ where
         )
         .await;
     };
-    let launch: LaunchRequestV1 = serde_json::from_slice(&request.payload)
+    let launch: LaunchRequestV2 = serde_json::from_slice(&request.payload)
         .map_err(|error| GuestError::Protocol(format!("decoding launch request: {error}")))?;
     if launch.schema_version != OPERATION_SCHEMA_VERSION {
         return send_rejection(
             host_writer,
             request.request_id,
             "unsupported-operation-schema",
+        )
+        .await;
+    }
+    if launch.boundary_plan_digest != services.secret_decryptor.boundary_plan_digest {
+        return send_rejection(
+            host_writer,
+            request.request_id,
+            "boundary-plan-digest-mismatch",
         )
         .await;
     }
@@ -324,7 +337,7 @@ where
 }
 
 fn build_execution_request(
-    launch: &LaunchRequestV1,
+    launch: &LaunchRequestV2,
     broker: &BrokerClientConfiguration,
     secret_decryptor: &GuestSecretDecryptor,
 ) -> Result<sendbox_exec::ExecutionRequest, GuestError> {
@@ -363,7 +376,7 @@ fn build_execution_request(
 }
 
 fn decrypt_environment(
-    launch: &LaunchRequestV1,
+    launch: &LaunchRequestV2,
     secret_decryptor: &GuestSecretDecryptor,
 ) -> Result<Vec<sendbox_exec::EnvironmentEntry>, GuestError> {
     let mut names = std::collections::BTreeSet::new();
@@ -382,6 +395,12 @@ fn decrypt_environment(
     }
     let now = unix_time_ms()?;
     for secret in &launch.secrets {
+        if secret.boundary_plan_digest != secret_decryptor.boundary_plan_digest {
+            return Err(GuestError::Protocol(format!(
+                "secret {} carries a different boundary plan digest",
+                secret.reference
+            )));
+        }
         if !names.insert(secret.reference.as_str()) {
             return Err(GuestError::Protocol(format!(
                 "duplicate environment or secret name {}",
@@ -396,6 +415,7 @@ fn decrypt_environment(
             sequence: secret.sequence,
             expires_at_unix_ms: secret.expires_at_unix_ms,
             policy_digest: secret.policy_digest,
+            boundary_plan_digest: secret_decryptor.boundary_plan_digest,
         };
         let value = secret_decryptor
             .cipher
@@ -459,7 +479,7 @@ fn descriptor_path(
     ))
 }
 
-fn terminal_result(result: sendbox_exec::ExecutionResult) -> TerminalResultV1 {
+fn terminal_result(result: sendbox_exec::ExecutionResult) -> TerminalResultV2 {
     use sendbox_exec::TerminalState;
     let terminal = match result.terminal {
         TerminalState::Exited(status) => TerminalStateV1::Exited {
@@ -477,7 +497,7 @@ fn terminal_result(result: sendbox_exec::ExecutionResult) -> TerminalResultV1 {
         TerminalState::BrokerShutdown => TerminalStateV1::BrokerShutdown,
         TerminalState::SupervisorDied => TerminalStateV1::SupervisorDied,
     };
-    TerminalResultV1 {
+    TerminalResultV2 {
         schema_version: OPERATION_SCHEMA_VERSION,
         terminal,
         cleanup_complete: result.cleanup.is_complete(),
@@ -496,7 +516,7 @@ where
         .send(&Message::Response(Response {
             request_id,
             status: ResponseStatus::Rejected,
-            payload: serde_json::to_vec(&TerminalResultV1 {
+            payload: serde_json::to_vec(&TerminalResultV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 terminal: TerminalStateV1::Rejected {
                     reason: reason.to_owned(),
@@ -560,7 +580,7 @@ where
 #[cfg(test)]
 mod tests {
     use rustix::process::{getgid, getuid};
-    use sendbox_core::SessionId;
+    use sendbox_core::{BoundaryPlanDigest, SessionId};
     use sendbox_protocol::{HostHandshake, Message, Request};
     use tempfile::tempdir;
 
@@ -587,6 +607,7 @@ mod tests {
             handshake_config(
                 SessionId::from_bytes([3; 16]),
                 BootstrapSecret::new([9; 32]).expect("secret"),
+                BoundaryPlanDigest::from_bytes([0x91; 32]),
             )
             .expect("config"),
             ProtocolServices::new(
@@ -602,8 +623,12 @@ mod tests {
                     audit_events: Vec::new(),
                 },
                 None,
-                GuestSecretDecryptor::new(SessionId::from_bytes([3; 16]), &[9; 32])
-                    .expect("secret decryptor"),
+                GuestSecretDecryptor::new(
+                    SessionId::from_bytes([3; 16]),
+                    &[9; 32],
+                    BoundaryPlanDigest::from_bytes([0x91; 32]),
+                )
+                .expect("secret decryptor"),
             ),
         )
         .await;
@@ -614,6 +639,7 @@ mod tests {
     async fn authenticated_launch_requires_a_configured_broker() {
         let temporary = tempdir().expect("temporary directory");
         let session_id = SessionId::from_bytes([4; 16]);
+        let boundary_plan_digest = BoundaryPlanDigest::from_bytes([0x92; 32]);
         let runtime = Arc::new(
             RuntimeSession::prepare(
                 &temporary.path().join("run"),
@@ -649,15 +675,20 @@ mod tests {
         let (host_stream, guest_stream) = tokio::io::duplex(16 * 1024);
         let guest = tokio::spawn(serve_authenticated(
             guest_stream,
-            handshake_config(session_id, BootstrapSecret::new([8; 32]).expect("secret"))
-                .expect("guest config"),
+            handshake_config(
+                session_id,
+                BootstrapSecret::new([8; 32]).expect("secret"),
+                boundary_plan_digest,
+            )
+            .expect("guest config"),
             ProtocolServices::new(
                 Arc::clone(&state),
                 ReadinessGate::test_ready(),
                 runtime,
                 readiness,
                 None,
-                GuestSecretDecryptor::new(session_id, &[8; 32]).expect("secret decryptor"),
+                GuestSecretDecryptor::new(session_id, &[8; 32], boundary_plan_digest)
+                    .expect("secret decryptor"),
             ),
         ));
         let mut host_handshake = HostHandshake::new(
@@ -668,6 +699,7 @@ mod tests {
                 sendbox_protocol::agent_host_required_capabilities(),
                 FrameLimits::default(),
                 BootstrapSecret::new([8; 32]).expect("secret"),
+                boundary_plan_digest,
             )
             .expect("host config"),
         );

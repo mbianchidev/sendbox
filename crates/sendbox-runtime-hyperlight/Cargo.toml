@@ -11,6 +11,7 @@ publish = false
 cap-std.workspace = true
 ipnet.workspace = true
 sendbox-bundle = { path = "../sendbox-bundle" }
+sendbox-core = { path = "../sendbox-core" }
 sendbox-egress = { path = "../sendbox-egress" }
 sendbox-guest = { path = "../../guest/sendbox-guest" }
 sendbox-runtime = { path = "../sendbox-runtime" }

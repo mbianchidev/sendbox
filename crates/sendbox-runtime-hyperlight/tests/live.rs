@@ -1,5 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
+use sendbox_core::BoundaryPlanDigest;
 use sendbox_runtime::{
     CancellationToken, CommandArgument, CommandSpec, ContainerId, CreateRequest, ExecPurpose,
     ExecRequest, InitializeRequest, PreflightRequest, Program, RuntimeProvider, RuntimeResources,
@@ -70,7 +71,9 @@ async fn live_hyperlight_launch_when_designated() {
     runtime
         .create(
             CreateRequest {
+                session_id: sendbox_core::SessionId::from_bytes([0x82; 16]),
                 container_id: id.clone(),
+                boundary_plan_digest: BoundaryPlanDigest::from_bytes([0x82; 32]),
                 image: bundle.display().to_string(),
                 hostname: String::new(),
                 resources: RuntimeResources {

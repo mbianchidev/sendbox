@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_guest::GuestError;
 use sendbox_guest::manifest::{
     ArtifactExpectation, ArtifactKind, ArtifactManifest, MANIFEST_DOMAIN, MANIFEST_SCHEMA_VERSION,
@@ -63,6 +63,7 @@ struct Fixture {
     _temporary: TempDir,
     options: SupervisorOptions,
     session_id: SessionId,
+    boundary_plan_digest: BoundaryPlanDigest,
     session_dir: PathBuf,
     service_pid: PathBuf,
     child_pid: PathBuf,
@@ -139,6 +140,7 @@ impl Fixture {
             .expect("trust-root mode");
 
         let session_id = SessionId::from_bytes([0x44; 16]);
+        let boundary_plan_digest = BoundaryPlanDigest::from_bytes([0x45; 32]);
         let session_dir = runtime_root.join(session_id.to_string());
         assert!(
             session_dir.join("control.sock").as_os_str().len() < 104,
@@ -230,8 +232,9 @@ impl Fixture {
         fs::write(
             &bootstrap_file,
             serde_json::to_vec(&json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "session_id": session_id,
+                "boundary_plan_digest": boundary_plan_digest,
                 "bootstrap_nonce": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
                     9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9],
                 "bootstrap_secret": SECRET,
@@ -270,6 +273,7 @@ impl Fixture {
                 replay_root,
             },
             session_id,
+            boundary_plan_digest,
             session_dir,
             service_pid,
             child_pid,
@@ -301,6 +305,7 @@ impl Fixture {
             handshake_config(
                 self.session_id,
                 BootstrapSecret::new(SECRET).expect("secret"),
+                self.boundary_plan_digest,
             )
             .expect("host handshake config"),
         );

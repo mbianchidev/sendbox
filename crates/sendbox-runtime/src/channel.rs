@@ -1,10 +1,10 @@
 use std::{fmt, path::PathBuf, time::Duration};
 
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use tokio::io::{AsyncRead, AsyncWrite};
 use zeroize::Zeroizing;
 
-use crate::{BoxFuture, CancellationToken, ContainerId, RuntimeError};
+use crate::{BoxFuture, CancellationToken, ContainerId, CreateRequest, RuntimeError};
 
 pub const MIN_READINESS_TIMEOUT: Duration = Duration::from_millis(10);
 pub const MAX_READINESS_TIMEOUT: Duration = Duration::from_secs(300);
@@ -87,6 +87,7 @@ impl fmt::Debug for BootstrapMaterial {
 pub struct ControlChannelRequest {
     pub session_id: SessionId,
     pub container_id: ContainerId,
+    pub boundary_plan_digest: BoundaryPlanDigest,
     pub endpoint_kind: ControlEndpointKind,
     pub ownership: ChannelOwnership,
     pub lifetime: ChannelLifetime,
@@ -117,6 +118,20 @@ impl ControlChannelRequest {
             return Err(RuntimeError::InvalidControlChannel {
                 reason: "control bootstrap cannot use standard input, output, or error descriptors"
                     .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_create_binding(&self, create: &CreateRequest) -> Result<(), RuntimeError> {
+        if self.container_id != create.container_id
+            || self.session_id != create.session_id
+            || self.boundary_plan_digest != create.boundary_plan_digest
+        {
+            return Err(RuntimeError::InvalidControlChannel {
+                reason:
+                    "control channel container, session, or boundary plan does not match creation"
+                        .to_owned(),
             });
         }
         Ok(())
@@ -158,9 +173,9 @@ pub trait ProvisionedControlChannel: Send {
 mod tests {
     use std::time::Duration;
 
-    use sendbox_core::SessionId;
+    use sendbox_core::{BoundaryPlanDigest, SessionId};
 
-    use crate::ContainerId;
+    use crate::{ContainerId, CreateRequest, RuntimeResources};
 
     use super::{
         BootstrapDelivery, BootstrapMaterial, ChannelLifetime, ChannelOwnership,
@@ -171,6 +186,7 @@ mod tests {
         ControlChannelRequest {
             session_id: SessionId::from_bytes([7; 16]),
             container_id: ContainerId::new("channel-test").expect("container"),
+            boundary_plan_digest: BoundaryPlanDigest::from_bytes([8; 32]),
             endpoint_kind: kind,
             ownership: ChannelOwnership::RuntimeLifecycle,
             lifetime: ChannelLifetime::UntilRuntimeCleanup,
@@ -178,6 +194,42 @@ mod tests {
             bootstrap_delivery: BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
             bootstrap_material: BootstrapMaterial::new([9; 32]).expect("bootstrap"),
         }
+    }
+
+    fn create(channel: &ControlChannelRequest) -> CreateRequest {
+        CreateRequest {
+            session_id: channel.session_id,
+            container_id: channel.container_id.clone(),
+            boundary_plan_digest: channel.boundary_plan_digest,
+            image: "fixture".to_owned(),
+            hostname: "fixture".to_owned(),
+            resources: RuntimeResources {
+                cpus: 1,
+                memory_bytes: 1,
+            },
+            mounts: Vec::new(),
+            environment: Vec::new(),
+            working_directory: "/".into(),
+            dns_servers: Vec::new(),
+            labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn create_binding_rejects_session_and_boundary_drift() {
+        let channel = request(ControlEndpointKind::Vsock);
+        let create = create(&channel);
+        channel
+            .validate_create_binding(&create)
+            .expect("matching binding");
+
+        let mut wrong_session = request(ControlEndpointKind::Vsock);
+        wrong_session.session_id = SessionId::from_bytes([9; 16]);
+        assert!(wrong_session.validate_create_binding(&create).is_err());
+
+        let mut wrong_boundary = request(ControlEndpointKind::Vsock);
+        wrong_boundary.boundary_plan_digest = BoundaryPlanDigest::from_bytes([10; 32]);
+        assert!(wrong_boundary.validate_create_binding(&create).is_err());
     }
 
     #[test]

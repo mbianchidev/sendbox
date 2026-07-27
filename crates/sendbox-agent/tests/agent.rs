@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -12,11 +12,18 @@ use sendbox_agent::{
     GuestExecution, GuestLaunchRequest, GuestSession, GuestTerminal, NoSignals, OutputSink,
     ProtocolGuestConnector, RunPlan, SecretEnvelope, SecretReference, SecretResolver, SignalSource,
 };
+use sendbox_boundary::{
+    Architecture, ArtifactIdentity, ArtifactKind, BOUNDARY_PLAN_FORMAT, BOUNDARY_PLAN_VERSION,
+    BoundaryPlan, CommandDeclaration, ControlTransport, EnvironmentDeclaration, HostPlatform,
+    MountDeclaration, OperatingSystem, ProviderDeclaration, ResourceDeclaration,
+    SignedBoundaryPlan, TrustDeclaration, VerifiedBoundaryPlan, WorkloadIdentity, select_runtime,
+    sha256_hex,
+};
 use sendbox_config::SandboxConfiguration;
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_protocol::{
     BootstrapSecret, Capability, CapabilitySet, Event, EventKind, FrameLimits, GuestHandshake,
-    HandshakeConfig, LaunchRequestV1, Message, Request, Response, ResponseStatus, VersionRange,
+    HandshakeConfig, LaunchRequestV2, Message, Request, Response, ResponseStatus, VersionRange,
 };
 use sendbox_runtime::{
     CancellationToken, ControlStream, ExecPurpose, ExecRequest, OutputStream, RuntimeCapabilities,
@@ -25,7 +32,18 @@ use sendbox_runtime::{
 use sendbox_secrets::{
     EnvelopeBinding, EnvelopeCipher, RecipientRole, ReplayGuard, SecretName, SessionKeyMaterial,
 };
+use sendbox_security::provenance::SigningKeyMaterial;
 use sendbox_testkit::{FakeRuntime, TempResource};
+
+const IMAGE_DIGEST: &str =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn plan_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_secs()
+}
 
 fn runtime_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities::from([
@@ -50,24 +68,148 @@ fn configuration(project_path: PathBuf) -> SandboxConfiguration {
 }
 
 fn request(resources: &TempResource, session_id: SessionId) -> AgentRequest {
+    let configuration = configuration(resources.path().to_path_buf());
+    let image = format!("registry.example/sendbox-test@{IMAGE_DIGEST}");
+    let guest_workspace = PathBuf::from("/workspace");
+    let command = GuestCommand {
+        program: "/usr/bin/agent".to_owned(),
+        arguments: vec!["run".to_owned()],
+        working_directory: "/workspace".to_owned(),
+    };
+    let environment = vec![EnvironmentIntent {
+        name: "SEND_BOX".to_owned(),
+        value: "1".to_owned(),
+        sensitive: false,
+    }];
+    let mounts = Vec::new();
     AgentRequest {
+        boundary_plan: verified_boundary_plan(
+            &configuration,
+            session_id,
+            &image,
+            &guest_workspace,
+            &command,
+            &environment,
+            &mounts,
+        ),
         session_id,
         state_directory: resources.path().join("state"),
-        image: "fake:image".to_owned(),
-        guest_workspace: PathBuf::from("/workspace"),
-        command: GuestCommand {
-            program: "/usr/bin/agent".to_owned(),
-            arguments: vec!["run".to_owned()],
-            working_directory: "/workspace".to_owned(),
-        },
-        environment: vec![EnvironmentIntent {
-            name: "SEND_BOX".to_owned(),
-            value: "1".to_owned(),
-        }],
-        mounts: Vec::new(),
+        image,
+        guest_workspace,
+        command,
+        environment,
+        mounts,
         bootstrap_reference: SecretReference::new("bootstrap").expect("reference"),
         readiness_timeout: Duration::from_secs(1),
     }
+}
+
+fn verified_boundary_plan(
+    configuration: &SandboxConfiguration,
+    session_id: SessionId,
+    image: &str,
+    guest_workspace: &std::path::Path,
+    command: &GuestCommand,
+    environment: &[EnvironmentIntent],
+    mounts: &[sendbox_agent::MountIntent],
+) -> VerifiedBoundaryPlan {
+    let now = plan_time();
+    let configuration_bytes = serde_json::to_vec(configuration).expect("configuration JSON");
+    let policy_bytes = serde_json::to_vec(&configuration.policy).expect("policy JSON");
+    let selection = select_runtime(
+        sendbox_config::RuntimeProvider::Kata,
+        HostPlatform {
+            operating_system: OperatingSystem::Linux,
+            architecture: Architecture::X86_64,
+        },
+    )
+    .expect("runtime selection");
+    let boundary = BoundaryPlan {
+        format: BOUNDARY_PLAN_FORMAT.to_owned(),
+        version: BOUNDARY_PLAN_VERSION,
+        session_id,
+        created_at_unix: now,
+        expires_at_unix: now + 600,
+        selection,
+        configuration_sha256: sha256_hex(&configuration_bytes),
+        policy_sha256: sha256_hex(&policy_bytes),
+        trust: TrustDeclaration {
+            trust_root_id: "test-root".to_owned(),
+            minimum_release_sequence: 1,
+            host_version: "0.1.0".to_owned(),
+            guest_version: "0.1.0".to_owned(),
+        },
+        workload: WorkloadIdentity::OciImage {
+            reference: image.to_owned(),
+            digest: IMAGE_DIGEST.to_owned(),
+        },
+        provider: ProviderDeclaration::Kata {
+            executable: PathBuf::from("/usr/bin/nerdctl"),
+            runtime_handler: "io.containerd.kata.v2".to_owned(),
+            namespace: "sendbox".to_owned(),
+            address: None,
+            snapshotter: None,
+            configuration_path: None,
+            transport: ControlTransport::RuntimeExecStdio,
+        },
+        command: CommandDeclaration {
+            program: command.program.clone(),
+            arguments: command.arguments.clone(),
+            working_directory: command.working_directory.clone(),
+        },
+        workspace: MountDeclaration {
+            source: configuration.project_path.clone(),
+            destination: guest_workspace.to_path_buf(),
+            writable: true,
+        },
+        mounts: mounts
+            .iter()
+            .map(|mount| MountDeclaration {
+                source: mount.source.clone(),
+                destination: mount.destination.clone(),
+                writable: mount.writable,
+            })
+            .collect(),
+        environment: environment
+            .iter()
+            .map(|entry| EnvironmentDeclaration {
+                name: entry.name.clone(),
+                value_sha256: sha256_hex(entry.value.as_bytes()),
+                sensitive: entry.sensitive,
+            })
+            .collect(),
+        secrets: configuration.secrets.clone(),
+        artifacts: vec![
+            ArtifactIdentity {
+                kind: ArtifactKind::RuntimeExecutable,
+                path: PathBuf::from("/usr/bin/nerdctl"),
+                sha256: "11".repeat(32),
+            },
+            ArtifactIdentity {
+                kind: ArtifactKind::GuestBundleManifest,
+                path: PathBuf::from("/opt/sendbox/manifest.json"),
+                sha256: "22".repeat(32),
+            },
+            ArtifactIdentity {
+                kind: ArtifactKind::TrustRoot,
+                path: PathBuf::from("/etc/sendbox/trust-root.pub"),
+                sha256: "33".repeat(32),
+            },
+        ],
+        resources: ResourceDeclaration {
+            cpus: u32::try_from(configuration.resources.cpus).expect("CPU count"),
+            memory_bytes: u64::try_from(configuration.resources.memory_mb).expect("memory")
+                * 1024
+                * 1024,
+        },
+        features: BTreeMap::new(),
+    };
+    let key = SigningKeyMaterial::generate().expect("signing key");
+    let fingerprint = key.identity("test", None, 0, None).fingerprint.clone();
+    SignedBoundaryPlan::sign(boundary, &key, now)
+        .expect("signed boundary")
+        .verify(&fingerprint, now)
+        .expect("verified boundary")
 }
 
 fn plan(
@@ -79,6 +221,7 @@ fn plan(
         &configuration(resources.path().to_path_buf()),
         request(resources, session_id),
         capabilities,
+        plan_time(),
     )
     .expect("run plan")
 }
@@ -296,6 +439,7 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
     let session_id = SessionId::from_bytes([3; 16]);
     let plan = plan(&resources, &capabilities, session_id);
     let expected_policy_digest = plan.policy_digest();
+    let expected_boundary_digest = plan.boundary_plan_digest();
     let (host, guest) = tokio::io::duplex(16 * 1024);
     runtime.set_control_stream(Box::new(host));
     let guest_task = tokio::spawn(async move {
@@ -306,6 +450,7 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             sendbox_protocol::agent_guest_required_capabilities(),
             FrameLimits::default(),
             BootstrapSecret::new([7; 32]).expect("bootstrap"),
+            expected_boundary_digest,
         )
         .expect("handshake config");
         let mut handshake = GuestHandshake::new(configuration);
@@ -330,7 +475,7 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             panic!("expected launch request");
         };
         assert_eq!(operation, "agent.launch");
-        let launch: LaunchRequestV1 = serde_json::from_slice(&payload).expect("launch payload");
+        let launch: LaunchRequestV2 = serde_json::from_slice(&payload).expect("launch payload");
         assert!(
             !payload
                 .windows(b"envelope:TOKEN".len())
@@ -340,6 +485,8 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
         let secret = &launch.secrets[0];
         assert_eq!(secret.reference, "TOKEN");
         assert_eq!(secret.policy_digest, expected_policy_digest);
+        assert_eq!(launch.boundary_plan_digest, expected_boundary_digest);
+        assert_eq!(secret.boundary_plan_digest, expected_boundary_digest);
         let material = SessionKeyMaterial::new([7; 32]).expect("secret material");
         let cipher = EnvelopeCipher::new(&material, session_id).expect("secret cipher");
         let binding = EnvelopeBinding {
@@ -349,6 +496,7 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             sequence: secret.sequence,
             expires_at_unix_ms: secret.expires_at_unix_ms,
             policy_digest: secret.policy_digest,
+            boundary_plan_digest: expected_boundary_digest,
         };
         let decrypted = cipher
             .open(&secret.envelope, &binding, &ReplayGuard::default(), 0)
@@ -366,7 +514,7 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             .send(&Message::Response(Response {
                 request_id,
                 status: ResponseStatus::Ok,
-                payload: serde_json::to_vec(&sendbox_protocol::TerminalResultV1 {
+                payload: serde_json::to_vec(&sendbox_protocol::TerminalResultV2 {
                     schema_version: sendbox_protocol::OPERATION_SCHEMA_VERSION,
                     terminal: sendbox_protocol::TerminalStateV1::Exited {
                         exit_code: Some(0),
@@ -556,6 +704,7 @@ async fn wrong_protocol_session_fails_readiness_and_cleans_up() {
     let capabilities = runtime_capabilities();
     let runtime = Arc::new(FakeRuntime::new(capabilities.clone()).expect("runtime"));
     let plan = plan(&resources, &capabilities, SessionId::from_bytes([11; 16]));
+    let boundary_plan_digest = plan.boundary_plan_digest();
     let (host, guest) = tokio::io::duplex(4096);
     runtime.set_control_stream(Box::new(host));
     let guest_task = tokio::spawn(async move {
@@ -566,6 +715,7 @@ async fn wrong_protocol_session_fails_readiness_and_cleans_up() {
             sendbox_protocol::agent_guest_required_capabilities(),
             FrameLimits::default(),
             BootstrapSecret::new([7; 32]).expect("bootstrap"),
+            boundary_plan_digest,
         )
         .expect("config");
         let mut handshake = GuestHandshake::new(configuration);
@@ -605,6 +755,7 @@ async fn readiness_timeout_is_distinct_from_transport_loss() {
         &configuration(resources.path().to_path_buf()),
         agent_request,
         &capabilities,
+        plan_time(),
     )
     .expect("plan");
     let (host, _silent_guest) = tokio::io::duplex(4096);
@@ -638,6 +789,7 @@ async fn protocol_connector_authenticates_over_unix_stream() {
     let socket_path = resources.path().join("agent.sock");
     let listener = UnixListener::bind(&socket_path).expect("listener");
     let session_id = SessionId::from_bytes([13; 16]);
+    let boundary_plan_digest = BoundaryPlanDigest::from_bytes([0xa1; 32]);
     let guest_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
         let configuration = HandshakeConfig::new(
@@ -647,6 +799,7 @@ async fn protocol_connector_authenticates_over_unix_stream() {
             sendbox_protocol::agent_guest_required_capabilities(),
             FrameLimits::default(),
             BootstrapSecret::new([7; 32]).expect("bootstrap"),
+            boundary_plan_digest,
         )
         .expect("config");
         let connection = GuestHandshake::new(configuration)
@@ -670,6 +823,7 @@ async fn protocol_connector_authenticates_over_unix_stream() {
             Box::new(stream),
             GuestConnectionConfiguration {
                 session_id,
+                boundary_plan_digest,
                 capabilities: sendbox_protocol::agent_host_capabilities(),
                 required_capabilities: sendbox_protocol::agent_host_required_capabilities(),
                 bootstrap_secret: vec![7; 32],
@@ -734,7 +888,8 @@ fn plan_rejects_missing_transport_and_prefers_vsock() {
         RunPlan::compile(
             &configuration(resources.path().to_path_buf()),
             request(&resources, session),
-            &missing
+            &missing,
+            plan_time(),
         )
         .is_err()
     );
@@ -788,6 +943,7 @@ fn guest_launch_debug_redacts_envelopes_and_environment_values() {
     let environment = [EnvironmentIntent {
         name: "TOKEN".to_owned(),
         value: "raw-environment-secret".to_owned(),
+        sensitive: true,
     }];
     let request = GuestLaunchRequest {
         command: &command,

@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_protocol::{
     BootstrapSecret, Capability, FrameLimits, HandshakeConfig, HostHandshake, Message, VersionRange,
 };
@@ -75,6 +75,7 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
     let mut session_bytes = nonce.to_le_bytes();
     session_bytes[..4].copy_from_slice(&std::process::id().to_le_bytes());
     let session_id = SessionId::from_bytes(session_bytes);
+    let boundary_plan_digest = BoundaryPlanDigest::from_bytes([0x84; 32]);
     let secret = [0x6d_u8; 32];
 
     let mut created = false;
@@ -83,7 +84,9 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
         runtime
             .create(
                 CreateRequest {
+                    session_id,
                     container_id: container_id.clone(),
+                    boundary_plan_digest,
                     image,
                     hostname: container_id.as_str().to_owned(),
                     resources: sendbox_runtime::RuntimeResources {
@@ -112,6 +115,7 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
                 ControlChannelRequest {
                     session_id,
                     container_id: container_id.clone(),
+                    boundary_plan_digest,
                     endpoint_kind: ControlEndpointKind::InheritedStdio,
                     ownership: ChannelOwnership::RuntimeLifecycle,
                     lifetime: ChannelLifetime::UntilRuntimeCleanup,
@@ -145,6 +149,7 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
             [Capability::Lifecycle, Capability::Health].into(),
             FrameLimits::default(),
             BootstrapSecret::new(secret).expect("secret"),
+            boundary_plan_digest,
         )
         .expect("handshake config");
         let mut handshake = HostHandshake::new(config);

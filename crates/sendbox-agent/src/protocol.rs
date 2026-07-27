@@ -1,7 +1,7 @@
 use sendbox_protocol::{
-    AGENT_LAUNCH_OPERATION, BootstrapSecret, CapabilitySet, CloseCode, EnvironmentEntryV1,
-    EventKind, FrameLimits, GracefulClose, HandshakeConfig, HostHandshake, LaunchRequestV1,
-    Message, OPERATION_SCHEMA_VERSION, Request, ResponseStatus, SecretEnvelopeV1, TerminalResultV1,
+    AGENT_LAUNCH_OPERATION, BootstrapSecret, CapabilitySet, CloseCode, EnvironmentEntryV2,
+    EventKind, FrameLimits, GracefulClose, HandshakeConfig, HostHandshake, LaunchRequestV2,
+    Message, OPERATION_SCHEMA_VERSION, Request, ResponseStatus, SecretEnvelopeV2, TerminalResultV2,
     TerminalStateV1, VersionRange,
 };
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
@@ -50,6 +50,7 @@ impl GuestConnector for ProtocolGuestConnector {
                 configuration.required_capabilities,
                 FrameLimits::default(),
                 BootstrapSecret::new(configuration.bootstrap_secret)?,
+                configuration.boundary_plan_digest,
             )?;
             let mut host = HostHandshake::new(handshake);
             let connection = host.establish(stream).await?;
@@ -74,6 +75,7 @@ impl GuestConnector for ProtocolGuestConnector {
                 writer: Some(writer),
                 session_id: configuration.session_id,
                 policy_digest: configuration.policy_digest,
+                boundary_plan_digest: configuration.boundary_plan_digest,
                 secret_cipher,
                 next_secret_sequence: 1,
             }) as Box<dyn GuestSession>)
@@ -87,6 +89,7 @@ pub struct ProtocolGuestSession {
     writer: Option<sendbox_protocol::FramedWriter<tokio::io::WriteHalf<Box<dyn ControlStream>>>>,
     session_id: sendbox_core::SessionId,
     policy_digest: [u8; 32],
+    boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     secret_cipher: EnvelopeCipher,
     next_secret_sequence: u64,
 }
@@ -110,18 +113,20 @@ impl GuestSession for ProtocolGuestSession {
                 request.secrets,
                 self.session_id,
                 self.policy_digest,
+                self.boundary_plan_digest,
                 &mut self.secret_cipher,
                 &mut self.next_secret_sequence,
             )?;
-            let payload = serde_json::to_vec(&LaunchRequestV1 {
+            let payload = serde_json::to_vec(&LaunchRequestV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
+                boundary_plan_digest: self.boundary_plan_digest,
                 program: request.command.program.clone(),
                 arguments: request.command.arguments.clone(),
                 working_directory: request.command.working_directory.clone(),
                 environment: request
                     .environment
                     .iter()
-                    .map(|entry| EnvironmentEntryV1 {
+                    .map(|entry| EnvironmentEntryV2 {
                         name: entry.name.clone(),
                         value: entry.value.clone(),
                     })
@@ -186,9 +191,10 @@ fn seal_secrets(
     secrets: Vec<crate::GuestSecretEnvelope<'_>>,
     session_id: sendbox_core::SessionId,
     policy_digest: [u8; 32],
+    boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     cipher: &mut EnvelopeCipher,
     next_sequence: &mut u64,
-) -> Result<Vec<SecretEnvelopeV1>, AgentError> {
+) -> Result<Vec<SecretEnvelopeV2>, AgentError> {
     let mut names = environment
         .iter()
         .map(|entry| entry.name.clone())
@@ -221,15 +227,17 @@ fn seal_secrets(
                 sequence,
                 expires_at_unix_ms,
                 policy_digest,
+                boundary_plan_digest,
             };
             let envelope = cipher
                 .seal(&binding, &value)
                 .map_err(|error| AgentError::Guest(format!("seal secret envelope: {error}")))?;
-            Ok(SecretEnvelopeV1 {
+            Ok(SecretEnvelopeV2 {
                 reference: secret.reference.to_owned(),
                 sequence,
                 expires_at_unix_ms,
                 policy_digest,
+                boundary_plan_digest,
                 envelope,
             })
         })
@@ -284,7 +292,7 @@ impl GuestExecution for ProtocolGuestExecution {
                 Message::Response(response) if response.request_id == REQUEST_ID => {
                     self.terminal = true;
                     if response.status == ResponseStatus::Ok {
-                        let terminal: TerminalResultV1 = serde_json::from_slice(&response.payload)
+                        let terminal: TerminalResultV2 = serde_json::from_slice(&response.payload)
                             .map_err(|error| {
                                 AgentError::Guest(format!("decode terminal response: {error}"))
                             })?;
@@ -375,7 +383,7 @@ fn validate_operational_readiness(payload: &[u8]) -> Result<(), AgentError> {
     }
 }
 
-fn map_terminal(result: TerminalResultV1) -> GuestTerminal {
+fn map_terminal(result: TerminalResultV2) -> GuestTerminal {
     match result.terminal {
         TerminalStateV1::Exited {
             exit_code: Some(code),
@@ -418,7 +426,7 @@ mod tests {
     #[test]
     fn broker_signal_terminal_is_preserved() {
         assert_eq!(
-            map_terminal(TerminalResultV1 {
+            map_terminal(TerminalResultV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 terminal: TerminalStateV1::Exited {
                     exit_code: None,

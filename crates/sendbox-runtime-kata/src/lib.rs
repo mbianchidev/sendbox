@@ -590,6 +590,7 @@ impl RuntimeProvider for KataRuntimeProvider {
                     to: LifecycleState::Running,
                 });
             }
+            request.validate_create_binding(&container.request)?;
             let trust_root =
                 Zeroizing::new(fs::read(&self.configuration.trust_root_file).map_err(
                     |source| RuntimeError::Provider(format!("read trust root: {source}")),
@@ -984,6 +985,7 @@ fn bootstrap_payload(
     let bootstrap = encode_bootstrap_document(
         BootstrapDocumentConfiguration {
             session_id: channel.session_id,
+            boundary_plan_digest: channel.boundary_plan_digest,
             host_version: env!("CARGO_PKG_VERSION").to_owned(),
             trust_root_id: configuration.trust_root_id.clone(),
             manifest_path: PathBuf::from("manifest.json"),
@@ -1331,7 +1333,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use sendbox_bootstrap::decode_bootstrap_document;
-    use sendbox_core::SessionId;
+    use sendbox_core::{BoundaryPlanDigest, SessionId};
     use sendbox_policy::Action;
     use sendbox_runtime::{
         BootstrapDelivery, BootstrapMaterial, ChannelLifetime, ChannelOwnership, CreateRequest,
@@ -1371,7 +1373,9 @@ mod tests {
 
     fn request(workspace: &Path) -> CreateRequest {
         CreateRequest {
+            session_id: SessionId::from_bytes([5; 16]),
             container_id: ContainerId::new("kata-test").expect("container"),
+            boundary_plan_digest: BoundaryPlanDigest::from_bytes([0x85; 32]),
             image: "registry.example/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             hostname: "kata-test".to_owned(),
             resources: RuntimeResources {
@@ -1415,8 +1419,9 @@ mod tests {
         );
         let create = request(&workspace);
         let channel = ControlChannelRequest {
-            session_id: SessionId::from_bytes([6; 16]),
+            session_id: create.session_id,
             container_id: create.container_id.clone(),
+            boundary_plan_digest: create.boundary_plan_digest,
             endpoint_kind: ControlEndpointKind::RuntimeExecStdio,
             ownership: ChannelOwnership::RuntimeLifecycle,
             lifetime: ChannelLifetime::UntilRuntimeCleanup,
@@ -1435,6 +1440,7 @@ mod tests {
         let decoded =
             decode_bootstrap_document(&envelope.bootstrap).expect("shared guest bootstrap schema");
         assert_eq!(decoded.session_id, channel.session_id);
+        assert_eq!(decoded.boundary_plan_digest, channel.boundary_plan_digest);
         assert_eq!(
             decoded.bootstrap_secret.expose_for_key_derivation(),
             &[9; 32]

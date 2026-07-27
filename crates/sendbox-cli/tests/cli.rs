@@ -105,7 +105,7 @@ fn experimental_run_rejects_relative_guest_commands_deterministically() {
     assert_eq!(result["exit_code"], 2);
     assert_eq!(
         result["message"],
-        "experimental Kata command must use an absolute guest executable path"
+        "guest command must use an absolute executable path"
     );
 }
 

@@ -16,7 +16,7 @@ use thiserror::Error;
 
 pub const BOUNDARY_PLAN_FORMAT: &str = "sendbox-boundary-plan";
 pub const SIGNED_BOUNDARY_PLAN_FORMAT: &str = "sendbox-signed-boundary-plan";
-pub const BOUNDARY_PLAN_VERSION: u16 = 1;
+pub const BOUNDARY_PLAN_VERSION: u16 = 2;
 pub const MAX_BOUNDARY_PLAN_BYTES: usize = 1024 * 1024;
 pub const MAX_BOUNDARY_PLAN_LIFETIME_SECS: u64 = 60 * 60;
 
@@ -195,6 +195,19 @@ pub struct ImageIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkloadIdentity {
+    OciImage {
+        reference: String,
+        digest: String,
+    },
+    GuestBundle {
+        root: PathBuf,
+        manifest_sha256: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandDeclaration {
     pub program: String,
@@ -224,6 +237,7 @@ pub enum ArtifactKind {
     RuntimeExecutable,
     GuestBundleManifest,
     TrustRoot,
+    ProviderConfiguration,
     Kernel,
     Initrd,
 }
@@ -258,6 +272,52 @@ pub struct ResourceDeclaration {
     pub memory_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlTransport {
+    InheritedStdio,
+    RuntimeExecStdio,
+    AuthenticatedOneShot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustDeclaration {
+    pub trust_root_id: String,
+    pub minimum_release_sequence: u64,
+    pub host_version: String,
+    pub guest_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "runtime", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderDeclaration {
+    Apple {
+        executable: PathBuf,
+        command_timeout_ms: u64,
+        output_limit_bytes: u64,
+        transport: ControlTransport,
+    },
+    Kata {
+        executable: PathBuf,
+        runtime_handler: String,
+        namespace: String,
+        address: Option<String>,
+        snapshotter: Option<String>,
+        configuration_path: Option<PathBuf>,
+        transport: ControlTransport,
+    },
+    Hyperlight {
+        executable: PathBuf,
+        kernel: PathBuf,
+        initrd: Option<PathBuf>,
+        stack_mib: u64,
+        network_enabled: bool,
+        listen_ports: Vec<u16>,
+        transport: ControlTransport,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoundaryPlan {
@@ -269,7 +329,9 @@ pub struct BoundaryPlan {
     pub selection: RuntimeSelection,
     pub configuration_sha256: String,
     pub policy_sha256: String,
-    pub image: ImageIdentity,
+    pub trust: TrustDeclaration,
+    pub workload: WorkloadIdentity,
+    pub provider: ProviderDeclaration,
     pub command: CommandDeclaration,
     pub workspace: MountDeclaration,
     pub mounts: Vec<MountDeclaration>,
@@ -300,7 +362,9 @@ impl BoundaryPlan {
         validate_selection(&self.selection)?;
         validate_digest(&self.configuration_sha256, "configuration")?;
         validate_digest(&self.policy_sha256, "policy")?;
-        validate_image(&self.image)?;
+        validate_trust(&self.trust)?;
+        validate_workload(&self.workload)?;
+        validate_provider(self.selection.selected, &self.provider)?;
         validate_command(&self.command)?;
         validate_mount(&self.workspace, "workspace")?;
         for mount in &self.mounts {
@@ -309,6 +373,7 @@ impl BoundaryPlan {
         validate_environment(&self.environment)?;
         validate_secret_names(&self.secrets)?;
         validate_artifacts(&self.artifacts)?;
+        validate_artifact_bindings(&self.workload, &self.provider, &self.artifacts)?;
         if self.resources.cpus == 0 || self.resources.memory_bytes == 0 {
             return Err(BoundaryError::Invalid(
                 "runtime resources must be greater than zero".to_owned(),
@@ -565,19 +630,108 @@ fn validate_selection(selection: &RuntimeSelection) -> Result<(), BoundaryError>
     Ok(())
 }
 
-fn validate_image(image: &ImageIdentity) -> Result<(), BoundaryError> {
-    let digest = image
-        .digest
-        .strip_prefix("sha256:")
-        .ok_or_else(|| BoundaryError::Invalid("image digest must use sha256".to_owned()))?;
-    validate_digest(digest, "image")?;
-    let suffix = format!("@{}", image.digest);
-    if image.reference.trim().is_empty() || !image.reference.ends_with(&suffix) {
+fn validate_workload(workload: &WorkloadIdentity) -> Result<(), BoundaryError> {
+    match workload {
+        WorkloadIdentity::OciImage { reference, digest } => {
+            let value = digest
+                .strip_prefix("sha256:")
+                .ok_or_else(|| BoundaryError::Invalid("image digest must use sha256".to_owned()))?;
+            validate_digest(value, "image")?;
+            let suffix = format!("@{digest}");
+            if reference.trim().is_empty() || !reference.ends_with(&suffix) {
+                return Err(BoundaryError::Invalid(
+                    "image reference must end with its immutable digest".to_owned(),
+                ));
+            }
+        }
+        WorkloadIdentity::GuestBundle {
+            root,
+            manifest_sha256,
+        } => {
+            if !root.is_absolute() {
+                return Err(BoundaryError::Invalid(
+                    "guest bundle root must be absolute".to_owned(),
+                ));
+            }
+            validate_digest(manifest_sha256, "guest bundle manifest")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_trust(trust: &TrustDeclaration) -> Result<(), BoundaryError> {
+    if trust.trust_root_id.is_empty()
+        || trust.host_version.is_empty()
+        || trust.guest_version.is_empty()
+        || trust.minimum_release_sequence == 0
+        || trust.trust_root_id.chars().any(char::is_control)
+    {
         return Err(BoundaryError::Invalid(
-            "image reference must end with its immutable digest".to_owned(),
+            "runtime trust declaration is invalid".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn validate_provider(
+    selected: ResolvedRuntime,
+    provider: &ProviderDeclaration,
+) -> Result<(), BoundaryError> {
+    let valid = match provider {
+        ProviderDeclaration::Apple {
+            executable,
+            command_timeout_ms,
+            output_limit_bytes,
+            transport,
+        } => {
+            selected == ResolvedRuntime::Apple
+                && executable.is_absolute()
+                && *command_timeout_ms > 0
+                && *output_limit_bytes > 0
+                && *transport == ControlTransport::InheritedStdio
+        }
+        ProviderDeclaration::Kata {
+            executable,
+            runtime_handler,
+            namespace,
+            configuration_path,
+            transport,
+            ..
+        } => {
+            selected == ResolvedRuntime::Kata
+                && executable.is_absolute()
+                && !runtime_handler.is_empty()
+                && !namespace.is_empty()
+                && configuration_path
+                    .as_ref()
+                    .is_none_or(|path| path.is_absolute())
+                && *transport == ControlTransport::RuntimeExecStdio
+        }
+        ProviderDeclaration::Hyperlight {
+            executable,
+            kernel,
+            initrd,
+            stack_mib,
+            listen_ports,
+            transport,
+            ..
+        } => {
+            selected == ResolvedRuntime::Hyperlight
+                && executable.is_absolute()
+                && kernel.is_absolute()
+                && initrd.as_ref().is_none_or(|path| path.is_absolute())
+                && *stack_mib > 0
+                && listen_ports.iter().all(|port| *port > 0)
+                && *transport == ControlTransport::AuthenticatedOneShot
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(BoundaryError::Invalid(
+            "provider declaration does not match the selected runtime".to_owned(),
+        ))
+    }
 }
 
 fn validate_command(command: &CommandDeclaration) -> Result<(), BoundaryError> {
@@ -652,6 +806,60 @@ fn validate_artifacts(artifacts: &[ArtifactIdentity]) -> Result<(), BoundaryErro
     Ok(())
 }
 
+fn validate_artifact_bindings(
+    workload: &WorkloadIdentity,
+    provider: &ProviderDeclaration,
+    artifacts: &[ArtifactIdentity],
+) -> Result<(), BoundaryError> {
+    let artifact = |kind| artifacts.iter().find(|artifact| artifact.kind == kind);
+    if artifact(ArtifactKind::GuestBundleManifest).is_none()
+        || artifact(ArtifactKind::TrustRoot).is_none()
+    {
+        return Err(BoundaryError::Invalid(
+            "boundary plan must bind the guest bundle manifest and trust root".to_owned(),
+        ));
+    }
+    if let WorkloadIdentity::GuestBundle { root, .. } = workload
+        && artifact(ArtifactKind::GuestBundleManifest)
+            .is_none_or(|identity| identity.path != root.join("manifest.json"))
+    {
+        return Err(BoundaryError::Invalid(
+            "guest bundle workload does not match the bound manifest".to_owned(),
+        ));
+    }
+    let (executable, configuration, kernel, initrd) = match provider {
+        ProviderDeclaration::Apple { executable, .. } => (executable, None, None, None),
+        ProviderDeclaration::Kata {
+            executable,
+            configuration_path,
+            ..
+        } => (executable, configuration_path.as_ref(), None, None),
+        ProviderDeclaration::Hyperlight {
+            executable,
+            kernel,
+            initrd,
+            ..
+        } => (executable, None, Some(kernel), initrd.as_ref()),
+    };
+    if artifact(ArtifactKind::RuntimeExecutable).is_none_or(|identity| &identity.path != executable)
+        || configuration.is_some_and(|path| {
+            artifact(ArtifactKind::ProviderConfiguration)
+                .is_none_or(|identity| &identity.path != path)
+        })
+        || kernel.is_some_and(|path| {
+            artifact(ArtifactKind::Kernel).is_none_or(|identity| &identity.path != path)
+        })
+        || initrd.is_some_and(|path| {
+            artifact(ArtifactKind::Initrd).is_none_or(|identity| &identity.path != path)
+        })
+    {
+        return Err(BoundaryError::Invalid(
+            "provider declaration does not match bound artifact identities".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_digest(value: &str, subject: &str) -> Result<(), BoundaryError> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(BoundaryError::Invalid(format!(
@@ -703,9 +911,24 @@ mod tests {
             selection: select_runtime(RuntimeProvider::Auto, linux()).expect("selection"),
             configuration_sha256: "1".repeat(64),
             policy_sha256: "2".repeat(64),
-            image: ImageIdentity {
+            trust: TrustDeclaration {
+                trust_root_id: "test-root".to_owned(),
+                minimum_release_sequence: 1,
+                host_version: "0.1.0".to_owned(),
+                guest_version: "0.1.0".to_owned(),
+            },
+            workload: WorkloadIdentity::OciImage {
                 reference: format!("registry.example/workload@sha256:{}", "3".repeat(64)),
                 digest: format!("sha256:{}", "3".repeat(64)),
+            },
+            provider: ProviderDeclaration::Kata {
+                executable: PathBuf::from("/usr/bin/nerdctl"),
+                runtime_handler: "io.containerd.kata.v2".to_owned(),
+                namespace: "sendbox".to_owned(),
+                address: None,
+                snapshotter: None,
+                configuration_path: None,
+                transport: ControlTransport::RuntimeExecStdio,
             },
             command: CommandDeclaration {
                 program: "/usr/bin/agent".to_owned(),
@@ -725,6 +948,11 @@ mod tests {
             }],
             secrets: vec!["TOKEN".to_owned()],
             artifacts: vec![
+                ArtifactIdentity {
+                    kind: ArtifactKind::RuntimeExecutable,
+                    path: PathBuf::from("/usr/bin/nerdctl"),
+                    sha256: "7".repeat(64),
+                },
                 ArtifactIdentity {
                     kind: ArtifactKind::GuestBundleManifest,
                     path: PathBuf::from("/opt/sendbox/bundle/manifest.json"),
@@ -819,7 +1047,10 @@ mod tests {
         assert!(SignedBoundaryPlan::decode(&reordered).is_err());
 
         let mut mutable = plan(now);
-        mutable.image.reference = "registry.example/workload:latest".to_owned();
+        let WorkloadIdentity::OciImage { reference, .. } = &mut mutable.workload else {
+            panic!("OCI workload");
+        };
+        *reference = "registry.example/workload:latest".to_owned();
         assert!(mutable.validate(now).is_err());
     }
 

@@ -1,0 +1,1199 @@
+#![forbid(unsafe_code)]
+
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use sendbox_agent::{
+    AgentOrchestrator, AgentReport, AgentRequest, BoxFuture, EnvironmentIntent, GuestCommand,
+    GuestTerminal, OutputSink, ProtocolGuestConnector, RunFailure, RunPlan, SecretEnvelope,
+    SecretReference, SecretResolver, SignalSource,
+};
+use sendbox_boundary::{
+    Architecture, ArtifactIdentity, ArtifactKind, BOUNDARY_PLAN_FORMAT, BOUNDARY_PLAN_VERSION,
+    BoundaryError, BoundaryPlan, CommandDeclaration, ControlTransport, EnvironmentDeclaration,
+    HostPlatform, MountDeclaration, OperatingSystem, ProviderDeclaration, ResolvedRuntime,
+    ResourceDeclaration, SignedBoundaryPlan, TrustDeclaration, VerifiedBoundaryPlan,
+    WorkloadIdentity, select_runtime, sha256_hex,
+};
+use sendbox_bundle::{Architecture as BundleArchitecture, VerifyOptions, verify_bundle};
+use sendbox_config::{RuntimeProvider as ConfiguredRuntime, SandboxConfiguration};
+use sendbox_core::{SessionId, VERSION};
+use sendbox_runtime::{
+    BootstrapMaterial, CancellationToken, CommandArgument, CommandSpec, ContainerId, CreateRequest,
+    InitializeRequest, OutputStream, ProcessOptions, ProcessOutcome, Program, RuntimeError,
+    RuntimeProvider, RuntimeResources, RuntimeSignal, StartRequest, StopRequest,
+};
+use sendbox_runtime_apple::{
+    APPLE_RUNTIME_ID, AppleRuntime, AppleRuntimeConfiguration, resolve_container_executable,
+};
+use sendbox_runtime_hyperlight::{
+    AuthenticatedLaunchRequest, HyperlightConfiguration, HyperlightMount,
+    HyperlightNetworkConfiguration, HyperlightRuntime,
+};
+use sendbox_runtime_kata::{KataProviderConfiguration, KataRuntimeProvider};
+use sendbox_secrets::{SecretName, SecretStore};
+use sendbox_security::{SecurityError, provenance::SigningKeyMaterial};
+use thiserror::Error;
+use zeroize::Zeroizing;
+
+const PLAN_VALIDITY: Duration = Duration::from_secs(60 * 60);
+#[cfg(target_os = "linux")]
+const SECRET_SERVICE: &str = "sendbox";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedRuntime {
+    Auto,
+    Apple,
+    Kata,
+    Hyperlight,
+}
+
+#[derive(Debug)]
+pub struct HostRunRequest {
+    pub requested_runtime: RequestedRuntime,
+    pub configuration: SandboxConfiguration,
+    pub image: Option<String>,
+    pub bundle_root: PathBuf,
+    pub trust_root: PathBuf,
+    pub trust_root_id: String,
+    pub minimum_release_sequence: u64,
+    pub command: Vec<String>,
+    pub state_root: PathBuf,
+    pub readiness_timeout: Duration,
+}
+
+#[derive(Debug)]
+pub enum HostRunReport {
+    Persistent(AgentReport),
+    OneShot(ProcessOutcome),
+}
+
+impl HostRunReport {
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Persistent(report) => match &report.terminal {
+                GuestTerminal::Exited { code } => *code,
+                GuestTerminal::Signaled { signal } => 128_i32.saturating_add(*signal),
+                GuestTerminal::Cancelled => 130,
+                GuestTerminal::Failed { .. } => 5,
+            },
+            Self::OneShot(outcome) => outcome
+                .status
+                .code
+                .unwrap_or_else(|| outcome.status.signal.map_or(5, |signal| 128 + signal)),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum HostError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("boundary plan: {0}")]
+    Boundary(#[from] BoundaryError),
+    #[error("runtime: {0}")]
+    Runtime(#[from] RuntimeError),
+    #[error("security: {0}")]
+    Security(#[from] SecurityError),
+    #[error("agent plan: {0}")]
+    AgentPlan(#[from] sendbox_agent::AgentError),
+    #[error("agent execution: {0}")]
+    AgentRun(#[from] RunFailure),
+    #[error("secret store: {0}")]
+    SecretStore(#[from] sendbox_secrets::SecretStoreError),
+    #[error("{context} `{path}`: {source}")]
+    Io {
+        context: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("bundle verification: {0}")]
+    Bundle(String),
+}
+
+pub struct PreparedHostRun {
+    execution: HostExecution,
+    secrets: Arc<HostSecretResolver>,
+    signed_plan_path: PathBuf,
+}
+
+enum HostExecution {
+    Persistent {
+        provider: Arc<dyn RuntimeProvider>,
+        plan: RunPlan,
+    },
+    Hyperlight {
+        provider: Arc<HyperlightRuntime>,
+        verified_plan: VerifiedBoundaryPlan,
+        create_request: CreateRequest,
+        state_directory: PathBuf,
+        command: CommandSpec,
+        listen_ports: Vec<u16>,
+    },
+}
+
+impl PreparedHostRun {
+    #[must_use]
+    pub fn signed_plan_path(&self) -> &Path {
+        &self.signed_plan_path
+    }
+
+    pub async fn execute(
+        self,
+        output: Arc<dyn OutputSink>,
+        signals: Arc<dyn SignalSource>,
+        cancellation: &CancellationToken,
+    ) -> Result<HostRunReport, HostError> {
+        match self.execution {
+            HostExecution::Persistent { provider, plan } => {
+                let orchestrator = AgentOrchestrator::new(
+                    provider,
+                    self.secrets,
+                    Arc::new(ProtocolGuestConnector),
+                    output,
+                    signals,
+                );
+                orchestrator
+                    .run(&plan, cancellation)
+                    .await
+                    .map(HostRunReport::Persistent)
+                    .map_err(HostError::AgentRun)
+            }
+            HostExecution::Hyperlight {
+                provider,
+                verified_plan,
+                create_request,
+                state_directory,
+                command,
+                listen_ports,
+            } => execute_hyperlight(
+                provider,
+                verified_plan,
+                create_request,
+                state_directory,
+                command,
+                listen_ports,
+                self.secrets,
+                output,
+                cancellation,
+            )
+            .await
+            .map(HostRunReport::OneShot),
+        }
+    }
+}
+
+pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
+    request
+        .configuration
+        .validate()
+        .map_err(|error| HostError::Invalid(error.to_string()))?;
+    let command = validate_command(&request.command)?;
+    let host = current_host()?;
+    let runtime_request = effective_runtime_request(
+        request.requested_runtime,
+        request
+            .configuration
+            .runtime
+            .as_ref()
+            .map_or(ConfiguredRuntime::Auto, |runtime| runtime.provider),
+    );
+    let selection = select_runtime(runtime_request, host)?;
+    let selected_runtime = selection.selected;
+    let session_id = random_session_id()?;
+    let state_directory = create_session_directory(&request.state_root, session_id)?;
+    let key = load_or_create_signing_key(&request.state_root)?;
+    let signer_fingerprint = key
+        .identity("SendBox local runtime", None, 0, None)
+        .fingerprint;
+    let now_unix = unix_time()?;
+
+    let bundle_root = canonical_file_or_directory(&request.bundle_root, "bundle root")?;
+    let trust_root = canonical_file_or_directory(&request.trust_root, "bundle trust root")?;
+    let bundle = verify_bundle(&VerifyOptions {
+        root: &bundle_root,
+        public_key: &trust_root,
+        trust_root_id: &request.trust_root_id,
+        minimum_release_sequence: request.minimum_release_sequence,
+        host_version: VERSION,
+        guest_version: VERSION,
+        architecture: bundle_architecture(host.architecture),
+    })
+    .map_err(|error| HostError::Bundle(error.to_string()))?;
+    let manifest_sha256 = hash_file(&bundle_root.join("manifest.json"))?;
+    let bundle_id = format!("{}:{}", request.trust_root_id, bundle.release_sequence);
+    let configuration_sha256 = sha256_serialized(&request.configuration)?;
+    let policy_sha256 = sha256_serialized(&request.configuration.policy)?;
+    let resources = runtime_resources(&request.configuration)?;
+    let workspace_source =
+        canonical_file_or_directory(&request.configuration.project_path, "project root")?;
+    let workspace_destination = PathBuf::from("/workspace");
+    let bootstrap_reference =
+        SecretReference::new(format!("bootstrap-{session_id}")).map_err(HostError::AgentPlan)?;
+    let secrets = Arc::new(HostSecretResolver::open(
+        bootstrap_reference.clone(),
+        random_bootstrap_secret()?,
+    )?);
+
+    let runtime = build_runtime(
+        selected_runtime,
+        &request,
+        &bundle_root,
+        &trust_root,
+        host,
+        resources,
+        &workspace_source,
+    )?;
+    let workload = match selected_runtime {
+        ResolvedRuntime::Hyperlight => WorkloadIdentity::GuestBundle {
+            root: bundle_root.clone(),
+            manifest_sha256: manifest_sha256.clone(),
+        },
+        ResolvedRuntime::Apple | ResolvedRuntime::Kata => {
+            let image = request.image.as_deref().ok_or_else(|| {
+                HostError::Invalid("persistent runtimes require --image".to_owned())
+            })?;
+            WorkloadIdentity::OciImage {
+                reference: image.to_owned(),
+                digest: parse_oci_digest(image)?,
+            }
+        }
+    };
+    let plan = BoundaryPlan {
+        format: BOUNDARY_PLAN_FORMAT.to_owned(),
+        version: BOUNDARY_PLAN_VERSION,
+        session_id,
+        created_at_unix: now_unix,
+        expires_at_unix: now_unix.saturating_add(PLAN_VALIDITY.as_secs()),
+        selection,
+        configuration_sha256,
+        policy_sha256,
+        workload,
+        workspace: MountDeclaration {
+            source: workspace_source.clone(),
+            destination: workspace_destination.clone(),
+            writable: true,
+        },
+        command: CommandDeclaration {
+            program: command.0.clone(),
+            arguments: command.1.clone(),
+            working_directory: workspace_destination.display().to_string(),
+        },
+        mounts: Vec::new(),
+        environment: Vec::<EnvironmentDeclaration>::new(),
+        secrets: request.configuration.secrets.clone(),
+        resources: ResourceDeclaration {
+            cpus: resources.cpus,
+            memory_bytes: resources.memory_bytes,
+        },
+        trust: TrustDeclaration {
+            trust_root_id: request.trust_root_id.clone(),
+            minimum_release_sequence: request.minimum_release_sequence,
+            host_version: VERSION.to_owned(),
+            guest_version: VERSION.to_owned(),
+        },
+        provider: runtime.declaration,
+        artifacts: runtime.artifacts,
+        features: BTreeMap::new(),
+    };
+    let signed_plan = SignedBoundaryPlan::sign(plan, &key, now_unix)?;
+    let verified_plan = signed_plan.verify(&signer_fingerprint, now_unix)?;
+    let signed_plan_path = state_directory.join("boundary-plan.json");
+    atomic_write(
+        &signed_plan_path,
+        &serde_json::to_vec_pretty(&signed_plan)
+            .map_err(|error| HostError::Invalid(error.to_string()))?,
+        0o600,
+    )?;
+
+    let execution = match runtime.provider {
+        RuntimeInstance::Persistent(provider) => {
+            assert_provider_identity(provider.as_ref(), selected_runtime)?;
+            let agent_request = AgentRequest {
+                boundary_plan: verified_plan,
+                session_id,
+                state_directory,
+                image: request.image.ok_or_else(|| {
+                    HostError::Invalid("persistent runtimes require --image".to_owned())
+                })?,
+                guest_workspace: workspace_destination,
+                command: GuestCommand {
+                    program: command.0,
+                    arguments: command.1,
+                    working_directory: "/workspace".to_owned(),
+                },
+                environment: Vec::<EnvironmentIntent>::new(),
+                mounts: Vec::new(),
+                bootstrap_reference,
+                readiness_timeout: request.readiness_timeout,
+            };
+            let plan = RunPlan::compile(
+                &request.configuration,
+                agent_request,
+                &provider.capabilities(),
+                now_unix,
+            )?;
+            HostExecution::Persistent { provider, plan }
+        }
+        RuntimeInstance::Hyperlight(provider) => {
+            assert_provider_identity(provider.as_ref(), selected_runtime)?;
+            let create_request = CreateRequest {
+                session_id,
+                container_id: container_id(&request.configuration.name, session_id)?,
+                boundary_plan_digest: verified_plan.digest(),
+                image: bundle_id,
+                hostname: format!("sendbox-{session_id}"),
+                resources,
+                mounts: vec![sendbox_runtime::RuntimeMount {
+                    source: workspace_source,
+                    destination: workspace_destination,
+                    writable: true,
+                }],
+                environment: Vec::new(),
+                working_directory: PathBuf::from("/workspace"),
+                dns_servers: Vec::new(),
+                labels: Vec::new(),
+            };
+            let command = CommandSpec {
+                arguments: command.1.into_iter().map(CommandArgument::plain).collect(),
+                current_directory: Some(PathBuf::from("/workspace")),
+                environment: Vec::new(),
+                clear_environment: true,
+                ..CommandSpec::new(Program::Absolute(PathBuf::from(command.0)))
+            };
+            HostExecution::Hyperlight {
+                provider,
+                verified_plan,
+                create_request,
+                state_directory,
+                command,
+                listen_ports: Vec::new(),
+            }
+        }
+    };
+
+    Ok(PreparedHostRun {
+        execution,
+        secrets,
+        signed_plan_path,
+    })
+}
+
+struct RuntimeBuild {
+    provider: RuntimeInstance,
+    declaration: ProviderDeclaration,
+    artifacts: Vec<ArtifactIdentity>,
+}
+
+enum RuntimeInstance {
+    Persistent(Arc<dyn RuntimeProvider>),
+    Hyperlight(Arc<HyperlightRuntime>),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_runtime(
+    selected_runtime: ResolvedRuntime,
+    request: &HostRunRequest,
+    bundle_root: &Path,
+    trust_root: &Path,
+    host: HostPlatform,
+    resources: RuntimeResources,
+    workspace_source: &Path,
+) -> Result<RuntimeBuild, HostError> {
+    let manifest_path = bundle_root.join("manifest.json");
+    let mut artifacts = vec![
+        artifact_identity(ArtifactKind::GuestBundleManifest, &manifest_path)?,
+        artifact_identity(ArtifactKind::TrustRoot, trust_root)?,
+    ];
+    match selected_runtime {
+        ResolvedRuntime::Apple => {
+            let executable = resolve_container_executable(None);
+            let executable =
+                executable.resolved_path.ok_or_else(|| {
+                    HostError::Invalid(
+                        executable.reasons.first().cloned().unwrap_or_else(|| {
+                            "Apple container executable was not found".to_owned()
+                        }),
+                    )
+                })?;
+            artifacts.push(artifact_identity(
+                ArtifactKind::RuntimeExecutable,
+                &executable,
+            )?);
+            let (workload_uid, workload_gid) = project_identity(workspace_source)?;
+            let mut configuration = AppleRuntimeConfiguration::new(
+                bundle_root,
+                trust_root,
+                &request.trust_root_id,
+                VERSION,
+                VERSION,
+                request.minimum_release_sequence,
+            );
+            configuration.executable = Some(executable.clone());
+            configuration.command_policy = request.configuration.policy.commands.clone();
+            configuration.workload_uid = workload_uid;
+            configuration.workload_gid = workload_gid;
+            configuration.launch.resources.cpus =
+                Some(u16::try_from(resources.cpus).map_err(|_| {
+                    HostError::Invalid("Apple CPU count is out of range".to_owned())
+                })?);
+            configuration.launch.resources.memory_mib =
+                Some(resources.memory_bytes / (1024 * 1024));
+            let declaration = ProviderDeclaration::Apple {
+                executable,
+                command_timeout_ms: u64::try_from(configuration.command_timeout.as_millis())
+                    .map_err(|_| HostError::Invalid("Apple timeout is out of range".to_owned()))?,
+                output_limit_bytes: u64::try_from(configuration.output_limit_bytes).map_err(
+                    |_| HostError::Invalid("Apple output limit is out of range".to_owned()),
+                )?,
+                transport: ControlTransport::InheritedStdio,
+            };
+            Ok(RuntimeBuild {
+                provider: RuntimeInstance::Persistent(Arc::new(AppleRuntime::new(configuration)?)),
+                declaration,
+                artifacts,
+            })
+        }
+        ResolvedRuntime::Kata => {
+            let kata = request
+                .configuration
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.kata.clone())
+                .unwrap_or_default();
+            let executable = resolve_executable(&kata.executable)?;
+            artifacts.push(artifact_identity(
+                ArtifactKind::RuntimeExecutable,
+                &executable,
+            )?);
+            let configuration_path = kata
+                .configuration_path
+                .as_deref()
+                .map(|path| canonical_file_or_directory(path, "Kata configuration"))
+                .transpose()?;
+            if let Some(path) = &configuration_path {
+                artifacts.push(artifact_identity(
+                    ArtifactKind::ProviderConfiguration,
+                    path,
+                )?);
+            }
+            let (workload_uid, workload_gid) = project_identity(workspace_source)?;
+            let configuration = KataProviderConfiguration {
+                executable: executable.display().to_string(),
+                runtime_handler: kata.runtime_handler.clone(),
+                namespace: kata.namespace.clone(),
+                address: kata.address.clone(),
+                snapshotter: kata.snapshotter.clone(),
+                configuration_path: configuration_path.clone(),
+                bundle_root: bundle_root.to_path_buf(),
+                trust_root_file: trust_root.to_path_buf(),
+                trust_root_id: request.trust_root_id.clone(),
+                minimum_release_sequence: request.minimum_release_sequence,
+                command_policy: request.configuration.policy.commands.clone(),
+                workload_uid,
+                workload_gid,
+            };
+            let declaration = ProviderDeclaration::Kata {
+                executable,
+                runtime_handler: kata.runtime_handler,
+                namespace: kata.namespace,
+                address: kata.address,
+                snapshotter: kata.snapshotter,
+                configuration_path,
+                transport: ControlTransport::RuntimeExecStdio,
+            };
+            Ok(RuntimeBuild {
+                provider: RuntimeInstance::Persistent(Arc::new(KataRuntimeProvider::new(
+                    configuration,
+                )?)),
+                declaration,
+                artifacts,
+            })
+        }
+        ResolvedRuntime::Hyperlight => {
+            let hyperlight = request
+                .configuration
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.hyperlight.clone())
+                .unwrap_or_default();
+            let executable =
+                canonical_file_or_directory(&hyperlight.executable, "Hyperlight executable")?;
+            let kernel_path =
+                canonical_file_or_directory(&hyperlight.kernel_path, "Hyperlight kernel")?;
+            let initrd_path = hyperlight
+                .initrd_path
+                .as_deref()
+                .map(|path| canonical_file_or_directory(path, "Hyperlight initrd"))
+                .transpose()?;
+            artifacts.push(artifact_identity(
+                ArtifactKind::RuntimeExecutable,
+                &executable,
+            )?);
+            artifacts.push(artifact_identity(ArtifactKind::Kernel, &kernel_path)?);
+            if let Some(path) = &initrd_path {
+                artifacts.push(artifact_identity(ArtifactKind::Initrd, path)?);
+            }
+            let memory_mib = resources.memory_bytes / (1024 * 1024);
+            let stack_mib = u64::try_from(hyperlight.stack_mb)
+                .map_err(|_| HostError::Invalid("Hyperlight stack size is invalid".to_owned()))?;
+            let mounts = vec![HyperlightMount {
+                source: workspace_source.to_path_buf(),
+                destination: PathBuf::from("/workspace"),
+                read_only: false,
+            }];
+            let configuration = HyperlightConfiguration {
+                executable: executable.clone(),
+                expected_cli_version: VERSION.to_owned(),
+                bundle_root: bundle_root.to_path_buf(),
+                public_key: trust_root.to_path_buf(),
+                trust_root_id: request.trust_root_id.clone(),
+                expected_host_version: VERSION.to_owned(),
+                expected_guest_version: VERSION.to_owned(),
+                minimum_release_sequence: request.minimum_release_sequence,
+                kernel_path: kernel_path.clone(),
+                initrd_path: initrd_path.clone(),
+                memory_mib,
+                stack_mib,
+                working_directory: request.state_root.clone(),
+                start_command: None,
+                mounts,
+                network: HyperlightNetworkConfiguration::default(),
+                listen_ports: Vec::new(),
+                process_options: ProcessOptions::default(),
+            };
+            let declaration = ProviderDeclaration::Hyperlight {
+                executable,
+                kernel: kernel_path,
+                initrd: initrd_path,
+                stack_mib,
+                network_enabled: false,
+                listen_ports: Vec::new(),
+                transport: ControlTransport::AuthenticatedOneShot,
+            };
+            let provider = HyperlightRuntime::new(configuration)?;
+            if host.operating_system != OperatingSystem::Linux
+                || host.architecture != Architecture::X86_64
+            {
+                return Err(HostError::Invalid(
+                    "Hyperlight requires Linux x86_64".to_owned(),
+                ));
+            }
+            Ok(RuntimeBuild {
+                provider: RuntimeInstance::Hyperlight(Arc::new(provider)),
+                declaration,
+                artifacts,
+            })
+        }
+    }
+}
+
+async fn execute_hyperlight(
+    provider: Arc<HyperlightRuntime>,
+    verified_plan: VerifiedBoundaryPlan,
+    create_request: CreateRequest,
+    state_directory: PathBuf,
+    command: CommandSpec,
+    listen_ports: Vec<u16>,
+    secrets: Arc<HostSecretResolver>,
+    output: Arc<dyn OutputSink>,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutcome, HostError> {
+    verified_plan.reverify(unix_time()?)?;
+    provider
+        .preflight(
+            sendbox_runtime::PreflightRequest {
+                required_capabilities: provider.capabilities(),
+            },
+            cancellation,
+        )
+        .await?;
+    let container_id = create_request.container_id.clone();
+    provider
+        .initialize(InitializeRequest { state_directory }, cancellation)
+        .await?;
+    provider
+        .create(create_request.clone(), cancellation)
+        .await?;
+    let result = async {
+        provider
+            .start(&container_id, StartRequest::default(), cancellation)
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled);
+        }
+        let bootstrap = secrets
+            .bootstrap_material()
+            .map_err(|error| RuntimeError::Provider(error.to_string()))?;
+        let outcome = provider
+            .execute_authenticated_once(
+                &container_id,
+                AuthenticatedLaunchRequest {
+                    session_id: create_request.session_id,
+                    boundary_plan_digest: verified_plan.digest(),
+                    command,
+                    bootstrap_material: bootstrap,
+                    listen_ports,
+                },
+                cancellation,
+            )
+            .await?;
+        if !outcome.stdout.bytes.is_empty() {
+            output
+                .write(OutputStream::Stdout, &outcome.stdout.bytes, cancellation)
+                .await
+                .map_err(|error| RuntimeError::Provider(error.to_string()))?;
+        }
+        if !outcome.stderr.bytes.is_empty() {
+            output
+                .write(OutputStream::Stderr, &outcome.stderr.bytes, cancellation)
+                .await
+                .map_err(|error| RuntimeError::Provider(error.to_string()))?;
+        }
+        Ok(outcome)
+    }
+    .await;
+    let cleanup = cleanup_hyperlight(provider.as_ref(), &container_id).await;
+    match (result, cleanup) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(primary), Ok(())) => Err(HostError::Runtime(primary)),
+        (Ok(_), Err(cleanup)) => Err(HostError::Runtime(cleanup)),
+        (Err(primary), Err(cleanup)) => Err(HostError::Invalid(format!(
+            "{primary}; cleanup also failed: {cleanup}"
+        ))),
+    }
+}
+
+async fn cleanup_hyperlight(
+    provider: &HyperlightRuntime,
+    container_id: &ContainerId,
+) -> Result<(), RuntimeError> {
+    let mut failures = Vec::new();
+    let cleanup_cancellation = CancellationToken::new();
+    if let Err(error) = provider
+        .signal(
+            container_id,
+            RuntimeSignal::Terminate,
+            &cleanup_cancellation,
+        )
+        .await
+    {
+        failures.push(error.to_string());
+    }
+    if let Err(error) = provider
+        .stop(container_id, StopRequest::default(), &cleanup_cancellation)
+        .await
+    {
+        failures.push(error.to_string());
+    }
+    match provider.cleanup(container_id, &cleanup_cancellation).await {
+        Ok(report) if report.is_complete() => {}
+        Ok(report) => failures.extend(
+            report
+                .failures
+                .into_iter()
+                .map(|failure| failure.error.to_string()),
+        ),
+        Err(error) => failures.push(error.to_string()),
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(RuntimeError::Provider(failures.join("; ")))
+    }
+}
+
+struct HostSecretResolver {
+    bootstrap_reference: SecretReference,
+    bootstrap: Zeroizing<[u8; 32]>,
+    native: Arc<dyn SecretStore>,
+}
+
+impl HostSecretResolver {
+    fn open(bootstrap_reference: SecretReference, bootstrap: [u8; 32]) -> Result<Self, HostError> {
+        Ok(Self {
+            bootstrap_reference,
+            bootstrap: Zeroizing::new(bootstrap),
+            native: native_secret_store()?,
+        })
+    }
+
+    fn bootstrap_material(&self) -> Result<BootstrapMaterial, HostError> {
+        BootstrapMaterial::new(self.bootstrap.to_vec()).map_err(HostError::Runtime)
+    }
+}
+
+impl SecretResolver for HostSecretResolver {
+    fn resolve<'a>(
+        &'a self,
+        reference: &'a SecretReference,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<SecretEnvelope, sendbox_agent::AgentError>> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(sendbox_agent::AgentError::Cancelled);
+            }
+            if reference == &self.bootstrap_reference {
+                return Ok(SecretEnvelope::new(
+                    reference.clone(),
+                    self.bootstrap.to_vec(),
+                ));
+            }
+            let name = SecretName::new(reference.as_str()).map_err(|error| {
+                sendbox_agent::AgentError::Secret {
+                    reference: reference.as_str().to_owned(),
+                    message: error.to_string(),
+                }
+            })?;
+            let secret =
+                self.native
+                    .retrieve(&name)
+                    .map_err(|error| sendbox_agent::AgentError::Secret {
+                        reference: reference.as_str().to_owned(),
+                        message: error.to_string(),
+                    })?;
+            Ok(SecretEnvelope::new(
+                reference.clone(),
+                secret.value.expose_secret().to_vec(),
+            ))
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_secret_store() -> Result<Arc<dyn SecretStore>, HostError> {
+    Ok(Arc::new(sendbox_secrets::KeychainStore::default_service()))
+}
+
+#[cfg(target_os = "linux")]
+fn native_secret_store() -> Result<Arc<dyn SecretStore>, HostError> {
+    Ok(Arc::new(sendbox_secrets::LinuxFileStore::open_default(
+        SECRET_SERVICE,
+    )?))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn native_secret_store() -> Result<Arc<dyn SecretStore>, HostError> {
+    Err(HostError::Invalid(
+        "native secret storage is unsupported on this host".to_owned(),
+    ))
+}
+
+fn effective_runtime_request(
+    requested: RequestedRuntime,
+    configured: ConfiguredRuntime,
+) -> ConfiguredRuntime {
+    let selected = match requested {
+        RequestedRuntime::Auto => configured,
+        RequestedRuntime::Apple => ConfiguredRuntime::Apple,
+        RequestedRuntime::Kata => ConfiguredRuntime::Kata,
+        RequestedRuntime::Hyperlight => ConfiguredRuntime::Hyperlight,
+    };
+    match selected {
+        ConfiguredRuntime::Auto => ConfiguredRuntime::Auto,
+        ConfiguredRuntime::Apple => ConfiguredRuntime::Apple,
+        ConfiguredRuntime::Kata => ConfiguredRuntime::Kata,
+        ConfiguredRuntime::Hyperlight => ConfiguredRuntime::Hyperlight,
+    }
+}
+
+fn current_host() -> Result<HostPlatform, HostError> {
+    let operating_system = if cfg!(target_os = "macos") {
+        OperatingSystem::Macos
+    } else if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else {
+        return Err(HostError::Invalid(
+            "sendbox runtime is supported only on macOS and Linux".to_owned(),
+        ));
+    };
+    let architecture = if cfg!(target_arch = "aarch64") {
+        Architecture::Aarch64
+    } else if cfg!(target_arch = "x86_64") {
+        Architecture::X86_64
+    } else {
+        return Err(HostError::Invalid(
+            "sendbox runtime requires arm64 or x86_64".to_owned(),
+        ));
+    };
+    Ok(HostPlatform {
+        operating_system,
+        architecture,
+    })
+}
+
+fn bundle_architecture(architecture: Architecture) -> BundleArchitecture {
+    match architecture {
+        Architecture::Aarch64 => BundleArchitecture::Aarch64,
+        Architecture::X86_64 => BundleArchitecture::X86_64,
+    }
+}
+
+fn validate_command(command: &[String]) -> Result<(String, Vec<String>), HostError> {
+    let Some(program) = command.first() else {
+        return Err(HostError::Invalid("command is empty".to_owned()));
+    };
+    if !Path::new(program).is_absolute() {
+        return Err(HostError::Invalid(
+            "guest command must use an absolute executable path".to_owned(),
+        ));
+    }
+    Ok((program.clone(), command[1..].to_vec()))
+}
+
+fn parse_oci_digest(image: &str) -> Result<String, HostError> {
+    let digest = image
+        .rsplit_once("@sha256:")
+        .map(|(_, digest)| digest)
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            HostError::Invalid(
+                "persistent runtimes require IMAGE@sha256:<64 hex characters>".to_owned(),
+            )
+        })?;
+    Ok(format!("sha256:{}", digest.to_ascii_lowercase()))
+}
+
+fn runtime_resources(configuration: &SandboxConfiguration) -> Result<RuntimeResources, HostError> {
+    let cpus = u32::try_from(configuration.resources.cpus)
+        .map_err(|_| HostError::Invalid("resource CPU count is out of range".to_owned()))?;
+    let memory_bytes = megabytes(configuration.resources.memory_mb, "memory")?;
+    if cpus == 0 || memory_bytes == 0 {
+        return Err(HostError::Invalid(
+            "runtime resources must be non-zero".to_owned(),
+        ));
+    }
+    Ok(RuntimeResources { cpus, memory_bytes })
+}
+
+fn megabytes(value: i64, description: &str) -> Result<u64, HostError> {
+    u64::try_from(value)
+        .ok()
+        .and_then(|value| value.checked_mul(1024 * 1024))
+        .ok_or_else(|| HostError::Invalid(format!("{description} is out of range")))
+}
+
+fn project_identity(path: &Path) -> Result<(u32, u32), HostError> {
+    let metadata = fs::metadata(path).map_err(|source| HostError::Io {
+        context: "inspect project root",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok((metadata.uid(), metadata.gid()))
+}
+
+fn resolve_executable(value: &str) -> Result<PathBuf, HostError> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return canonical_file_or_directory(path, "runtime executable");
+    }
+    ["/usr/local/bin", "/usr/bin", "/bin"]
+        .into_iter()
+        .map(|directory| Path::new(directory).join(value))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| HostError::Invalid(format!("runtime executable `{value}` was not found")))
+}
+
+fn artifact_identity(kind: ArtifactKind, path: &Path) -> Result<ArtifactIdentity, HostError> {
+    let path = canonical_file_or_directory(path, "runtime artifact")?;
+    Ok(ArtifactIdentity {
+        kind,
+        sha256: hash_file(&path)?,
+        path,
+    })
+}
+
+fn hash_file(path: &Path) -> Result<String, HostError> {
+    let bytes = fs::read(path).map_err(|source| HostError::Io {
+        context: "read file",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn sha256_serialized<T: serde::Serialize>(value: &T) -> Result<String, HostError> {
+    serde_json::to_vec(value)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| HostError::Invalid(error.to_string()))
+}
+
+fn assert_provider_identity(
+    provider: &dyn RuntimeProvider,
+    selected: ResolvedRuntime,
+) -> Result<(), HostError> {
+    let expected = match selected {
+        ResolvedRuntime::Apple => APPLE_RUNTIME_ID,
+        ResolvedRuntime::Kata => "kata",
+        ResolvedRuntime::Hyperlight => "hyperlight",
+    };
+    if provider.runtime_id().as_str() == expected {
+        Ok(())
+    } else {
+        Err(HostError::Invalid(format!(
+            "signed runtime `{expected}` does not match provider `{}`",
+            provider.runtime_id()
+        )))
+    }
+}
+
+fn container_id(name: &str, session_id: SessionId) -> Result<ContainerId, HostError> {
+    let sanitized = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    ContainerId::new(format!("{sanitized}-{session_id}"))
+        .or_else(|_| ContainerId::new(format!("sendbox-{session_id}")))
+        .map_err(HostError::Runtime)
+}
+
+fn canonical_file_or_directory(path: &Path, context: &'static str) -> Result<PathBuf, HostError> {
+    if !path.is_absolute() {
+        return Err(HostError::Invalid(format!(
+            "{context} must be an absolute path"
+        )));
+    }
+    reject_symlink_components(path, context)?;
+    fs::canonicalize(path).map_err(|source| HostError::Io {
+        context,
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn reject_symlink_components(path: &Path, context: &'static str) -> Result<(), HostError> {
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(value) => current.push(value),
+            _ => {
+                return Err(HostError::Invalid(format!(
+                    "{context} contains an invalid path component"
+                )));
+            }
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|source| HostError::Io {
+            context,
+            path: current.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(HostError::Invalid(format!(
+                "{context} must not contain symbolic links"
+            )));
+        }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(HostError::Invalid(format!(
+                "{context} path component `{}` is group/world writable",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn create_session_directory(root: &Path, session_id: SessionId) -> Result<PathBuf, HostError> {
+    ensure_private_directory(root)?;
+    let sessions = root.join("sessions");
+    ensure_private_directory(&sessions)?;
+    let session = sessions.join(session_id.to_string());
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(&session).map_err(|source| HostError::Io {
+        context: "create session state directory",
+        path: session.clone(),
+        source,
+    })?;
+    Ok(session)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), HostError> {
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path).map_err(|source| HostError::Io {
+            context: "inspect private directory",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != current_uid()
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(HostError::Invalid(format!(
+                "private directory `{}` must be user-owned, mode 0700, and not a symlink",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+    let parent = path.parent().ok_or_else(|| {
+        HostError::Invalid(format!(
+            "private directory `{}` has no parent",
+            path.display()
+        ))
+    })?;
+    if !parent.exists() {
+        ensure_private_directory(parent)?;
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path).map_err(|source| HostError::Io {
+        context: "create private directory",
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn load_or_create_signing_key(root: &Path) -> Result<SigningKeyMaterial, HostError> {
+    let identity = root.join("identity");
+    ensure_private_directory(&identity)?;
+    let path = identity.join("boundary-signing.key");
+    if path.exists() {
+        return read_signing_key(&path);
+    }
+    let key = SigningKeyMaterial::generate()?;
+    let exported = key.export();
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(exported.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|source| HostError::Io {
+                    context: "write boundary signing key",
+                    path,
+                    source,
+                })?;
+            Ok(key)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_signing_key(&path),
+        Err(source) => Err(HostError::Io {
+            context: "create boundary signing key",
+            path,
+            source,
+        }),
+    }
+}
+
+fn read_signing_key(path: &Path) -> Result<SigningKeyMaterial, HostError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| HostError::Io {
+        context: "inspect boundary signing key",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(HostError::Invalid(
+            "boundary signing key must be user-owned, mode 0600, single-link, and not a symlink"
+                .to_owned(),
+        ));
+    }
+    let mut representation = Zeroizing::new(String::new());
+    File::open(path)
+        .and_then(|mut file| file.read_to_string(&mut representation))
+        .map_err(|source| HostError::Io {
+            context: "read boundary signing key",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    SigningKeyMaterial::import(representation.trim()).map_err(HostError::Security)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), HostError> {
+    let parent = path.parent().ok_or_else(|| {
+        HostError::Invalid(format!("output path `{}` has no parent", path.display()))
+    })?;
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("sendbox"),
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&temporary)
+            .map_err(|source| HostError::Io {
+                context: "create temporary file",
+                path: temporary.clone(),
+                source,
+            })?;
+        file.write_all(bytes).map_err(|source| HostError::Io {
+            context: "write temporary file",
+            path: temporary.clone(),
+            source,
+        })?;
+        file.sync_all().map_err(|source| HostError::Io {
+            context: "sync temporary file",
+            path: temporary.clone(),
+            source,
+        })?;
+        fs::rename(&temporary, path).map_err(|source| HostError::Io {
+            context: "install file",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| HostError::Io {
+                context: "sync parent directory",
+                path: parent.to_path_buf(),
+                source,
+            })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn random_session_id() -> Result<SessionId, HostError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| HostError::Invalid(format!("generate session ID: {error}")))?;
+    Ok(SessionId::from_bytes(bytes))
+}
+
+fn random_bootstrap_secret() -> Result<[u8; 32], HostError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| HostError::Invalid(format!("generate bootstrap secret: {error}")))?;
+    Ok(bytes)
+}
+
+fn unix_time() -> Result<u64, HostError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| HostError::Invalid(format!("system clock is before Unix epoch: {error}")))
+}
+
+fn current_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
