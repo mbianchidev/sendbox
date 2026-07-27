@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use sendbox_protocol::{Capability, CapabilitySet};
+use sendbox_protocol::agent_host_capabilities;
 use sendbox_runtime::{
     BootstrapDelivery, BootstrapMaterial, CancellationToken, ChannelLifetime, ChannelOwnership,
     CleanupReport, ControlChannelRequest, ControlEndpointKind, CreateRequest, InitializeRequest,
@@ -262,14 +262,10 @@ impl AgentOrchestrator {
                 stream,
                 GuestConnectionConfiguration {
                     session_id: plan.session_id(),
-                    capabilities: CapabilitySet::from([
-                        Capability::Exec,
-                        Capability::StreamedIo,
-                        Capability::Signals,
-                        Capability::Health,
-                    ]),
+                    capabilities: agent_host_capabilities(),
                     required_capabilities: plan.required_guest_capabilities().clone(),
                     bootstrap_secret: bootstrap.as_bytes().to_vec(),
+                    policy_digest: plan.policy_digest(),
                 },
                 cancellation,
             ),

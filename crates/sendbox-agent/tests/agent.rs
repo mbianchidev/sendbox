@@ -16,11 +16,14 @@ use sendbox_config::SandboxConfiguration;
 use sendbox_core::SessionId;
 use sendbox_protocol::{
     BootstrapSecret, Capability, CapabilitySet, Event, EventKind, FrameLimits, GuestHandshake,
-    HandshakeConfig, Message, Request, Response, ResponseStatus, VersionRange,
+    HandshakeConfig, LaunchRequestV1, Message, Request, Response, ResponseStatus, VersionRange,
 };
 use sendbox_runtime::{
     CancellationToken, ControlStream, ExecPurpose, ExecRequest, OutputStream, RuntimeCapabilities,
     RuntimeCapability, RuntimeError, RuntimeProvider,
+};
+use sendbox_secrets::{
+    EnvelopeBinding, EnvelopeCipher, RecipientRole, ReplayGuard, SecretName, SessionKeyMaterial,
 };
 use sendbox_testkit::{FakeRuntime, TempResource};
 
@@ -31,6 +34,11 @@ fn runtime_capabilities() -> RuntimeCapabilities {
         RuntimeCapability::BrokeredExec,
         RuntimeCapability::PublishedUnixControlChannel,
     ])
+}
+
+fn negotiated_agent_capabilities() -> CapabilitySet {
+    sendbox_protocol::agent_host_capabilities()
+        .intersection(&sendbox_protocol::agent_guest_capabilities())
 }
 
 fn configuration(project_path: PathBuf) -> SandboxConfiguration {
@@ -141,11 +149,7 @@ struct FakeConnector {
 impl FakeConnector {
     fn successful() -> Self {
         Self {
-            capabilities: CapabilitySet::from([
-                Capability::Exec,
-                Capability::StreamedIo,
-                Capability::Health,
-            ]),
+            capabilities: negotiated_agent_capabilities(),
             events: Mutex::new(Some(VecDeque::from([
                 Ok(GuestEvent::Output {
                     stream: OutputStream::Stdout,
@@ -158,11 +162,7 @@ impl FakeConnector {
 
     fn service_death() -> Self {
         Self {
-            capabilities: CapabilitySet::from([
-                Capability::Exec,
-                Capability::StreamedIo,
-                Capability::Health,
-            ]),
+            capabilities: negotiated_agent_capabilities(),
             events: Mutex::new(Some(VecDeque::from([Err(AgentError::Guest(
                 "guest service died".to_owned(),
             ))]))),
@@ -295,20 +295,15 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
     let runtime = Arc::new(FakeRuntime::new(capabilities.clone()).expect("runtime"));
     let session_id = SessionId::from_bytes([3; 16]);
     let plan = plan(&resources, &capabilities, session_id);
+    let expected_policy_digest = plan.policy_digest();
     let (host, guest) = tokio::io::duplex(16 * 1024);
     runtime.set_control_stream(Box::new(host));
     let guest_task = tokio::spawn(async move {
-        let guest_capabilities = CapabilitySet::from([
-            Capability::Exec,
-            Capability::StreamedIo,
-            Capability::Signals,
-            Capability::Health,
-        ]);
         let configuration = HandshakeConfig::new(
             session_id,
             VersionRange::default(),
-            guest_capabilities,
-            CapabilitySet::default(),
+            sendbox_protocol::agent_guest_capabilities(),
+            sendbox_protocol::agent_guest_required_capabilities(),
             FrameLimits::default(),
             BootstrapSecret::new([7; 32]).expect("bootstrap"),
         )
@@ -335,11 +330,30 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             panic!("expected launch request");
         };
         assert_eq!(operation, "agent.launch");
+        let launch: LaunchRequestV1 = serde_json::from_slice(&payload).expect("launch payload");
         assert!(
             !payload
-                .windows(b"TOKEN".len())
-                .any(|window| window == b"TOKEN")
+                .windows(b"envelope:TOKEN".len())
+                .any(|window| window == b"envelope:TOKEN")
         );
+        assert_eq!(launch.secrets.len(), 1);
+        let secret = &launch.secrets[0];
+        assert_eq!(secret.reference, "TOKEN");
+        assert_eq!(secret.policy_digest, expected_policy_digest);
+        let material = SessionKeyMaterial::new([7; 32]).expect("secret material");
+        let cipher = EnvelopeCipher::new(&material, session_id).expect("secret cipher");
+        let binding = EnvelopeBinding {
+            session_id,
+            recipient: RecipientRole::Guest,
+            secret_name: SecretName::new("TOKEN").expect("secret name"),
+            sequence: secret.sequence,
+            expires_at_unix_ms: secret.expires_at_unix_ms,
+            policy_digest: secret.policy_digest,
+        };
+        let decrypted = cipher
+            .open(&secret.envelope, &binding, &ReplayGuard::default(), 0)
+            .expect("decrypt secret");
+        assert_eq!(decrypted.expose_secret(), b"envelope:TOKEN");
         writer
             .send(&Message::Event(Event {
                 stream_id: request_id,
@@ -548,8 +562,8 @@ async fn wrong_protocol_session_fails_readiness_and_cleans_up() {
         let configuration = HandshakeConfig::new(
             SessionId::from_bytes([12; 16]),
             VersionRange::default(),
-            CapabilitySet::from([Capability::Exec, Capability::StreamedIo, Capability::Health]),
-            CapabilitySet::default(),
+            sendbox_protocol::agent_guest_capabilities(),
+            sendbox_protocol::agent_guest_required_capabilities(),
             FrameLimits::default(),
             BootstrapSecret::new([7; 32]).expect("bootstrap"),
         )
@@ -629,8 +643,8 @@ async fn protocol_connector_authenticates_over_unix_stream() {
         let configuration = HandshakeConfig::new(
             session_id,
             VersionRange::default(),
-            CapabilitySet::from([Capability::Exec, Capability::StreamedIo, Capability::Health]),
-            CapabilitySet::default(),
+            sendbox_protocol::agent_guest_capabilities(),
+            sendbox_protocol::agent_guest_required_capabilities(),
             FrameLimits::default(),
             BootstrapSecret::new([7; 32]).expect("bootstrap"),
         )
@@ -656,18 +670,10 @@ async fn protocol_connector_authenticates_over_unix_stream() {
             Box::new(stream),
             GuestConnectionConfiguration {
                 session_id,
-                capabilities: CapabilitySet::from([
-                    Capability::Exec,
-                    Capability::StreamedIo,
-                    Capability::Signals,
-                    Capability::Health,
-                ]),
-                required_capabilities: CapabilitySet::from([
-                    Capability::Exec,
-                    Capability::StreamedIo,
-                    Capability::Health,
-                ]),
+                capabilities: sendbox_protocol::agent_host_capabilities(),
+                required_capabilities: sendbox_protocol::agent_host_required_capabilities(),
                 bootstrap_secret: vec![7; 32],
+                policy_digest: [9; 32],
             },
             &CancellationToken::new(),
         )

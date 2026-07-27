@@ -19,6 +19,7 @@ sendbox-core = { path = "../../crates/sendbox-core" }
 sendbox-exec = { path = "../../crates/sendbox-exec", optional = true }
 sendbox-policy = { path = "../../crates/sendbox-policy", optional = true }
 sendbox-protocol = { path = "../../crates/sendbox-protocol" }
+sendbox-secrets = { path = "../../crates/sendbox-secrets" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

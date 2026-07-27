@@ -6,11 +6,13 @@ use std::{
 
 use sendbox_config::SandboxConfiguration;
 use sendbox_core::SessionId;
-use sendbox_protocol::{Capability, CapabilitySet};
+use sendbox_protocol::{CapabilitySet, agent_host_required_capabilities};
 use sendbox_runtime::{
     ContainerId, ControlEndpointKind, RuntimeCapabilities, RuntimeCapability, RuntimeResources,
 };
+use sendbox_secrets::SecretName;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::AgentError;
 
@@ -21,11 +23,9 @@ pub struct SecretReference(String);
 impl SecretReference {
     pub fn new(value: impl Into<String>) -> Result<Self, AgentError> {
         let value = value.into();
-        if value.is_empty() || value.len() > 128 || value.as_bytes().contains(&0) {
-            return Err(AgentError::InvalidPlan(
-                "secret references must contain 1..=128 non-NUL bytes".to_owned(),
-            ));
-        }
+        SecretName::new(value.clone()).map_err(|error| {
+            AgentError::InvalidPlan(format!("invalid secret reference: {error}"))
+        })?;
         Ok(Self(value))
     }
 
@@ -92,6 +92,7 @@ pub struct RunPlan {
     resources: RuntimeResources,
     required_runtime_capabilities: RuntimeCapabilities,
     required_guest_capabilities: CapabilitySet,
+    policy_digest: [u8; 32],
 }
 
 impl RunPlan {
@@ -123,6 +124,11 @@ impl RunPlan {
             .iter()
             .map(|reference| SecretReference::new(reference.clone()))
             .collect::<Result<Vec<_>, _>>()?;
+        let policy_digest = Sha256::digest(
+            serde_json::to_vec(&configuration.policy)
+                .map_err(|error| AgentError::InvalidPlan(error.to_string()))?,
+        )
+        .into();
         let container_id = ContainerId::new(format!(
             "{}-{}",
             sanitize_identifier(&configuration.name),
@@ -161,11 +167,8 @@ impl RunPlan {
                     })?,
             },
             required_runtime_capabilities,
-            required_guest_capabilities: CapabilitySet::from([
-                Capability::Exec,
-                Capability::StreamedIo,
-                Capability::Health,
-            ]),
+            required_guest_capabilities: agent_host_required_capabilities(),
+            policy_digest,
         })
     }
 
@@ -237,6 +240,11 @@ impl RunPlan {
     #[must_use]
     pub const fn required_runtime_capabilities(&self) -> &RuntimeCapabilities {
         &self.required_runtime_capabilities
+    }
+
+    #[must_use]
+    pub const fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
     }
 
     #[must_use]

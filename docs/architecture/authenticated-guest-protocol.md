@@ -13,9 +13,10 @@ crate. The secret must be unique per session and available only to the trusted
 host and guest bootstrap processes.
 
 The protocol provides mutual session authentication and integrity. It does not
-encrypt payloads. A runtime adapter must provide a transport whose
-confidentiality matches the data it carries, or a future protocol version must
-add encryption before secrets or other confidential payloads use that transport.
+encrypt general payloads. Runtime adapters must provide transport confidentiality
+for ordinary confidential messages. Secret values are never placed directly in
+frames: `agent.launch` carries XChaCha20-Poly1305 envelopes bound to the session,
+guest role, secret name, sequence, expiry, and policy digest.
 Long-lived trust roots, release signing, policy signing, and key rotation remain
 part of ADR-005 qualification.
 
@@ -56,9 +57,10 @@ Capabilities are typed identifiers for lifecycle, exec, streamed I/O, signals,
 mounts, network, MCP, audit, and health. Authenticated framing remains version
 1. The first operational schema is separately versioned by
 `OPERATION_SCHEMA_VERSION = 1`: `agent.launch` carries an exact program,
-argument vector, absolute working directory, bounded environment, and timeout;
-its terminal response carries exit/signal or a typed cancellation/failure state
-plus broker cleanup completion. Existing protocol vectors are unchanged.
+argument vector, absolute working directory, bounded non-secret environment,
+policy-bound secret envelopes, and timeout; its terminal response carries
+exit/signal or a typed cancellation/failure state plus broker cleanup
+completion. Existing frame vectors are unchanged.
 
 ## Handshake
 

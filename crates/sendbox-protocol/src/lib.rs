@@ -16,7 +16,9 @@ pub use handshake::{BootstrapSecret, GuestHandshake, HandshakeConfig, HostHandsh
 pub use limits::{DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES};
 pub use operations::{
     AGENT_LAUNCH_OPERATION, EnvironmentEntryV1, HEALTH_OPERATION, HealthResponseV1,
-    LaunchRequestV1, OPERATION_SCHEMA_VERSION, TerminalResultV1, TerminalStateV1,
+    LaunchRequestV1, OPERATION_SCHEMA_VERSION, SecretEnvelopeV1, TerminalResultV1, TerminalStateV1,
+    agent_guest_capabilities, agent_guest_required_capabilities, agent_host_capabilities,
+    agent_host_required_capabilities,
 };
 pub use types::{
     Cancellation, Capability, CapabilitySet, CloseCode, Event, EventKind, GracefulClose, Hello,

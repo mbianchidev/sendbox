@@ -13,7 +13,7 @@ use crate::bootstrap::ImmutableBootstrapSource;
 use crate::broker;
 use crate::manifest::{VerifiedManifest, verify_manifest};
 use crate::platform::PlatformControls;
-use crate::protocol::{handshake_config, serve_authenticated};
+use crate::protocol::{ProtocolServices, handshake_config, serve_authenticated};
 use crate::runtime::{ReadinessSnapshot, RuntimeIdentity, RuntimeSession};
 use crate::secure_fs::{leaf_name, open_directory_no_symlinks, validate_regular_metadata};
 use crate::service::{ServiceId, ServiceManager};
@@ -167,16 +167,23 @@ pub async fn run<P: PlatformControls>(
     };
     let result = match stream {
         Ok(stream) => {
+            let secret_decryptor = crate::protocol::GuestSecretDecryptor::new(
+                bootstrap.session_id,
+                bootstrap.bootstrap_secret.expose_for_key_derivation(),
+            )?;
             let config = handshake_config(bootstrap.session_id, bootstrap.bootstrap_secret)?;
             tokio::select! {
                 protocol = serve_authenticated(
                     stream,
                     config,
-                    Arc::clone(&state),
-                    Arc::clone(&service_readiness),
-                    Arc::clone(&runtime),
-                    readiness,
-                    broker_client.as_ref().map(|(client, _)| client.clone()),
+                    ProtocolServices::new(
+                        Arc::clone(&state),
+                        Arc::clone(&service_readiness),
+                        Arc::clone(&runtime),
+                        readiness,
+                        broker_client.as_ref().map(|(client, _)| client.clone()),
+                        secret_decryptor,
+                    ),
                 ) => protocol,
                 failure = services.wait_for_mandatory_failure() => Err(failure),
             }

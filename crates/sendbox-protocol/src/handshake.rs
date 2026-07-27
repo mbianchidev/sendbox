@@ -30,6 +30,11 @@ impl BootstrapSecret {
     fn expose(&self) -> &[u8] {
         self.0.as_ref()
     }
+
+    #[must_use]
+    pub fn expose_for_key_derivation(&self) -> &[u8] {
+        self.0.as_ref()
+    }
 }
 
 impl fmt::Debug for BootstrapSecret {

@@ -117,6 +117,7 @@ pub struct GuestConnectionConfiguration {
     pub capabilities: CapabilitySet,
     pub required_capabilities: CapabilitySet,
     pub bootstrap_secret: Vec<u8>,
+    pub policy_digest: [u8; 32],
 }
 
 impl fmt::Debug for GuestConnectionConfiguration {
@@ -127,6 +128,7 @@ impl fmt::Debug for GuestConnectionConfiguration {
             .field("capabilities", &self.capabilities)
             .field("required_capabilities", &self.required_capabilities)
             .field("bootstrap_secret", &"[REDACTED]")
+            .field("policy_digest", &self.policy_digest)
             .finish()
     }
 }
