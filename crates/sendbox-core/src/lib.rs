@@ -10,6 +10,41 @@ pub use glob::glob_matches;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const SHA256_DIGEST_BYTES: usize = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BoundaryPlanDigest([u8; SHA256_DIGEST_BYTES]);
+
+impl BoundaryPlanDigest {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; SHA256_DIGEST_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; SHA256_DIGEST_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for BoundaryPlanDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("BoundaryPlanDigest")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl fmt::Display for BoundaryPlanDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -116,3 +151,15 @@ impl fmt::Display for ValidationFailure {
 }
 
 impl std::error::Error for ValidationFailure {}
+
+#[cfg(test)]
+mod tests {
+    use super::BoundaryPlanDigest;
+
+    #[test]
+    fn boundary_plan_digest_has_stable_hex_encoding() {
+        let digest = BoundaryPlanDigest::from_bytes([0xab; 32]);
+        assert_eq!(digest.to_string(), "ab".repeat(32));
+        assert_eq!(digest.as_bytes(), &[0xab; 32]);
+    }
+}

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use sendbox_config::RuntimeProvider;
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_security::SecurityError;
 use sendbox_security::provenance::{
     DetachedSignature, Identity, SignedSubject, SigningKeyMaterial, SubjectKind, TrustPolicy,
@@ -332,12 +332,14 @@ impl BoundaryPlan {
         encode_canonical(self)
     }
 
-    pub fn digest(&self) -> Result<[u8; 32], BoundaryError> {
-        Ok(Sha256::digest(self.encode()?).into())
+    pub fn digest(&self) -> Result<BoundaryPlanDigest, BoundaryError> {
+        Ok(BoundaryPlanDigest::from_bytes(
+            Sha256::digest(self.encode()?).into(),
+        ))
     }
 
     pub fn digest_hex(&self) -> Result<String, BoundaryError> {
-        self.digest().map(|digest| encode_hex(&digest))
+        self.digest().map(|digest| digest.to_string())
     }
 }
 
@@ -352,9 +354,10 @@ pub struct SignedBoundaryPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundaryVerification {
-    pub plan_digest: [u8; 32],
-    pub signer_fingerprint: String,
+pub struct VerifiedBoundaryPlan {
+    signed: SignedBoundaryPlan,
+    plan_digest: BoundaryPlanDigest,
+    signer_fingerprint: String,
 }
 
 impl SignedBoundaryPlan {
@@ -397,7 +400,20 @@ impl SignedBoundaryPlan {
         &self,
         expected_signer_fingerprint: &str,
         now_unix: u64,
-    ) -> Result<BoundaryVerification, BoundaryError> {
+    ) -> Result<VerifiedBoundaryPlan, BoundaryError> {
+        let plan_digest = self.verify_inner(expected_signer_fingerprint, now_unix)?;
+        Ok(VerifiedBoundaryPlan {
+            signed: self.clone(),
+            plan_digest,
+            signer_fingerprint: expected_signer_fingerprint.to_owned(),
+        })
+    }
+
+    fn verify_inner(
+        &self,
+        expected_signer_fingerprint: &str,
+        now_unix: u64,
+    ) -> Result<BoundaryPlanDigest, BoundaryError> {
         if self.format != SIGNED_BOUNDARY_PLAN_FORMAT || self.version != BOUNDARY_PLAN_VERSION {
             return Err(BoundaryError::Invalid(
                 "unsupported signed boundary plan format or version".to_owned(),
@@ -432,10 +448,9 @@ impl SignedBoundaryPlan {
             std::slice::from_ref(&self.signature),
             now_unix,
         )?;
-        Ok(BoundaryVerification {
-            plan_digest: Sha256::digest(&plan_bytes).into(),
-            signer_fingerprint: expected_signer_fingerprint.to_owned(),
-        })
+        Ok(BoundaryPlanDigest::from_bytes(
+            Sha256::digest(&plan_bytes).into(),
+        ))
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, BoundaryError> {
@@ -455,6 +470,40 @@ impl SignedBoundaryPlan {
             ));
         }
         Ok(plan)
+    }
+}
+
+impl VerifiedBoundaryPlan {
+    #[must_use]
+    pub const fn plan(&self) -> &BoundaryPlan {
+        &self.signed.plan
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> BoundaryPlanDigest {
+        self.plan_digest
+    }
+
+    #[must_use]
+    pub fn signer_fingerprint(&self) -> &str {
+        &self.signer_fingerprint
+    }
+
+    #[must_use]
+    pub const fn signed_plan(&self) -> &SignedBoundaryPlan {
+        &self.signed
+    }
+
+    pub fn reverify(&self, now_unix: u64) -> Result<(), BoundaryError> {
+        let digest = self
+            .signed
+            .verify_inner(&self.signer_fingerprint, now_unix)?;
+        if digest != self.plan_digest {
+            return Err(BoundaryError::Invalid(
+                "verified boundary plan digest changed".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -731,7 +780,10 @@ mod tests {
         let expected = key.identity("expected", None, 0, None).fingerprint;
         let signed = SignedBoundaryPlan::sign(plan(now), &key, now).expect("signed plan");
         let verified = signed.verify(&expected, now).expect("verified plan");
-        assert_eq!(verified.plan_digest, signed.plan.digest().expect("digest"));
+        assert_eq!(verified.digest(), signed.plan.digest().expect("digest"));
+        assert_eq!(verified.plan(), &signed.plan);
+        assert_eq!(verified.signer_fingerprint(), expected);
+        verified.reverify(now).expect("reverify");
         assert!(signed.verify(&"f".repeat(64), now).is_err());
     }
 
@@ -769,5 +821,17 @@ mod tests {
         let mut mutable = plan(now);
         mutable.image.reference = "registry.example/workload:latest".to_owned();
         assert!(mutable.validate(now).is_err());
+    }
+
+    #[test]
+    fn verified_plan_rejects_expiry_on_revalidation() {
+        let now = 40_000;
+        let key = SigningKeyMaterial::generate().expect("signing key");
+        let expected = key.identity("expected", None, 0, None).fingerprint;
+        let verified = SignedBoundaryPlan::sign(plan(now), &key, now)
+            .expect("signed plan")
+            .verify(&expected, now)
+            .expect("verified plan");
+        assert!(verified.reverify(now + 301).is_err());
     }
 }
