@@ -12,8 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+clap_complete.workspace = true
 sendbox-config = { path = "../sendbox-config" }
 sendbox-core = { path = "../sendbox-core" }
+sendbox-policy = { path = "../sendbox-policy" }
 sendbox-project = { path = "../sendbox-project" }
 serde.workspace = true
 serde_json.workspace = true

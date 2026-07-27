@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "root": {
+    "command_name": "sendbox",
+    "binary_during_migration": "sendbox-rs",
+    "implemented_commands": ["analyze", "completions", "devcontainer", "init", "policy"],
+    "deferred_commands": ["run", "secrets", "mcp", "boundary"]
+  },
+  "exit_codes": {
+    "success": 0,
+    "invalid_input_or_configuration": 2,
+    "analysis_failure": 3,
+    "output_or_refusal": 4
+  },
+  "init": {
+    "config_name": ".sendbox.yaml",
+    "project_path": "existing readable/searchable directory resolved to an absolute canonical path",
+    "policy_presets": ["default", "permissive", "strict"],
+    "runtime_selections": ["auto", "apple", "kata", "hyperlight"],
+    "create_mode": "atomic_no_clobber",
+    "file_mode_octal": "0600",
+    "existing_config": {"exit_code": 4, "diagnostic_code": "io", "content_unchanged": true},
+    "invalid_project": {"exit_code": 2, "diagnostic_code": "invalid_path"},
+    "json": "single deterministic object on stdout; stderr empty",
+    "hyperlight_adjustments": {
+      "boundaries_enabled": false,
+      "branch_protection_enabled": false,
+      "wildcard_domains": "removed",
+      "kernel_path": "/opt/hyperlight/shell-kernel"
+    }
+  },
+  "policy_show": {
+    "sources": ["default", "config"],
+    "text_sections": ["Command Policy", "Network Policy", "Boundary Policy"],
+    "json": "deterministic declaration-order object",
+    "config_behavior": "strict decode plus policy-only validation",
+    "migration_report": "included for config input"
+  },
+  "completions": {
+    "shells": ["bash", "zsh", "fish"],
+    "detection": "SHELL basename with zsh fallback; explicit unsupported --shell is an exit-2 usage error",
+    "generator": "clap command tree with command name sendbox",
+    "self_spawn": false,
+    "shell_spawn": false,
+    "paths": {
+      "bash": "~/.local/share/bash-completion/completions/sendbox",
+      "zsh": "~/.zsh/completions/_sendbox",
+      "fish": "~/.config/fish/completions/sendbox.fish"
+    },
+    "file_mode_octal": "0644",
+    "directory_mode_octal": "0755 for newly created directories; stricter existing modes are preserved",
+    "install_mode": "secure atomic replacement without following symlinked directory components",
+    "race_behavior": "init no-clobber loses destination-creation races without changing the winner"
+  },
+  "evidence": [
+    "crates/sendbox-cli/tests/cli.rs",
+    "crates/sendbox-cli/src/completions.rs",
+    "crates/sendbox-config/tests/config.rs"
+  ]
+}

@@ -34,6 +34,20 @@
       }
     },
     {
+      "id": "cli.parity-subset",
+      "area": "cli",
+      "description": "Runtime-independent Rust CLI parity for root help, init, policy show, and completion print/install.",
+      "oracle": "intended_behavior",
+      "status": "implemented",
+      "negative_case": false,
+      "data_path": "Tests/qualification/fixtures/cli-parity-subset.v1.json",
+      "swift_observation": {
+        "evidence_path": "Sources/sendbox/SendBox.swift",
+        "note": "Swift command names, presets, and install paths are retained where safe; Rust adds strict validation, JSON, stable exits, and direct clap generation."
+      },
+      "command": null
+    },
+    {
       "id": "config.contracts",
       "area": "config",
       "description": "Canonical defaults, strict decoding, validation errors, and compatibility behavior.",

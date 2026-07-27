@@ -42,6 +42,18 @@ pub enum DiagnosticCode {
     Io,
 }
 
+impl fmt::Display for DiagnosticCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::IncompatibleConfiguration => "incompatible_configuration",
+            Self::InvalidPath => "invalid_path",
+            Self::InvalidValue => "invalid_value",
+            Self::InvalidYaml => "invalid_yaml",
+            Self::Io => "io",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Diagnostic {
