@@ -36,7 +36,7 @@
     {
       "id": "cli.parity-subset",
       "area": "cli",
-      "description": "Runtime-independent Rust CLI parity for root help, init, policy show, and completion print/install.",
+      "description": "Runtime-independent Rust CLI parity for root help, init, analysis/devcontainer generation, secret management, MCP observation parsing/reporting, policy show, boundary artifact description, and completion print/install.",
       "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": false,

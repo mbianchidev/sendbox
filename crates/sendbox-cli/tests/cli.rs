@@ -1,5 +1,7 @@
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sendbox_config::SandboxConfiguration;
 use sendbox_policy::{Action, DnsPolicy};
@@ -47,18 +49,28 @@ fn root_help_uses_the_final_command_name_and_only_implemented_surfaces() {
         "completions",
         "devcontainer",
         "init",
+        "mcp",
         "policy",
         "run",
+        "secrets",
+        "boundary",
     ] {
         assert!(stdout.contains(command));
     }
-    for deferred in ["secret", "mcp", "boundary"] {
-        assert!(
-            !stdout
-                .lines()
-                .any(|line| line.trim_start().starts_with(deferred))
-        );
-    }
+    let mcp = String::from_utf8(run(&["mcp", "--help"]).stdout).unwrap();
+    assert!(mcp.contains("parse"));
+    assert!(mcp.contains("report"));
+    assert!(
+        !mcp.lines()
+            .any(|line| line.trim_start().starts_with("script"))
+    );
+    let boundary = String::from_utf8(run(&["boundary", "--help"]).stdout).unwrap();
+    assert!(boundary.contains("inspect"));
+    assert!(
+        !boundary
+            .lines()
+            .any(|line| line.trim_start().starts_with("script"))
+    );
 }
 
 #[test]
@@ -528,6 +540,39 @@ fn analyzes_projects_with_stable_bridge_compatible_json() {
 }
 
 #[test]
+fn analyze_can_write_the_swift_compatible_devcontainer_output() {
+    let project = tempdir().unwrap();
+    let output_root = tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"dependencies":{"react":"19"}}"#,
+    )
+    .unwrap();
+    let output = run_in(
+        &[
+            "analyze",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--output",
+            output_root.path().to_str().unwrap(),
+            "--json",
+        ],
+        project.path(),
+    );
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["language"], "node");
+    let generated = output_root.path().join(".devcontainer/devcontainer.json");
+    assert!(generated.is_file());
+    let spec: Value = serde_json::from_slice(&std::fs::read(generated).unwrap()).unwrap();
+    assert_eq!(
+        spec["image"],
+        "mcr.microsoft.com/devcontainers/javascript-node:1-22-bookworm"
+    );
+}
+
+#[test]
 fn analysis_errors_use_a_stable_exit_and_json_shape() {
     let output = run(&["analyze", "--project", "does-not-exist", "--json"]);
     assert_eq!(output.status.code(), Some(3));
@@ -596,4 +641,149 @@ fn generates_and_merges_devcontainer_with_typed_overrides() {
     )
     .unwrap();
     assert_eq!(written, result["spec"]);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn secrets_round_trip_never_prints_secret_values() {
+    #[cfg(target_os = "linux")]
+    let home = tempdir().unwrap();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let service = format!("com.sendbox.tests.cli.{}.{}", std::process::id(), nonce);
+    let first_secret = "never-print-this-secret";
+    let second_secret = "never-print-this-updated-secret";
+
+    let command = |arguments: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sendbox-rs"));
+        command
+            .args(arguments)
+            .env("SENDBOX_SECRET_SERVICE", &service);
+        #[cfg(target_os = "linux")]
+        command.env("HOME", home.path());
+        command
+    };
+    let write_secret = |value: &str| {
+        let mut add = command(&["secrets", "add", "TEST_TOKEN", "--stdin", "--json"]);
+        add.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = add.spawn().unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("{value}\n").as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let empty = write_secret("");
+    assert_eq!(empty.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&empty.stdout).contains("no secret value provided"));
+
+    let added = write_secret(first_secret);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(added.stderr.is_empty());
+    assert!(!String::from_utf8_lossy(&added.stdout).contains(first_secret));
+    let added_result: Value = serde_json::from_slice(&added.stdout).unwrap();
+    assert_eq!(added_result["action"], "added");
+
+    let updated = write_secret(second_secret);
+    assert!(updated.status.success());
+    let updated_stdout = String::from_utf8_lossy(&updated.stdout);
+    assert!(!updated_stdout.contains(first_secret));
+    assert!(!updated_stdout.contains(second_secret));
+    let updated_result: Value = serde_json::from_slice(&updated.stdout).unwrap();
+    assert_eq!(updated_result["action"], "updated");
+
+    let listed = command(&["secrets", "list", "--json"]).output().unwrap();
+    assert!(listed.status.success());
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains(first_secret));
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains(second_secret));
+    let result: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(result["secrets"][0]["name"], "TEST_TOKEN");
+
+    let removed = command(&["secrets", "remove", "TEST_TOKEN", "--json"])
+        .output()
+        .unwrap();
+    assert!(removed.status.success());
+    let removed_result: Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(removed_result["removed"], true);
+
+    let already_absent = command(&["secrets", "remove", "TEST_TOKEN", "--json"])
+        .output()
+        .unwrap();
+    assert!(already_absent.status.success());
+    let absent_result: Value = serde_json::from_slice(&already_absent.stdout).unwrap();
+    assert_eq!(absent_result["removed"], false);
+}
+
+#[test]
+fn mcp_parse_and_report_use_native_bounded_observation_data() {
+    let fixture = workspace_root().join("crates/sendbox-mcp/tests/fixtures/native-events-v1.log");
+    let parsed = run(&[
+        "mcp",
+        "parse",
+        fixture.to_str().unwrap(),
+        "--redact",
+        "--json",
+    ]);
+    assert!(parsed.status.success());
+    assert!(parsed.stderr.is_empty());
+    let calls: Value = serde_json::from_slice(&parsed.stdout).unwrap();
+    assert_eq!(calls.as_array().unwrap().len(), 3);
+    assert_eq!(calls[1]["method"], "tools/call");
+    assert_eq!(calls[1]["subject"], "delete_file");
+    assert!(!String::from_utf8_lossy(&parsed.stdout).contains("/private/project"));
+
+    let report = run(&["mcp", "report", fixture.to_str().unwrap(), "--json"]);
+    assert!(report.status.success());
+    assert!(report.stderr.is_empty());
+    let summary: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(summary["total_calls"], 3);
+    assert_eq!(summary["tool_call_count"], 1);
+    assert_eq!(summary["error_count"], 1);
+    assert_eq!(summary["tool_invocations"]["delete_file"], 1);
+}
+
+#[test]
+fn boundary_inspection_is_structured_and_never_emits_executable_scripts() {
+    let project = tempdir().unwrap();
+    let config_path = project.path().join("sandbox.yaml");
+    let configuration = SandboxConfiguration::for_project(
+        project.path().canonicalize().unwrap(),
+        sendbox_config::PolicyPreset::Default,
+        sendbox_config::RuntimeProvider::Kata,
+    );
+    std::fs::write(&config_path, serde_json::to_vec(&configuration).unwrap()).unwrap();
+
+    let output = run(&[
+        "boundary",
+        "inspect",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("#!/"));
+    assert!(!stdout.contains("bpftrace"));
+    let inspection: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        inspection["artifact_kind"],
+        "sendbox.boundary-plan-inspection"
+    );
+    assert_eq!(inspection["generated_executables"], false);
+    assert_eq!(
+        inspection["observer"]["artifact_kind"],
+        "sendbox.native-mcp-observer-description"
+    );
 }

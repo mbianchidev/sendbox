@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod boundary;
 mod completions;
+mod mcp;
+mod secrets;
 
 use std::fs;
 use std::io::{self, Write};
@@ -48,12 +51,15 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Analyze(AnalyzeArgs),
+    Boundary(boundary::BoundaryArgs),
     Completions(CompletionsArgs),
     Devcontainer(Box<DevContainerArgs>),
     Init(InitArgs),
+    Mcp(mcp::McpArgs),
     Policy(PolicyArgs),
     /// Run one exact argv workload through the experimental Rust Kata runtime.
     Run(RunArgs),
+    Secrets(secrets::SecretsArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -87,6 +93,12 @@ struct RunArgs {
 struct AnalyzeArgs {
     #[command(flatten)]
     scan: ScanArgs,
+    #[arg(
+        long,
+        value_name = "PROJECT_ROOT",
+        help = "Write PROJECT_ROOT/.devcontainer/devcontainer.json"
+    )]
+    output: Option<PathBuf>,
     #[arg(long, help = "Emit the complete deterministic JSON analysis")]
     json: bool,
 }
@@ -318,16 +330,19 @@ struct CompletionInstallResult<'a> {
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Analyze(arguments) => analyze(arguments),
+        Command::Boundary(arguments) => boundary::execute(arguments),
         Command::Completions(arguments) => completions(arguments),
         Command::Devcontainer(arguments) => match arguments.command {
             DevContainerCommand::Generate(arguments) => generate_devcontainer(arguments),
         },
         Command::Init(arguments) => init(arguments),
+        Command::Mcp(arguments) => mcp::execute(arguments),
         Command::Policy(policy) => match policy.command {
             PolicyCommand::Show(arguments) => show_policy(arguments),
             PolicyCommand::Validate(arguments) => validate(arguments),
         },
         Command::Run(arguments) => run(arguments).await,
+        Command::Secrets(arguments) => secrets::execute(arguments),
     }
 }
 
@@ -606,6 +621,12 @@ fn analyze(arguments: AnalyzeArgs) -> ExitCode {
     let project = arguments.scan.project.display().to_string();
     match analyzer(&arguments.scan).analyze(&arguments.scan.project) {
         Ok(analysis) => {
+            if let Some(output) = arguments.output.as_deref()
+                && let Err(error) =
+                    write_devcontainer(output, None, &analysis, &DevContainerOverrides::default())
+            {
+                return emit_project_error(arguments.json, OUTPUT_EXIT, &project, &error);
+            }
             if arguments.json {
                 print_json(&analysis);
             } else {

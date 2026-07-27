@@ -3,8 +3,11 @@
   "root": {
     "command_name": "sendbox",
     "binary_during_migration": "sendbox-rs",
-    "implemented_commands": ["analyze", "completions", "devcontainer", "init", "policy"],
-    "deferred_commands": ["run", "secrets", "mcp", "boundary"]
+    "implemented_commands": ["analyze", "boundary", "completions", "devcontainer", "init", "mcp", "policy", "run", "secrets"],
+    "remaining_production_wiring": [
+      "provider-neutral secure run composition",
+      "signed runtime-plan boundary inspection"
+    ]
   },
   "exit_codes": {
     "success": 0,
@@ -36,6 +39,32 @@
     "config_behavior": "strict decode plus policy-only validation",
     "migration_report": "included for config input"
   },
+  "analyze": {
+    "json": "existing deterministic project-analysis shape remains unchanged",
+    "output": "an existing project root receives .devcontainer/devcontainer.json",
+    "output_write": "secure atomic generation through the native Rust devcontainer builder"
+  },
+  "secrets": {
+    "stores": {
+      "macos": "Keychain service com.sendbox.secrets",
+      "linux": "descriptor-relative private records under ~/.sendbox/secrets"
+    },
+    "add": "hidden terminal input by default; bounded --stdin automation; existing names are updated",
+    "remove": "idempotent when the name is absent",
+    "list": "sorted names and non-secret metadata only",
+    "secret_values_in_argv_or_output": false
+  },
+  "mcp": {
+    "parse": "bounded regular-file input using the native and legacy Rust observation parser",
+    "redaction": "--redact removes payload and error details while retaining method/id/tool metadata",
+    "report": "deterministic counts for calls, tools, errors, categories, kinds, transports, methods, and servers",
+    "script_generation": false
+  },
+  "boundary": {
+    "inspection": "deterministic structured configuration and native observer artifact description",
+    "generated_executables": false,
+    "remaining": "accept and inspect signed provider runtime plans once production run composition emits them"
+  },
   "completions": {
     "shells": ["bash", "zsh", "fish"],
     "detection": "SHELL basename with zsh fallback; explicit unsupported --shell is an exit-2 usage error",
@@ -54,7 +83,10 @@
   },
   "evidence": [
     "crates/sendbox-cli/tests/cli.rs",
+    "crates/sendbox-cli/src/boundary.rs",
     "crates/sendbox-cli/src/completions.rs",
+    "crates/sendbox-cli/src/mcp.rs",
+    "crates/sendbox-cli/src/secrets.rs",
     "crates/sendbox-config/tests/config.rs"
   ]
 }
