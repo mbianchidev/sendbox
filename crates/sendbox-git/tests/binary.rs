@@ -1,8 +1,9 @@
 #![cfg(unix)]
 
 use std::{
-    fs,
-    os::unix::process::ExitStatusExt,
+    fs::OpenOptions,
+    io::Write,
+    os::unix::{fs::OpenOptionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -35,11 +36,16 @@ fn policy(workspace: &Path) -> GuardPolicyDocument {
 fn guard_binary_exec_preserves_git_output_and_exit_status() {
     let root = tempfile::tempdir().unwrap();
     let policy_path = root.path().join("policy.json");
-    fs::write(
-        &policy_path,
-        serde_json::to_vec(&policy(root.path())).unwrap(),
-    )
-    .unwrap();
+    let mut policy_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&policy_path)
+        .unwrap();
+    policy_file
+        .write_all(&serde_json::to_vec(&policy(root.path())).unwrap())
+        .unwrap();
+    drop(policy_file);
     let output = Command::new(env!("CARGO_BIN_EXE_sendbox-git-guard"))
         .args([
             "--policy",
@@ -53,7 +59,11 @@ fn guard_binary_exec_preserves_git_output_and_exit_status() {
         .env("PATH", "/usr/bin:/bin")
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "guard stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("git version "));
 
     let direct = Command::new(git_path())

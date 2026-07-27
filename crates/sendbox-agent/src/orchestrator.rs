@@ -510,9 +510,11 @@ fn runtime_hostname(container_id: &str) -> String {
 
 fn bootstrap_delivery(endpoint: ControlEndpointKind) -> BootstrapDelivery {
     match endpoint {
-        ControlEndpointKind::RuntimeExecStdio => BootstrapDelivery::RuntimeInjection {
-            target: RUNTIME_INJECTED_BOOTSTRAP_TARGET.to_owned(),
-        },
+        ControlEndpointKind::InheritedStdio | ControlEndpointKind::RuntimeExecStdio => {
+            BootstrapDelivery::RuntimeInjection {
+                target: RUNTIME_INJECTED_BOOTSTRAP_TARGET.to_owned(),
+            }
+        }
         _ => BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
     }
 }
@@ -522,11 +524,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_exec_transport_uses_the_shared_injection_target() {
-        assert!(matches!(
-            bootstrap_delivery(ControlEndpointKind::RuntimeExecStdio),
-            BootstrapDelivery::RuntimeInjection { target }
-                if target == RUNTIME_INJECTED_BOOTSTRAP_TARGET
-        ));
+    fn stdio_transports_use_the_shared_injection_target() {
+        for endpoint in [
+            ControlEndpointKind::InheritedStdio,
+            ControlEndpointKind::RuntimeExecStdio,
+        ] {
+            assert!(matches!(
+                bootstrap_delivery(endpoint),
+                BootstrapDelivery::RuntimeInjection { target }
+                    if target == RUNTIME_INJECTED_BOOTSTRAP_TARGET
+            ));
+        }
+        assert_eq!(
+            bootstrap_delivery(ControlEndpointKind::InheritedFileDescriptor),
+            BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 }
+        );
     }
 }
