@@ -1,19 +1,25 @@
 #![forbid(unsafe_code)]
 
-use std::io::Write;
+mod completions;
+
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use completions::CompletionShell;
 use sendbox_agent::{
     AgentError, AgentOrchestrator, AgentRequest, AgentSignal, BoxFuture, EnvironmentIntent,
     GuestCommand, GuestTerminal, NoSignals, OutputSink, ProtocolGuestConnector, RunPlan,
     SecretEnvelope, SecretReference, SecretResolver, SignalSource,
 };
-use sendbox_config::{RuntimeProvider, SandboxConfiguration};
-use sendbox_core::{CONFIG_SCHEMA_VERSION, Diagnostic, SessionId, VERSION};
+use sendbox_config::{
+    ConfigurationError, MigrationReport, PolicyPreset, RuntimeProvider, SandboxConfiguration,
+};
+use sendbox_core::{CONFIG_SCHEMA_VERSION, Diagnostic, DiagnosticCode, SessionId, VERSION};
 use sendbox_project::{
     Analyzer, DevContainerOverrides, ProjectError, ScanLimits, write_devcontainer,
 };
@@ -29,11 +35,12 @@ const RUNTIME_EXIT: u8 = 5;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "sendbox-rs",
+    name = "sendbox",
+    bin_name = "sendbox",
     version = VERSION,
-    about = "Experimental native SendBox CLI"
+    about = "Secure hardware-isolated sandbox for AI agents"
 )]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Command,
 }
@@ -41,7 +48,9 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Analyze(AnalyzeArgs),
+    Completions(CompletionsArgs),
     Devcontainer(Box<DevContainerArgs>),
+    Init(InitArgs),
     Policy(PolicyArgs),
     /// Run one exact argv workload through the experimental Rust Kata runtime.
     Run(RunArgs),
@@ -97,6 +106,75 @@ struct ScanArgs {
 }
 
 #[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(long, value_name = "PATH", default_value = ".")]
+    project: PathBuf,
+    #[arg(long, value_enum, default_value_t = PolicyPresetArg::Default)]
+    policy: PolicyPresetArg,
+    #[arg(long, value_enum, default_value_t = RuntimeArg::Auto)]
+    runtime: RuntimeArg,
+    #[arg(long, help = "Emit a deterministic JSON result")]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PolicyPresetArg {
+    Default,
+    Permissive,
+    Strict,
+}
+
+impl PolicyPresetArg {
+    fn value(self) -> PolicyPreset {
+        match self {
+            Self::Default => PolicyPreset::Default,
+            Self::Permissive => PolicyPreset::Permissive,
+            Self::Strict => PolicyPreset::Strict,
+        }
+    }
+}
+
+impl std::fmt::Display for PolicyPresetArg {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Default => "default",
+            Self::Permissive => "permissive",
+            Self::Strict => "strict",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RuntimeArg {
+    Auto,
+    Apple,
+    Kata,
+    Hyperlight,
+}
+
+impl RuntimeArg {
+    fn value(self) -> RuntimeProvider {
+        match self {
+            Self::Auto => RuntimeProvider::Auto,
+            Self::Apple => RuntimeProvider::Apple,
+            Self::Kata => RuntimeProvider::Kata,
+            Self::Hyperlight => RuntimeProvider::Hyperlight,
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeArg {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Auto => "auto",
+            Self::Apple => "apple",
+            Self::Kata => "kata",
+            Self::Hyperlight => "hyperlight",
+        })
+    }
+}
+
+#[derive(Debug, Args)]
 struct DevContainerArgs {
     #[command(subcommand)]
     command: DevContainerCommand,
@@ -143,7 +221,16 @@ struct PolicyArgs {
 
 #[derive(Debug, Subcommand)]
 enum PolicyCommand {
+    Show(ShowArgs),
     Validate(ValidateArgs),
+}
+
+#[derive(Debug, Args)]
+struct ShowArgs {
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    #[arg(long, help = "Emit the effective policy as deterministic JSON")]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -152,6 +239,32 @@ struct ValidateArgs {
     config: PathBuf,
     #[arg(long, help = "Emit a deterministic JSON result")]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CompletionsArgs {
+    #[command(subcommand)]
+    command: Option<CompletionsCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum CompletionsCommand {
+    Install(CompletionInstallArgs),
+    Print(CompletionPrintArgs),
+}
+
+#[derive(Debug, Args)]
+struct CompletionInstallArgs {
+    #[arg(long, value_enum)]
+    shell: Option<CompletionShell>,
+    #[arg(long, help = "Emit a deterministic JSON result")]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CompletionPrintArgs {
+    #[arg(long, value_enum, default_value_t = CompletionShell::Bash)]
+    shell: CompletionShell,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,14 +278,53 @@ struct ValidationResult<'a> {
     diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug, Serialize)]
+struct CliFailure {
+    schema_version: u32,
+    ok: bool,
+    exit_code: u8,
+    diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Serialize)]
+struct InitResult<'a> {
+    schema_version: u32,
+    ok: bool,
+    config: &'a str,
+    project: &'a str,
+    sandbox: &'a str,
+    policy: &'a str,
+    runtime: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyShowResult<'a> {
+    schema_version: u32,
+    source: &'a str,
+    config: Option<&'a str>,
+    migration: Option<&'a MigrationReport>,
+    policy: &'a sendbox_policy::PolicyConfiguration,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionInstallResult<'a> {
+    schema_version: u32,
+    ok: bool,
+    shell: &'a str,
+    path: &'a str,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Analyze(arguments) => analyze(arguments),
+        Command::Completions(arguments) => completions(arguments),
         Command::Devcontainer(arguments) => match arguments.command {
             DevContainerCommand::Generate(arguments) => generate_devcontainer(arguments),
         },
+        Command::Init(arguments) => init(arguments),
         Command::Policy(policy) => match policy.command {
+            PolicyCommand::Show(arguments) => show_policy(arguments),
             PolicyCommand::Validate(arguments) => validate(arguments),
         },
         Command::Run(arguments) => run(arguments).await,
@@ -323,8 +475,7 @@ async fn run(arguments: RunArgs) -> ExitCode {
         signals,
     );
     let cancellation = CancellationToken::new();
-    let result = orchestrator.run(&plan, &cancellation).await;
-    match result {
+    match orchestrator.run(&plan, &cancellation).await {
         Ok(report) => {
             let code = match report.terminal {
                 GuestTerminal::Exited { code } => code,
@@ -333,32 +484,26 @@ async fn run(arguments: RunArgs) -> ExitCode {
                 GuestTerminal::Failed { .. } => i32::from(RUNTIME_EXIT),
             };
             if arguments.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "result",
-                        "ok": code == 0,
-                        "exit_code": code,
-                        "terminal": report.terminal,
-                    })
-                );
+                print_json(&serde_json::json!({
+                    "event": "result",
+                    "ok": code == 0,
+                    "exit_code": code,
+                    "terminal": report.terminal,
+                }));
             }
             exit_code(code)
         }
         Err(error) if matches!(error.primary, AgentError::Cancelled) => {
             if arguments.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "result",
-                        "ok": false,
-                        "exit_code": 130,
-                        "terminal": "cancelled",
-                        "cleanup_failures": error.cleanup.len(),
-                    })
-                );
+                print_json(&serde_json::json!({
+                    "event": "result",
+                    "ok": false,
+                    "exit_code": 130,
+                    "terminal": "cancelled",
+                    "cleanup_failures": error.cleanup.len(),
+                }));
             } else {
-                eprintln!("sendbox-rs run: cancelled");
+                eprintln!("sendbox run: cancelled");
             }
             ExitCode::from(130)
         }
@@ -367,6 +512,94 @@ async fn run(arguments: RunArgs) -> ExitCode {
             ExitCode::from(RUNTIME_EXIT)
         }
     }
+}
+
+fn init(arguments: InitArgs) -> ExitCode {
+    let project = match canonical_project(&arguments.project) {
+        Ok(project) => project,
+        Err(diagnostic) => {
+            return emit_diagnostics(arguments.json, INVALID_CONFIGURATION_EXIT, vec![diagnostic]);
+        }
+    };
+    let config_path = project.join(".sendbox.yaml");
+    let configuration = SandboxConfiguration::for_project(
+        project.clone(),
+        arguments.policy.value(),
+        arguments.runtime.value(),
+    );
+
+    if let Err(error) =
+        configuration.write(&config_path, sendbox_config::AtomicWriteMode::CreateNew)
+    {
+        let diagnostics = if matches!(
+            &error,
+            ConfigurationError::Write { source, .. }
+                if source.kind() == io::ErrorKind::AlreadyExists
+        ) {
+            vec![Diagnostic::new(
+                DiagnosticCode::Io,
+                config_path.display().to_string(),
+                "configuration already exists; refusing to overwrite it",
+            )]
+        } else {
+            configuration_error_diagnostics(error)
+        };
+        return emit_diagnostics(arguments.json, OUTPUT_EXIT, diagnostics);
+    }
+
+    let config = config_path.display().to_string();
+    let project = project.display().to_string();
+    if arguments.json {
+        print_json(&InitResult {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            ok: true,
+            config: &config,
+            project: &project,
+            sandbox: &configuration.name,
+            policy: &arguments.policy.to_string(),
+            runtime: &arguments.runtime.to_string(),
+        });
+    } else {
+        println!("created configuration: {config}");
+        println!("project: {project}");
+        println!("policy: {}", arguments.policy);
+        println!("runtime: {}", arguments.runtime);
+    }
+    ExitCode::SUCCESS
+}
+
+fn canonical_project(path: &Path) -> Result<PathBuf, Diagnostic> {
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        Diagnostic::new(
+            DiagnosticCode::InvalidPath,
+            path.display().to_string(),
+            format!("could not resolve project directory: {error}"),
+        )
+    })?;
+    let metadata = fs::metadata(&canonical).map_err(|error| {
+        Diagnostic::new(
+            DiagnosticCode::InvalidPath,
+            canonical.display().to_string(),
+            format!("could not inspect project directory: {error}"),
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(Diagnostic::new(
+            DiagnosticCode::InvalidPath,
+            canonical.display().to_string(),
+            "project path is not a directory",
+        ));
+    }
+    fs::read_dir(&canonical).map_err(|error| {
+        Diagnostic::new(
+            DiagnosticCode::InvalidPath,
+            canonical.display().to_string(),
+            format!(
+                "project directory must be readable and searchable for secure configuration writes: {error}"
+            ),
+        )
+    })?;
+    Ok(canonical)
 }
 
 fn analyze(arguments: AnalyzeArgs) -> ExitCode {
@@ -465,6 +698,142 @@ fn emit_project_error(json: bool, exit_code: u8, project: &str, error: &ProjectE
     ExitCode::from(exit_code)
 }
 
+fn show_policy(arguments: ShowArgs) -> ExitCode {
+    let display_path = arguments
+        .config
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let (policy, migration, source) = match &arguments.config {
+        Some(path) => match SandboxConfiguration::load_with_migration(path) {
+            Ok(loaded) => (
+                loaded.configuration.policy,
+                Some(loaded.migration),
+                "config",
+            ),
+            Err(error) => {
+                return emit_diagnostics(
+                    arguments.json,
+                    INVALID_CONFIGURATION_EXIT,
+                    configuration_error_diagnostics(error),
+                );
+            }
+        },
+        None => (PolicyPreset::Default.configuration(), None, "default"),
+    };
+    if let Err(error) = policy.validate() {
+        return emit_diagnostics(
+            arguments.json,
+            INVALID_CONFIGURATION_EXIT,
+            error.into_diagnostics(),
+        );
+    }
+
+    if arguments.json {
+        print_json(&PolicyShowResult {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            source,
+            config: display_path.as_deref(),
+            migration: migration.as_ref(),
+            policy: &policy,
+        });
+    } else {
+        if let Some(path) = display_path {
+            println!("policy from: {path}");
+        } else {
+            println!("default policy");
+        }
+        print_policy(&policy);
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_policy(policy: &sendbox_policy::PolicyConfiguration) {
+    println!();
+    println!("Command Policy:");
+    println!(
+        "  Default action: {}",
+        action_name(policy.commands.default_action)
+    );
+    println!("  Log blocked:    {}", policy.commands.log_blocked);
+    print_list("  Allowlist:", "+", &policy.commands.allowlist);
+    print_list("  Denylist:", "-", &policy.commands.denylist);
+
+    println!();
+    println!("Network Policy:");
+    println!(
+        "  Default action: {}",
+        action_name(policy.network.default_action)
+    );
+    println!("  Allow DNS:      {}", policy.network.allow_dns);
+    if let Some(max_connections) = policy.network.max_connections {
+        println!("  Max connections: {max_connections}");
+    }
+    print_list("  Allowed domains:", "+", &policy.network.allowed_domains);
+    print_list("  Blocked domains:", "-", &policy.network.blocked_domains);
+
+    println!();
+    println!("Boundary Policy:");
+    println!("  Enabled:        {}", policy.boundaries.enabled);
+    println!(
+        "  MCP transport:  {}",
+        match policy.boundaries.tool_calls.transport {
+            sendbox_policy::ToolTransport::Stdio => "stdio",
+        }
+    );
+    println!(
+        "  Tool default:    {}",
+        action_name(policy.boundaries.tool_calls.default_action)
+    );
+    println!(
+        "  Max frame bytes: {}",
+        policy.boundaries.tool_calls.max_frame_bytes
+    );
+    println!("  Log path:       {}", policy.boundaries.log_path);
+    print_list(
+        "  Tool allowlist:",
+        "+",
+        &policy.boundaries.tool_calls.allowlist,
+    );
+    print_list(
+        "  Tool denylist:",
+        "-",
+        &policy.boundaries.tool_calls.denylist,
+    );
+    print_list(
+        "  Additional denied syscalls:",
+        "-",
+        &policy.boundaries.syscalls.additional_denylist,
+    );
+    if !policy
+        .boundaries
+        .tool_calls
+        .allowed_server_commands
+        .is_empty()
+    {
+        println!("  Allowed MCP server commands:");
+        for command in &policy.boundaries.tool_calls.allowed_server_commands {
+            println!("    + {}", command.join(" "));
+        }
+    }
+}
+
+fn print_list(heading: &str, marker: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    println!("{heading}");
+    for value in values {
+        println!("    {marker} {value}");
+    }
+}
+
+fn action_name(action: sendbox_policy::Action) -> &'static str {
+    match action {
+        sendbox_policy::Action::Allow => "allow",
+        sendbox_policy::Action::Deny => "deny",
+    }
+}
+
 fn validate(arguments: ValidateArgs) -> ExitCode {
     let display_path = arguments.config.display().to_string();
     match SandboxConfiguration::load(&arguments.config) {
@@ -484,16 +853,13 @@ fn validate(arguments: ValidateArgs) -> ExitCode {
                         diagnostics: Vec::new(),
                     });
                 } else {
-                    println!(
-                        "valid configuration: {} (sandbox: {})",
-                        arguments.config.display(),
-                        configuration.name
-                    );
+                    println!("Validating {}...", arguments.config.display());
+                    println!("✅ Configuration is valid");
                 }
                 ExitCode::SUCCESS
             }
             Err(error) => {
-                emit_failure(
+                emit_validation_failure(
                     arguments.json,
                     display_path,
                     Some(&configuration),
@@ -503,13 +869,18 @@ fn validate(arguments: ValidateArgs) -> ExitCode {
             }
         },
         Err(error) => {
-            emit_failure(arguments.json, display_path, None, vec![error.diagnostic()]);
+            emit_validation_failure(
+                arguments.json,
+                display_path,
+                None,
+                configuration_error_diagnostics(error),
+            );
             ExitCode::from(INVALID_CONFIGURATION_EXIT)
         }
     }
 }
 
-fn emit_failure(
+fn emit_validation_failure(
     json: bool,
     config: String,
     configuration: Option<&SandboxConfiguration>,
@@ -528,17 +899,103 @@ fn emit_failure(
             diagnostics,
         });
     } else {
-        for diagnostic in diagnostics {
-            eprintln!(
-                "{:?} at {}: {}",
-                diagnostic.code, diagnostic.path, diagnostic.message
-            );
+        print_diagnostics(&diagnostics);
+    }
+}
+
+fn completions(arguments: CompletionsArgs) -> ExitCode {
+    match arguments
+        .command
+        .unwrap_or(CompletionsCommand::Install(CompletionInstallArgs {
+            shell: None,
+            json: false,
+        })) {
+        CompletionsCommand::Install(arguments) => install_completions(arguments),
+        CompletionsCommand::Print(arguments) => print_completions(arguments),
+    }
+}
+
+fn install_completions(arguments: CompletionInstallArgs) -> ExitCode {
+    let shell = match arguments.shell {
+        Some(shell) => shell,
+        None => CompletionShell::detect(),
+    };
+    match shell.install() {
+        Ok(path) => {
+            let path = path.display().to_string();
+            let shell_name = shell.to_string();
+            if arguments.json {
+                print_json(&CompletionInstallResult {
+                    schema_version: CONFIG_SCHEMA_VERSION,
+                    ok: true,
+                    shell: &shell_name,
+                    path: &path,
+                });
+            } else {
+                println!("installed {shell} completions: {path}");
+            }
+            ExitCode::SUCCESS
         }
+        Err(error) => emit_diagnostics(
+            arguments.json,
+            OUTPUT_EXIT,
+            vec![Diagnostic::new(
+                DiagnosticCode::Io,
+                "completions",
+                error.to_string(),
+            )],
+        ),
+    }
+}
+
+fn print_completions(arguments: CompletionPrintArgs) -> ExitCode {
+    let output = arguments.shell.generate();
+    match io::stdout().write_all(&output) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => emit_diagnostics(
+            false,
+            OUTPUT_EXIT,
+            vec![Diagnostic::new(
+                DiagnosticCode::Io,
+                "stdout",
+                error.to_string(),
+            )],
+        ),
+    }
+}
+
+fn emit_diagnostics(json: bool, exit_code: u8, diagnostics: Vec<Diagnostic>) -> ExitCode {
+    if json {
+        print_json(&CliFailure {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            ok: false,
+            exit_code,
+            diagnostics,
+        });
+    } else {
+        print_diagnostics(&diagnostics);
+    }
+    ExitCode::from(exit_code)
+}
+
+fn print_diagnostics(diagnostics: &[Diagnostic]) {
+    for diagnostic in diagnostics {
+        eprintln!(
+            "error[{}] {}: {}",
+            diagnostic.code, diagnostic.path, diagnostic.message
+        );
+    }
+}
+
+fn configuration_error_diagnostics(error: ConfigurationError) -> Vec<Diagnostic> {
+    match error {
+        ConfigurationError::Validation(error) => error.into_diagnostics(),
+        error => vec![error.diagnostic()],
     }
 }
 
 fn print_json(result: &impl Serialize) {
-    let json = serde_json::to_string(result).expect("validation results are serializable");
+    let json = serde_json::to_string(result).expect("CLI results are serializable");
     println!("{json}");
 }
 
@@ -605,27 +1062,24 @@ impl OutputSink for CliOutput {
                 return Err(sendbox_agent::AgentError::Cancelled);
             }
             if self.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "output",
-                        "stream": match stream {
-                            OutputStream::Stdout => "stdout",
-                            OutputStream::Stderr => "stderr",
-                        },
-                        "encoding": "hex",
-                        "data": encode_hex(bytes),
-                    })
-                );
+                print_json(&serde_json::json!({
+                    "event": "output",
+                    "stream": match stream {
+                        OutputStream::Stdout => "stdout",
+                        OutputStream::Stderr => "stderr",
+                    },
+                    "encoding": "hex",
+                    "data": encode_hex(bytes),
+                }));
                 return Ok(());
             }
             let result = match stream {
                 OutputStream::Stdout => {
-                    let mut output = std::io::stdout().lock();
+                    let mut output = io::stdout().lock();
                     output.write_all(bytes).and_then(|()| output.flush())
                 }
                 OutputStream::Stderr => {
-                    let mut output = std::io::stderr().lock();
+                    let mut output = io::stderr().lock();
                     output.write_all(bytes).and_then(|()| output.flush())
                 }
             };
@@ -669,15 +1123,13 @@ fn runtime_state_directory() -> Result<PathBuf, String> {
         .map(PathBuf::from)
         .ok_or_else(|| "HOME is not set for the Kata state directory".to_owned())?;
     let path = home.join(".sendbox").join("run");
-    std::fs::create_dir_all(&path)
-        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    fs::create_dir_all(&path).map_err(|error| format!("create {}: {error}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("set {} permissions: {error}", path.display()))?;
     }
-
     Ok(path)
 }
 
@@ -694,7 +1146,6 @@ fn project_identity(path: &Path) -> Result<(u32, u32), String> {
                     .to_owned(),
             );
         }
-
         Ok((metadata.uid(), metadata.gid()))
     }
     #[cfg(not(unix))]
@@ -743,17 +1194,14 @@ fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'sta
 
 fn emit_run_error(json: bool, exit_code: u8, message: &str) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "event": "error",
-                "ok": false,
-                "exit_code": exit_code,
-                "message": message,
-            })
-        );
+        print_json(&serde_json::json!({
+            "event": "error",
+            "ok": false,
+            "exit_code": exit_code,
+            "message": message,
+        }));
     } else {
-        eprintln!("sendbox-rs run: {message}");
+        eprintln!("sendbox run: {message}");
     }
 }
 
