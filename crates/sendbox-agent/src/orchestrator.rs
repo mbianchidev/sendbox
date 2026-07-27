@@ -4,8 +4,8 @@ use sendbox_protocol::{Capability, CapabilitySet};
 use sendbox_runtime::{
     BootstrapDelivery, BootstrapMaterial, CancellationToken, ChannelLifetime, ChannelOwnership,
     CleanupReport, ControlChannelRequest, ControlEndpointKind, CreateRequest, InitializeRequest,
-    PreflightRequest, ProvisionedControlChannel, RuntimeEnvironment, RuntimeLabel, RuntimeMount,
-    RuntimeProvider, StartRequest, StopRequest,
+    PreflightRequest, ProvisionedControlChannel, RUNTIME_INJECTED_BOOTSTRAP_TARGET,
+    RuntimeEnvironment, RuntimeLabel, RuntimeMount, RuntimeProvider, StartRequest, StopRequest,
 };
 
 use crate::{
@@ -235,12 +235,7 @@ impl AgentOrchestrator {
             ownership: ChannelOwnership::RuntimeLifecycle,
             lifetime: ChannelLifetime::UntilRuntimeCleanup,
             readiness_timeout: plan.readiness_timeout(),
-            bootstrap_delivery: match plan.endpoint_kind() {
-                ControlEndpointKind::RuntimeExecStdio => BootstrapDelivery::RuntimeInjection {
-                    target: "/run/sendbox-bootstrap/bootstrap.json".to_owned(),
-                },
-                _ => BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
-            },
+            bootstrap_delivery: bootstrap_delivery(plan.endpoint_kind()),
             bootstrap_material: BootstrapMaterial::new(bootstrap.as_bytes().to_vec())?,
         };
         let channel = self
@@ -511,4 +506,27 @@ fn runtime_hostname(container_id: &str) -> String {
         })
         .take(63)
         .collect()
+}
+
+fn bootstrap_delivery(endpoint: ControlEndpointKind) -> BootstrapDelivery {
+    match endpoint {
+        ControlEndpointKind::RuntimeExecStdio => BootstrapDelivery::RuntimeInjection {
+            target: RUNTIME_INJECTED_BOOTSTRAP_TARGET.to_owned(),
+        },
+        _ => BootstrapDelivery::PreopenedFileDescriptor { descriptor: 3 },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_exec_transport_uses_the_shared_injection_target() {
+        assert!(matches!(
+            bootstrap_delivery(ControlEndpointKind::RuntimeExecStdio),
+            BootstrapDelivery::RuntimeInjection { target }
+                if target == RUNTIME_INJECTED_BOOTSTRAP_TARGET
+        ));
+    }
 }

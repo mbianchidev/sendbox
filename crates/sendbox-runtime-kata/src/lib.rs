@@ -18,9 +18,10 @@ use sendbox_runtime::{
     ContainerId, ControlChannelRequest, ControlEndpointKind, ExecPurpose, ExecRequest,
     GuestAddress, HostAddress, InitializeRequest, LifecycleState, OutputSubscription,
     PreflightReport, PreflightRequest, ProcessOptions, ProcessOutcome, ProcessRunner, Program,
-    ProvisionedControlChannel, ProvisionedControlChannelDescriptor, RuntimeCapabilities,
-    RuntimeCapability, RuntimeError, RuntimeHealth, RuntimeId, RuntimeProvider, RuntimeSignal,
-    RuntimeStatus, SearchPathResolver, StartRequest, StopRequest,
+    ProvisionedControlChannel, ProvisionedControlChannelDescriptor,
+    RUNTIME_INJECTED_BOOTSTRAP_TARGET, RuntimeCapabilities, RuntimeCapability, RuntimeError,
+    RuntimeHealth, RuntimeId, RuntimeProvider, RuntimeSignal, RuntimeStatus, SearchPathResolver,
+    StartRequest, StopRequest,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -31,7 +32,7 @@ use zeroize::Zeroizing;
 const BUNDLE_GUEST: &str = "bin/sendbox-guest";
 const BUNDLE_LAUNCHER: &str = "bin/sendbox-exec-launcher";
 const GUEST_BUNDLE_ROOT: &str = "/opt/sendbox";
-const GUEST_BOOTSTRAP: &str = "/run/sendbox-injected/bootstrap.json";
+const GUEST_BOOTSTRAP: &str = RUNTIME_INJECTED_BOOTSTRAP_TARGET;
 const GUEST_TRUST_ROOT: &str = "/run/sendbox-injected/trust.key";
 const GUEST_RUNTIME_ROOT: &str = "/run/sendbox";
 const GUEST_REPLAY_ROOT: &str = "/var/lib/sendbox/replay";
