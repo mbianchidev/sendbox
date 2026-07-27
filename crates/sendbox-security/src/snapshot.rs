@@ -474,6 +474,9 @@ impl<'a> SnapshotManager<'a> {
         if workspace_metadata.entry_type != EntryType::Directory {
             return Err(SecurityError::UnsupportedFileType(workspace_name));
         }
+        let mut excluded_paths = Vec::new();
+        self.collect_excluded_paths(parent, &workspace_name, Path::new(""), &mut excluded_paths)?;
+        excluded_paths.sort();
         let nonce = random_hex()?;
         let display_name = workspace_name.to_string_lossy();
         let stage = PathBuf::from(format!(".{display_name}.{nonce}.snapshot-stage"));
@@ -509,24 +512,63 @@ impl<'a> SnapshotManager<'a> {
                 }),
             };
         }
+        let mut moved_exclusions = Vec::new();
+        if let Err(primary) = move_excluded_paths(
+            parent,
+            &backup,
+            &stage,
+            &excluded_paths,
+            &mut moved_exclusions,
+        ) {
+            return rollback_staged_restore(
+                parent,
+                &workspace_name,
+                &stage,
+                &backup,
+                &moved_exclusions,
+                "preserve excluded snapshot paths",
+                primary,
+            );
+        }
         if let Err(primary) = parent.rename(&stage, &workspace_name) {
-            let rollback = parent.rename(&backup, &workspace_name);
-            let cleanup = parent.remove_tree(&stage);
-            return match (rollback, cleanup) {
-                (Ok(()), Ok(())) => Err(primary),
-                (rollback, cleanup) => Err(SecurityError::Cleanup {
-                    operation: "commit snapshot restore",
-                    path: workspace_name,
-                    primary: primary.to_string(),
-                    cleanup: format!(
-                        "rollback: {}; staging cleanup: {}",
-                        result_detail(&rollback),
-                        result_detail(&cleanup)
-                    ),
-                }),
-            };
+            return rollback_staged_restore(
+                parent,
+                &workspace_name,
+                &stage,
+                &backup,
+                &moved_exclusions,
+                "commit snapshot restore",
+                primary,
+            );
         }
         parent.remove_tree(backup)
+    }
+
+    #[cfg(unix)]
+    fn collect_excluded_paths(
+        &self,
+        parent: &SecureRoot,
+        workspace_name: &Path,
+        directory: &Path,
+        paths: &mut Vec<PathBuf>,
+    ) -> SecurityResult<()> {
+        let absolute_directory = workspace_name.join(directory);
+        for entry in parent.list_dir(&absolute_directory)? {
+            let component = entry
+                .name
+                .to_str()
+                .ok_or_else(|| SecurityError::InvalidPath(directory.join(&entry.name)))?;
+            validate_component(component)?;
+            let relative_path = directory.join(component);
+            let absolute_path = workspace_name.join(&relative_path);
+            check_device(parent, &absolute_path, &entry.metadata)?;
+            if self.exclusions.excludes(component) {
+                paths.push(relative_path);
+            } else if entry.metadata.entry_type == EntryType::Directory {
+                self.collect_excluded_paths(parent, workspace_name, &relative_path, paths)?;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1204,6 +1246,82 @@ fn cleanup_after_error<T>(
 }
 
 #[cfg(unix)]
+fn move_excluded_paths(
+    root: &SecureRoot,
+    backup: &Path,
+    stage: &Path,
+    paths: &[PathBuf],
+    moved: &mut Vec<PathBuf>,
+) -> SecurityResult<()> {
+    for path in paths {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            root.create_dir_all(stage.join(parent), PRIVATE_DIRECTORY_MODE)?;
+        }
+        root.rename(backup.join(path), stage.join(path))?;
+        moved.push(path.clone());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn rollback_staged_restore<T>(
+    root: &SecureRoot,
+    workspace: &Path,
+    stage: &Path,
+    backup: &Path,
+    moved_exclusions: &[PathBuf],
+    operation: &'static str,
+    primary: SecurityError,
+) -> SecurityResult<T> {
+    let exclusions = restore_moved_exclusions(root, backup, stage, moved_exclusions);
+    let rollback = root.rename(backup, workspace);
+    let cleanup = if exclusions.is_ok() && rollback.is_ok() {
+        root.remove_tree(stage)
+    } else {
+        Err(SecurityError::Cleanup {
+            operation,
+            path: stage.to_path_buf(),
+            primary: "staging cleanup skipped to preserve recoverable data".to_owned(),
+            cleanup: "excluded-path or workspace rollback failed".to_owned(),
+        })
+    };
+    match (&exclusions, &rollback, &cleanup) {
+        (Ok(()), Ok(()), Ok(())) => Err(primary),
+        _ => Err(SecurityError::Cleanup {
+            operation,
+            path: workspace.to_path_buf(),
+            primary: primary.to_string(),
+            cleanup: format!(
+                "excluded paths: {}; rollback: {}; staging cleanup: {}",
+                result_detail(&exclusions),
+                result_detail(&rollback),
+                result_detail(&cleanup)
+            ),
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn restore_moved_exclusions(
+    root: &SecureRoot,
+    backup: &Path,
+    stage: &Path,
+    moved_exclusions: &[PathBuf],
+) -> SecurityResult<()> {
+    for path in moved_exclusions.iter().rev() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            root.create_dir_all(backup.join(parent), PRIVATE_DIRECTORY_MODE)?;
+        }
+        root.rename(stage.join(path), backup.join(path))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn result_detail(result: &SecurityResult<()>) -> String {
     match result {
         Ok(()) => "ok".to_owned(),
@@ -1432,6 +1550,129 @@ mod tests {
         assert_eq!(
             fs::read(fixture.workspace_path.join("file")).expect("read rolled back workspace"),
             b"current"
+        );
+        let leftovers = fs::read_dir(fixture.workspace_path.parent().expect("workspace parent"))
+            .expect("list parent")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name() != "workspace" && entry.file_name() != ".snapshot-restore.lock"
+            })
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn restore_preserves_current_excluded_paths() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.workspace_path.join(".git")).expect("create git dir");
+        fs::write(fixture.workspace_path.join(".git/HEAD"), b"before-git").expect("write git head");
+        fs::create_dir(fixture.workspace_path.join("src")).expect("create src");
+        fs::write(fixture.workspace_path.join("src/lib.rs"), b"before").expect("write source");
+        fs::create_dir(fixture.workspace_path.join("src/node_modules"))
+            .expect("create nested ignored dir");
+        fs::write(
+            fixture.workspace_path.join("src/node_modules/package"),
+            b"before-package",
+        )
+        .expect("write package");
+
+        let manifest = fixture
+            .manager()
+            .capture(&fixture.workspace)
+            .expect("capture");
+
+        fs::write(fixture.workspace_path.join(".git/HEAD"), b"current-git")
+            .expect("update git head");
+        fs::write(fixture.workspace_path.join("src/lib.rs"), b"current").expect("update source");
+        fs::write(
+            fixture.workspace_path.join("src/node_modules/package"),
+            b"current-package",
+        )
+        .expect("update package");
+        fs::create_dir(fixture.workspace_path.join("generated")).expect("create generated");
+        fs::create_dir(fixture.workspace_path.join("generated/node_modules"))
+            .expect("create generated ignored dir");
+        fs::write(
+            fixture
+                .workspace_path
+                .join("generated/node_modules/generated-package"),
+            b"generated",
+        )
+        .expect("write generated package");
+        fs::write(fixture.workspace_path.join(".DS_Store"), b"current-desktop")
+            .expect("write desktop metadata");
+
+        fixture
+            .manager()
+            .restore(&manifest.id, &fixture.parent, "workspace")
+            .expect("restore");
+
+        assert_eq!(
+            fs::read(fixture.workspace_path.join("src/lib.rs")).expect("read restored source"),
+            b"before"
+        );
+        assert_eq!(
+            fs::read(fixture.workspace_path.join(".git/HEAD")).expect("read preserved git head"),
+            b"current-git"
+        );
+        assert_eq!(
+            fs::read(fixture.workspace_path.join("src/node_modules/package"))
+                .expect("read preserved package"),
+            b"current-package"
+        );
+        assert_eq!(
+            fs::read(
+                fixture
+                    .workspace_path
+                    .join("generated/node_modules/generated-package")
+            )
+            .expect("read generated package"),
+            b"generated"
+        );
+        assert_eq!(
+            fs::read(fixture.workspace_path.join(".DS_Store")).expect("read desktop metadata"),
+            b"current-desktop"
+        );
+    }
+
+    #[test]
+    fn excluded_path_move_failure_restores_current_workspace() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.workspace_path.join(".git")).expect("create git dir");
+        fs::write(fixture.workspace_path.join(".git/HEAD"), b"before-git").expect("write git head");
+        fs::write(fixture.workspace_path.join("conflict"), b"snapshot-file")
+            .expect("write conflict file");
+        let manifest = fixture
+            .manager()
+            .capture(&fixture.workspace)
+            .expect("capture");
+
+        fs::write(fixture.workspace_path.join(".git/HEAD"), b"current-git")
+            .expect("update git head");
+        fs::remove_file(fixture.workspace_path.join("conflict")).expect("remove conflict file");
+        fs::create_dir(fixture.workspace_path.join("conflict")).expect("create conflict dir");
+        fs::create_dir(fixture.workspace_path.join("conflict/node_modules"))
+            .expect("create ignored conflict dir");
+        fs::write(
+            fixture.workspace_path.join("conflict/node_modules/package"),
+            b"current-package",
+        )
+        .expect("write current package");
+
+        assert!(
+            fixture
+                .manager()
+                .restore(&manifest.id, &fixture.parent, "workspace")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(fixture.workspace_path.join(".git/HEAD")).expect("read current git head"),
+            b"current-git"
+        );
+        assert_eq!(
+            fs::read(fixture.workspace_path.join("conflict/node_modules/package"))
+                .expect("read current package"),
+            b"current-package"
         );
         let leftovers = fs::read_dir(fixture.workspace_path.parent().expect("workspace parent"))
             .expect("list parent")
