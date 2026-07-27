@@ -32,6 +32,11 @@ period, and deletes only the owned container. Workload exec is rejected;
 `container exec` is reserved for bootstrap/control operations because workload
 commands must pass through the authenticated guest broker.
 
+Provider-neutral create requests are applied at container creation: dynamic
+environment, mounts, DNS servers, CPU, memory, working directory, and labels
+override or extend adapter defaults. Memory must be expressed in whole MiB, and
+conflicting no-DNS/DNS settings fail before the CLI is invoked.
+
 Apple 0.10.0 advertises `--publish-socket`, but the available development host
 reported an unregistered service, so no live VM evidence established its
 replacement, ownership, cancellation, or bidirectional semantics. The
@@ -85,6 +90,9 @@ identities and always attempts channel cleanup, stop, and targeted delete.
 - The adapter does not start/register/stop the Apple service.
 - `--publish-socket`, Rosetta, virtualization passthrough, SSH forwarding, TTY
   mode, and arbitrary workload exec are not advertised.
+- Apple CLI 0.10.0 has no hostname option. Container identity remains the
+  session-unique container name rather than claiming a separately configured
+  kernel hostname.
 - Runtime `Network` capability means Apple network/DNS configuration only. It
   does not claim domain egress enforcement; that requires the signed guest
   egress controls and must fail policy validation when those controls are not

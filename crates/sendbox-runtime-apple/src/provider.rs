@@ -552,10 +552,11 @@ impl RuntimeProvider for AppleRuntime {
                 }
                 containers.insert(request.container_id.clone(), Arc::clone(&record));
             }
+            let launch = self.configuration.launch.merge_create_request(&request)?;
             let command = self.commands.create(
                 &request.container_id,
                 &request.image,
-                &self.configuration.launch,
+                &launch,
                 &self.configuration.bundle_root,
                 &self.configuration.public_key,
             )?;
@@ -916,6 +917,8 @@ fn required_help_tokens() -> [(&'static str, &'static [&'static str]); 8] {
                 "--cpus",
                 "--memory",
                 "--kernel",
+                "--workdir",
+                "--label",
             ],
         ),
         ("start", &["container start"]),
@@ -1139,7 +1142,7 @@ mod tests {
     use sendbox_bundle::{Architecture, StageOptions, stage_bundle, write_public_key};
     use sendbox_runtime::{
         CommandArgument, CommandSpec, CreateRequest, ExecPurpose, ExecRequest, InitializeRequest,
-        Program, RuntimeResources, StartRequest,
+        Program, RuntimeEnvironment, RuntimeLabel, RuntimeMount, RuntimeResources, StartRequest,
     };
     use sendbox_testkit::{RuntimeConformanceScenario, run_runtime_conformance};
 
@@ -1153,6 +1156,8 @@ mod tests {
             r#"#!/bin/sh
 set -eu
 state='{}'
+commands="$state/commands"
+printf '%s\n' "$*" >> "$commands"
 last=''
 for arg in "$@"; do last="$arg"; done
 case "$1" in
@@ -1161,7 +1166,7 @@ case "$1" in
   create|start|exec|logs|kill|stop|delete|inspect)
     if [ "${{2:-}}" = "--help" ]; then
       case "$1" in
-        create) echo 'container create --mount --env --network --dns --cpus --memory --kernel' ;;
+        create) echo 'container create --mount --env --network --dns --cpus --memory --kernel --workdir --label' ;;
         start) echo 'container start' ;;
         exec) echo 'container exec --interactive --detach --workdir' ;;
         logs) echo 'container logs --follow' ;;
@@ -1284,6 +1289,74 @@ esac
         run_runtime_conformance(&runtime, scenario)
             .await
             .expect("conformance");
+    }
+
+    #[tokio::test]
+    async fn create_applies_dynamic_request_configuration() {
+        let (temporary, runtime) = fixture_runtime();
+        let cancellation = CancellationToken::new();
+        runtime
+            .initialize(
+                InitializeRequest {
+                    state_directory: temporary.path().join("state"),
+                },
+                &cancellation,
+            )
+            .await
+            .expect("initialize");
+        let project = temporary.path().join("project");
+        fs::create_dir(&project).expect("project");
+        let mut request = create_request("apple-dynamic", "fixture:image");
+        request.resources = RuntimeResources {
+            cpus: 3,
+            memory_bytes: 768 * 1024 * 1024,
+        };
+        request.mounts = vec![RuntimeMount {
+            source: project.clone(),
+            destination: PathBuf::from("/workspace"),
+            writable: true,
+        }];
+        request.environment = vec![
+            RuntimeEnvironment {
+                name: "PUBLIC".to_owned(),
+                value: "yes".to_owned(),
+                sensitive: false,
+            },
+            RuntimeEnvironment {
+                name: "TOKEN".to_owned(),
+                value: "secret-value".to_owned(),
+                sensitive: true,
+            },
+        ];
+        request.working_directory = PathBuf::from("/workspace");
+        request.dns_servers = vec!["1.1.1.1".to_owned()];
+        request.labels = vec![RuntimeLabel {
+            name: "com.sendbox.session".to_owned(),
+            value: "fixture".to_owned(),
+        }];
+        runtime
+            .create(request, &cancellation)
+            .await
+            .expect("create");
+
+        let commands =
+            fs::read_to_string(temporary.path().join("fake-state/commands")).expect("commands");
+        let create = commands
+            .lines()
+            .find(|line| line.starts_with("create "))
+            .expect("create command");
+        assert!(create.contains("--cpus 3"));
+        assert!(create.contains("--memory 768M"));
+        assert!(create.contains("--workdir /workspace"));
+        assert!(create.contains("--dns 1.1.1.1"));
+        assert!(create.contains("--env PUBLIC=yes"));
+        assert!(create.contains("--env TOKEN"));
+        assert!(!create.contains("secret-value"));
+        assert!(create.contains("--label com.sendbox.session=fixture"));
+        assert!(create.contains(&format!(
+            "--mount type=bind,source={},target=/workspace",
+            project.display()
+        )));
     }
 
     #[tokio::test]
