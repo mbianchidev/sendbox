@@ -165,7 +165,17 @@ The repository policy preserves the Swift behavior:
 - cross-organization non-public scope is always denied.
 
 Copilot authentication is independently gated by
-`forward_copilot_auth`. `SessionCredentialConfiguration` returns the broker
+`forward_copilot_auth`. The host resolves the credential from
+`COPILOT_GITHUB_TOKEN`, falling back to the legacy `GITHUB_COPILOT_TOKEN` only
+when the supported variable is absent; a variable that is present but empty is a
+hard error rather than a silent fallback. Repository-scoped credentials
+(`GH_TOKEN`, `GITHUB_TOKEN`) are never consulted, so Copilot forwarding stays
+independent of `forward_auth`. Whichever host variable supplied the value, the
+guest only ever receives `COPILOT_GITHUB_TOKEN`, which is the name current
+GitHub Copilot CLI releases read. Errors name the supported variables and never
+include a credential value.
+
+`SessionCredentialConfiguration` returns the broker
 listener and per-rule agent endpoints plus zeroizing GitHub/Copilot values for a
 specific session. It does not install environment variables or start a runtime.
 

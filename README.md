@@ -344,6 +344,26 @@ root-owned broker and signed policy before the agent starts; server children rec
 signed environment and fixed workspace. Optional stdio observation is written below
 `/var/log/sendbox`. HTTP/SSE inspection and Hyperlight MCP composition fail closed.
 
+### Copilot credentials
+
+`github.forward_copilot_auth: true` forwards a Copilot credential independently of
+repository-scoped GitHub authentication. The host resolves it from the first variable that
+is set, in this order:
+
+| Host variable | Status |
+|---|---|
+| `COPILOT_GITHUB_TOKEN` | Supported |
+| `GITHUB_COPILOT_TOKEN` | Legacy compatibility only |
+
+Only an *absent* variable falls through to the next candidate; a variable that is set but
+empty is a hard error rather than a silent fallback. Repository-scoped credentials
+(`GH_TOKEN`, `GITHUB_TOKEN`) are never consulted for Copilot.
+
+Whichever host variable supplied the value, the guest receives it as
+**`COPILOT_GITHUB_TOKEN`** — the name current GitHub Copilot CLI releases read — so no
+wrapper script or duplicated GitHub token is required. Errors name the supported variables
+and never print a credential value.
+
 ### Configuration Reference
 
 | Section | Key | Description |
@@ -367,7 +387,7 @@ signed environment and fixed workspace. Optional stdio observation is written be
 | `secrets` | list | Secret names injected at runtime |
 | `devcontainer.auto_generate` | bool | Generate a devcontainer spec |
 | `github.forward_auth` | bool | Forward guarded GitHub credentials for the selected repository |
-| `github.forward_copilot_auth` | bool | Forward Copilot authentication independently |
+| `github.forward_copilot_auth` | bool | Forward Copilot authentication independently as `COPILOT_GITHUB_TOKEN` |
 | `github.allow_private_repository_access` | bool | Permit additional same-organization private repositories |
 | `github.ssh_key_path` | string | Owner-only SSH private key used by the trusted Git SSH wrapper |
 | `github.branch_protection.enabled` | bool | Guard selected-repository pushes and pulls by branch |
@@ -419,8 +439,7 @@ SendBox follows a **deny-by-default** security posture:
 1. **Filesystem** — Only explicitly configured host paths are mounted into the guest. State and workspace roots cannot overlap.
 2. **Commands** — Deny rules win over allow rules for the brokered top-level argv. Descendants are constrained by the guest execution boundary, not recursively reinterpreted as shell text.
 3. **Network** — Persistent workloads can reach only the loopback DNS and SOCKS5 brokers. Kernel rules deny direct external agent traffic and unmarked broker traffic.
-4. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when repository scope matches policy. Secret values use authenticated envelopes and temporary owner-only guest files where a child process requires a file.
-5. **Isolation** — Apple and Kata provide persistent Linux VMs; Hyperlight provides explicit Linux/KVM one-shot isolation. Missing host or runtime capabilities are errors, never silent fallbacks.
+4. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when repository scope matches policy. Secret values use authenticated envelopes and temporary owner-only guest files where a child process requires a file.5. **Isolation** — Apple and Kata provide persistent Linux VMs; Hyperlight provides explicit Linux/KVM one-shot isolation. Missing host or runtime capabilities are errors, never silent fallbacks.
 6. **Boundaries** — Signed guest services must become ready before execution. Local stdio MCP calls must traverse the installed broker; HTTP/SSE, direct project-server configuration, and unsupported transports fail closed.
 7. **Branches** — Trusted Git wrappers restrict selected-repository push and pull operations. Alternate clients and direct hosting-provider APIs remain outside this local guard, so server-side rules stay required.
 

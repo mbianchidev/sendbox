@@ -67,7 +67,17 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 const PLAN_VALIDITY: Duration = Duration::from_secs(60 * 60);
-const COPILOT_TOKEN_ENVIRONMENT: &str = "GITHUB_COPILOT_TOKEN";
+/// Name injected into the guest environment. Current GitHub Copilot CLI
+/// releases read `COPILOT_GITHUB_TOKEN`; the legacy `GITHUB_COPILOT_TOKEN`
+/// name is never exposed inside the guest.
+const COPILOT_GUEST_TOKEN_ENVIRONMENT: &str = "COPILOT_GITHUB_TOKEN";
+/// Host variables consulted for independent Copilot forwarding, in precedence
+/// order. Only a missing variable falls through to the next candidate; a
+/// present-but-empty variable is a hard error. Repository-scoped GitHub
+/// credentials (`GH_TOKEN`/`GITHUB_TOKEN`) are deliberately excluded so that
+/// Copilot authentication stays independent of `github.forward_auth`.
+const COPILOT_HOST_TOKEN_ENVIRONMENTS: &[&str] =
+    &[COPILOT_GUEST_TOKEN_ENVIRONMENT, "GITHUB_COPILOT_TOKEN"];
 const MCP_PROXY_ENVIRONMENT: &str = "SENDBOX_MCP_PROXY";
 const MAX_EXECUTION_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;
 const MAX_EXECUTION_ENVIRONMENT_BYTES: usize = 16 * 1024;
@@ -1372,7 +1382,8 @@ fn boundary_features(
             "github_copilot_credentials".to_owned(),
             FeatureAdmission {
                 decision: FeatureDecision::Enforced,
-                mechanism: "independent_copilot_token+secret_envelope_v2".to_owned(),
+                mechanism: "independent_copilot_token+copilot_github_token+secret_envelope_v2"
+                    .to_owned(),
             },
         );
     }
@@ -1415,15 +1426,7 @@ async fn prepare_effective_credentials(
     selected_repository: Option<&RepositoryIdentity>,
 ) -> Result<EffectiveCredentialSet, HostError> {
     let copilot_token = if configuration.github.forward_copilot_auth {
-        let value = std::env::var(COPILOT_TOKEN_ENVIRONMENT).map_err(|_| {
-            HostError::Invalid(format!(
-                "{COPILOT_TOKEN_ENVIRONMENT} is unavailable for requested Copilot forwarding"
-            ))
-        })?;
-        Some(checked_environment_secret(
-            COPILOT_TOKEN_ENVIRONMENT,
-            value.into_bytes(),
-        )?)
+        Some(discover_copilot_token()?)
     } else {
         None
     };
@@ -1463,6 +1466,13 @@ async fn prepare_effective_credentials(
         }
     };
 
+    collect_credential_values(configuration, github)
+}
+
+fn collect_credential_values(
+    configuration: &SandboxConfiguration,
+    github: GitHubSessionCredentials,
+) -> Result<EffectiveCredentialSet, HostError> {
     let mut values = BTreeMap::new();
     if let Some(value) = github.github_token {
         values.insert(
@@ -1472,8 +1482,11 @@ async fn prepare_effective_credentials(
     }
     if let Some(value) = github.copilot_token {
         values.insert(
-            COPILOT_TOKEN_ENVIRONMENT.to_owned(),
-            checked_environment_secret(COPILOT_TOKEN_ENVIRONMENT, value.expose_secret().to_vec())?,
+            COPILOT_GUEST_TOKEN_ENVIRONMENT.to_owned(),
+            checked_environment_secret(
+                COPILOT_GUEST_TOKEN_ENVIRONMENT,
+                value.expose_secret().to_vec(),
+            )?,
         );
     }
     if let Some(path) = configuration.github.ssh_key_path.as_deref() {
@@ -1492,7 +1505,7 @@ async fn prepare_effective_credentials(
     }
     Ok(EffectiveCredentialSet {
         github_https_auth: values.contains_key(GITHUB_TOKEN_ENVIRONMENT),
-        copilot_auth: values.contains_key(COPILOT_TOKEN_ENVIRONMENT),
+        copilot_auth: values.contains_key(COPILOT_GUEST_TOKEN_ENVIRONMENT),
         git_ssh_auth: values.contains_key(SSH_KEY_ENVIRONMENT),
         values,
     })
@@ -1625,6 +1638,37 @@ fn validate_security_composition(composition: SecurityComposition<'_>) -> Result
         ));
     }
     Ok(())
+}
+
+/// Resolves the independent Copilot credential from the host environment.
+///
+/// Candidates are consulted in [`COPILOT_HOST_TOKEN_ENVIRONMENTS`] order. Only
+/// an absent variable falls through to the next candidate: a variable that is
+/// present but empty is a hard error, so a blanked-out primary never silently
+/// resolves to a stale legacy value. Errors name the supported variables and
+/// never include a credential value.
+fn discover_copilot_token() -> Result<SecretValue, HostError> {
+    discover_copilot_token_from(|name| std::env::var(name).ok())
+}
+
+fn discover_copilot_token_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<SecretValue, HostError> {
+    for name in COPILOT_HOST_TOKEN_ENVIRONMENTS {
+        let Some(value) = lookup(name) else {
+            continue;
+        };
+        if value.is_empty() {
+            return Err(HostError::Invalid(format!(
+                "{name} is set but empty for requested Copilot forwarding"
+            )));
+        }
+        return checked_environment_secret(COPILOT_GUEST_TOKEN_ENVIRONMENT, value.into_bytes());
+    }
+    Err(HostError::Invalid(format!(
+        "no Copilot credential is available for requested Copilot forwarding; set one of {}",
+        COPILOT_HOST_TOKEN_ENVIRONMENTS.join(", ")
+    )))
 }
 
 fn checked_environment_secret(name: &str, bytes: Vec<u8>) -> Result<SecretValue, HostError> {
@@ -2760,6 +2804,109 @@ mod tests {
             HostError::Invalid(message)
                 if message == "guest command is denied by command policy rule `true`"
         ));
+    }
+
+    #[test]
+    fn copilot_discovery_prefers_the_supported_variable_over_the_legacy_one() {
+        let token = discover_copilot_token_from(|name| match name {
+            "COPILOT_GITHUB_TOKEN" => Some("supported-token".to_owned()),
+            "GITHUB_COPILOT_TOKEN" => Some("legacy-token".to_owned()),
+            _ => None,
+        })
+        .expect("supported variable must resolve");
+
+        assert_eq!(token.expose_secret(), b"supported-token");
+    }
+
+    #[test]
+    fn copilot_discovery_falls_back_to_the_legacy_variable() {
+        let token = discover_copilot_token_from(|name| {
+            (name == "GITHUB_COPILOT_TOKEN").then(|| "legacy-token".to_owned())
+        })
+        .expect("legacy variable must remain supported");
+
+        assert_eq!(token.expose_secret(), b"legacy-token");
+    }
+
+    #[test]
+    fn copilot_discovery_rejects_an_empty_supported_variable_without_legacy_fallback() {
+        let error = discover_copilot_token_from(|name| match name {
+            "COPILOT_GITHUB_TOKEN" => Some(String::new()),
+            "GITHUB_COPILOT_TOKEN" => Some("legacy-token".to_owned()),
+            _ => None,
+        })
+        .expect_err("a blanked-out supported variable must fail closed");
+
+        assert!(matches!(
+            error,
+            HostError::Invalid(message)
+                if message == "COPILOT_GITHUB_TOKEN is set but empty for requested Copilot forwarding"
+        ));
+    }
+
+    #[test]
+    fn copilot_discovery_names_every_supported_variable_when_absent() {
+        let error = discover_copilot_token_from(|_| None)
+            .expect_err("missing Copilot credentials must fail closed");
+
+        let HostError::Invalid(message) = error else {
+            panic!("expected an invalid-configuration error");
+        };
+        assert!(message.contains("COPILOT_GITHUB_TOKEN"));
+        assert!(message.contains("GITHUB_COPILOT_TOKEN"));
+    }
+
+    #[test]
+    fn copilot_discovery_ignores_repository_scoped_github_credentials() {
+        let error = discover_copilot_token_from(|name| {
+            matches!(name, "GH_TOKEN" | "GITHUB_TOKEN").then(|| "repository-token".to_owned())
+        })
+        .expect_err("Copilot forwarding must stay independent of repository credentials");
+
+        assert!(matches!(error, HostError::Invalid(_)));
+    }
+
+    #[test]
+    fn copilot_errors_never_disclose_credential_values() {
+        const SENTINEL: &str = "ghu_supersecretcopilotcredential";
+        let oversized = SENTINEL.repeat(MAX_EXECUTION_ENVIRONMENT_ENTRY_BYTES);
+        let error = discover_copilot_token_from(|name| {
+            (name == "COPILOT_GITHUB_TOKEN").then(|| oversized.clone())
+        })
+        .expect_err("oversized credentials must fail closed");
+
+        let HostError::Invalid(message) = error else {
+            panic!("expected an invalid-configuration error");
+        };
+        assert!(
+            !message.contains(SENTINEL),
+            "error disclosed the credential: {message}"
+        );
+    }
+
+    #[test]
+    fn prepared_copilot_credentials_only_expose_the_supported_guest_variable() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.github.forward_auth = false;
+        configuration.github.forward_copilot_auth = true;
+
+        let credentials = collect_credential_values(
+            &configuration,
+            GitHubSessionCredentials {
+                github_token: None,
+                copilot_token: Some(SecretValue::new(b"guest-token".to_vec()).expect("secret")),
+            },
+        )
+        .expect("Copilot-only forwarding must prepare credentials");
+
+        assert!(credentials.copilot_auth);
+        assert!(!credentials.github_https_auth);
+        assert_eq!(
+            credentials.values.keys().collect::<Vec<_>>(),
+            vec!["COPILOT_GITHUB_TOKEN"],
+            "the legacy variable must never reach the guest"
+        );
     }
 
     #[test]
