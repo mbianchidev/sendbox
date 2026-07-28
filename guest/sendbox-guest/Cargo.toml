@@ -14,6 +14,7 @@ execution-broker = ["dep:sendbox-exec", "dep:sendbox-policy"]
 [dependencies]
 clap.workspace = true
 ed25519-dalek.workspace = true
+getrandom = "0.3.4"
 rustix.workspace = true
 sendbox-bootstrap = { path = "../../crates/sendbox-bootstrap" }
 sendbox-core = { path = "../../crates/sendbox-core" }

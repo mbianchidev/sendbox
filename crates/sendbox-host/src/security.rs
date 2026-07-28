@@ -956,6 +956,7 @@ impl HostError {
             Self::RuntimeSecurity { .. } => "runtime_security",
             Self::AgentPlan(_) => "agent_plan",
             Self::AgentRun(_) => "agent_run",
+            Self::Credentials(_) => "credentials",
             Self::GitGuard(_) => "git_guard",
             Self::SecretStore(_) => "secret_store",
             Self::Io { .. } => "io",

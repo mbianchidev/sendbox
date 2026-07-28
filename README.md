@@ -13,7 +13,7 @@ SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's 
 - **Network Firewall** — Restrict outbound traffic to specific hosts, ports, or protocols.
 - **Runtime Providers** — Select Apple Containerization, Kata Containers, or Hyperlight through one lifecycle API and `--runtime`.
 - **Hyperlight Execution** — The Rust runtime adapter runs verified one-shot commands in Hyperlight/Unikraft micro-VMs on Linux; persistent agent/MCP transport is rejected.
-- **Credential Injection** — Secrets load from macOS Keychain or the protected Linux secret store and are injected without persisting them in the guest filesystem.
+- **Credential Injection** — Secrets and repository-scoped GitHub/Copilot credentials use authenticated, encrypted host-to-guest envelopes. SSH keys are staged only in an owner-only runtime directory for the trusted SSH child and removed afterward.
 - **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
 - **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
 - **Native MCP Core** — Safe Rust framing, strict JSON-RPC validation, deny-first stdio tool policy, exact-command brokering, config validation, legacy trace parsing, and versioned native observation records. Runtime/guest wiring remains separate. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
@@ -273,6 +273,10 @@ Copilot authentication is forwarded independently from repository credentials. B
 GitHub token may cover the selected repository and public repositories only. Set
 `github.allow_private_repository_access` to permit additional private repositories in the
 selected repository's organization; cross-organization private access remains blocked.
+GitHub repository forwarding currently supports `github.com`. Ordinary HTTPS Git uses a fixed
+authenticated askpass helper rather than assuming `GITHUB_TOKEN` is consumed automatically.
+`github.ssh_key_path` accepts an owner-only private-key file and routes Git SSH through a trusted
+wrapper with strict host-key checking; the guest image must provide trusted SSH host keys.
 
 Selected-repository `git push` and `git pull` operations are branch-protected by default.
 `main` and `master` are denied, while `{username}/*`, `copilot/*`, and `feature/*` are
@@ -281,10 +285,9 @@ requires `policy.boundaries.enabled`; keep GitHub server-side branch protection 
 defense in depth against direct API ref mutations or alternate Git clients. Disable
 `github.branch_protection.enabled` for non-Git projects.
 
-The native Rust admission engine is implemented independently of the current
-Swift-generated wrapper. It is not yet connected to `sendbox run`, and neither
-implementation replaces hosting-provider rulesets or protects alternate clients
-and direct GitHub API calls.
+The native Rust admission engine is connected to persistent Apple and Kata `sendbox run`
+sessions through authenticated guest bootstrap. It does not replace hosting-provider rulesets
+or protect alternate clients and direct GitHub API calls.
 
 ### Configuration Reference
 
@@ -311,6 +314,7 @@ and direct GitHub API calls.
 | `github.forward_auth` | bool | Forward guarded GitHub credentials for the selected repository |
 | `github.forward_copilot_auth` | bool | Forward Copilot authentication independently |
 | `github.allow_private_repository_access` | bool | Permit additional same-organization private repositories |
+| `github.ssh_key_path` | string | Owner-only SSH private key used by the trusted Git SSH wrapper |
 | `github.branch_protection.enabled` | bool | Guard selected-repository pushes and pulls by branch |
 | `github.branch_protection.username` | string | Username used to expand `{username}` patterns; auto-detected by default |
 | `github.branch_protection.protected_branches` | list | Branch names that push and pull can never target |

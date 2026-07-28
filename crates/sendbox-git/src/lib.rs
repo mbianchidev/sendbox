@@ -29,7 +29,8 @@ pub use process::{
     EnvironmentPolicy, GitProcessRunner, ProcessOutput, ProcessRequest, SystemGitProcessRunner,
 };
 pub use service::{
-    Admission, GuardLimits, GuardPolicyDocument, GuardService, PolicySchemaVersion,
+    Admission, GIT_ASKPASS_PATH, GIT_SSH_PATH, GITHUB_TOKEN_ENVIRONMENT, GuardLimits,
+    GuardPolicyDocument, GuardService, PolicySchemaVersion, SSH_KEY_ENVIRONMENT,
     parse_push_refspec,
 };
 pub use standalone::{execute_guarded_git, read_policy_file};

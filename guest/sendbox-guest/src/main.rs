@@ -140,12 +140,36 @@ enum FixtureMode {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    if invoked_as_git() {
+    let invocation = invocation_name();
+    if invocation.as_deref() == Some("git") {
         let arguments = std::env::args().skip(1).collect::<Vec<_>>();
         return match sendbox_guest::git_guard::execute_current(&arguments) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("[sendbox-git-guard] {error}");
+                ExitCode::from(sendbox_guest::git_guard::denied_exit_code())
+            }
+        };
+    }
+    if invocation.as_deref() == Some("sendbox-git-askpass") {
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        return match sendbox_guest::git_guard::askpass_response(&arguments) {
+            Ok(response) => {
+                println!("{response}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("[sendbox-git-askpass] {error}");
+                ExitCode::from(sendbox_guest::git_guard::denied_exit_code())
+            }
+        };
+    }
+    if invocation.as_deref() == Some("sendbox-git-ssh") {
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        return match sendbox_guest::git_guard::execute_ssh(&arguments) {
+            Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
+            Err(error) => {
+                eprintln!("[sendbox-git-ssh] {error}");
                 ExitCode::from(sendbox_guest::git_guard::denied_exit_code())
             }
         };
@@ -159,12 +183,13 @@ async fn main() -> ExitCode {
     }
 }
 
-fn invoked_as_git() -> bool {
+fn invocation_name() -> Option<String> {
     std::env::args_os()
         .next()
         .as_deref()
         .and_then(|name| Path::new(name).file_name())
-        .is_some_and(|name| name == "git")
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
 }
 
 async fn execute(cli: Cli) -> Result<(), GuestError> {

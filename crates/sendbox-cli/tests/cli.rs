@@ -148,6 +148,46 @@ fn production_run_no_longer_rejects_the_native_git_guard_as_unwired() {
     );
 }
 
+#[test]
+fn production_run_no_longer_rejects_guarded_credentials_as_unwired() {
+    let temporary = tempdir().unwrap();
+    let config = temporary.path().join("sandbox.yaml");
+    let mut configuration =
+        SandboxConfiguration::load(workspace_root().join("config/example-sandbox.yaml")).unwrap();
+    configuration.secrets.clear();
+    configuration.project_path = temporary.path().join("missing-project");
+    configuration.github.forward_auth = true;
+    configuration.github.forward_copilot_auth = false;
+    configuration.github.allow_private_repository_access = false;
+    configuration.github.branch_protection.enabled = false;
+    configuration.github.ssh_key_path = None;
+    make_network_permissive(&mut configuration);
+    std::fs::write(&config, serde_json::to_vec(&configuration).unwrap()).unwrap();
+    let output = run(&[
+        "run",
+        "--config",
+        config.to_str().unwrap(),
+        "--runtime",
+        "kata",
+        "--image",
+        "example.invalid/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--bundle",
+        ".",
+        "--trust-root",
+        "Cargo.toml",
+        "--json",
+        "--",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["message"].is_string());
+    assert_ne!(
+        result["message"],
+        "production run does not yet wire the credential broker"
+    );
+}
+
 fn make_network_permissive(configuration: &mut SandboxConfiguration) {
     let network = &mut configuration.policy.network;
     network.default_action = Action::Allow;

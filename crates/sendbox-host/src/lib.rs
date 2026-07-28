@@ -27,11 +27,16 @@ use sendbox_boundary::{
 use sendbox_bundle::{Architecture as BundleArchitecture, VerifyOptions, verify_bundle};
 use sendbox_config::{RuntimeProvider as ConfiguredRuntime, SandboxConfiguration};
 use sendbox_core::{SessionId, VERSION};
+use sendbox_credentials::{
+    CredentialBrokerError, GhMetadataClient, GhProcessConfiguration, GitHubSessionCredentials,
+    RepositoryIdentity as CredentialRepositoryIdentity, authorize_github,
+};
 use sendbox_exec::{AdmissionDisposition, CompiledCommandPolicy};
 use sendbox_git::{
-    BranchPolicyConfiguration, EnvironmentPolicy, GitProcessRunner, GuardError, GuardLimits,
-    GuardPolicyDocument, PolicySchemaVersion, ProcessRequest, SystemGitProcessRunner,
-    TrustedGitBinary, discover_repository_identity,
+    BranchPolicyConfiguration, EnvironmentPolicy, GITHUB_TOKEN_ENVIRONMENT, GitProcessRunner,
+    GuardError, GuardLimits, GuardPolicyDocument, PolicySchemaVersion, ProcessRequest,
+    RepositoryIdentity, SSH_KEY_ENVIRONMENT, SystemGitProcessRunner, TrustedGitBinary,
+    discover_repository_identity,
 };
 use sendbox_policy::{Action, DnsPolicy};
 use sendbox_runtime::{
@@ -47,13 +52,16 @@ use sendbox_runtime_hyperlight::{
     HyperlightNetworkConfiguration, HyperlightRuntime,
 };
 use sendbox_runtime_kata::{KataProviderConfiguration, KataRuntimeProvider};
-use sendbox_secrets::{SecretName, SecretStore};
+use sendbox_secrets::{SecretName, SecretStore, SecretValue, requires_guarded_github_forwarding};
 use sendbox_security::{SecurityError, provenance::SigningKeyMaterial};
 use sendbox_session_security::SessionSecurityError;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 const PLAN_VALIDITY: Duration = Duration::from_secs(60 * 60);
+const COPILOT_TOKEN_ENVIRONMENT: &str = "GITHUB_COPILOT_TOKEN";
+const MAX_EXECUTION_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;
+const MAX_EXECUTION_ENVIRONMENT_BYTES: usize = 16 * 1024;
 #[cfg(target_os = "linux")]
 const SECRET_SERVICE: &str = "sendbox";
 
@@ -142,6 +150,8 @@ pub enum HostError {
     AgentRun(#[from] RunFailure),
     #[error("Git guard: {0}")]
     GitGuard(#[from] GuardError),
+    #[error("credentials: {0}")]
+    Credentials(#[from] CredentialBrokerError),
     #[error("secret store: {0}")]
     SecretStore(#[from] sendbox_secrets::SecretStoreError),
     #[error("{context} `{path}`: {source}")]
@@ -160,6 +170,23 @@ pub struct PreparedHostRun {
     secrets: Arc<HostSecretResolver>,
     security: security::HostSecurityContext,
     signed_plan_path: PathBuf,
+}
+
+struct EffectiveCredentialSet {
+    values: BTreeMap<String, SecretValue>,
+    github_https_auth: bool,
+    copilot_auth: bool,
+    git_ssh_auth: bool,
+}
+
+impl EffectiveCredentialSet {
+    fn apply_to(&self, configuration: &mut SandboxConfiguration) {
+        configuration.secrets.extend(self.values.keys().cloned());
+    }
+
+    fn into_values(self) -> BTreeMap<String, SecretValue> {
+        self.values
+    }
 }
 
 enum HostExecution {
@@ -196,11 +223,12 @@ impl PreparedHostRun {
     }
 }
 
-pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
+pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
     request
         .configuration
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
+    validate_reserved_secret_names(&request.configuration)?;
     if let Some(error) = unavailable_run_feature(&request.configuration) {
         return Err(HostError::Invalid(error.to_owned()));
     }
@@ -220,18 +248,6 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
     validate_runtime_features(selected_runtime, &request.configuration)?;
     let workspace_source =
         canonical_file_or_directory(&request.configuration.project_path, "project root")?;
-    ensure_private_directory(&request.state_root)?;
-    let state_root = canonical_file_or_directory(&request.state_root, "runtime state root")?;
-    let session_id = random_session_id()?;
-    let prospective_state_directory = state_root.join("sessions").join(session_id.to_string());
-    security::validate_state_workspace_disjoint(&workspace_source, &prospective_state_directory)?;
-    let state_directory = create_session_directory(&state_root, session_id)?;
-    let key = load_or_create_signing_key(&state_root)?;
-    let signer_fingerprint = key
-        .identity("SendBox local runtime", None, 0, None)
-        .fingerprint;
-    let now_unix = unix_time()?;
-
     let bundle_root = canonical_file_or_directory(&request.bundle_root, "bundle root")?;
     let trust_root = canonical_file_or_directory(&request.trust_root, "bundle trust root")?;
     let bundle = verify_bundle(&VerifyOptions {
@@ -246,6 +262,49 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
     .map_err(|error| HostError::Bundle(error.to_string()))?;
     let manifest_sha256 = hash_file(&bundle_root.join("manifest.json"))?;
     let bundle_id = format!("{}:{}", request.trust_root_id, bundle.release_sequence);
+    let selected_repository =
+        discover_selected_repository(&request.configuration, &workspace_source)?;
+    let credentials =
+        prepare_effective_credentials(&request.configuration, selected_repository.as_ref()).await?;
+    credentials.apply_to(&mut request.configuration);
+    request
+        .configuration
+        .validate()
+        .map_err(|error| HostError::Invalid(error.to_string()))?;
+    let workspace_destination = PathBuf::from("/workspace");
+    let git_guard_policy = make_git_guard_policy(
+        selected_runtime,
+        &request.configuration,
+        selected_repository.as_ref(),
+        &workspace_source,
+        &workspace_destination,
+        &credentials,
+    )?;
+    let features = boundary_features(
+        &request.configuration,
+        git_guard_policy.as_ref(),
+        &credentials,
+    )?;
+    validate_security_composition(
+        selected_runtime,
+        &request.configuration,
+        selected_repository.as_ref(),
+        git_guard_policy.as_ref(),
+        &credentials,
+        &features,
+    )?;
+
+    ensure_private_directory(&request.state_root)?;
+    let state_root = canonical_file_or_directory(&request.state_root, "runtime state root")?;
+    let session_id = random_session_id()?;
+    let prospective_state_directory = state_root.join("sessions").join(session_id.to_string());
+    security::validate_state_workspace_disjoint(&workspace_source, &prospective_state_directory)?;
+    let state_directory = create_session_directory(&state_root, session_id)?;
+    let key = load_or_create_signing_key(&state_root)?;
+    let signer_fingerprint = key
+        .identity("SendBox local runtime", None, 0, None)
+        .fingerprint;
+    let now_unix = unix_time()?;
     let configuration_bytes = serde_json::to_vec(&request.configuration)
         .map_err(|error| HostError::Invalid(error.to_string()))?;
     let policy_bytes = serde_json::to_vec(&request.configuration.policy)
@@ -253,18 +312,12 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
     let configuration_sha256 = sha256_hex(&configuration_bytes);
     let policy_sha256 = sha256_hex(&policy_bytes);
     let resources = runtime_resources(&request.configuration)?;
-    let workspace_destination = PathBuf::from("/workspace");
-    let git_guard_policy = make_git_guard_policy(
-        selected_runtime,
-        &request.configuration,
-        &workspace_source,
-        &workspace_destination,
-    )?;
     let bootstrap_reference =
         SecretReference::new(format!("bootstrap-{session_id}")).map_err(HostError::AgentPlan)?;
     let secrets = Arc::new(HostSecretResolver::open(
         bootstrap_reference.clone(),
         random_bootstrap_secret()?,
+        credentials.into_values(),
     )?);
 
     let runtime = build_runtime(
@@ -277,7 +330,6 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
         &workspace_source,
         git_guard_policy.as_ref(),
     )?;
-    let features = boundary_features(git_guard_policy.as_ref())?;
     let workload = match selected_runtime {
         ResolvedRuntime::Hyperlight => WorkloadIdentity::GuestBundle {
             root: bundle_root.clone(),
@@ -786,14 +838,20 @@ async fn cleanup_hyperlight(
 struct HostSecretResolver {
     bootstrap_reference: SecretReference,
     bootstrap: Zeroizing<[u8; 32]>,
+    ephemeral: BTreeMap<String, SecretValue>,
     native: Arc<dyn SecretStore>,
 }
 
 impl HostSecretResolver {
-    fn open(bootstrap_reference: SecretReference, bootstrap: [u8; 32]) -> Result<Self, HostError> {
+    fn open(
+        bootstrap_reference: SecretReference,
+        bootstrap: [u8; 32],
+        ephemeral: BTreeMap<String, SecretValue>,
+    ) -> Result<Self, HostError> {
         Ok(Self {
             bootstrap_reference,
             bootstrap: Zeroizing::new(bootstrap),
+            ephemeral,
             native: native_secret_store()?,
         })
     }
@@ -817,6 +875,12 @@ impl SecretResolver for HostSecretResolver {
                 return Ok(SecretEnvelope::new(
                     reference.clone(),
                     self.bootstrap.to_vec(),
+                ));
+            }
+            if let Some(secret) = self.ephemeral.get(reference.as_str()) {
+                return Ok(SecretEnvelope::new(
+                    reference.clone(),
+                    secret.expose_secret().to_vec(),
                 ));
             }
             let name = SecretName::new(reference.as_str()).map_err(|error| {
@@ -911,13 +975,6 @@ fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'sta
     {
         return Some("production run does not yet wire the native MCP subsystem");
     }
-    if configuration.github.forward_auth
-        || configuration.github.forward_copilot_auth
-        || configuration.github.allow_private_repository_access
-        || configuration.github.ssh_key_path.is_some()
-    {
-        return Some("production run does not yet wire the credential broker");
-    }
     let network = &configuration.policy.network;
     if network.default_action != Action::Allow
         || !network.allowed_domains.is_empty()
@@ -944,10 +1001,13 @@ fn validate_runtime_features(
         ));
     }
     if selected_runtime == ResolvedRuntime::Hyperlight
-        && configuration.github.branch_protection.enabled
+        && (configuration.github.branch_protection.enabled
+            || configuration.github.forward_auth
+            || configuration.github.forward_copilot_auth
+            || configuration.github.ssh_key_path.is_some())
     {
         return Err(HostError::Invalid(
-            "Hyperlight does not support the authenticated guest Git guard".to_owned(),
+            "Hyperlight does not support authenticated Git or credential delivery".to_owned(),
         ));
     }
     Ok(())
@@ -956,10 +1016,15 @@ fn validate_runtime_features(
 fn make_git_guard_policy(
     selected_runtime: ResolvedRuntime,
     configuration: &SandboxConfiguration,
+    selected_repository: Option<&RepositoryIdentity>,
     workspace_source: &Path,
     workspace_destination: &Path,
+    credentials: &EffectiveCredentialSet,
 ) -> Result<Option<GuardPolicyDocument>, HostError> {
-    if !configuration.github.branch_protection.enabled {
+    if !configuration.github.branch_protection.enabled
+        && !credentials.github_https_auth
+        && !credentials.git_ssh_auth
+    {
         return Ok(None);
     }
     if selected_runtime == ResolvedRuntime::Hyperlight {
@@ -967,24 +1032,35 @@ fn make_git_guard_policy(
             "Hyperlight does not support the authenticated guest Git guard".to_owned(),
         ));
     }
-    let git = trusted_host_git()?;
-    let repository = discover_repository_identity(
-        &git,
-        &SystemGitProcessRunner,
-        workspace_source,
-        host_git_environment(),
-    )?;
+    let repository = selected_repository
+        .ok_or_else(|| HostError::Invalid("selected Git repository is unavailable".to_owned()))?;
     let configured = &configuration.github.branch_protection;
     let username = configured
-        .username
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .or_else(|| resolve_github_username(repository.host(), workspace_source));
+        .enabled
+        .then(|| {
+            configured
+                .username
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .or_else(|| resolve_github_username(repository.host(), workspace_source))
+        })
+        .flatten();
+    let mut environment = EnvironmentPolicy::default();
+    if credentials.github_https_auth {
+        environment
+            .inherited_keys
+            .insert(GITHUB_TOKEN_ENVIRONMENT.to_owned());
+    }
+    if credentials.git_ssh_auth {
+        environment
+            .inherited_keys
+            .insert(SSH_KEY_ENVIRONMENT.to_owned());
+    }
     let policy = GuardPolicyDocument {
         schema_version: PolicySchemaVersion::V1,
-        selected_repository: repository,
+        selected_repository: repository.clone(),
         selected_workspace: workspace_destination.to_path_buf(),
         branch_protection: BranchPolicyConfiguration {
             enabled: configured.enabled,
@@ -992,7 +1068,9 @@ fn make_git_guard_policy(
             protected_branches: configured.protected_branches.clone(),
             allowed_branch_patterns: configured.allowed_branch_patterns.clone(),
         },
-        environment: EnvironmentPolicy::default(),
+        environment,
+        github_https_auth: credentials.github_https_auth,
+        git_ssh_auth: credentials.git_ssh_auth,
         limits: GuardLimits::default(),
     };
     policy.validate()?;
@@ -1000,23 +1078,313 @@ fn make_git_guard_policy(
 }
 
 fn boundary_features(
+    configuration: &SandboxConfiguration,
     git_guard_policy: Option<&GuardPolicyDocument>,
+    credentials: &EffectiveCredentialSet,
 ) -> Result<BTreeMap<String, FeatureAdmission>, HostError> {
-    let Some(policy) = git_guard_policy else {
-        return Ok(BTreeMap::new());
+    let mut features = BTreeMap::new();
+    if let Some(policy) = git_guard_policy {
+        let encoded =
+            serde_json::to_vec(policy).map_err(|error| HostError::Invalid(error.to_string()))?;
+        let mechanism = format!(
+            "authenticated_guest_git_guard_v1:sha256={}",
+            sha256_hex(&encoded)
+        );
+        features.insert(
+            "git_runtime_guard".to_owned(),
+            FeatureAdmission {
+                decision: FeatureDecision::Enforced,
+                mechanism: mechanism.clone(),
+            },
+        );
+        if configuration.github.branch_protection.enabled {
+            features.insert(
+                "git_branch_protection".to_owned(),
+                FeatureAdmission {
+                    decision: FeatureDecision::Enforced,
+                    mechanism,
+                },
+            );
+        }
+    }
+    if credentials.github_https_auth {
+        features.insert(
+            "github_repository_credentials".to_owned(),
+            FeatureAdmission {
+                decision: FeatureDecision::Enforced,
+                mechanism: "repository_scoped_gh_authorization+secret_envelope_v2".to_owned(),
+            },
+        );
+    }
+    if credentials.copilot_auth {
+        features.insert(
+            "github_copilot_credentials".to_owned(),
+            FeatureAdmission {
+                decision: FeatureDecision::Enforced,
+                mechanism: "independent_copilot_token+secret_envelope_v2".to_owned(),
+            },
+        );
+    }
+    if credentials.git_ssh_auth {
+        features.insert(
+            "git_ssh_credentials".to_owned(),
+            FeatureAdmission {
+                decision: FeatureDecision::Enforced,
+                mechanism: "validated_private_key+secret_envelope_v2+trusted_ssh_wrapper"
+                    .to_owned(),
+            },
+        );
+    }
+    Ok(features)
+}
+
+fn discover_selected_repository(
+    configuration: &SandboxConfiguration,
+    workspace_source: &Path,
+) -> Result<Option<RepositoryIdentity>, HostError> {
+    if !configuration.github.branch_protection.enabled
+        && !configuration.github.forward_auth
+        && configuration.github.ssh_key_path.is_none()
+    {
+        return Ok(None);
+    }
+    let git = trusted_host_git()?;
+    discover_repository_identity(
+        &git,
+        &SystemGitProcessRunner,
+        workspace_source,
+        host_git_environment(),
+    )
+    .map(Some)
+    .map_err(HostError::GitGuard)
+}
+
+async fn prepare_effective_credentials(
+    configuration: &SandboxConfiguration,
+    selected_repository: Option<&RepositoryIdentity>,
+) -> Result<EffectiveCredentialSet, HostError> {
+    let copilot_token = if configuration.github.forward_copilot_auth {
+        let value = std::env::var(COPILOT_TOKEN_ENVIRONMENT).map_err(|_| {
+            HostError::Invalid(format!(
+                "{COPILOT_TOKEN_ENVIRONMENT} is unavailable for requested Copilot forwarding"
+            ))
+        })?;
+        Some(checked_environment_secret(
+            COPILOT_TOKEN_ENVIRONMENT,
+            value.into_bytes(),
+        )?)
+    } else {
+        None
     };
-    let encoded =
-        serde_json::to_vec(policy).map_err(|error| HostError::Invalid(error.to_string()))?;
-    Ok(BTreeMap::from([(
-        "git_branch_protection".to_owned(),
-        FeatureAdmission {
-            decision: FeatureDecision::Enforced,
-            mechanism: format!(
-                "authenticated_guest_guard_v1:sha256={}",
-                sha256_hex(&encoded)
-            ),
-        },
-    )]))
+
+    let github = if configuration.github.forward_auth {
+        let repository = selected_repository.ok_or_else(|| {
+            HostError::Invalid(
+                "selected Git repository is required for GitHub credential authorization"
+                    .to_owned(),
+            )
+        })?;
+        if repository.host() != "github.com" {
+            return Err(HostError::Invalid(format!(
+                "guarded GitHub credential forwarding currently supports github.com, not {}",
+                repository.host()
+            )));
+        }
+        let identity = CredentialRepositoryIdentity::parse(&format!(
+            "{}/{}",
+            repository.owner(),
+            repository.name()
+        ))?;
+        let client = GhMetadataClient::new(gh_process_configuration()?)?;
+        authorize_github(
+            &client,
+            &identity,
+            &configuration.github,
+            copilot_token,
+            &CancellationToken::new(),
+        )
+        .await?
+        .credentials
+    } else {
+        GitHubSessionCredentials {
+            github_token: None,
+            copilot_token,
+        }
+    };
+
+    let mut values = BTreeMap::new();
+    if let Some(value) = github.github_token {
+        values.insert(
+            GITHUB_TOKEN_ENVIRONMENT.to_owned(),
+            checked_environment_secret(GITHUB_TOKEN_ENVIRONMENT, value.expose_secret().to_vec())?,
+        );
+    }
+    if let Some(value) = github.copilot_token {
+        values.insert(
+            COPILOT_TOKEN_ENVIRONMENT.to_owned(),
+            checked_environment_secret(COPILOT_TOKEN_ENVIRONMENT, value.expose_secret().to_vec())?,
+        );
+    }
+    if let Some(path) = configuration.github.ssh_key_path.as_deref() {
+        values.insert(SSH_KEY_ENVIRONMENT.to_owned(), read_ssh_private_key(path)?);
+    }
+    let environment_bytes = values.iter().fold(0_usize, |total, (name, value)| {
+        total
+            .saturating_add(name.len())
+            .saturating_add(value.expose_secret().len())
+            .saturating_add(1)
+    });
+    if environment_bytes > MAX_EXECUTION_ENVIRONMENT_BYTES {
+        return Err(HostError::Invalid(
+            "prepared credentials exceed the guest environment limit".to_owned(),
+        ));
+    }
+    Ok(EffectiveCredentialSet {
+        github_https_auth: values.contains_key(GITHUB_TOKEN_ENVIRONMENT),
+        copilot_auth: values.contains_key(COPILOT_TOKEN_ENVIRONMENT),
+        git_ssh_auth: values.contains_key(SSH_KEY_ENVIRONMENT),
+        values,
+    })
+}
+
+fn validate_reserved_secret_names(configuration: &SandboxConfiguration) -> Result<(), HostError> {
+    for value in &configuration.secrets {
+        let name = SecretName::new(value.clone())?;
+        if requires_guarded_github_forwarding(&name) {
+            return Err(HostError::Invalid(format!(
+                "configured secret `{value}` requires guarded credential forwarding"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_security_composition(
+    selected_runtime: ResolvedRuntime,
+    configuration: &SandboxConfiguration,
+    selected_repository: Option<&RepositoryIdentity>,
+    git_guard_policy: Option<&GuardPolicyDocument>,
+    credentials: &EffectiveCredentialSet,
+    features: &BTreeMap<String, FeatureAdmission>,
+) -> Result<(), HostError> {
+    if credentials.github_https_auth != configuration.github.forward_auth
+        || credentials.copilot_auth != configuration.github.forward_copilot_auth
+        || credentials.git_ssh_auth != configuration.github.ssh_key_path.is_some()
+    {
+        return Err(HostError::Invalid(
+            "credential preparation does not match the requested configuration".to_owned(),
+        ));
+    }
+    let expected_guard = configuration.github.branch_protection.enabled
+        || credentials.github_https_auth
+        || credentials.git_ssh_auth;
+    if git_guard_policy.is_some() != expected_guard {
+        return Err(HostError::Invalid(
+            "authenticated Git guard composition is inconsistent".to_owned(),
+        ));
+    }
+    if let Some(policy) = git_guard_policy
+        && (selected_runtime == ResolvedRuntime::Hyperlight
+            || Some(&policy.selected_repository) != selected_repository
+            || policy.branch_protection.enabled != configuration.github.branch_protection.enabled
+            || policy.github_https_auth != credentials.github_https_auth
+            || policy.git_ssh_auth != credentials.git_ssh_auth)
+    {
+        return Err(HostError::Invalid(
+            "authenticated Git policy does not match the signed run configuration".to_owned(),
+        ));
+    }
+    let expected_names = credentials.values.keys().cloned().collect::<Vec<_>>();
+    let actual_names = configuration
+        .secrets
+        .iter()
+        .filter_map(|value| {
+            SecretName::new(value.clone())
+                .ok()
+                .filter(requires_guarded_github_forwarding)
+                .map(|_| value.clone())
+        })
+        .collect::<Vec<_>>();
+    if actual_names != expected_names {
+        return Err(HostError::Invalid(
+            "signed secret names do not match prepared credentials".to_owned(),
+        ));
+    }
+    let expected_features = boundary_features(configuration, git_guard_policy, credentials)?;
+    if &expected_features != features {
+        return Err(HostError::Invalid(
+            "signed feature admissions do not match prepared credentials".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn checked_environment_secret(name: &str, bytes: Vec<u8>) -> Result<SecretValue, HostError> {
+    if name.len().saturating_add(bytes.len()).saturating_add(1)
+        > MAX_EXECUTION_ENVIRONMENT_ENTRY_BYTES
+    {
+        return Err(HostError::Invalid(format!(
+            "credential `{name}` exceeds the guest environment entry limit"
+        )));
+    }
+    SecretValue::new(bytes).map_err(HostError::SecretStore)
+}
+
+fn read_ssh_private_key(path: &Path) -> Result<SecretValue, HostError> {
+    let path = canonical_file_or_directory(path, "Git SSH private key")?;
+    let metadata = path.symlink_metadata().map_err(|source| HostError::Io {
+        context: "inspect Git SSH private key",
+        path: path.clone(),
+        source,
+    })?;
+    if !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(HostError::Invalid(format!(
+            "Git SSH private key `{}` must be an owner-only regular file",
+            path.display()
+        )));
+    }
+    let bytes = fs::read(&path).map_err(|source| HostError::Io {
+        context: "read Git SSH private key",
+        path: path.clone(),
+        source,
+    })?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| HostError::Invalid("Git SSH private key must be UTF-8".to_owned()))?;
+    if !text.contains("PRIVATE KEY") {
+        return Err(HostError::Invalid(
+            "Git SSH private key has an unsupported format".to_owned(),
+        ));
+    }
+    checked_environment_secret(SSH_KEY_ENVIRONMENT, bytes)
+}
+
+fn gh_process_configuration() -> Result<GhProcessConfiguration, HostError> {
+    let executable = trusted_gh_path()?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| HostError::Invalid("HOME is unavailable for gh".to_owned()))?;
+    let home = canonical_file_or_directory(&home, "gh home directory")?;
+    let config_dir = std::env::var_os("GH_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(|root| PathBuf::from(root).join("gh")))
+        .unwrap_or_else(|| home.join(".config/gh"));
+    GhProcessConfiguration::new(executable, config_dir, home).map_err(HostError::Credentials)
+}
+
+fn trusted_gh_path() -> Result<PathBuf, HostError> {
+    [
+        "/usr/local/bin/gh",
+        "/opt/homebrew/bin/gh",
+        "/usr/bin/gh",
+        "/bin/gh",
+    ]
+    .into_iter()
+    .filter_map(|candidate| Path::new(candidate).canonicalize().ok())
+    .find_map(|candidate| TrustedGitBinary::verify(&candidate).ok().map(|_| candidate))
+    .ok_or_else(|| HostError::Invalid("a trusted gh executable was not found".to_owned()))
 }
 
 fn trusted_host_git() -> Result<TrustedGitBinary, HostError> {
@@ -1528,16 +1896,16 @@ mod tests {
         }
     }
 
-    fn assert_prepare_rejects(request: HostRunRequest, expected: &str) {
-        let error = match prepare(request) {
+    async fn assert_prepare_rejects(request: HostRunRequest, expected: &str) {
+        let error = match prepare(request).await {
             Ok(_) => panic!("unsupported feature must be rejected"),
             Err(error) => error,
         };
         assert!(matches!(error, HostError::Invalid(message) if message == expected));
     }
 
-    #[test]
-    fn direct_host_api_rejects_uncomposed_security_features() {
+    #[tokio::test]
+    async fn direct_host_api_rejects_uncomposed_security_features() {
         let temp = TempDir::new().expect("temp dir");
 
         let mut mcp = supported_configuration(temp.path().to_path_buf());
@@ -1549,21 +1917,20 @@ mod tests {
         assert_prepare_rejects(
             request(&temp, mcp),
             "production run does not yet wire the native MCP subsystem",
-        );
+        )
+        .await;
 
         let mut credentials = supported_configuration(temp.path().to_path_buf());
         credentials.github.forward_auth = true;
-        assert_prepare_rejects(
-            request(&temp, credentials),
-            "production run does not yet wire the credential broker",
-        );
+        assert_eq!(unavailable_run_feature(&credentials), None);
 
         let mut egress = supported_configuration(temp.path().to_path_buf());
         egress.policy.network.default_action = Action::Deny;
         assert_prepare_rejects(
             request(&temp, egress),
             "production run does not yet wire production egress enforcement",
-        );
+        )
+        .await;
     }
 
     #[test]
@@ -1589,7 +1956,7 @@ mod tests {
         assert!(matches!(
             error,
             HostError::Invalid(message)
-                if message == "Hyperlight does not support the authenticated guest Git guard"
+                if message == "Hyperlight does not support authenticated Git or credential delivery"
         ));
         validate_runtime_features(ResolvedRuntime::Kata, &configuration)
             .expect("persistent runtime supports the Git guard");
@@ -1613,10 +1980,20 @@ mod tests {
             selected_workspace: PathBuf::from("/workspace"),
             branch_protection: BranchPolicyConfiguration::default(),
             environment: EnvironmentPolicy::default(),
+            github_https_auth: false,
+            git_ssh_auth: false,
             limits: GuardLimits::default(),
         };
-        let first = boundary_features(Some(&policy)).expect("features");
-        let second = boundary_features(Some(&policy)).expect("features");
+        let credentials = EffectiveCredentialSet {
+            values: BTreeMap::new(),
+            github_https_auth: false,
+            copilot_auth: false,
+            git_ssh_auth: false,
+        };
+        let first =
+            boundary_features(&configuration, Some(&policy), &credentials).expect("features");
+        let second =
+            boundary_features(&configuration, Some(&policy), &credentials).expect("features");
         assert_eq!(first, second);
         let admission = first
             .get("git_branch_protection")
@@ -1625,8 +2002,166 @@ mod tests {
         assert!(
             admission
                 .mechanism
-                .starts_with("authenticated_guest_guard_v1:sha256=")
+                .starts_with("authenticated_guest_git_guard_v1:sha256=")
         );
+    }
+    #[test]
+    fn auth_only_and_ssh_only_runs_install_the_transport_guard() {
+        let temp = TempDir::new().expect("temp dir");
+        let repository =
+            RepositoryIdentity::new("github.com", "owner", "repository").expect("repository");
+        let workspace = temp.path().to_path_buf();
+
+        let mut auth_configuration = supported_configuration(workspace.clone());
+        auth_configuration.github.forward_auth = true;
+        let auth_credentials = EffectiveCredentialSet {
+            values: BTreeMap::from([(
+                GITHUB_TOKEN_ENVIRONMENT.to_owned(),
+                SecretValue::try_from("token").expect("token"),
+            )]),
+            github_https_auth: true,
+            copilot_auth: false,
+            git_ssh_auth: false,
+        };
+        let auth_policy = make_git_guard_policy(
+            ResolvedRuntime::Kata,
+            &auth_configuration,
+            Some(&repository),
+            &workspace,
+            Path::new("/workspace"),
+            &auth_credentials,
+        )
+        .expect("auth policy")
+        .expect("transport guard");
+        assert!(!auth_policy.branch_protection.enabled);
+        assert!(auth_policy.github_https_auth);
+
+        let mut ssh_configuration = supported_configuration(workspace.clone());
+        ssh_configuration.github.ssh_key_path = Some(workspace.join("id"));
+        let ssh_credentials = EffectiveCredentialSet {
+            values: BTreeMap::from([(
+                SSH_KEY_ENVIRONMENT.to_owned(),
+                SecretValue::try_from("-----BEGIN PRIVATE KEY-----").expect("private key"),
+            )]),
+            github_https_auth: false,
+            copilot_auth: false,
+            git_ssh_auth: true,
+        };
+        let ssh_policy = make_git_guard_policy(
+            ResolvedRuntime::Apple,
+            &ssh_configuration,
+            Some(&repository),
+            &workspace,
+            Path::new("/workspace"),
+            &ssh_credentials,
+        )
+        .expect("SSH policy")
+        .expect("transport guard");
+        assert!(ssh_policy.git_ssh_auth);
+    }
+
+    #[test]
+    fn reserved_credentials_cannot_come_from_the_general_secret_store() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.secrets.push("github_token".to_owned());
+        let error = validate_reserved_secret_names(&configuration)
+            .expect_err("reserved credential must fail");
+        assert!(matches!(
+            error,
+            HostError::Invalid(message)
+                if message
+                    == "configured secret `github_token` requires guarded credential forwarding"
+        ));
+    }
+
+    #[test]
+    fn security_composition_rejects_feature_and_secret_drift() {
+        let temp = TempDir::new().expect("temp dir");
+        let workspace = temp.path().to_path_buf();
+        let repository =
+            RepositoryIdentity::new("github.com", "owner", "repository").expect("repository");
+        let mut configuration = supported_configuration(workspace.clone());
+        configuration.github.forward_auth = true;
+        let credentials = EffectiveCredentialSet {
+            values: BTreeMap::from([(
+                GITHUB_TOKEN_ENVIRONMENT.to_owned(),
+                SecretValue::try_from("token").expect("token"),
+            )]),
+            github_https_auth: true,
+            copilot_auth: false,
+            git_ssh_auth: false,
+        };
+        credentials.apply_to(&mut configuration);
+        let policy = make_git_guard_policy(
+            ResolvedRuntime::Kata,
+            &configuration,
+            Some(&repository),
+            &workspace,
+            Path::new("/workspace"),
+            &credentials,
+        )
+        .expect("policy");
+        let mut features =
+            boundary_features(&configuration, policy.as_ref(), &credentials).expect("features");
+        validate_security_composition(
+            ResolvedRuntime::Kata,
+            &configuration,
+            Some(&repository),
+            policy.as_ref(),
+            &credentials,
+            &features,
+        )
+        .expect("consistent composition");
+
+        features.remove("github_repository_credentials");
+        assert!(
+            validate_security_composition(
+                ResolvedRuntime::Kata,
+                &configuration,
+                Some(&repository),
+                policy.as_ref(),
+                &credentials,
+                &features,
+            )
+            .is_err()
+        );
+        configuration.secrets.clear();
+        assert!(
+            validate_security_composition(
+                ResolvedRuntime::Kata,
+                &configuration,
+                Some(&repository),
+                policy.as_ref(),
+                &credentials,
+                &boundary_features(&configuration, policy.as_ref(), &credentials)
+                    .expect("features"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ssh_private_keys_require_owner_only_files_and_execution_size() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temporary");
+        let key = root.join("id");
+        fs::write(
+            &key,
+            "-----BEGIN PRIVATE KEY-----\nvalue\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("write key");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).expect("mode");
+        assert!(read_ssh_private_key(&key).is_err());
+
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("mode");
+        read_ssh_private_key(&key).expect("valid key");
+        fs::write(
+            &key,
+            format!("-----BEGIN PRIVATE KEY-----\n{}\n", "x".repeat(4096)),
+        )
+        .expect("large key");
+        assert!(read_ssh_private_key(&key).is_err());
     }
 
     #[test]

@@ -406,7 +406,9 @@ async fn run(arguments: RunArgs) -> ExitCode {
         command: arguments.command,
         state_root,
         readiness_timeout: Duration::from_secs(60),
-    }) {
+    })
+    .await
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             let code = host_error_exit_code(&error);
@@ -1061,13 +1063,6 @@ fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'sta
         return Some("production run does not yet wire the native MCP subsystem");
     }
 
-    if configuration.github.forward_auth
-        || configuration.github.forward_copilot_auth
-        || configuration.github.allow_private_repository_access
-        || configuration.github.ssh_key_path.is_some()
-    {
-        return Some("production run does not yet wire the credential broker");
-    }
     let network = &configuration.policy.network;
     if network.default_action != sendbox_policy::Action::Allow
         || !network.allowed_domains.is_empty()
@@ -1088,6 +1083,7 @@ fn host_error_exit_code(error: &HostError) -> u8 {
     match error {
         HostError::Invalid(_)
         | HostError::Boundary(_)
+        | HostError::Credentials(_)
         | HostError::GitGuard(_)
         | HostError::AgentPlan(_)
         | HostError::Bundle(_) => INVALID_CONFIGURATION_EXIT,

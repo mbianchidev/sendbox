@@ -66,6 +66,8 @@ fn policy(workspace: &Path) -> GuardPolicyDocument {
             ..BranchPolicyConfiguration::default()
         },
         environment: EnvironmentPolicy::default(),
+        github_https_auth: false,
+        git_ssh_auth: false,
         limits: GuardLimits::default(),
     }
 }

@@ -4,19 +4,29 @@ use std::{
     io::Write,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 
-use sendbox_git::{GuardPolicyDocument, TrustedExecutable, TrustedGitBinary, execute_guarded_git};
+use sendbox_git::{
+    GIT_ASKPASS_PATH, GIT_SSH_PATH, GITHUB_TOKEN_ENVIRONMENT, GuardPolicyDocument,
+    SSH_KEY_ENVIRONMENT, TrustedExecutable, TrustedGitBinary, execute_guarded_git,
+};
 
 use crate::GuestError;
 
 const ROOT_PATH: &str = "/run/sendbox-branch-protection";
 const POLICY_PATH: &str = "/run/sendbox-branch-protection/policy.json";
 const REAL_GIT_PATH: &str = "/run/sendbox-branch-protection/git-real";
+const SSH_WORK_ROOT: &str = "/run/sendbox-branch-protection/ssh-work";
 const GIT_CANDIDATES: [&str; 3] = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"];
 const EXIT_DENIED: u8 = 128;
 
-pub fn install(policy: &GuardPolicyDocument, artifact_root: &Path) -> Result<(), GuestError> {
+pub fn install(
+    policy: &GuardPolicyDocument,
+    artifact_root: &Path,
+    workload_uid: u32,
+    workload_gid: u32,
+) -> Result<(), GuestError> {
     let guest_binary = artifact_root.join("bin/sendbox-guest");
     install_with_paths(
         policy,
@@ -24,16 +34,89 @@ pub fn install(policy: &GuardPolicyDocument, artifact_root: &Path) -> Result<(),
             root: PathBuf::from(ROOT_PATH),
             policy: PathBuf::from(POLICY_PATH),
             real_git: PathBuf::from(REAL_GIT_PATH),
+            askpass: PathBuf::from(GIT_ASKPASS_PATH),
+            ssh_wrapper: PathBuf::from(GIT_SSH_PATH),
+            ssh_work_root: PathBuf::from(SSH_WORK_ROOT),
             guest_binary,
             git_candidates: GIT_CANDIDATES.iter().map(PathBuf::from).collect(),
         },
         0,
+        workload_uid,
+        workload_gid,
     )
 }
 
 pub fn execute_current(arguments: &[String]) -> Result<(), GuestError> {
     execute_guarded_git(Path::new(POLICY_PATH), Path::new(REAL_GIT_PATH), arguments)
         .map_err(|error| GuestError::Runtime(error.to_string()))
+}
+
+pub fn askpass_response(arguments: &[String]) -> Result<String, GuestError> {
+    let prompt = arguments
+        .first()
+        .map_or("", String::as_str)
+        .to_ascii_lowercase();
+    if prompt.contains("username") {
+        return Ok("x-access-token".to_owned());
+    }
+    if !prompt.contains("password") && !prompt.contains("token") {
+        return Err(GuestError::Runtime(
+            "Git askpass received an unsupported prompt".to_owned(),
+        ));
+    }
+    let token = std::env::var(GITHUB_TOKEN_ENVIRONMENT)
+        .map_err(|_| GuestError::Runtime("GitHub token is unavailable".to_owned()))?;
+    if token.is_empty() || token.contains(['\r', '\n']) {
+        return Err(GuestError::Runtime(
+            "GitHub token is invalid for askpass".to_owned(),
+        ));
+    }
+    Ok(token)
+}
+
+pub fn execute_ssh(arguments: &[String]) -> Result<i32, GuestError> {
+    validate_ssh_arguments(arguments)?;
+    let key = std::env::var(SSH_KEY_ENVIRONMENT)
+        .map_err(|_| GuestError::Runtime("Git SSH key is unavailable".to_owned()))?;
+    if key.is_empty() || !key.contains("PRIVATE KEY") {
+        return Err(GuestError::Runtime(
+            "Git SSH key is not a supported private key".to_owned(),
+        ));
+    }
+    let mut temporary = TemporarySshKey::create(key.as_bytes())?;
+    let ssh = trusted_ssh()?;
+    let status = Command::new(ssh.path())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .args([
+            "-F",
+            "/dev/null",
+            "-i",
+            temporary
+                .key
+                .to_str()
+                .ok_or_else(|| GuestError::Runtime("Git SSH key path is not UTF-8".to_owned()))?,
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "IdentityAgent=none",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+        ])
+        .args(arguments)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| GuestError::io("running trusted SSH", error))?;
+    temporary.cleanup()?;
+    use std::os::unix::process::ExitStatusExt;
+    Ok(status
+        .code()
+        .unwrap_or_else(|| status.signal().map_or(1, |signal| 128 + signal)))
 }
 
 #[must_use]
@@ -45,6 +128,9 @@ struct InstallPaths {
     root: PathBuf,
     policy: PathBuf,
     real_git: PathBuf,
+    askpass: PathBuf,
+    ssh_wrapper: PathBuf,
+    ssh_work_root: PathBuf,
     guest_binary: PathBuf,
     git_candidates: Vec<PathBuf>,
 }
@@ -53,6 +139,8 @@ fn install_with_paths(
     policy: &GuardPolicyDocument,
     paths: &InstallPaths,
     expected_owner: u32,
+    workload_uid: u32,
+    workload_gid: u32,
 ) -> Result<(), GuestError> {
     policy
         .validate()
@@ -79,6 +167,21 @@ fn install_with_paths(
         .map_err(|error| GuestError::Runtime(error.to_string()))?;
     fs::set_permissions(&paths.real_git, fs::Permissions::from_mode(0o555))
         .map_err(|error| GuestError::io("setting guarded Git mode", error))?;
+    if policy.github_https_auth {
+        copy_wrapper(&guest_binary, &paths.askpass)?;
+    }
+    if policy.git_ssh_auth {
+        copy_wrapper(&guest_binary, &paths.ssh_wrapper)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&paths.ssh_work_root)
+            .map_err(|error| GuestError::io("creating Git SSH work root", error))?;
+        std::os::unix::fs::chown(&paths.ssh_work_root, Some(workload_uid), Some(workload_gid))
+            .map_err(|error| GuestError::io("assigning Git SSH work root", error))?;
+        fs::set_permissions(&paths.ssh_work_root, fs::Permissions::from_mode(0o700))
+            .map_err(|error| GuestError::io("setting Git SSH work root mode", error))?;
+        validate_directory(&paths.ssh_work_root, workload_uid, "Git SSH work root")?;
+    }
 
     for replacement in replacement_paths {
         if replacement.symlink_metadata().is_ok() {
@@ -94,11 +197,7 @@ fn install_with_paths(
             fs::remove_file(&replacement)
                 .map_err(|error| GuestError::io("removing original Git path", error))?;
         }
-        guest_binary
-            .copy_to(&replacement, 0o555)
-            .map_err(|error| GuestError::Runtime(error.to_string()))?;
-        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o555))
-            .map_err(|error| GuestError::io("setting Git guard wrapper mode", error))?;
+        copy_wrapper(&guest_binary, &replacement)?;
     }
     fs::File::open(&paths.root)
         .and_then(|directory| directory.sync_all())
@@ -109,7 +208,18 @@ fn validate_layout(paths: &InstallPaths) -> Result<(), GuestError> {
     if !paths.root.is_absolute()
         || paths.policy.parent() != Some(paths.root.as_path())
         || paths.real_git.parent() != Some(paths.root.as_path())
-        || paths.policy == paths.real_git
+        || paths.askpass.parent() != Some(paths.root.as_path())
+        || paths.ssh_wrapper.parent() != Some(paths.root.as_path())
+        || paths.ssh_work_root.parent() != Some(paths.root.as_path())
+        || BTreeSet::from([
+            &paths.policy,
+            &paths.real_git,
+            &paths.askpass,
+            &paths.ssh_wrapper,
+            &paths.ssh_work_root,
+        ])
+        .len()
+            != 5
         || !paths.guest_binary.is_absolute()
     {
         return Err(GuestError::Runtime(
@@ -122,6 +232,137 @@ fn validate_layout(paths: &InstallPaths) -> Result<(), GuestError> {
         ));
     }
     Ok(())
+}
+
+fn copy_wrapper(guest_binary: &TrustedExecutable, destination: &Path) -> Result<(), GuestError> {
+    guest_binary
+        .copy_to(destination, 0o555)
+        .map_err(|error| GuestError::Runtime(error.to_string()))?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o555))
+        .map_err(|error| GuestError::io("setting Git helper mode", error))
+}
+
+struct TemporarySshKey {
+    directory: PathBuf,
+    key: PathBuf,
+    active: bool,
+}
+
+impl TemporarySshKey {
+    fn create(bytes: &[u8]) -> Result<Self, GuestError> {
+        let work_root = Path::new(SSH_WORK_ROOT);
+        validate_directory(
+            work_root,
+            rustix::process::geteuid().as_raw(),
+            "Git SSH work root",
+        )?;
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|error| GuestError::Runtime(format!("generate Git SSH key path: {error}")))?;
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let directory = work_root.join(suffix);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .map_err(|error| GuestError::io("creating private Git SSH directory", error))?;
+        let key = directory.join("identity");
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&key)
+            .map_err(|error| GuestError::io("creating temporary Git SSH key", error))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| GuestError::io("writing temporary Git SSH key", error))?;
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600))
+            .map_err(|error| GuestError::io("setting temporary Git SSH key mode", error))?;
+        Ok(Self {
+            directory,
+            key,
+            active: true,
+        })
+    }
+
+    fn cleanup(&mut self) -> Result<(), GuestError> {
+        fs::remove_file(&self.key)
+            .map_err(|error| GuestError::io("removing temporary Git SSH key", error))?;
+        fs::remove_dir(&self.directory)
+            .map_err(|error| GuestError::io("removing private Git SSH directory", error))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for TemporarySshKey {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_file(&self.key);
+            let _ = fs::remove_dir(&self.directory);
+        }
+    }
+}
+
+fn trusted_ssh() -> Result<TrustedExecutable, GuestError> {
+    ["/usr/bin/ssh", "/bin/ssh"]
+        .into_iter()
+        .filter_map(|candidate| Path::new(candidate).canonicalize().ok())
+        .find_map(|candidate| TrustedExecutable::verify(candidate).ok())
+        .ok_or_else(|| GuestError::Runtime("trusted SSH is unavailable in the guest".to_owned()))
+}
+
+fn validate_ssh_arguments(arguments: &[String]) -> Result<(), GuestError> {
+    let mut index = 0;
+    let mut host_seen = false;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if host_seen {
+            index += 1;
+            continue;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            host_seen = true;
+            index += 1;
+            continue;
+        }
+        match argument.as_str() {
+            "-4" | "-6" | "-q" | "-T" | "-v" => index += 1,
+            "-l" | "-p" => {
+                index += 2;
+                if index > arguments.len() {
+                    return Err(GuestError::Runtime(
+                        "Git SSH option is missing its value".to_owned(),
+                    ));
+                }
+            }
+            "-o" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    GuestError::Runtime("Git SSH -o option is missing its value".to_owned())
+                })?;
+                if value != "SendEnv=GIT_PROTOCOL" {
+                    return Err(GuestError::Runtime(format!(
+                        "Git SSH option `{value}` is not allowed"
+                    )));
+                }
+                index += 2;
+            }
+            _ => {
+                return Err(GuestError::Runtime(format!(
+                    "Git SSH option `{argument}` is not allowed"
+                )));
+            }
+        }
+    }
+    if host_seen {
+        Ok(())
+    } else {
+        Err(GuestError::Runtime(
+            "Git SSH invocation does not include a host".to_owned(),
+        ))
+    }
 }
 
 fn find_git_and_replacement_paths(
@@ -258,6 +499,8 @@ mod tests {
             selected_workspace: workspace,
             branch_protection: BranchPolicyConfiguration::default(),
             environment: EnvironmentPolicy::default(),
+            github_https_auth: false,
+            git_ssh_auth: false,
             limits: GuardLimits::default(),
         }
     }
@@ -282,11 +525,32 @@ mod tests {
         let paths = InstallPaths {
             policy: root.join("policy.json"),
             real_git: root.join("git-real"),
+            askpass: root.join("sendbox-git-askpass"),
+            ssh_wrapper: root.join("sendbox-git-ssh"),
+            ssh_work_root: root.join("ssh-work"),
             root: root.clone(),
             guest_binary: guest.clone(),
             git_candidates: vec![git.clone()],
         };
-        install_with_paths(&policy(PathBuf::from("/workspace")), &paths, owner).expect("install");
+        let mut configured = policy(PathBuf::from("/workspace"));
+        configured.github_https_auth = true;
+        configured.git_ssh_auth = true;
+        configured
+            .environment
+            .inherited_keys
+            .insert(GITHUB_TOKEN_ENVIRONMENT.to_owned());
+        configured
+            .environment
+            .inherited_keys
+            .insert(SSH_KEY_ENVIRONMENT.to_owned());
+        install_with_paths(
+            &configured,
+            &paths,
+            owner,
+            owner,
+            rustix::process::getegid().as_raw(),
+        )
+        .expect("install");
 
         assert!(
             !git.symlink_metadata()
@@ -301,6 +565,23 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("git-real")).expect("real git"),
             "#!/bin/sh\nexit 0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("sendbox-git-askpass")).expect("askpass"),
+            "#!/bin/sh\nexit 64\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("sendbox-git-ssh")).expect("SSH wrapper"),
+            "#!/bin/sh\nexit 64\n"
+        );
+        assert_eq!(
+            root.join("ssh-work")
+                .symlink_metadata()
+                .expect("SSH work root")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
         let installed = read_policy_file(&root.join("policy.json")).expect("policy");
         assert_eq!(installed.selected_workspace, Path::new("/workspace"));
@@ -323,10 +604,47 @@ mod tests {
         let paths = InstallPaths {
             policy: root.join("policy.json"),
             real_git: root.join("git-real"),
+            askpass: root.join("sendbox-git-askpass"),
+            ssh_wrapper: root.join("sendbox-git-ssh"),
+            ssh_work_root: root.join("ssh-work"),
             root,
             guest_binary: guest,
             git_candidates: vec![git],
         };
-        assert!(install_with_paths(&policy(PathBuf::from("/workspace")), &paths, owner).is_err());
+        assert!(
+            install_with_paths(
+                &policy(PathBuf::from("/workspace")),
+                &paths,
+                owner,
+                owner,
+                rustix::process::getegid().as_raw(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn askpass_and_ssh_argument_filters_fail_closed() {
+        assert_eq!(
+            askpass_response(&["Username for 'https://github.com':".to_owned()]).expect("username"),
+            "x-access-token"
+        );
+        assert!(
+            validate_ssh_arguments(&[
+                "-o".to_owned(),
+                "ProxyCommand=attacker".to_owned(),
+                "git@github.com".to_owned(),
+            ])
+            .is_err()
+        );
+        validate_ssh_arguments(&[
+            "-o".to_owned(),
+            "SendEnv=GIT_PROTOCOL".to_owned(),
+            "-p".to_owned(),
+            "22".to_owned(),
+            "git@github.com".to_owned(),
+            "git-upload-pack 'owner/repo.git'".to_owned(),
+        ])
+        .expect("Git SSH arguments");
     }
 }

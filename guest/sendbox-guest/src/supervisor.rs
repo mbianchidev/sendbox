@@ -64,12 +64,15 @@ pub async fn run<P: PlatformControls>(
     runtime.write_state(StartupState::RuntimePrepared)?;
     transition(&state, &audit, StartupState::RuntimePrepared)?;
 
-    if let Some(policy) = bootstrap
-        .execution_broker
-        .as_ref()
-        .and_then(|broker| broker.git_guard_policy.as_ref())
+    if let Some((policy, workload_uid, workload_gid)) =
+        bootstrap.execution_broker.as_ref().and_then(|broker| {
+            broker
+                .git_guard_policy
+                .as_ref()
+                .map(|policy| (policy, broker.workload_uid, broker.workload_gid))
+        })
     {
-        git_guard::install(policy, &options.artifact_root)?;
+        git_guard::install(policy, &options.artifact_root, workload_uid, workload_gid)?;
         audit.lock().expect("audit mutex").record(
             "git_guard_installed",
             policy.selected_repository.to_string(),
