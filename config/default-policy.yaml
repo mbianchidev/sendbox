@@ -195,31 +195,20 @@ commands:
 #
 #   /run/sendbox-boundary/mcp-broker -- <server> [args...]
 #
-# The authenticated guest broker validates JSON-RPC and exact argv, clears the
-# server environment, and applies the configured tool policy. HTTP/SSE MCP is
-# intentionally unsupported because TLS plaintext is unavailable at this boundary.
+# The authenticated guest broker derives the server policy from exact argv,
+# validates JSON-RPC, filters tools/list, clears the server environment, and
+# applies that server's independent tool policy. HTTP/SSE remains unsupported
+# until the trusted HTTP gateway is configured.
 boundaries:
   enabled: true
   tool_calls:
-    transport: stdio
-    default_action: deny
-    allowlist: []
-    denylist: []
     max_frame_bytes: 1048576
-    server_command_patterns:
-      - mcp-server
-      - mcp_server
-      - modelcontextprotocol
-      - model-context-protocol
-      - "@modelcontextprotocol"
-      - mcp-remote
-      - server-mcp
-      - mcp.server
-    # Exact commands the authenticated MCP broker may launch. Executables must be
-    # absolute paths. Package runners/shells such as npx, npm, yarn, pnpm, uvx,
-    # sh, and bash are rejected; use the final interpreter/native command.
-    # An empty list disables all MCP servers.
-    allowed_server_commands: []
+    # Stable server IDs map exact transport identities to independent deny-first
+    # tool policies. An empty map disables all MCP servers.
+    servers: {}
+    # Deprecated compatibility mode: old configurations may use the global
+    # allowlist, denylist, default_action, and allowed_server_commands fields.
+    # Those fields cannot be mixed with servers.
   syscalls:
     # Added to the built-in hardening denylist (mount, ptrace, bpf, module
     # loading, keyring, new mount API, perf_event_open, and related syscalls).

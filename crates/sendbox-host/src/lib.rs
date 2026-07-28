@@ -1213,6 +1213,12 @@ fn make_mcp_policy(
             .tool_calls
             .allowed_server_commands
             .is_empty()
+        && configuration
+            .policy
+            .boundaries
+            .tool_calls
+            .servers
+            .is_empty()
         && inspection.is_none()
     {
         return Ok(None);
@@ -1233,9 +1239,15 @@ fn make_mcp_policy(
         .tool_calls
         .allowed_server_commands
         .is_empty()
+        && configuration
+            .policy
+            .boundaries
+            .tool_calls
+            .servers
+            .is_empty()
     {
         return Err(HostError::Invalid(
-            "MCP composition requires at least one exactly approved server command".to_owned(),
+            "MCP composition requires at least one allowed server policy".to_owned(),
         ));
     }
     let (workload_uid, workload_gid) = workload_identity
@@ -1294,6 +1306,7 @@ fn make_mcp_policy(
         workload_uid,
         workload_gid,
         tool_policy: configuration.policy.boundaries.tool_calls.clone(),
+        audit_log_path: configuration.policy.boundaries.log_path.clone().into(),
         fixed_environment,
         inherited_environment_keys,
         observation,
@@ -2259,7 +2272,7 @@ fn current_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use sendbox_config::{PolicyPreset, RuntimeProvider as ConfigRuntimeProvider};
-    use sendbox_policy::Action;
+    use sendbox_policy::{Action, McpServerPolicy, ServerToolPolicy};
     use tempfile::TempDir;
 
     use super::*;
@@ -2349,12 +2362,18 @@ mod tests {
         )
         .expect("MCP configuration");
         let mut configuration = supported_configuration(temp.path().to_path_buf());
-        configuration
-            .policy
-            .boundaries
-            .tool_calls
-            .allowed_server_commands =
-            vec![vec!["/usr/bin/mcp-server".to_owned(), "--stdio".to_owned()]];
+        configuration.policy.boundaries.tool_calls.default_action = Action::Deny;
+        configuration.policy.boundaries.tool_calls.servers.insert(
+            "fixture-policy".to_owned(),
+            McpServerPolicy::Stdio {
+                command: vec!["/usr/bin/mcp-server".to_owned(), "--stdio".to_owned()],
+                tools: ServerToolPolicy {
+                    default_action: Action::Deny,
+                    allowlist: vec!["read_*".to_owned()],
+                    denylist: vec!["delete_*".to_owned()],
+                },
+            },
+        );
         let inspection = &mut configuration
             .observability
             .as_mut()
@@ -2374,6 +2393,19 @@ mod tests {
         .expect("MCP policy")
         .expect("MCP composition");
         assert_eq!(policy.workspace_root, Path::new("/workspace"));
+        let command = sendbox_mcp::config::ApprovedCommand::from_argv(&[
+            "/usr/bin/mcp-server".to_owned(),
+            "--stdio".to_owned(),
+        ])
+        .expect("approved command");
+        assert_eq!(
+            policy
+                .resolve_stdio(&command)
+                .expect("resolved policy")
+                .identity
+                .id,
+            "fixture-policy"
+        );
         assert_eq!(
             runtime_environment(Some(&policy), None)[0].value,
             NATIVE_BROKER_PATH

@@ -86,11 +86,15 @@ pub async fn run<P: PlatformControls>(
         .as_ref()
         .and_then(|broker| broker.mcp_policy.as_ref())
     {
+        let server_count = policy
+            .approved_commands()
+            .map_err(|error| GuestError::Runtime(format!("invalid MCP runtime policy: {error}")))?
+            .len();
         mcp_broker::install(policy, &options.artifact_root)?;
         audit.lock().expect("audit mutex").record(
             "mcp_broker_installed",
             policy.workspace_root.display().to_string(),
-            policy.tool_policy.allowed_server_commands.len().to_string(),
+            server_count.to_string(),
         );
     }
     let egress_configured = bootstrap.egress_policy.is_some();

@@ -329,20 +329,28 @@ framing-aware stdio authorization boundary for Apple and Kata runs:
 
 - Complete bounded newline or `Content-Length` JSON-RPC messages are parsed
   before forwarding.
-- `tools/call` names use denylist-first glob matching, then allowlist/default action.
+- Exact argv derives one stable server policy; caller-supplied IDs and
+  project-local aliases do not select permissions.
+- Each server has an independent tool namespace. `tools/list` is correlated and
+  filtered, while every `tools/call` uses denylist-first glob matching, then
+  allowlist/default action.
 - Denied requests receive JSON-RPC error `-32001`; denied notifications are dropped.
 - An injected launcher receives only an exact approved absolute executable and
   argv vector; shells, package runners, inherited environment variables, and
   project-defined `env`/`cwd` overrides are rejected.
 - Child death, malformed frames, output saturation, cancellation, and cleanup
   failure are fail-closed outcomes.
+- Authorization records containing the server ID, command fingerprint, tool,
+  matching rule, and outcome are appended before forwarding. Audit failure is a
+  denial and does not expose command or tool arguments.
 - Legacy bpftrace records remain readable, while the guest broker emits the
   versioned native observation format.
 - Remote HTTP/SSE MCP remains observation-only and is never presented as
   authorization.
 
 Project MCP configuration must route each approved local server through the
-trusted guest broker with an exact allowlisted executable and argv. Unbrokered,
+trusted guest broker with an exact executable and argv mapped to one configured
+server policy. Unbrokered,
 remote, shell, package-runner, environment, and working-directory overrides fail
 closed.
 

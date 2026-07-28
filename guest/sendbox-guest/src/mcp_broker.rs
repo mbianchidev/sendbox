@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::GuestError;
 use sendbox_git::TrustedExecutable;
+use sendbox_mcp::audit::FileAuditSink;
 use sendbox_mcp::broker::{
     BrokerCancellation, BrokerConfiguration, BrokerDirection, BrokerObserver, StderrPolicy,
     StdioBroker, TokioProcessLauncher,
@@ -18,7 +19,6 @@ use sendbox_mcp::framing::FramingMode;
 use sendbox_mcp::observation::{
     Direction, ObservationEventV1, ObservationMetadata, ObservationParser, Transport,
 };
-use sendbox_mcp::policy::CompiledToolPolicy;
 use sendbox_mcp::runtime::{
     NATIVE_POLICY_PATH, OBSERVATION_ROOT, RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
@@ -52,6 +52,9 @@ pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
             "MCP server command is not exactly approved".to_owned(),
         ));
     }
+    let resolved = policy.resolve_stdio(&command).map_err(|error| {
+        GuestError::Runtime(format!("MCP server policy resolution failed: {error}"))
+    })?;
 
     let mut environment = policy.fixed_environment.clone();
     environment.extend(
@@ -61,7 +64,7 @@ pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
             .filter_map(|key| std::env::var(key).ok().map(|value| (key.clone(), value))),
     );
     let launcher = TokioProcessLauncher::new(environment, Some(policy.workspace_root.clone()));
-    let compiled = CompiledToolPolicy::compile(&policy.tool_policy);
+    let compiled = resolved.compile();
     let configuration = BrokerConfiguration {
         client_framing: FramingMode::Auto,
         server_framing: FramingMode::Auto,
@@ -70,7 +73,17 @@ pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
         stderr_policy: StderrPolicy::Inherit,
         ..BrokerConfiguration::default()
     };
-    let mut broker = StdioBroker::new(launcher, approved, command.clone(), compiled, configuration);
+    let audit = FileAuditSink::open(&policy.audit_log_path)
+        .map(Arc::new)
+        .map_err(|error| GuestError::Runtime(format!("opening MCP audit log: {error}")))?;
+    let mut broker = StdioBroker::new(
+        launcher,
+        approved,
+        command.clone(),
+        compiled,
+        audit,
+        configuration,
+    );
     if let Some(observation) = &policy.observation {
         broker = broker.with_observer(Arc::new(FileObserver::open(
             observation,
@@ -132,6 +145,12 @@ fn install_with_paths(
         .map_err(|error| GuestError::Runtime(format!("invalid MCP runtime policy: {error}")))?;
     validate_layout(policy, paths)?;
     prepare_root(&paths.root, expected_owner, 0o755, "MCP boundary root")?;
+    prepare_root(
+        &paths.observation_root,
+        expected_owner,
+        0o755,
+        "MCP log root",
+    )?;
 
     let guest_binary = TrustedExecutable::verify(&paths.guest_binary)
         .map_err(|error| GuestError::Runtime(error.to_string()))?;
@@ -161,30 +180,9 @@ fn install_with_paths(
         .and_then(|()| file.sync_all())
         .map_err(|error| GuestError::io("writing MCP policy", error))?;
 
+    create_log(&policy.audit_log_path, expected_owner, policy.workload_gid)?;
     if let Some(observation) = &policy.observation {
-        prepare_root(
-            &paths.observation_root,
-            expected_owner,
-            0o755,
-            "MCP observation root",
-        )?;
-        let log = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o620)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&observation.log_path)
-            .map_err(|error| GuestError::io("creating MCP observation log", error))?;
-        std::os::unix::fs::chown(
-            &observation.log_path,
-            Some(expected_owner),
-            Some(policy.workload_gid),
-        )
-        .map_err(|error| GuestError::io("assigning MCP observation log", error))?;
-        fs::set_permissions(&observation.log_path, fs::Permissions::from_mode(0o620))
-            .map_err(|error| GuestError::io("setting MCP observation log mode", error))?;
-        log.sync_all()
-            .map_err(|error| GuestError::io("syncing MCP observation log", error))?;
+        create_log(&observation.log_path, expected_owner, policy.workload_gid)?;
     }
 
     File::open(&paths.root)
@@ -199,20 +197,39 @@ fn validate_layout(policy: &RuntimePolicyDocument, paths: &InstallPaths) -> Resu
         || paths.policy == paths.wrapper
         || !paths.guest_binary.is_absolute()
         || !paths.observation_root.is_absolute()
+        || policy.audit_log_path.parent() != Some(paths.observation_root.as_path())
         || policy.observation.as_ref().is_some_and(|observation| {
             observation.log_path.parent() != Some(paths.observation_root.as_path())
+                || observation.log_path == policy.audit_log_path
         })
     {
         return Err(GuestError::Runtime(
             "MCP installation paths are invalid".to_owned(),
         ));
     }
+
     if paths.policy.symlink_metadata().is_ok() || paths.wrapper.symlink_metadata().is_ok() {
         return Err(GuestError::Runtime(
             "MCP policy or wrapper path already exists".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn create_log(path: &Path, expected_owner: u32, workload_gid: u32) -> Result<(), GuestError> {
+    let log = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o620)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| GuestError::io("creating MCP boundary log", error))?;
+    std::os::unix::fs::chown(path, Some(expected_owner), Some(workload_gid))
+        .map_err(|error| GuestError::io("assigning MCP boundary log", error))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o620))
+        .map_err(|error| GuestError::io("setting MCP boundary log mode", error))?;
+    log.sync_all()
+        .map_err(|error| GuestError::io("syncing MCP boundary log", error))
 }
 
 fn prepare_root(
@@ -428,7 +445,9 @@ mod tests {
                 max_frame_bytes: 4096,
                 server_command_patterns: Vec::new(),
                 allowed_server_commands: vec![vec!["/bin/echo".to_owned()]],
+                servers: BTreeMap::new(),
             },
+            audit_log_path: PathBuf::from("/var/log/sendbox/boundary.log"),
             fixed_environment: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
             inherited_environment_keys: BTreeSet::new(),
             observation: None,

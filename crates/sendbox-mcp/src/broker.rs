@@ -8,11 +8,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
+use crate::audit::{BoundaryAuditEvent, BoundaryAuditSink};
 use crate::config::ApprovedCommand;
 use crate::error::BrokerError;
 use crate::framing::{FrameDecoder, FramingMode, encode_frame};
@@ -36,6 +37,15 @@ pub trait BrokerObserver: Send + Sync {
 struct BrokerIoContext {
     config: BrokerConfiguration,
     observer: Option<Arc<dyn BrokerObserver>>,
+    policy: CompiledToolPolicy,
+    audit: Arc<dyn BoundaryAuditSink>,
+    requests: Arc<AsyncMutex<RequestTracker>>,
+}
+
+#[derive(Debug, Default)]
+struct RequestTracker {
+    client_requests: BTreeMap<String, String>,
+    server_requests: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +216,7 @@ pub struct StdioBroker<L> {
     approved_commands: BTreeSet<ApprovedCommand>,
     command: ApprovedCommand,
     policy: CompiledToolPolicy,
+    audit: Arc<dyn BoundaryAuditSink>,
     config: BrokerConfiguration,
     observer: Option<Arc<dyn BrokerObserver>>,
 }
@@ -217,6 +228,7 @@ impl<L: ProcessLauncher> StdioBroker<L> {
         approved_commands: impl IntoIterator<Item = ApprovedCommand>,
         command: ApprovedCommand,
         policy: CompiledToolPolicy,
+        audit: Arc<dyn BoundaryAuditSink>,
         config: BrokerConfiguration,
     ) -> Self {
         Self {
@@ -224,6 +236,7 @@ impl<L: ProcessLauncher> StdioBroker<L> {
             approved_commands: approved_commands.into_iter().collect(),
             command,
             policy,
+            audit,
             config,
             observer: None,
         }
@@ -271,16 +284,19 @@ impl<L: ProcessLauncher> StdioBroker<L> {
         let internal = CancellationToken::new();
         let client_input_closed = Arc::new(AtomicBool::new(false));
         let (outbound_tx, outbound_rx) = mpsc::channel(self.config.outbound_queue_capacity.max(1));
+        let requests = Arc::new(AsyncMutex::new(RequestTracker::default()));
         let io_context = BrokerIoContext {
             config: self.config.clone(),
             observer: self.observer.clone(),
+            policy: self.policy.clone(),
+            audit: Arc::clone(&self.audit),
+            requests,
         };
         let mut tasks = JoinSet::new();
         tasks.spawn(client_to_server(
             client_reader,
             child_stdin,
             outbound_tx.clone(),
-            self.policy.clone(),
             io_context.clone(),
             internal.clone(),
             Arc::clone(&client_input_closed),
@@ -333,15 +349,9 @@ impl<L: ProcessLauncher> StdioBroker<L> {
                 }
 
                 tokio::select! {
+                    biased;
                     () = cancellation.0.cancelled() => {
                         break Err(BrokerError::Cancelled);
-                    }
-                    status = &mut child_wait, if child_status.is_none() => {
-                        let status = status?;
-                        if !client_input_closed.load(Ordering::Acquire) {
-                            break Err(BrokerError::ChildExited);
-                        }
-                        child_status = Some(status);
                     }
                     task = tasks.join_next(), if !tasks.is_empty() => {
                         let task = task
@@ -353,13 +363,23 @@ impl<L: ProcessLauncher> StdioBroker<L> {
                                 client_done = true;
                                 shutdown_deadline = Some(Instant::now() + self.config.graceful_shutdown_timeout);
                             }
-                            TaskOutcome::Server => server_done = true,
+                            TaskOutcome::Server(mut task_decisions) => {
+                                decisions.append(&mut task_decisions);
+                                server_done = true;
+                            }
                             TaskOutcome::Writer => writer_done = true,
                             TaskOutcome::Stderr(bytes) => {
                                 stderr = bytes;
                                 stderr_done = true;
                             }
                         }
+                    }
+                    status = &mut child_wait, if child_status.is_none() => {
+                        let status = status?;
+                        if !client_input_closed.load(Ordering::Acquire) {
+                            break Err(BrokerError::ChildExited);
+                        }
+                        child_status = Some(status);
                     }
                     _ = async {
                         if let Some(deadline) = shutdown_deadline {
@@ -394,7 +414,7 @@ impl<L: ProcessLauncher> StdioBroker<L> {
 #[derive(Debug)]
 enum TaskOutcome {
     Client(Vec<AuditDecision>),
-    Server,
+    Server(Vec<AuditDecision>),
     Writer,
     Stderr(Vec<u8>),
 }
@@ -403,7 +423,6 @@ async fn client_to_server<R>(
     mut client: R,
     mut server: ChildWriter,
     outbound: mpsc::Sender<Vec<u8>>,
-    policy: CompiledToolPolicy,
     context: BrokerIoContext,
     cancellation: CancellationToken,
     client_input_closed: Arc<AtomicBool>,
@@ -433,13 +452,20 @@ where
             if let Some(observer) = &context.observer {
                 observer.observe(BrokerDirection::ToServer, &frame.payload)?;
             }
-            match policy.evaluate_message(&message) {
+            match context.policy.evaluate_message(&message) {
                 PolicyAction::Forward(decision) => {
+                    context
+                        .audit
+                        .record(&BoundaryAuditEvent::from_decision(&decision))?;
+                    track_client_message(&context.requests, &message).await?;
                     decisions.push(decision);
                     server.write_all(&frame.raw).await?;
                     server.flush().await?;
                 }
                 PolicyAction::Respond { response, decision } => {
+                    context
+                        .audit
+                        .record(&BoundaryAuditEvent::from_decision(&decision))?;
                     decisions.push(decision);
                     send_outbound(
                         &outbound,
@@ -449,7 +475,12 @@ where
                     )
                     .await?;
                 }
-                PolicyAction::Drop(decision) => decisions.push(decision),
+                PolicyAction::Drop(decision) => {
+                    context
+                        .audit
+                        .record(&BoundaryAuditEvent::from_decision(&decision))?;
+                    decisions.push(decision);
+                }
                 PolicyAction::Terminate(reason) => return Err(BrokerError::Policy(reason)),
             }
         }
@@ -467,6 +498,7 @@ async fn server_to_client(
         context.config.max_frame_bytes,
     );
     let mut buffer = [0u8; 8192];
+    let mut decisions = Vec::new();
     loop {
         let read = tokio::select! {
             () = cancellation.cancelled() => return Err(BrokerError::Cancelled),
@@ -474,21 +506,120 @@ async fn server_to_client(
         };
         if read == 0 {
             decoder.finish()?;
-            return Ok(TaskOutcome::Server);
+            return Ok(TaskOutcome::Server(decisions));
         }
         for frame in decoder.feed(&buffer[..read])? {
-            validate_message(&frame.payload)?;
+            let message = validate_message(&frame.payload)?;
             if let Some(observer) = &context.observer {
                 observer.observe(BrokerDirection::FromServer, &frame.payload)?;
             }
+            let request_method = track_server_message(&context.requests, &message).await?;
+            let raw = if request_method.as_deref() == Some("tools/list") {
+                let filtered = context.policy.filter_tools_list_response(&frame.payload)?;
+                for decision in filtered.decisions {
+                    context
+                        .audit
+                        .record(&BoundaryAuditEvent::from_decision(&decision))?;
+                    decisions.push(decision);
+                }
+                encode_frame(&filtered.payload, frame.mode)
+            } else {
+                frame.raw
+            };
             send_outbound(
                 &outbound,
-                frame.raw,
+                raw,
                 context.config.backpressure_timeout,
                 &cancellation,
             )
             .await?;
         }
+    }
+}
+
+async fn track_client_message(
+    requests: &AsyncMutex<RequestTracker>,
+    message: &crate::jsonrpc::ValidatedMessage,
+) -> Result<(), BrokerError> {
+    let mut requests = requests.lock().await;
+    match message.kind {
+        crate::jsonrpc::MessageKind::Request => {
+            let id = message
+                .id
+                .raw()
+                .ok_or_else(|| BrokerError::Policy("MCP request is missing an id".to_owned()))?;
+            let method = message
+                .method
+                .as_deref()
+                .ok_or_else(|| BrokerError::Policy("MCP request is missing a method".to_owned()))?;
+            if requests
+                .client_requests
+                .insert(id.to_owned(), method.to_owned())
+                .is_some()
+            {
+                return Err(BrokerError::Policy(format!(
+                    "duplicate outstanding MCP client request id {id}"
+                )));
+            }
+        }
+        crate::jsonrpc::MessageKind::Response | crate::jsonrpc::MessageKind::Error => {
+            let id = message
+                .id
+                .raw()
+                .ok_or_else(|| BrokerError::Policy("MCP response is missing an id".to_owned()))?;
+            if requests.server_requests.remove(id).is_none() {
+                return Err(BrokerError::Policy(format!(
+                    "MCP client response id {id} has no matching server request"
+                )));
+            }
+        }
+        crate::jsonrpc::MessageKind::Notification => {}
+    }
+    Ok(())
+}
+
+async fn track_server_message(
+    requests: &AsyncMutex<RequestTracker>,
+    message: &crate::jsonrpc::ValidatedMessage,
+) -> Result<Option<String>, BrokerError> {
+    let mut requests = requests.lock().await;
+    match message.kind {
+        crate::jsonrpc::MessageKind::Request => {
+            let id = message
+                .id
+                .raw()
+                .ok_or_else(|| BrokerError::Policy("MCP request is missing an id".to_owned()))?;
+            let method = message
+                .method
+                .as_deref()
+                .ok_or_else(|| BrokerError::Policy("MCP request is missing a method".to_owned()))?;
+            if requests
+                .server_requests
+                .insert(id.to_owned(), method.to_owned())
+                .is_some()
+            {
+                return Err(BrokerError::Policy(format!(
+                    "duplicate outstanding MCP server request id {id}"
+                )));
+            }
+            Ok(None)
+        }
+        crate::jsonrpc::MessageKind::Response | crate::jsonrpc::MessageKind::Error => {
+            let id = message
+                .id
+                .raw()
+                .ok_or_else(|| BrokerError::Policy("MCP response is missing an id".to_owned()))?;
+            requests
+                .client_requests
+                .remove(id)
+                .map(Some)
+                .ok_or_else(|| {
+                    BrokerError::Policy(format!(
+                        "MCP server response id {id} has no matching client request"
+                    ))
+                })
+        }
+        crate::jsonrpc::MessageKind::Notification => Ok(None),
     }
 }
 
@@ -591,6 +722,7 @@ mod tests {
     use tokio::sync::{Notify, oneshot};
 
     use super::*;
+    use crate::error::AuditError;
 
     type RecordedEvents = Arc<Mutex<Vec<(BrokerDirection, Vec<u8>)>>>;
 
@@ -603,6 +735,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FakeBehavior {
         Echo,
+        ToolList,
         Flood,
         Die,
     }
@@ -619,6 +752,22 @@ mod tests {
 
     struct RecordingObserver {
         events: RecordedEvents,
+    }
+
+    struct TestAudit;
+
+    impl BoundaryAuditSink for TestAudit {
+        fn record(&self, _event: &BoundaryAuditEvent) -> Result<(), AuditError> {
+            Ok(())
+        }
+    }
+
+    struct FailingAudit;
+
+    impl BoundaryAuditSink for FailingAudit {
+        fn record(&self, _event: &BoundaryAuditEvent) -> Result<(), AuditError> {
+            Err(AuditError::UntrustedPath("test".to_owned()))
+        }
     }
 
     impl BrokerObserver for RecordingObserver {
@@ -652,6 +801,17 @@ mod tests {
                         server_stdin.read_to_end(&mut bytes).await.unwrap();
                         if !bytes.is_empty() {
                             let _ = server_stdout.write_all(&bytes).await;
+                        }
+                    }
+                    FakeBehavior::ToolList => {
+                        let mut bytes = Vec::new();
+                        server_stdin.read_to_end(&mut bytes).await.unwrap();
+                        if !bytes.is_empty() {
+                            let _ = server_stdout
+                                .write_all(
+                                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"read_file\"},{\"name\":\"delete_file\"},{\"name\":\"other\"}],\"nextCursor\":\"next\"}}\n",
+                                )
+                                .await;
                         }
                     }
                     FakeBehavior::Flood => {
@@ -775,7 +935,7 @@ mod tests {
         let command =
             ApprovedCommand::new("/usr/bin/node", ["/opt/mcp-server-filesystem.js".into()])
                 .unwrap();
-        let policy = CompiledToolPolicy::compile(&ToolCallPolicy {
+        let policy = CompiledToolPolicy::compile_legacy_unbound(&ToolCallPolicy {
             transport: ToolTransport::Stdio,
             default_action: Action::Deny,
             allowlist: vec!["read_*".into()],
@@ -783,6 +943,7 @@ mod tests {
             max_frame_bytes: 4096,
             server_command_patterns: Vec::new(),
             allowed_server_commands: Vec::new(),
+            servers: BTreeMap::new(),
         });
         let killed = Arc::new(Mutex::new(false));
         let broker = StdioBroker::new(
@@ -793,6 +954,7 @@ mod tests {
             [command.clone()],
             command,
             policy,
+            Arc::new(TestAudit),
             config,
         );
         (broker, killed)
@@ -891,6 +1053,78 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, BrokerDirection::ToServer);
         assert!(String::from_utf8_lossy(&events[0].1).contains("delete_file"));
+    }
+
+    #[tokio::test]
+    async fn filters_correlated_tools_list_responses() {
+        let (mut input_writer, input_reader) = duplex(4096);
+        let (output_writer, mut output_reader) = duplex(4096);
+        input_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
+            .await
+            .unwrap();
+        input_writer.shutdown().await.unwrap();
+
+        let report = broker(FakeBehavior::ToolList, BrokerConfiguration::default())
+            .run(input_reader, output_writer, BrokerCancellation::default())
+            .await
+            .unwrap();
+        let mut output = Vec::new();
+        output_reader.read_to_end(&mut output).await.unwrap();
+        let response = String::from_utf8(output).unwrap();
+        assert!(response.contains("read_file"));
+        assert!(!response.contains("delete_file"));
+        assert!(!response.contains("\"other\""));
+        assert!(response.contains("nextCursor"));
+        assert_eq!(
+            report
+                .decisions
+                .iter()
+                .filter(|decision| decision.method == "tools/list" && decision.tool.is_some())
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_failure_denies_before_forwarding_and_kills_child() {
+        let command =
+            ApprovedCommand::new("/usr/bin/node", ["/opt/mcp-server-filesystem.js".into()])
+                .unwrap();
+        let killed = Arc::new(Mutex::new(false));
+        let broker = StdioBroker::new(
+            FakeLauncher {
+                behavior: FakeBehavior::Echo,
+                killed: Arc::clone(&killed),
+            },
+            [command.clone()],
+            command,
+            CompiledToolPolicy::compile_legacy_unbound(&ToolCallPolicy {
+                allowlist: vec!["read_*".to_owned()],
+                ..ToolCallPolicy::default()
+            }),
+            Arc::new(FailingAudit),
+            BrokerConfiguration::default(),
+        );
+        let (mut input_writer, input_reader) = duplex(4096);
+        let (output_writer, _output_reader) = duplex(4096);
+        input_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"read_file\"}}\n",
+            )
+            .await
+            .unwrap();
+        input_writer.shutdown().await.unwrap();
+
+        let error = broker
+            .run(input_reader, output_writer, BrokerCancellation::default())
+            .await
+            .expect_err("audit failure must fail the broker");
+        assert!(
+            matches!(error, BrokerError::Audit(_)),
+            "unexpected broker error: {error:?}"
+        );
+        assert!(*killed.lock().unwrap());
     }
 
     #[tokio::test]

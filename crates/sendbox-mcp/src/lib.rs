@@ -7,6 +7,7 @@
 //! but are never treated as an authorization boundary.
 
 pub mod artifact;
+pub mod audit;
 pub mod broker;
 pub mod config;
 pub mod error;
@@ -16,4 +17,4 @@ pub mod observation;
 pub mod policy;
 pub mod runtime;
 
-pub use error::{BrokerError, ConfigError, FrameError, JsonRpcError, ObservationError};
+pub use error::{AuditError, BrokerError, ConfigError, FrameError, JsonRpcError, ObservationError};

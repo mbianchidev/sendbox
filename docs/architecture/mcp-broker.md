@@ -17,13 +17,18 @@ flowchart LR
     Client[MCP client stdio] --> Guest
     Guest --> Decoder[Bounded frame decoder]
     Decoder --> Validator[Strict JSON-RPC validator]
-    Validator --> Policy[Deny-first tool policy]
-    Policy -->|allowed| ChildIn[Approved child stdin]
+    Validator --> Resolve[Exact argv to server policy]
+    Resolve --> Policy[Per-server deny-first tool policy]
+    Policy --> Audit[Mandatory redacted audit]
+    Audit -->|allowed| ChildIn[Approved child stdin]
     Policy -->|denied request| ClientOut[Bounded client writer]
     Policy -->|denied notification| Drop[Drop + audit decision]
     ChildOut[Approved child stdout] --> ServerDecoder[Bounded frame decoder]
     ServerDecoder --> ServerValidator[Strict JSON-RPC validator]
-    ServerValidator --> ClientOut
+    ServerValidator --> Correlate[Request correlation]
+    Correlate --> ListFilter[Filter tools/list]
+    ListFilter --> Audit
+    Audit --> ClientOut
 ```
 
 The client writer is single-owner and fed through a bounded queue. Queue
@@ -37,10 +42,13 @@ The guest installs a regular root-owned copy of `sendbox-guest` at
 `/run/sendbox-boundary/mcp-broker` and a root-owned policy document at
 `/run/sendbox-boundary/mcp-policy.json`. Project configuration must invoke the
 broker, then `--`, then one exact command from
-`policy.boundaries.tool_calls.allowed_server_commands`.
+`policy.boundaries.tool_calls.servers`. The exact executable and ordered
+arguments derive the stable server policy ID; project aliases and caller-provided
+IDs are not trusted.
 
 `ProcessLauncher` is injected. `StdioBroker` verifies that the selected
-`ApprovedCommand` is in the exact approval set before launching it.
+`ApprovedCommand` is in the exact approval set before launching it and receives
+only the tool policy resolved for that exact command.
 `TokioProcessLauncher`:
 
 - invokes `Command::new(executable).args(argv)` without a shell;
@@ -55,9 +63,16 @@ On malformed input, I/O failure, cancellation, output saturation, or premature
 child exit, the broker stops admission, starts child termination, and performs a
 bounded reap. Cleanup failure is surfaced with the primary failure.
 
-The runtime policy binds the guest workspace, workload UID/GID, exact commands,
-tool-call policy, frame limit, environment names and values, and optional
-observation configuration. Bootstrap rejects identity or workspace drift.
+Client and server request IDs are tracked independently. A response without one
+matching outstanding request terminates the broker. Successful `tools/list`
+responses must contain uniquely named tool objects; denied tools are removed
+from every page before forwarding. Audit records are appended before an allowed,
+denied, or dropped action takes effect, so an audit write failure fails closed.
+
+The runtime policy binds the guest workspace, workload UID/GID, server IDs,
+exact commands, independent tool policies, frame limit, mandatory audit path,
+environment names and values, and optional observation configuration. Bootstrap
+rejects identity or workspace drift.
 
 ## Framing
 
@@ -69,12 +84,14 @@ reserving it. Allowed messages retain their original wire bytes.
 
 ## Trust limits
 
-- This crate authorizes local stdio `tools/call` traffic only.
+- This crate authorizes local stdio discovery and `tools/call` traffic.
 - Apple and Kata install the authenticated guest broker. Hyperlight rejects MCP
   composition.
 - Enabled observation writes versioned stdio events to the configured file below
   `/var/log/sendbox`; payload redaction is applied before persistence when
   capture is disabled.
+- Mandatory authorization audit records contain server IDs and hashed command
+  fingerprints but never command or tool arguments.
 - HTTP/SSE authorization and inspection are rejected because TLS plaintext is
   not available at this boundary.
 - Exact project-config validation does not prevent a workload from invoking a

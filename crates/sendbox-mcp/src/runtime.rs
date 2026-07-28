@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use sendbox_policy::ToolCallPolicy;
+use sendbox_policy::{McpServerPolicy, ToolCallPolicy};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ApprovedCommand, ProjectConfigValidator};
+use crate::policy::{ResolvedServerPolicy, resolve_stdio_server};
 
-pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const NATIVE_POLICY_PATH: &str = "/run/sendbox-boundary/mcp-policy.json";
 pub const OBSERVATION_ROOT: &str = "/var/log/sendbox";
+pub const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/sendbox/boundary.log";
 const MAX_FRAME_BYTES: i64 = 16 * 1024 * 1024;
 const MAX_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;
 const MAX_ENVIRONMENT_BYTES: usize = 16 * 1024;
@@ -29,6 +31,7 @@ pub struct RuntimePolicyDocument {
     pub workload_uid: u32,
     pub workload_gid: u32,
     pub tool_policy: ToolCallPolicy,
+    pub audit_log_path: PathBuf,
     pub fixed_environment: BTreeMap<String, String>,
     pub inherited_environment_keys: BTreeSet<String>,
     #[serde(default)]
@@ -47,10 +50,22 @@ impl RuntimePolicyDocument {
             return Err("MCP workloads must use a non-root uid and gid".to_owned());
         }
         validate_absolute_normalized(&self.workspace_root, "MCP workspace")?;
+        if self.tool_policy.uses_hierarchical_servers() && self.tool_policy.uses_legacy_fields() {
+            return Err(
+                "hierarchical MCP servers cannot be combined with legacy global policy fields"
+                    .to_owned(),
+            );
+        }
         let _ = self.approved_commands()?;
         if !(1..=MAX_FRAME_BYTES).contains(&self.tool_policy.max_frame_bytes) {
             return Err(format!(
                 "MCP maximum frame size must be between 1 and {MAX_FRAME_BYTES} bytes"
+            ));
+        }
+        validate_absolute_normalized(&self.audit_log_path, "MCP audit log")?;
+        if self.audit_log_path.parent() != Some(Path::new(OBSERVATION_ROOT)) {
+            return Err(format!(
+                "MCP audit log must be a direct child of {OBSERVATION_ROOT}"
             ));
         }
         if self
@@ -107,23 +122,40 @@ impl RuntimePolicyDocument {
                     "MCP observation log must be a direct child of {OBSERVATION_ROOT}"
                 ));
             }
+            if observation.log_path == self.audit_log_path {
+                return Err("MCP audit and observation logs must be different files".to_owned());
+            }
         }
         Ok(())
     }
 
     pub fn approved_commands(&self) -> Result<Vec<ApprovedCommand>, String> {
-        self.tool_policy
-            .allowed_server_commands
-            .iter()
-            .map(|command| ApprovedCommand::from_argv(command))
-            .collect()
+        if self.tool_policy.uses_hierarchical_servers() {
+            self.tool_policy
+                .servers
+                .values()
+                .filter_map(|server| match server {
+                    McpServerPolicy::Stdio { command, .. } => Some(command),
+                    McpServerPolicy::StreamableHttp { .. }
+                    | McpServerPolicy::StreamableHttp2025 { .. } => None,
+                })
+                .map(|command| ApprovedCommand::from_argv(command))
+                .collect()
+        } else {
+            self.tool_policy
+                .allowed_server_commands
+                .iter()
+                .map(|command| ApprovedCommand::from_argv(command))
+                .collect()
+        }
+    }
+
+    pub fn resolve_stdio(&self, command: &ApprovedCommand) -> Result<ResolvedServerPolicy, String> {
+        resolve_stdio_server(&self.tool_policy, &command.argv())
     }
 
     pub fn project_validator(&self) -> Result<ProjectConfigValidator, String> {
-        Ok(ProjectConfigValidator::new(
-            [vec![crate::config::NATIVE_BROKER_PATH.to_owned()]],
-            self.approved_commands()?,
-        ))
+        ProjectConfigValidator::from_policy(&self.tool_policy)
     }
 }
 
@@ -168,7 +200,9 @@ mod tests {
                     "/usr/bin/server".to_owned(),
                     "--stdio".to_owned(),
                 ]],
+                servers: BTreeMap::new(),
             },
+            audit_log_path: PathBuf::from(DEFAULT_AUDIT_LOG_PATH),
             fixed_environment: BTreeMap::from([
                 ("HOME".to_owned(), "/workspace".to_owned()),
                 ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),

@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use sendbox_policy::ToolCallPolicy;
+use sendbox_policy::{McpServerPolicy, ToolCallPolicy};
 use serde_json::{Map, Value};
 
 use crate::error::ConfigError;
@@ -104,7 +104,7 @@ impl ApprovedCommand {
 #[derive(Debug, Clone)]
 pub struct ProjectConfigValidator {
     broker_prefixes: BTreeSet<Vec<String>>,
-    allowed_server_commands: BTreeSet<ApprovedCommand>,
+    stdio_servers: BTreeMap<ApprovedCommand, String>,
 }
 
 impl ProjectConfigValidator {
@@ -113,25 +113,44 @@ impl ProjectConfigValidator {
         broker_prefixes: impl IntoIterator<Item = Vec<String>>,
         allowed_server_commands: impl IntoIterator<Item = ApprovedCommand>,
     ) -> Self {
+        let stdio_servers = allowed_server_commands
+            .into_iter()
+            .map(|command| {
+                let fingerprint = crate::policy::stdio_fingerprint(&command.argv());
+                (command, format!("legacy-{}", &fingerprint[..16]))
+            })
+            .collect();
         Self {
             broker_prefixes: broker_prefixes.into_iter().collect(),
-            allowed_server_commands: allowed_server_commands.into_iter().collect(),
+            stdio_servers,
         }
     }
 
     pub fn from_policy(policy: &ToolCallPolicy) -> Result<Self, String> {
-        let commands = policy
-            .allowed_server_commands
-            .iter()
-            .map(|command| ApprovedCommand::from_argv(command))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::new(
-            [
-                vec![NATIVE_BROKER_PATH.to_owned()],
-                vec![LEGACY_PROXY_PATH.to_owned()],
-            ],
-            commands,
-        ))
+        let mut stdio_servers = BTreeMap::new();
+        if policy.uses_hierarchical_servers() {
+            for (id, server) in &policy.servers {
+                let McpServerPolicy::Stdio { command, .. } = server else {
+                    continue;
+                };
+                let command = ApprovedCommand::from_argv(command)?;
+                if let Some(existing) = stdio_servers.insert(command, id.clone()) {
+                    return Err(format!(
+                        "MCP stdio command is ambiguously mapped to '{existing}' and '{id}'"
+                    ));
+                }
+            }
+        } else {
+            for command in &policy.allowed_server_commands {
+                let command = ApprovedCommand::from_argv(command)?;
+                let fingerprint = crate::policy::stdio_fingerprint(&command.argv());
+                stdio_servers.insert(command, format!("legacy-{}", &fingerprint[..16]));
+            }
+        }
+        Ok(Self {
+            broker_prefixes: BTreeSet::from([vec![NATIVE_BROKER_PATH.to_owned()]]),
+            stdio_servers,
+        })
     }
 
     pub fn validate_project(&self, project: impl AsRef<Path>) -> Result<(), ConfigError> {
@@ -236,6 +255,16 @@ impl ProjectConfigValidator {
                 "server env/cwd overrides are rejected; the broker uses a scrubbed environment and fixed working directory",
             );
         }
+        if ["policy", "policyId", "serverId", "sendboxPolicy"]
+            .iter()
+            .any(|field| server.contains_key(*field))
+        {
+            return invalid_server(
+                path,
+                name,
+                "project MCP definitions cannot select a SendBox server policy ID",
+            );
+        }
 
         let command = parse_command(path, name, server)?;
         let separator = command
@@ -266,11 +295,11 @@ impl ProjectConfigValidator {
                     message,
                 }
             })?;
-        if !self.allowed_server_commands.contains(&server_command) {
+        if !self.stdio_servers.contains_key(&server_command) {
             return invalid_server(
                 path,
                 name,
-                "server executable and arguments are not exactly approved",
+                "server executable and arguments do not map to an allowed server policy",
             );
         }
         Ok(())
@@ -360,6 +389,8 @@ fn invalid_server<T>(path: &Path, server: &str, message: &str) -> Result<T, Conf
 mod tests {
     use std::fs;
 
+    use sendbox_policy::{Action, ServerToolPolicy};
+
     use super::*;
     use tempfile::TempDir;
 
@@ -409,6 +440,7 @@ mod tests {
             r#"{"servers":{"x":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/npx","mcp-server-filesystem"]}}}"#,
             r#"{"servers":{"x":{"type":"websocket","command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/node","/opt/mcp-server-filesystem.js"]}}}"#,
             r#"{"servers":{"x":{"command":["/run/sendbox-boundary/mcp-broker","--","/usr/bin/node","/opt/mcp-server-filesystem.js"],"args":[]}}}"#,
+            r#"{"servers":{"x":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/node","/opt/mcp-server-filesystem.js"],"policyId":"more-permissive"}}}"#,
         ];
         for case in cases {
             let temp = TempDir::new().unwrap();
@@ -430,5 +462,38 @@ mod tests {
         .unwrap();
         symlink(&target, temp.path().join(".mcp.json")).unwrap();
         assert!(validator().validate_project(temp.path()).is_err());
+    }
+
+    #[test]
+    fn hierarchical_policy_maps_aliases_by_exact_command_not_project_name() {
+        let policy = ToolCallPolicy {
+            servers: BTreeMap::from([(
+                "trusted-github".to_owned(),
+                McpServerPolicy::Stdio {
+                    command: vec!["/usr/bin/github-mcp".to_owned(), "stdio".to_owned()],
+                    tools: ServerToolPolicy {
+                        default_action: Action::Deny,
+                        allowlist: vec!["search_code".to_owned()],
+                        denylist: Vec::new(),
+                    },
+                },
+            )]),
+            ..ToolCallPolicy::default()
+        };
+        let validator = ProjectConfigValidator::from_policy(&policy).unwrap();
+        let temp = TempDir::new().unwrap();
+        write_config(
+            &temp,
+            ".mcp.json",
+            r#"{"servers":{"untrusted-alias":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/github-mcp","stdio"]},"second-alias":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/github-mcp","stdio"]}}}"#,
+        );
+        validator.validate_project(temp.path()).unwrap();
+
+        write_config(
+            &temp,
+            ".vscode/mcp.json",
+            r#"{"servers":{"trusted-github":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/github-mcp","changed"]}}}"#,
+        );
+        assert!(validator.validate_project(temp.path()).is_err());
     }
 }

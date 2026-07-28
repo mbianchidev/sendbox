@@ -2,6 +2,18 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+#[derive(Debug, Error)]
+pub enum AuditError {
+    #[error("MCP audit log I/O failed: {0}")]
+    Io(#[source] std::io::Error),
+    #[error("MCP audit event encoding failed: {0}")]
+    Encode(#[source] serde_json::Error),
+    #[error("MCP audit log path is not a trusted regular file: {0}")]
+    UntrustedPath(String),
+    #[error("MCP audit log lock is poisoned")]
+    Poisoned,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum FrameError {
     #[error("MCP frame exceeds configured maximum of {max} bytes")]
@@ -66,6 +78,8 @@ pub enum BrokerError {
     JsonRpc(#[from] JsonRpcError),
     #[error("MCP tool policy rejected malformed request: {0}")]
     Policy(String),
+    #[error(transparent)]
+    Audit(#[from] AuditError),
     #[error("MCP client disconnected")]
     ClientDisconnected,
     #[error("MCP output remained saturated past the configured deadline")]

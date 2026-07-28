@@ -318,20 +318,22 @@ policy:
     # Set to false when using Hyperlight.
     enabled: true
     tool_calls:
-      transport: stdio       # HTTP/SSE MCP is rejected in boundary mode
-      default_action: deny
-      allowlist:
-        - read_file
-        - list_directory
-        - search_code
-      denylist:
-        - "*delete*"
       max_frame_bytes: 1048576
-      server_command_patterns:
-        - mcp-server
-        - "@modelcontextprotocol"
-      allowed_server_commands:
-        - ["/usr/local/bin/node", "/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspaces/my-project"]
+      servers:
+        filesystem:
+          transport: stdio
+          command: ["/usr/local/bin/node", "/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspaces/my-project"]
+          tools:
+            default_action: deny
+            allowlist: [read_file, list_directory]
+            denylist: ["write_*", "delete_*"]
+        github:
+          transport: stdio
+          command: ["/usr/local/bin/github-mcp-server", "stdio"]
+          tools:
+            default_action: deny
+            allowlist: [search_code, get_file_contents]
+            denylist: ["create_*", "update_*", "delete_*"]
     syscalls:
       additional_denylist:
         - io_uring_setup
@@ -388,10 +390,11 @@ sessions through authenticated guest bootstrap. It does not replace hosting-prov
 or protect alternate clients and direct GitHub API calls.
 
 Local stdio MCP configuration is validated before launch and must use
-`/run/sendbox-boundary/mcp-broker -- <exact-approved-command>`. Apple and Kata guests install the
-root-owned broker and signed policy before the agent starts; server children receive a cleared,
-signed environment and fixed workspace. Optional stdio observation is written below
-`/var/log/sendbox`. HTTP/SSE inspection and Hyperlight MCP composition fail closed.
+`/run/sendbox-boundary/mcp-broker -- <exact-approved-command>`. The broker derives a stable server
+policy from exact argv, filters `tools/list`, and enforces that server's deny-first tool rules again
+at `tools/call`. Apple and Kata guests install the root-owned broker, signed policy, and mandatory
+append-only audit log before the agent starts; server children receive a cleared, signed environment
+and fixed workspace. HTTP/SSE inspection and Hyperlight MCP composition fail closed.
 
 ### Copilot credentials
 
