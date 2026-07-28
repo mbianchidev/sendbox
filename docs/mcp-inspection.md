@@ -1,9 +1,10 @@
 # MCP brokering and inspection
 
 `sendbox-mcp` is the native Rust library for local stdio MCP authorization,
-project configuration validation, and observation processing. This PR provides
-the production library boundary only. It does not connect the broker or observer
-to a guest/runtime and does not change the CLI.
+project configuration validation, and observation processing. Production
+`sendbox run` validates configuration on the host, binds the policy digest into
+the signed boundary plan, and installs the broker in authenticated Apple and Kata
+guests.
 
 ## Authorization boundary
 
@@ -25,8 +26,8 @@ broker:
 - The Tokio launcher clears its inherited environment before applying the
   administrator-supplied minimal environment.
 
-Remote HTTP/SSE MCP is not an authorization surface. It may be represented in
-observation records, but this crate makes no remote authorization claim.
+Remote HTTP/SSE MCP is not an authorization or inspection surface. Enabling HTTP
+inspection fails closed because the native runtime cannot observe TLS plaintext.
 
 ## Project configuration
 
@@ -39,7 +40,7 @@ The validator checks every existing Swift-recognized path:
 - `.claude/mcp.json`
 
 It accepts `mcpServers` or `servers` at the root or below `mcp`. A local server
-must use an exact approved broker/proxy prefix, `--`, and an exact command from
+must use `/run/sendbox-boundary/mcp-broker`, `--`, and an exact command from
 `policy.boundaries.tool_calls.allowed_server_commands`. Remote transports,
 unproxied commands, shells, package runners, `env`, and `cwd` are rejected.
 
@@ -57,24 +58,19 @@ The native versioned format is:
 SENDBOX_MCP_EVENT<TAB>{"schema_version":1,...}
 ```
 
-`ObservationMetadata` is the ingestion boundary for a future C/libbpf
-ring-buffer producer. It contains metadata and captured UTF-8 payload bytes; no
-C code, loader, ring-buffer reader, or guest attachment is included here.
+The guest broker emits the native format for wrapper-mediated stdio traffic. The
+log is created by the root supervisor and is writable only by the configured
+workload group. When payload capture is disabled, arguments and error messages
+are removed before the event is written.
 
 Both formats support request/response correlation by process and JSON-RPC ID,
 method/category classification, payload redaction, deterministic summaries, and
 deterministic reports.
 
-## Native observer artifacts
+## Runtime limits
 
-The old `mcp script` behavior generated executable bpftrace/bootstrap scripts.
-The Rust library intentionally does not reproduce that architecture.
-`NativeObserverArtifact` instead emits deterministic JSON describing:
-
-- the configured transports and capture limits;
-- the future native ring-buffer metadata producer;
-- stdio-only authorization semantics;
-- the explicit absence of runtime integration.
-
-This artifact is descriptive, not executable, and never claims that a native
-observer has been loaded.
+Only traffic that traverses the installed stdio broker is authorized and
+observed. Project configuration that launches a server directly, sets its own
+environment or working directory, uses a shell/package runner, or selects a
+remote transport is rejected. Separately available binaries and alternate
+clients remain outside this wrapper boundary.

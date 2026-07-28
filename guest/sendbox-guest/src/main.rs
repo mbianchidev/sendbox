@@ -141,6 +141,16 @@ enum FixtureMode {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let invocation = invocation_name();
+    if invocation.as_deref() == Some("mcp-broker") {
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        return match sendbox_guest::mcp_broker::execute_current(&arguments).await {
+            Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
+            Err(error) => {
+                eprintln!("[sendbox-mcp-broker] {error}");
+                ExitCode::from(sendbox_guest::mcp_broker::denied_exit_code())
+            }
+        };
+    }
     if invocation.as_deref() == Some("git") {
         let arguments = std::env::args().skip(1).collect::<Vec<_>>();
         return match sendbox_guest::git_guard::execute_current(&arguments) {

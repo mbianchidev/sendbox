@@ -3,7 +3,7 @@
 mod security;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -25,7 +25,9 @@ use sendbox_boundary::{
     TrustDeclaration, VerifiedBoundaryPlan, WorkloadIdentity, select_runtime, sha256_hex,
 };
 use sendbox_bundle::{Architecture as BundleArchitecture, VerifyOptions, verify_bundle};
-use sendbox_config::{RuntimeProvider as ConfiguredRuntime, SandboxConfiguration};
+use sendbox_config::{
+    InspectionTransport, RuntimeProvider as ConfiguredRuntime, SandboxConfiguration,
+};
 use sendbox_core::{SessionId, VERSION};
 use sendbox_credentials::{
     CredentialBrokerError, GhMetadataClient, GhProcessConfiguration, GitHubSessionCredentials,
@@ -37,6 +39,10 @@ use sendbox_git::{
     GuardError, GuardLimits, GuardPolicyDocument, PolicySchemaVersion, ProcessRequest,
     RepositoryIdentity, SSH_KEY_ENVIRONMENT, SystemGitProcessRunner, TrustedGitBinary,
     discover_repository_identity,
+};
+use sendbox_mcp::config::{NATIVE_BROKER_PATH, PROJECT_CONFIG_PATHS};
+use sendbox_mcp::runtime::{
+    RUNTIME_POLICY_SCHEMA_VERSION, RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
 use sendbox_policy::{Action, DnsPolicy};
 use sendbox_runtime::{
@@ -60,6 +66,7 @@ use zeroize::Zeroizing;
 
 const PLAN_VALIDITY: Duration = Duration::from_secs(60 * 60);
 const COPILOT_TOKEN_ENVIRONMENT: &str = "GITHUB_COPILOT_TOKEN";
+const MCP_PROXY_ENVIRONMENT: &str = "SENDBOX_MCP_PROXY";
 const MAX_EXECUTION_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;
 const MAX_EXECUTION_ENVIRONMENT_BYTES: usize = 16 * 1024;
 #[cfg(target_os = "linux")]
@@ -272,6 +279,12 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
     let workspace_destination = PathBuf::from("/workspace");
+    let workload_identity = match selected_runtime {
+        ResolvedRuntime::Apple | ResolvedRuntime::Kata => {
+            Some(project_identity(&workspace_source)?)
+        }
+        ResolvedRuntime::Hyperlight => None,
+    };
     let git_guard_policy = make_git_guard_policy(
         selected_runtime,
         &request.configuration,
@@ -280,19 +293,32 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         &workspace_destination,
         &credentials,
     )?;
+    let mcp_policy = make_mcp_policy(
+        selected_runtime,
+        &request.configuration,
+        &workspace_source,
+        &workspace_destination,
+        workload_identity,
+    )?;
+    let environment = runtime_environment(mcp_policy.as_ref());
     let features = boundary_features(
         &request.configuration,
         git_guard_policy.as_ref(),
+        mcp_policy.as_ref(),
         &credentials,
     )?;
-    validate_security_composition(
+    validate_security_composition(SecurityComposition {
         selected_runtime,
-        &request.configuration,
-        selected_repository.as_ref(),
-        git_guard_policy.as_ref(),
-        &credentials,
-        &features,
-    )?;
+        configuration: &request.configuration,
+        selected_repository: selected_repository.as_ref(),
+        host_workspace: &workspace_source,
+        guest_workspace: &workspace_destination,
+        workload_identity,
+        git_guard_policy: git_guard_policy.as_ref(),
+        mcp_policy: mcp_policy.as_ref(),
+        credentials: &credentials,
+        features: &features,
+    })?;
 
     ensure_private_directory(&request.state_root)?;
     let state_root = canonical_file_or_directory(&request.state_root, "runtime state root")?;
@@ -328,7 +354,9 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         host,
         resources,
         &workspace_source,
+        workload_identity,
         git_guard_policy.as_ref(),
+        mcp_policy.as_ref(),
     )?;
     let workload = match selected_runtime {
         ResolvedRuntime::Hyperlight => WorkloadIdentity::GuestBundle {
@@ -366,7 +394,14 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
             working_directory: workspace_destination.display().to_string(),
         },
         mounts: Vec::new(),
-        environment: Vec::<EnvironmentDeclaration>::new(),
+        environment: environment
+            .iter()
+            .map(|entry| EnvironmentDeclaration {
+                name: entry.name.clone(),
+                value_sha256: sha256_hex(entry.value.as_bytes()),
+                sensitive: entry.sensitive,
+            })
+            .collect(),
         secrets: request.configuration.secrets.clone(),
         resources: ResourceDeclaration {
             cpus: resources.cpus,
@@ -409,7 +444,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                     arguments: command.1,
                     working_directory: "/workspace".to_owned(),
                 },
-                environment: Vec::<EnvironmentIntent>::new(),
+                environment,
                 mounts: Vec::new(),
                 bootstrap_reference,
                 readiness_timeout: request.readiness_timeout,
@@ -525,7 +560,9 @@ fn build_runtime(
     host: HostPlatform,
     resources: RuntimeResources,
     workspace_source: &Path,
+    workload_identity: Option<(u32, u32)>,
     git_guard_policy: Option<&GuardPolicyDocument>,
+    mcp_policy: Option<&RuntimePolicyDocument>,
 ) -> Result<RuntimeBuild, HostError> {
     let manifest_path = bundle_root.join("manifest.json");
     let mut artifacts = vec![
@@ -547,7 +584,9 @@ fn build_runtime(
                 ArtifactKind::RuntimeExecutable,
                 &executable,
             )?);
-            let (workload_uid, workload_gid) = project_identity(workspace_source)?;
+            let (workload_uid, workload_gid) = workload_identity.ok_or_else(|| {
+                HostError::Invalid("Apple workload identity was not prepared".to_owned())
+            })?;
             let mut configuration = AppleRuntimeConfiguration::new(
                 bundle_root,
                 trust_root,
@@ -559,6 +598,7 @@ fn build_runtime(
             configuration.executable = Some(executable.clone());
             configuration.command_policy = request.configuration.policy.commands.clone();
             configuration.git_guard_policy = git_guard_policy.cloned();
+            configuration.mcp_policy = mcp_policy.cloned();
             configuration.workload_uid = workload_uid;
             configuration.workload_gid = workload_gid;
             configuration.launch.resources.cpus =
@@ -605,7 +645,9 @@ fn build_runtime(
                     path,
                 )?);
             }
-            let (workload_uid, workload_gid) = project_identity(workspace_source)?;
+            let (workload_uid, workload_gid) = workload_identity.ok_or_else(|| {
+                HostError::Invalid("Kata workload identity was not prepared".to_owned())
+            })?;
             let configuration = KataProviderConfiguration {
                 executable: executable.display().to_string(),
                 runtime_handler: kata.runtime_handler.clone(),
@@ -619,6 +661,7 @@ fn build_runtime(
                 minimum_release_sequence: request.minimum_release_sequence,
                 command_policy: request.configuration.policy.commands.clone(),
                 git_guard_policy: git_guard_policy.cloned(),
+                mcp_policy: mcp_policy.cloned(),
                 workload_uid,
                 workload_gid,
             };
@@ -968,13 +1011,6 @@ fn bundle_architecture(architecture: Architecture) -> BundleArchitecture {
 }
 
 fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'static str> {
-    if configuration
-        .observability
-        .as_ref()
-        .is_some_and(|value| value.mcp_inspection.enabled)
-    {
-        return Some("production run does not yet wire the native MCP subsystem");
-    }
     let network = &configuration.policy.network;
     if network.default_action != Action::Allow
         || !network.allowed_domains.is_empty()
@@ -1077,9 +1113,137 @@ fn make_git_guard_policy(
     Ok(Some(policy))
 }
 
+fn make_mcp_policy(
+    selected_runtime: ResolvedRuntime,
+    configuration: &SandboxConfiguration,
+    host_workspace: &Path,
+    guest_workspace: &Path,
+    workload_identity: Option<(u32, u32)>,
+) -> Result<Option<RuntimePolicyDocument>, HostError> {
+    let has_project_configuration = PROJECT_CONFIG_PATHS
+        .iter()
+        .any(|relative| host_workspace.join(relative).symlink_metadata().is_ok());
+    let inspection = configuration
+        .observability
+        .as_ref()
+        .map(|observability| &observability.mcp_inspection)
+        .filter(|inspection| inspection.enabled);
+    if !has_project_configuration
+        && configuration
+            .policy
+            .boundaries
+            .tool_calls
+            .allowed_server_commands
+            .is_empty()
+        && inspection.is_none()
+    {
+        return Ok(None);
+    }
+    if selected_runtime == ResolvedRuntime::Hyperlight {
+        return Err(HostError::Invalid(
+            "Hyperlight does not support the authenticated MCP broker".to_owned(),
+        ));
+    }
+    if !configuration.policy.boundaries.enabled {
+        return Err(HostError::Invalid(
+            "MCP composition requires policy.boundaries.enabled".to_owned(),
+        ));
+    }
+    if configuration
+        .policy
+        .boundaries
+        .tool_calls
+        .allowed_server_commands
+        .is_empty()
+    {
+        return Err(HostError::Invalid(
+            "MCP composition requires at least one exactly approved server command".to_owned(),
+        ));
+    }
+    let (workload_uid, workload_gid) = workload_identity
+        .ok_or_else(|| HostError::Invalid("MCP workload identity was not prepared".to_owned()))?;
+    let observation = inspection
+        .map(|inspection| {
+            if inspection
+                .transports
+                .contains(&InspectionTransport::Http)
+            {
+                return Err(HostError::Invalid(
+                    "HTTP/SSE MCP inspection is not available in the authenticated native runtime; configure stdio inspection only"
+                        .to_owned(),
+                ));
+            }
+            if !inspection
+                .transports
+                .contains(&InspectionTransport::Stdio)
+            {
+                return Err(HostError::Invalid(
+                    "native MCP inspection requires the stdio transport".to_owned(),
+                ));
+            }
+            Ok(RuntimeObservationConfiguration {
+                capture_payloads: inspection.capture_payloads,
+                max_payload_bytes: usize::try_from(inspection.max_payload_bytes).map_err(|_| {
+                    HostError::Invalid("MCP observation payload limit is invalid".to_owned())
+                })?,
+                log_path: inspection.log_path.clone(),
+            })
+        })
+        .transpose()?;
+    let fixed_environment = BTreeMap::from([
+        ("HOME".to_owned(), guest_workspace.display().to_string()),
+        ("LANG".to_owned(), "C.UTF-8".to_owned()),
+        ("LOGNAME".to_owned(), "sendbox".to_owned()),
+        (
+            MCP_PROXY_ENVIRONMENT.to_owned(),
+            NATIVE_BROKER_PATH.to_owned(),
+        ),
+        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ("TMPDIR".to_owned(), "/tmp".to_owned()),
+        ("USER".to_owned(), "sendbox".to_owned()),
+    ]);
+    let inherited_environment_keys = configuration
+        .secrets
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let policy = RuntimePolicyDocument {
+        schema_version: RUNTIME_POLICY_SCHEMA_VERSION,
+        workspace_root: guest_workspace.to_path_buf(),
+        workload_uid,
+        workload_gid,
+        tool_policy: configuration.policy.boundaries.tool_calls.clone(),
+        fixed_environment,
+        inherited_environment_keys,
+        observation,
+    };
+    policy
+        .validate()
+        .map_err(|error| HostError::Invalid(format!("invalid MCP runtime policy: {error}")))?;
+    policy
+        .project_validator()
+        .map_err(|error| HostError::Invalid(format!("invalid MCP project policy: {error}")))?
+        .validate_project(host_workspace)
+        .map_err(|error| {
+            HostError::Invalid(format!("unsafe MCP project configuration: {error}"))
+        })?;
+    Ok(Some(policy))
+}
+
+fn runtime_environment(mcp_policy: Option<&RuntimePolicyDocument>) -> Vec<EnvironmentIntent> {
+    mcp_policy.map_or_else(Vec::new, |_| {
+        vec![EnvironmentIntent {
+            name: MCP_PROXY_ENVIRONMENT.to_owned(),
+            value: NATIVE_BROKER_PATH.to_owned(),
+            sensitive: false,
+        }]
+    })
+}
+
 fn boundary_features(
     configuration: &SandboxConfiguration,
     git_guard_policy: Option<&GuardPolicyDocument>,
+    mcp_policy: Option<&RuntimePolicyDocument>,
     credentials: &EffectiveCredentialSet,
 ) -> Result<BTreeMap<String, FeatureAdmission>, HostError> {
     let mut features = BTreeMap::new();
@@ -1100,6 +1264,30 @@ fn boundary_features(
         if configuration.github.branch_protection.enabled {
             features.insert(
                 "git_branch_protection".to_owned(),
+                FeatureAdmission {
+                    decision: FeatureDecision::Enforced,
+                    mechanism,
+                },
+            );
+        }
+    }
+    if let Some(policy) = mcp_policy {
+        let encoded =
+            serde_json::to_vec(policy).map_err(|error| HostError::Invalid(error.to_string()))?;
+        let mechanism = format!(
+            "authenticated_guest_mcp_broker_v1:sha256={}",
+            sha256_hex(&encoded)
+        );
+        features.insert(
+            "mcp_stdio_broker".to_owned(),
+            FeatureAdmission {
+                decision: FeatureDecision::Enforced,
+                mechanism: mechanism.clone(),
+            },
+        );
+        if policy.observation.is_some() {
+            features.insert(
+                "mcp_stdio_observation".to_owned(),
                 FeatureAdmission {
                     decision: FeatureDecision::Enforced,
                     mechanism,
@@ -1259,14 +1447,32 @@ fn validate_reserved_secret_names(configuration: &SandboxConfiguration) -> Resul
     Ok(())
 }
 
-fn validate_security_composition(
+struct SecurityComposition<'a> {
     selected_runtime: ResolvedRuntime,
-    configuration: &SandboxConfiguration,
-    selected_repository: Option<&RepositoryIdentity>,
-    git_guard_policy: Option<&GuardPolicyDocument>,
-    credentials: &EffectiveCredentialSet,
-    features: &BTreeMap<String, FeatureAdmission>,
-) -> Result<(), HostError> {
+    configuration: &'a SandboxConfiguration,
+    selected_repository: Option<&'a RepositoryIdentity>,
+    host_workspace: &'a Path,
+    guest_workspace: &'a Path,
+    workload_identity: Option<(u32, u32)>,
+    git_guard_policy: Option<&'a GuardPolicyDocument>,
+    mcp_policy: Option<&'a RuntimePolicyDocument>,
+    credentials: &'a EffectiveCredentialSet,
+    features: &'a BTreeMap<String, FeatureAdmission>,
+}
+
+fn validate_security_composition(composition: SecurityComposition<'_>) -> Result<(), HostError> {
+    let SecurityComposition {
+        selected_runtime,
+        configuration,
+        selected_repository,
+        host_workspace,
+        guest_workspace,
+        workload_identity,
+        git_guard_policy,
+        mcp_policy,
+        credentials,
+        features,
+    } = composition;
     if credentials.github_https_auth != configuration.github.forward_auth
         || credentials.copilot_auth != configuration.github.forward_copilot_auth
         || credentials.git_ssh_auth != configuration.github.ssh_key_path.is_some()
@@ -1294,6 +1500,28 @@ fn validate_security_composition(
             "authenticated Git policy does not match the signed run configuration".to_owned(),
         ));
     }
+    if let Some(policy) = mcp_policy {
+        if selected_runtime == ResolvedRuntime::Hyperlight {
+            return Err(HostError::Invalid(
+                "Hyperlight does not support the authenticated MCP broker".to_owned(),
+            ));
+        }
+        policy
+            .validate()
+            .map_err(|error| HostError::Invalid(format!("invalid MCP composition: {error}")))?;
+    }
+    let expected_mcp_policy = make_mcp_policy(
+        selected_runtime,
+        configuration,
+        host_workspace,
+        guest_workspace,
+        workload_identity,
+    )?;
+    if expected_mcp_policy.as_ref() != mcp_policy {
+        return Err(HostError::Invalid(
+            "authenticated MCP policy does not match the signed run configuration".to_owned(),
+        ));
+    }
     let expected_names = credentials.values.keys().cloned().collect::<Vec<_>>();
     let actual_names = configuration
         .secrets
@@ -1310,7 +1538,8 @@ fn validate_security_composition(
             "signed secret names do not match prepared credentials".to_owned(),
         ));
     }
-    let expected_features = boundary_features(configuration, git_guard_policy, credentials)?;
+    let expected_features =
+        boundary_features(configuration, git_guard_policy, mcp_policy, credentials)?;
     if &expected_features != features {
         return Err(HostError::Invalid(
             "signed feature admissions do not match prepared credentials".to_owned(),
@@ -1909,16 +2138,29 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
 
         let mut mcp = supported_configuration(temp.path().to_path_buf());
-        mcp.observability
+        mcp.policy.boundaries.tool_calls.allowed_server_commands =
+            vec![vec!["/usr/bin/mcp-server".to_owned()]];
+        let inspection = &mut mcp
+            .observability
             .as_mut()
             .expect("observability")
-            .mcp_inspection
-            .enabled = true;
-        assert_prepare_rejects(
-            request(&temp, mcp),
-            "production run does not yet wire the native MCP subsystem",
+            .mcp_inspection;
+        inspection.enabled = true;
+        inspection.transports = vec![InspectionTransport::Stdio, InspectionTransport::Http];
+        let error = make_mcp_policy(
+            ResolvedRuntime::Kata,
+            &mcp,
+            temp.path(),
+            Path::new("/workspace"),
+            Some((1000, 1000)),
         )
-        .await;
+        .expect_err("HTTP inspection must be rejected");
+        assert!(matches!(
+            error,
+            HostError::Invalid(message)
+                if message
+                    == "HTTP/SSE MCP inspection is not available in the authenticated native runtime; configure stdio inspection only"
+        ));
 
         let mut credentials = supported_configuration(temp.path().to_path_buf());
         credentials.github.forward_auth = true;
@@ -1931,6 +2173,136 @@ mod tests {
             "production run does not yet wire production egress enforcement",
         )
         .await;
+    }
+
+    #[test]
+    fn native_mcp_policy_validates_project_configuration_and_binds_features() {
+        let temp = TempDir::new().expect("temp dir");
+        fs::write(
+            temp.path().join(".mcp.json"),
+            r#"{
+                "mcpServers": {
+                    "fixture": {
+                        "type": "stdio",
+                        "command": "/run/sendbox-boundary/mcp-broker",
+                        "args": ["--", "/usr/bin/mcp-server", "--stdio"]
+                    }
+                }
+            }"#,
+        )
+        .expect("MCP configuration");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration
+            .policy
+            .boundaries
+            .tool_calls
+            .allowed_server_commands =
+            vec![vec!["/usr/bin/mcp-server".to_owned(), "--stdio".to_owned()]];
+        let inspection = &mut configuration
+            .observability
+            .as_mut()
+            .expect("observability")
+            .mcp_inspection;
+        inspection.enabled = true;
+        inspection.transports = vec![InspectionTransport::Stdio];
+
+        let policy = make_mcp_policy(
+            ResolvedRuntime::Kata,
+            &configuration,
+            temp.path(),
+            Path::new("/workspace"),
+            Some((1000, 1000)),
+        )
+        .expect("MCP policy")
+        .expect("MCP composition");
+        assert_eq!(policy.workspace_root, Path::new("/workspace"));
+        assert_eq!(
+            runtime_environment(Some(&policy))[0].value,
+            NATIVE_BROKER_PATH
+        );
+        let credentials = EffectiveCredentialSet {
+            values: BTreeMap::new(),
+            github_https_auth: false,
+            copilot_auth: false,
+            git_ssh_auth: false,
+        };
+        let features = boundary_features(&configuration, None, Some(&policy), &credentials)
+            .expect("MCP features");
+        assert!(features.contains_key("mcp_stdio_broker"));
+        assert!(features.contains_key("mcp_stdio_observation"));
+        validate_security_composition(SecurityComposition {
+            selected_runtime: ResolvedRuntime::Kata,
+            configuration: &configuration,
+            selected_repository: None,
+            host_workspace: temp.path(),
+            guest_workspace: Path::new("/workspace"),
+            workload_identity: Some((1000, 1000)),
+            git_guard_policy: None,
+            mcp_policy: Some(&policy),
+            credentials: &credentials,
+            features: &features,
+        })
+        .expect("consistent MCP composition");
+
+        let mut drifted = policy.clone();
+        drifted
+            .fixed_environment
+            .insert("PATH".to_owned(), "/tmp/bin".to_owned());
+        let drifted_features =
+            boundary_features(&configuration, None, Some(&drifted), &credentials)
+                .expect("drifted features");
+        assert!(
+            validate_security_composition(SecurityComposition {
+                selected_runtime: ResolvedRuntime::Kata,
+                configuration: &configuration,
+                selected_repository: None,
+                host_workspace: temp.path(),
+                guest_workspace: Path::new("/workspace"),
+                workload_identity: Some((1000, 1000)),
+                git_guard_policy: None,
+                mcp_policy: Some(&drifted),
+                credentials: &credentials,
+                features: &drifted_features,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_mcp_policy_rejects_unbrokered_project_server() {
+        let temp = TempDir::new().expect("temp dir");
+        fs::write(
+            temp.path().join(".mcp.json"),
+            r#"{
+                "mcpServers": {
+                    "fixture": {
+                        "type": "stdio",
+                        "command": "/usr/bin/mcp-server",
+                        "args": ["--stdio"]
+                    }
+                }
+            }"#,
+        )
+        .expect("MCP configuration");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration
+            .policy
+            .boundaries
+            .tool_calls
+            .allowed_server_commands =
+            vec![vec!["/usr/bin/mcp-server".to_owned(), "--stdio".to_owned()]];
+        let error = make_mcp_policy(
+            ResolvedRuntime::Kata,
+            &configuration,
+            temp.path(),
+            Path::new("/workspace"),
+            Some((1000, 1000)),
+        )
+        .expect_err("unbrokered MCP must fail");
+        assert!(matches!(
+            error,
+            HostError::Invalid(message) if message.contains("approved broker prefix")
+        ));
     }
 
     #[test]
@@ -1991,9 +2363,9 @@ mod tests {
             git_ssh_auth: false,
         };
         let first =
-            boundary_features(&configuration, Some(&policy), &credentials).expect("features");
+            boundary_features(&configuration, Some(&policy), None, &credentials).expect("features");
         let second =
-            boundary_features(&configuration, Some(&policy), &credentials).expect("features");
+            boundary_features(&configuration, Some(&policy), None, &credentials).expect("features");
         assert_eq!(first, second);
         let admission = first
             .get("git_branch_protection")
@@ -2102,41 +2474,53 @@ mod tests {
             &credentials,
         )
         .expect("policy");
-        let mut features =
-            boundary_features(&configuration, policy.as_ref(), &credentials).expect("features");
-        validate_security_composition(
-            ResolvedRuntime::Kata,
-            &configuration,
-            Some(&repository),
-            policy.as_ref(),
-            &credentials,
-            &features,
-        )
+        let mut features = boundary_features(&configuration, policy.as_ref(), None, &credentials)
+            .expect("features");
+        validate_security_composition(SecurityComposition {
+            selected_runtime: ResolvedRuntime::Kata,
+            configuration: &configuration,
+            selected_repository: Some(&repository),
+            host_workspace: &workspace,
+            guest_workspace: Path::new("/workspace"),
+            workload_identity: None,
+            git_guard_policy: policy.as_ref(),
+            mcp_policy: None,
+            credentials: &credentials,
+            features: &features,
+        })
         .expect("consistent composition");
 
         features.remove("github_repository_credentials");
         assert!(
-            validate_security_composition(
-                ResolvedRuntime::Kata,
-                &configuration,
-                Some(&repository),
-                policy.as_ref(),
-                &credentials,
-                &features,
-            )
+            validate_security_composition(SecurityComposition {
+                selected_runtime: ResolvedRuntime::Kata,
+                configuration: &configuration,
+                selected_repository: Some(&repository),
+                host_workspace: &workspace,
+                guest_workspace: Path::new("/workspace"),
+                workload_identity: None,
+                git_guard_policy: policy.as_ref(),
+                mcp_policy: None,
+                credentials: &credentials,
+                features: &features,
+            })
             .is_err()
         );
         configuration.secrets.clear();
         assert!(
-            validate_security_composition(
-                ResolvedRuntime::Kata,
-                &configuration,
-                Some(&repository),
-                policy.as_ref(),
-                &credentials,
-                &boundary_features(&configuration, policy.as_ref(), &credentials)
+            validate_security_composition(SecurityComposition {
+                selected_runtime: ResolvedRuntime::Kata,
+                configuration: &configuration,
+                selected_repository: Some(&repository),
+                host_workspace: &workspace,
+                guest_workspace: Path::new("/workspace"),
+                workload_identity: None,
+                git_guard_policy: policy.as_ref(),
+                mcp_policy: None,
+                credentials: &credentials,
+                features: &boundary_features(&configuration, policy.as_ref(), None, &credentials,)
                     .expect("features"),
-            )
+            })
             .is_err()
         );
     }

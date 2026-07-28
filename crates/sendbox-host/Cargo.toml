@@ -17,6 +17,7 @@ sendbox-core = { path = "../sendbox-core" }
 sendbox-credentials = { path = "../sendbox-credentials" }
 sendbox-exec = { path = "../sendbox-exec" }
 sendbox-git = { path = "../sendbox-git" }
+sendbox-mcp = { path = "../sendbox-mcp" }
 sendbox-policy = { path = "../sendbox-policy" }
 sendbox-runtime = { path = "../sendbox-runtime" }
 sendbox-runtime-apple = { path = "../sendbox-runtime-apple" }

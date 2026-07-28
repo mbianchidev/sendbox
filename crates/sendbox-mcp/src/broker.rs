@@ -22,6 +22,22 @@ use crate::policy::{AuditDecision, CompiledToolPolicy, PolicyAction};
 pub type ChildReader = Box<dyn AsyncRead + Send + Unpin>;
 pub type ChildWriter = Box<dyn AsyncWrite + Send + Unpin>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerDirection {
+    ToServer,
+    FromServer,
+}
+
+pub trait BrokerObserver: Send + Sync {
+    fn observe(&self, direction: BrokerDirection, payload: &[u8]) -> Result<(), BrokerError>;
+}
+
+#[derive(Clone)]
+struct BrokerIoContext {
+    config: BrokerConfiguration,
+    observer: Option<Arc<dyn BrokerObserver>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StderrPolicy {
     Inherit,
@@ -191,6 +207,7 @@ pub struct StdioBroker<L> {
     command: ApprovedCommand,
     policy: CompiledToolPolicy,
     config: BrokerConfiguration,
+    observer: Option<Arc<dyn BrokerObserver>>,
 }
 
 impl<L: ProcessLauncher> StdioBroker<L> {
@@ -208,7 +225,14 @@ impl<L: ProcessLauncher> StdioBroker<L> {
             command,
             policy,
             config,
+            observer: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn BrokerObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub async fn run<R, W>(
@@ -247,20 +271,24 @@ impl<L: ProcessLauncher> StdioBroker<L> {
         let internal = CancellationToken::new();
         let client_input_closed = Arc::new(AtomicBool::new(false));
         let (outbound_tx, outbound_rx) = mpsc::channel(self.config.outbound_queue_capacity.max(1));
+        let io_context = BrokerIoContext {
+            config: self.config.clone(),
+            observer: self.observer.clone(),
+        };
         let mut tasks = JoinSet::new();
         tasks.spawn(client_to_server(
             client_reader,
             child_stdin,
             outbound_tx.clone(),
             self.policy.clone(),
-            self.config.clone(),
+            io_context.clone(),
             internal.clone(),
             Arc::clone(&client_input_closed),
         ));
         tasks.spawn(server_to_client(
             child_stdout,
             outbound_tx,
-            self.config.clone(),
+            io_context,
             internal.clone(),
         ));
         tasks.spawn(write_client(
@@ -376,14 +404,17 @@ async fn client_to_server<R>(
     mut server: ChildWriter,
     outbound: mpsc::Sender<Vec<u8>>,
     policy: CompiledToolPolicy,
-    config: BrokerConfiguration,
+    context: BrokerIoContext,
     cancellation: CancellationToken,
     client_input_closed: Arc<AtomicBool>,
 ) -> Result<TaskOutcome, BrokerError>
 where
     R: AsyncRead + Send + Unpin + 'static,
 {
-    let mut decoder = FrameDecoder::new(config.client_framing, config.max_frame_bytes);
+    let mut decoder = FrameDecoder::new(
+        context.config.client_framing,
+        context.config.max_frame_bytes,
+    );
     let mut buffer = [0u8; 8192];
     let mut decisions = Vec::new();
     loop {
@@ -399,6 +430,9 @@ where
         }
         for frame in decoder.feed(&buffer[..read])? {
             let message = validate_message(&frame.payload)?;
+            if let Some(observer) = &context.observer {
+                observer.observe(BrokerDirection::ToServer, &frame.payload)?;
+            }
             match policy.evaluate_message(&message) {
                 PolicyAction::Forward(decision) => {
                     decisions.push(decision);
@@ -410,7 +444,7 @@ where
                     send_outbound(
                         &outbound,
                         encode_frame(&response, frame.mode),
-                        config.backpressure_timeout,
+                        context.config.backpressure_timeout,
                         &cancellation,
                     )
                     .await?;
@@ -425,10 +459,13 @@ where
 async fn server_to_client(
     mut server: ChildReader,
     outbound: mpsc::Sender<Vec<u8>>,
-    config: BrokerConfiguration,
+    context: BrokerIoContext,
     cancellation: CancellationToken,
 ) -> Result<TaskOutcome, BrokerError> {
-    let mut decoder = FrameDecoder::new(config.server_framing, config.max_frame_bytes);
+    let mut decoder = FrameDecoder::new(
+        context.config.server_framing,
+        context.config.max_frame_bytes,
+    );
     let mut buffer = [0u8; 8192];
     loop {
         let read = tokio::select! {
@@ -441,10 +478,13 @@ async fn server_to_client(
         }
         for frame in decoder.feed(&buffer[..read])? {
             validate_message(&frame.payload)?;
+            if let Some(observer) = &context.observer {
+                observer.observe(BrokerDirection::FromServer, &frame.payload)?;
+            }
             send_outbound(
                 &outbound,
                 frame.raw,
-                config.backpressure_timeout,
+                context.config.backpressure_timeout,
                 &cancellation,
             )
             .await?;
@@ -541,6 +581,7 @@ async fn cleanup_child(
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
@@ -550,6 +591,8 @@ mod tests {
     use tokio::sync::{Notify, oneshot};
 
     use super::*;
+
+    type RecordedEvents = Arc<Mutex<Vec<(BrokerDirection, Vec<u8>)>>>;
 
     #[derive(Clone)]
     struct FakeLauncher {
@@ -572,6 +615,20 @@ mod tests {
         cached_status: Option<ExitStatus>,
         killed: Arc<Mutex<bool>>,
         notify: Arc<Notify>,
+    }
+
+    struct RecordingObserver {
+        events: RecordedEvents,
+    }
+
+    impl BrokerObserver for RecordingObserver {
+        fn observe(&self, direction: BrokerDirection, payload: &[u8]) -> Result<(), BrokerError> {
+            self.events
+                .lock()
+                .expect("observer mutex")
+                .push((direction, payload.to_vec()));
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -767,6 +824,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tokio_launcher_clears_unapproved_environment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let executable = temp.path().join("mcp-env-fixture");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nprintf '%s|%s' \"$ALLOWED\" \"${SENDBOX_MCP_TEST_BLOCKED-unset}\"\n",
+        )
+        .expect("fixture");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("fixture mode");
+        let command = ApprovedCommand::new(executable.display().to_string(), Vec::<String>::new())
+            .expect("approved command");
+        let launcher = TokioProcessLauncher::new(
+            BTreeMap::from([("ALLOWED".to_owned(), "visible".to_owned())]),
+            Some(temp.path().to_path_buf()),
+        );
+        let mut child = launcher
+            .spawn(&command, &StderrPolicy::Discard)
+            .await
+            .expect("launch");
+        let mut stdin = child.take_stdin().expect("stdin");
+        stdin.shutdown().await.expect("shutdown stdin");
+        let mut stdout = child.take_stdout().expect("stdout");
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).await.expect("read stdout");
+        assert!(child.wait().await.expect("wait").success());
+        assert_eq!(output, b"visible|unset");
+    }
+
+    #[tokio::test]
     async fn denied_content_length_request_gets_matching_error_frame() {
         let config = BrokerConfiguration {
             client_framing: FramingMode::ContentLength,
@@ -782,7 +869,11 @@ mod tests {
             .await
             .unwrap();
         input_writer.shutdown().await.unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
         let _report = broker(FakeBehavior::Echo, config)
+            .with_observer(Arc::new(RecordingObserver {
+                events: Arc::clone(&events),
+            }))
             .run(input_reader, output_writer, BrokerCancellation::default())
             .await
             .unwrap();
@@ -796,6 +887,10 @@ mod tests {
                 .unwrap()
                 .contains("-32001")
         );
+        let events = events.lock().expect("observer mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, BrokerDirection::ToServer);
+        assert!(String::from_utf8_lossy(&events[0].1).contains("delete_file"));
     }
 
     #[tokio::test]

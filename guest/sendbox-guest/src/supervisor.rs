@@ -13,6 +13,7 @@ use crate::bootstrap::ImmutableBootstrapSource;
 use crate::broker;
 use crate::git_guard;
 use crate::manifest::{VerifiedManifest, verify_manifest};
+use crate::mcp_broker;
 use crate::platform::PlatformControls;
 use crate::protocol::{ProtocolServices, handshake_config, serve_authenticated};
 use crate::runtime::{ReadinessSnapshot, RuntimeIdentity, RuntimeSession};
@@ -77,6 +78,18 @@ pub async fn run<P: PlatformControls>(
             "git_guard_installed",
             policy.selected_repository.to_string(),
             policy.selected_workspace.display().to_string(),
+        );
+    }
+    if let Some(policy) = bootstrap
+        .execution_broker
+        .as_ref()
+        .and_then(|broker| broker.mcp_policy.as_ref())
+    {
+        mcp_broker::install(policy, &options.artifact_root)?;
+        audit.lock().expect("audit mutex").record(
+            "mcp_broker_installed",
+            policy.workspace_root.display().to_string(),
+            policy.tool_policy.allowed_server_commands.len().to_string(),
         );
     }
     let broker_client = bootstrap

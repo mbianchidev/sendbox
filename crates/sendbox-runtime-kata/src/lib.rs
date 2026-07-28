@@ -17,6 +17,7 @@ use sendbox_bootstrap::{
 };
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
 use sendbox_git::GuardPolicyDocument;
+use sendbox_mcp::runtime::RuntimePolicyDocument;
 use sendbox_policy::CommandPolicy;
 use sendbox_runtime::{
     BootstrapDelivery, BoxFuture, CancellationToken, CleanupReport, CommandArgument, CommandSpec,
@@ -59,6 +60,7 @@ pub struct KataProviderConfiguration {
     pub minimum_release_sequence: u64,
     pub command_policy: CommandPolicy,
     pub git_guard_policy: Option<GuardPolicyDocument>,
+    pub mcp_policy: Option<RuntimePolicyDocument>,
     pub workload_uid: u32,
     pub workload_gid: u32,
 }
@@ -1009,6 +1011,7 @@ fn bootstrap_payload(
                 workload_gid: configuration.workload_gid,
                 command_policy: configuration.command_policy.clone(),
                 git_guard_policy: configuration.git_guard_policy.clone(),
+                mcp_policy: configuration.mcp_policy.clone(),
             }),
         },
         secret,
@@ -1370,6 +1373,7 @@ mod tests {
                 log_blocked: true,
             },
             git_guard_policy: None,
+            mcp_policy: None,
             workload_uid: 65_534,
             workload_gid: 65_534,
         }

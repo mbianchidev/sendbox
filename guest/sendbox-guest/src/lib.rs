@@ -9,6 +9,7 @@ pub mod broker;
 pub mod error;
 pub mod git_guard;
 pub mod manifest;
+pub mod mcp_broker;
 #[cfg(feature = "execution-broker")]
 pub mod platform;
 #[cfg(feature = "execution-broker")]

@@ -263,7 +263,7 @@ github:
 observability:
   mcp_inspection:
     enabled: false
-    transports: [stdio, http]
+    transports: [stdio]
     capture_payloads: false
     max_payload_bytes: 16384
     log_path: /var/log/sendbox/mcp-trace.log
@@ -288,6 +288,12 @@ defense in depth against direct API ref mutations or alternate Git clients. Disa
 The native Rust admission engine is connected to persistent Apple and Kata `sendbox run`
 sessions through authenticated guest bootstrap. It does not replace hosting-provider rulesets
 or protect alternate clients and direct GitHub API calls.
+
+Local stdio MCP configuration is validated before launch and must use
+`/run/sendbox-boundary/mcp-broker -- <exact-approved-command>`. Apple and Kata guests install the
+root-owned broker and signed policy before the agent starts; server children receive a cleared,
+signed environment and fixed workspace. Optional stdio observation is written below
+`/var/log/sendbox`. HTTP/SSE inspection and Hyperlight MCP composition fail closed.
 
 ### Configuration Reference
 

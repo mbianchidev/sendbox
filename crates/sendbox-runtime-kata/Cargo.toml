@@ -11,6 +11,7 @@ sendbox-bootstrap = { path = "../sendbox-bootstrap" }
 sendbox-bundle = { path = "../sendbox-bundle" }
 sendbox-core = { path = "../sendbox-core" }
 sendbox-git = { path = "../sendbox-git" }
+sendbox-mcp = { path = "../sendbox-mcp" }
 sendbox-policy = { path = "../sendbox-policy" }
 sendbox-runtime = { path = "../sendbox-runtime" }
 serde.workspace = true

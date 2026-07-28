@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_git::GuardPolicyDocument;
+use sendbox_mcp::runtime::RuntimePolicyDocument;
 use sendbox_policy::CommandPolicy;
 use sendbox_protocol::BootstrapSecret;
 use serde::de::{SeqAccess, Visitor};
@@ -145,6 +146,7 @@ pub struct ExecutionBrokerConfiguration {
     pub workload_gid: u32,
     pub command_policy: CommandPolicy,
     pub git_guard_policy: Option<GuardPolicyDocument>,
+    pub mcp_policy: Option<RuntimePolicyDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +164,8 @@ pub struct ExecutionBrokerBootstrap {
     pub command_policy: CommandPolicy,
     #[serde(default)]
     pub git_guard_policy: Option<GuardPolicyDocument>,
+    #[serde(default)]
+    pub mcp_policy: Option<RuntimePolicyDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +310,7 @@ pub fn encode_bootstrap_document(
                 workload_gid: configuration.workload_gid,
                 command_policy: configuration.command_policy,
                 git_guard_policy: configuration.git_guard_policy,
+                mcp_policy: configuration.mcp_policy,
             })
         })
         .transpose()?;
@@ -363,6 +368,7 @@ fn validate_configuration(
             &broker.workspace_root,
             &broker.system_root,
             broker.git_guard_policy.as_ref(),
+            broker.mcp_policy.as_ref(),
         )?;
     }
     Ok(())
@@ -397,6 +403,7 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
             &broker.workspace_root,
             &broker.system_root,
             broker.git_guard_policy.as_ref(),
+            broker.mcp_policy.as_ref(),
         )?;
     }
     let bootstrap_secret = BootstrapSecret::new(wire.bootstrap_secret.0.as_ref().to_vec())
@@ -428,6 +435,7 @@ fn validate_broker(
     workspace_root: &Path,
     system_root: &Path,
     git_guard_policy: Option<&GuardPolicyDocument>,
+    mcp_policy: Option<&RuntimePolicyDocument>,
 ) -> Result<(), BootstrapError> {
     if workload_uid == 0 || workload_gid == 0 {
         return Err(BootstrapError::Invalid(
@@ -455,6 +463,18 @@ fn validate_broker(
         if policy.selected_workspace != workspace_root {
             return Err(BootstrapError::Invalid(
                 "Git guard workspace must match the execution broker workspace".to_owned(),
+            ));
+        }
+    }
+    if let Some(policy) = mcp_policy {
+        policy.validate().map_err(BootstrapError::Invalid)?;
+        if policy.workspace_root != workspace_root
+            || policy.workload_uid != workload_uid
+            || policy.workload_gid != workload_gid
+        {
+            return Err(BootstrapError::Invalid(
+                "MCP policy workspace and workload identity must match the execution broker"
+                    .to_owned(),
             ));
         }
     }
@@ -534,7 +554,10 @@ const fn default_log_bytes() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use sendbox_policy::Action;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use sendbox_mcp::runtime::RUNTIME_POLICY_SCHEMA_VERSION;
+    use sendbox_policy::{Action, ToolCallPolicy, ToolTransport};
 
     use super::*;
 
@@ -567,7 +590,29 @@ mod tests {
                     log_blocked: true,
                 },
                 git_guard_policy: None,
+                mcp_policy: None,
             }),
+        }
+    }
+
+    fn mcp_policy() -> RuntimePolicyDocument {
+        RuntimePolicyDocument {
+            schema_version: RUNTIME_POLICY_SCHEMA_VERSION,
+            workspace_root: PathBuf::from("/workspace"),
+            workload_uid: 65_534,
+            workload_gid: 65_534,
+            tool_policy: ToolCallPolicy {
+                transport: ToolTransport::Stdio,
+                default_action: Action::Deny,
+                allowlist: vec!["read_*".to_owned()],
+                denylist: Vec::new(),
+                max_frame_bytes: 4096,
+                server_command_patterns: Vec::new(),
+                allowed_server_commands: vec![vec!["/usr/bin/mcp-server".to_owned()]],
+            },
+            fixed_environment: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
+            inherited_environment_keys: BTreeSet::from(["TOKEN".to_owned()]),
+            observation: None,
         }
     }
 
@@ -612,5 +657,37 @@ mod tests {
             .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
         let bytes = serde_json::to_vec(&value).expect("mutated bootstrap");
         assert!(decode_bootstrap_document(&bytes).is_err());
+    }
+
+    #[test]
+    fn authenticated_bootstrap_round_trips_mcp_policy() {
+        let mut configuration = configuration();
+        configuration
+            .execution_broker
+            .as_mut()
+            .expect("execution broker")
+            .mcp_policy = Some(mcp_policy());
+        let encoded = encode_bootstrap_document(configuration, &[4; 32]).expect("encode bootstrap");
+        let decoded = decode_bootstrap_document(&encoded).expect("decode bootstrap");
+        assert_eq!(
+            decoded
+                .execution_broker
+                .expect("execution broker")
+                .mcp_policy,
+            Some(mcp_policy())
+        );
+    }
+
+    #[test]
+    fn authenticated_bootstrap_rejects_mcp_identity_drift() {
+        let mut configuration = configuration();
+        let mut policy = mcp_policy();
+        policy.workload_uid = 1000;
+        configuration
+            .execution_broker
+            .as_mut()
+            .expect("execution broker")
+            .mcp_policy = Some(policy);
+        assert!(encode_bootstrap_document(configuration, &[4; 32]).is_err());
     }
 }

@@ -9,6 +9,7 @@ description = "Fail-closed MCP framing, policy, stdio brokering, project validat
 
 [dependencies]
 async-trait.workspace = true
+libc.workspace = true
 sendbox-config = { path = "../sendbox-config" }
 sendbox-core = { path = "../sendbox-core" }
 sendbox-policy = { path = "../sendbox-policy" }

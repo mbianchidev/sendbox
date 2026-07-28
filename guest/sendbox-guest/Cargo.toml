@@ -15,11 +15,13 @@ execution-broker = ["dep:sendbox-exec", "dep:sendbox-policy"]
 clap.workspace = true
 ed25519-dalek.workspace = true
 getrandom = "0.3.4"
+libc.workspace = true
 rustix.workspace = true
 sendbox-bootstrap = { path = "../../crates/sendbox-bootstrap" }
 sendbox-core = { path = "../../crates/sendbox-core" }
 sendbox-exec = { path = "../../crates/sendbox-exec", optional = true }
 sendbox-git = { path = "../../crates/sendbox-git" }
+sendbox-mcp = { path = "../../crates/sendbox-mcp" }
 sendbox-policy = { path = "../../crates/sendbox-policy", optional = true }
 sendbox-protocol = { path = "../../crates/sendbox-protocol" }
 sendbox-secrets = { path = "../../crates/sendbox-secrets" }

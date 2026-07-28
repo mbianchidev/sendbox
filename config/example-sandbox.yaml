@@ -127,7 +127,7 @@ policy:
     tool_calls:
       # Secure enforcement currently supports newline-framed stdio MCP only.
       # Prefix each configured server command with:
-      #   /run/sendbox-boundary/mcp-proxy --
+      #   /run/sendbox-boundary/mcp-broker --
       transport: stdio
       default_action: deny
       allowlist:
