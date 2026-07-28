@@ -538,7 +538,7 @@ fn run(
     // All pump threads start only after clone3, so the single-thread guard
     // above still holds for the raw child branch.
     let mut readers = Vec::new();
-    let writer_done = Arc::new(AtomicBool::new(false));
+    let terminal_io_done = Arc::new(AtomicBool::new(false));
     let mut terminal_writer = None;
     if let Some(device) = terminal_device {
         let writer = match TerminalWriter::new(device, request.stdin.uses_flow_control()) {
@@ -562,6 +562,7 @@ fn run(
             primary,
             StreamKind::Stdout,
             sender.clone(),
+            Arc::clone(&terminal_io_done),
         ));
         if let Some(stderr) = writer.devices.stderr_primary() {
             let primary = match stderr.try_clone() {
@@ -578,6 +579,7 @@ fn run(
                 primary,
                 StreamKind::Stderr,
                 sender.clone(),
+                Arc::clone(&terminal_io_done),
             ));
         }
         if let Some(queue) = terminal_input {
@@ -585,7 +587,7 @@ fn run(
                 writer,
                 queue,
                 cancellation.clone(),
-                Arc::clone(&writer_done),
+                Arc::clone(&terminal_io_done),
                 sender.clone(),
                 request.stdin.uses_flow_control(),
             ));
@@ -661,7 +663,7 @@ fn run(
         Duration::from_millis(250),
     );
     drop(receiver);
-    writer_done.store(true, Ordering::Release);
+    terminal_io_done.store(true, Ordering::Release);
     if let Some(writer) = terminal_writer {
         let _ = writer.join();
     }
@@ -763,11 +765,12 @@ fn spawn_terminal_reader(
     descriptor: OwnedFd,
     stream: StreamKind,
     sender: SyncSender<LauncherEvent>,
+    done: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut file = File::from(descriptor);
         let mut buffer = vec![0u8; OUTPUT_CHUNK_BYTES];
-        loop {
+        while !done.load(Ordering::Acquire) {
             match file.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(length) => {
@@ -783,7 +786,7 @@ fn spawn_terminal_reader(
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if !wait_readable(&file) {
+                    if !wait_readable(&file, &done) {
                         break;
                     }
                 }
@@ -793,19 +796,25 @@ fn spawn_terminal_reader(
     })
 }
 
-fn wait_readable(primary: &File) -> bool {
+fn wait_readable(primary: &File, done: &AtomicBool) -> bool {
     let primary = primary.as_fd();
     let mut fds = [rustix::event::PollFd::new(
         &primary,
         rustix::event::PollFlags::IN,
     )];
-    loop {
-        match rustix::event::poll(&mut fds, None) {
+    let timeout = rustix::event::Timespec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
+    while !done.load(Ordering::Acquire) {
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+            Ok(0) => {}
             Ok(_) => return true,
             Err(rustix::io::Errno::INTR) => {}
             Err(_) => return false,
         }
     }
+    false
 }
 
 fn receive_output(receiver: &Receiver<LauncherEvent>) -> Option<LauncherEvent> {
