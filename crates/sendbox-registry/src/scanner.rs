@@ -41,9 +41,10 @@ pub(crate) fn normalize_npm_manifest(
                 ));
             }
             if entry.size > limits.max_entry_bytes {
-                return Err(RegistryError::Inspection(
-                    "npm package manifest exceeds the entry limit".to_owned(),
-                ));
+                return Err(RegistryError::Finding {
+                    kind: PackageFindingKind::OversizedEntry,
+                    message: "npm package manifest exceeds the entry limit".to_owned(),
+                });
             }
             let capacity = usize::try_from(entry.size).map_err(|_| {
                 RegistryError::Inspection("npm package manifest is too large".to_owned())
@@ -56,9 +57,10 @@ pub(crate) fn normalize_npm_manifest(
                     RegistryError::Inspection(format!("read package.json: {error}"))
                 })?;
             if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limits.max_entry_bytes {
-                return Err(RegistryError::Inspection(
-                    "npm package manifest exceeds the entry limit".to_owned(),
-                ));
+                return Err(RegistryError::Finding {
+                    kind: PackageFindingKind::OversizedEntry,
+                    message: "npm package manifest exceeds the entry limit".to_owned(),
+                });
             }
             manifest = Some(parse_manifest(&bytes, descriptor)?);
         }
@@ -108,10 +110,13 @@ pub(crate) fn inspect_npm_archive(
             return Ok(());
         }
         let remaining = limits.max_source_scan_bytes.saturating_sub(source_bytes);
-        if remaining == 0 {
-            return Ok(());
+        if entry.size > remaining {
+            return Err(RegistryError::Finding {
+                kind: PackageFindingKind::UnsupportedContent,
+                message: "npm source scan exceeds the configured byte limit".to_owned(),
+            });
         }
-        let maximum = entry.size.min(remaining);
+        let maximum = entry.size;
         let capacity = usize::try_from(maximum).map_err(|_| {
             RegistryError::Inspection("source scan byte limit is too large".to_owned())
         })?;
@@ -161,9 +166,10 @@ pub(crate) fn inspect_npm_archive(
     findings.dedup();
     let maximum = usize::try_from(limits.max_report_findings).unwrap_or(usize::MAX);
     if findings.len() > maximum {
-        return Err(RegistryError::Inspection(
-            "npm findings exceed the report limit".to_owned(),
-        ));
+        return Err(RegistryError::Finding {
+            kind: PackageFindingKind::ScannerFailure,
+            message: "npm findings exceed the report limit".to_owned(),
+        });
     }
     Ok(findings)
 }
@@ -286,9 +292,10 @@ where
         RegistryError::Inspection(format!("inspect archive {}: {error}", artifact.display()))
     })?;
     if metadata.len() > limits.max_download_bytes {
-        return Err(RegistryError::Inspection(
-            "compressed archive exceeds the download limit".to_owned(),
-        ));
+        return Err(RegistryError::Finding {
+            kind: PackageFindingKind::OversizedEntry,
+            message: "compressed archive exceeds the download limit".to_owned(),
+        });
     }
     let file = File::open(artifact).map_err(|error| {
         RegistryError::Inspection(format!("open archive {}: {error}", artifact.display()))
@@ -298,7 +305,7 @@ where
     let mut archive = Archive::new(bounded);
     let entries = archive
         .entries()
-        .map_err(|error| RegistryError::Inspection(format!("read tar archive: {error}")))?;
+        .map_err(|error| archive_error("read tar archive", error))?;
     let mut count = 0_u32;
     for entry in entries {
         check_deadline(deadline)?;
@@ -306,17 +313,18 @@ where
             RegistryError::Inspection("archive entry count overflowed".to_owned())
         })?;
         if count > limits.max_entries {
-            return Err(RegistryError::Inspection(
-                "archive exceeds the configured entry count".to_owned(),
-            ));
+            return Err(RegistryError::Finding {
+                kind: PackageFindingKind::UnsupportedContent,
+                message: "archive exceeds the configured entry count".to_owned(),
+            });
         }
-        let mut entry =
-            entry.map_err(|error| RegistryError::Inspection(format!("read tar entry: {error}")))?;
+        let mut entry = entry.map_err(|error| archive_error("read tar entry", error))?;
         let path_bytes = entry.path_bytes();
         if path_bytes.len() > usize::try_from(limits.max_path_bytes).unwrap_or(usize::MAX) {
-            return Err(RegistryError::Inspection(
-                "archive path exceeds the configured byte limit".to_owned(),
-            ));
+            return Err(RegistryError::Finding {
+                kind: PackageFindingKind::UnsupportedContent,
+                message: "archive path exceeds the configured byte limit".to_owned(),
+            });
         }
         let path = std::str::from_utf8(path_bytes.as_ref())
             .map_err(|_| RegistryError::Unsupported("archive path is not UTF-8".to_owned()))?
@@ -386,10 +394,16 @@ fn parse_manifest(
         .map_err(|error| RegistryError::Inspection(format!("decode package.json: {error}")))?;
     if manifest.name != descriptor.identity.name || manifest.version != descriptor.identity.version
     {
-        return Err(RegistryError::Verification(format!(
-            "package.json identity {}@{} does not match requested {}@{}",
-            manifest.name, manifest.version, descriptor.identity.name, descriptor.identity.version
-        )));
+        return Err(RegistryError::Finding {
+            kind: PackageFindingKind::IdentityMismatch,
+            message: format!(
+                "package.json identity {}@{} does not match requested {}@{}",
+                manifest.name,
+                manifest.version,
+                descriptor.identity.name,
+                descriptor.identity.version
+            ),
+        });
     }
     let executable_paths = match manifest.bin {
         None => Vec::new(),
@@ -553,6 +567,20 @@ fn check_deadline(deadline: Instant) -> RegistryResult<()> {
         ))
     } else {
         Ok(())
+    }
+}
+
+fn archive_error(action: &str, error: io::Error) -> RegistryError {
+    if error
+        .to_string()
+        .contains("decompressed archive exceeds byte limit")
+    {
+        RegistryError::Finding {
+            kind: PackageFindingKind::DecompressionLimit,
+            message: "decompressed archive exceeds the configured byte limit".to_owned(),
+        }
+    } else {
+        RegistryError::Inspection(format!("{action}: {error}"))
     }
 }
 

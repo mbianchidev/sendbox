@@ -47,10 +47,12 @@ pub struct PackageFinding {
 pub struct PackageVerdictRecord {
     pub identity: PackageIdentity,
     pub upstream: String,
-    pub artifact_digest: ArtifactDigest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_digest: Option<ArtifactDigest>,
     pub policy_digest: String,
     pub scanner_version: String,
-    pub verification: VerificationEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationEvidence>,
     pub findings: Vec<PackageFinding>,
     pub verdict: Verdict,
     pub cache: CacheOutcome,
@@ -81,12 +83,36 @@ impl PackageSecurityReport {
         }
     }
 
-    pub fn validate(&self, maximum_findings: usize) -> Result<(), String> {
+    #[must_use]
+    pub const fn enabled() -> Self {
+        Self {
+            schema_version: REGISTRY_REPORT_SCHEMA_VERSION,
+            proxy_enabled: true,
+            records: Vec::new(),
+            allowed: 0,
+            denied: 0,
+            quarantined: 0,
+        }
+    }
+
+    pub fn push(&mut self, record: PackageVerdictRecord) {
+        match record.verdict {
+            Verdict::Allow => self.allowed = self.allowed.saturating_add(1),
+            Verdict::Deny => self.denied = self.denied.saturating_add(1),
+            Verdict::Quarantine => self.quarantined = self.quarantined.saturating_add(1),
+        }
+        self.records.push(record);
+    }
+
+    pub fn validate(&self, maximum_records: usize, maximum_findings: usize) -> Result<(), String> {
         if self.schema_version != REGISTRY_REPORT_SCHEMA_VERSION {
             return Err(format!(
                 "unsupported package report schema {}",
                 self.schema_version
             ));
+        }
+        if self.records.len() > maximum_records {
+            return Err("package report exceeds the configured record limit".to_owned());
         }
         let mut allowed = 0_u32;
         let mut denied = 0_u32;

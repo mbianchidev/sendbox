@@ -10,8 +10,8 @@ use p256::ecdsa::signature::Verifier as _;
 use p256::ecdsa::{Signature, VerifyingKey};
 use p256::pkcs8::DecodePublicKey as _;
 use sendbox_policy::{
-    EvidenceRequirement, PackageAnalysisLimits, PackageEcosystem, PackageRegistryPolicy,
-    PackageSupplyChainPolicy,
+    EvidenceRequirement, PackageAnalysisLimits, PackageEcosystem, PackageFindingKind,
+    PackageRegistryPolicy, PackageSupplyChainPolicy,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -113,7 +113,7 @@ impl NpmAdapter {
         &self.package_policy.limits
     }
 
-    pub async fn fetch_trust_metadata(
+    async fn resolve_trust_metadata(
         &self,
         descriptor: &ArtifactDescriptor,
         upstream: &dyn UpstreamClient,
@@ -421,6 +421,14 @@ impl RegistryAdapter for NpmAdapter {
             .await
     }
 
+    async fn fetch_trust_metadata(
+        &self,
+        descriptor: &ArtifactDescriptor,
+        upstream: &dyn UpstreamClient,
+    ) -> RegistryResult<TrustMetadata> {
+        self.resolve_trust_metadata(descriptor, upstream).await
+    }
+
     async fn verify_artifact(
         &self,
         descriptor: &ArtifactDescriptor,
@@ -429,22 +437,30 @@ impl RegistryAdapter for NpmAdapter {
         provenance: &dyn PackageProvenanceVerifier,
     ) -> RegistryResult<VerificationEvidence> {
         let computed = compute_digests(artifact)?;
-        let verified_integrity = verify_integrity(descriptor, &computed)?;
-        let signature_key_ids = verify_registry_signatures(descriptor, &trust.registry_keys)?;
+        let verified_integrity = verify_integrity(descriptor, &computed)
+            .map_err(|error| error.with_finding(PackageFindingKind::IntegrityFailure))?;
+        let signature_key_ids = verify_registry_signatures(descriptor, &trust.registry_keys)
+            .map_err(|error| error.with_finding(PackageFindingKind::SignatureFailure))?;
         if self.registry_policy.signature == EvidenceRequirement::Required
             && signature_key_ids.is_empty()
         {
-            return Err(RegistryError::Verification(format!(
-                "{}@{} has no required registry signature",
-                descriptor.identity.name, descriptor.identity.version
-            )));
+            return Err(RegistryError::Finding {
+                kind: PackageFindingKind::SignatureFailure,
+                message: format!(
+                    "{}@{} has no required registry signature",
+                    descriptor.identity.name, descriptor.identity.version
+                ),
+            });
         }
         let provenance_subjects = match descriptor.provenance.as_ref() {
             None if self.registry_policy.provenance == EvidenceRequirement::Required => {
-                return Err(RegistryError::Verification(format!(
-                    "{}@{} has no required provenance",
-                    descriptor.identity.name, descriptor.identity.version
-                )));
+                return Err(RegistryError::Finding {
+                    kind: PackageFindingKind::ProvenanceFailure,
+                    message: format!(
+                        "{}@{} has no required provenance",
+                        descriptor.identity.name, descriptor.identity.version
+                    ),
+                });
             }
             None => Vec::new(),
             Some(_) => {
@@ -458,7 +474,8 @@ impl RegistryAdapter for NpmAdapter {
                         bundle,
                         &trust.package_trust_root,
                     )
-                    .await?
+                    .await
+                    .map_err(|error| error.with_finding(PackageFindingKind::ProvenanceFailure))?
             }
         };
         Ok(VerificationEvidence {

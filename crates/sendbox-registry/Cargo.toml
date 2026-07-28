@@ -11,9 +11,14 @@ async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 flate2.workspace = true
+fs2.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
+libc.workspace = true
 p256.workspace = true
 reqwest.workspace = true
+rustix.workspace = true
+sendbox-config = { path = "../sendbox-config" }
 sendbox-policy = { path = "../sendbox-policy" }
 sendbox-security = { path = "../sendbox-security" }
 serde.workspace = true
@@ -23,7 +28,7 @@ sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["fs", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "net", "rt-multi-thread", "sync"] }
 tokio-util.workspace = true
 url.workspace = true
 zeroize.workspace = true

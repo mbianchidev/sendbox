@@ -98,6 +98,12 @@ pub trait RegistryAdapter: Send + Sync {
         upstream: &dyn UpstreamClient,
     ) -> RegistryResult<u64>;
 
+    async fn fetch_trust_metadata(
+        &self,
+        descriptor: &ArtifactDescriptor,
+        upstream: &dyn UpstreamClient,
+    ) -> RegistryResult<TrustMetadata>;
+
     async fn verify_artifact(
         &self,
         descriptor: &ArtifactDescriptor,

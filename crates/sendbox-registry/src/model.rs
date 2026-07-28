@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use sendbox_policy::PackageEcosystem;
+use sendbox_policy::PackageFindingKind;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -20,9 +21,35 @@ pub enum RegistryError {
     Timeout(String),
     #[error("unsupported package content: {0}")]
     Unsupported(String),
+    #[error("package policy finding {kind:?}: {message}")]
+    Finding {
+        kind: PackageFindingKind,
+        message: String,
+    },
 }
 
 pub type RegistryResult<T> = Result<T, RegistryError>;
+
+impl RegistryError {
+    #[must_use]
+    pub fn with_finding(self, kind: PackageFindingKind) -> Self {
+        match self {
+            Self::Finding { .. } => self,
+            error => Self::Finding {
+                kind,
+                message: error.to_string(),
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn finding_kind(&self) -> Option<PackageFindingKind> {
+        match self {
+            Self::Finding { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

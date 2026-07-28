@@ -343,6 +343,7 @@ impl PackageFindingKind {
         matches!(
             self,
             Self::DecompressionLimit
+                | Self::OversizedEntry
                 | Self::IntegrityFailure
                 | Self::IdentityMismatch
                 | Self::SignatureFailure
