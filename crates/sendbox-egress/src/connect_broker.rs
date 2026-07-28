@@ -87,6 +87,25 @@ impl Default for ConnectBrokerConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct ConnectAuthorizationState {
+    authorizations: Arc<AuthorizationCache>,
+    reservations: Arc<OriginReservations>,
+}
+
+impl ConnectAuthorizationState {
+    #[must_use]
+    pub fn new(
+        authorizations: Arc<AuthorizationCache>,
+        reservations: Arc<OriginReservations>,
+    ) -> Self {
+        Self {
+            authorizations,
+            reservations,
+        }
+    }
+}
+
 pub struct ConnectBroker<R: UpstreamResolver> {
     policy: Arc<PolicyEngine>,
     resolver: Arc<R>,
@@ -110,40 +129,38 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         audit: Arc<dyn AuditSink>,
         config: ConnectBrokerConfig,
     ) -> Arc<Self> {
-        Self::new_with_reservations(
+        Self::new_with_authorization_state(
             policy,
             resolver,
-            authorizations,
+            ConnectAuthorizationState::new(authorizations, Arc::new(OriginReservations::default())),
             guard,
             dialer,
             audit,
             config,
-            Arc::new(OriginReservations::default()),
         )
     }
 
     #[must_use]
-    pub fn new_with_reservations(
+    pub fn new_with_authorization_state(
         policy: Arc<PolicyEngine>,
         resolver: Arc<R>,
-        authorizations: Arc<AuthorizationCache>,
+        authorization_state: ConnectAuthorizationState,
         guard: Arc<DnsGuard>,
         dialer: Arc<dyn Dialer>,
         audit: Arc<dyn AuditSink>,
         config: ConnectBrokerConfig,
-        reservations: Arc<OriginReservations>,
     ) -> Arc<Self> {
         let permits = Arc::new(Semaphore::new(policy.max_concurrent_connections() as usize));
         Arc::new(Self {
             policy,
             resolver,
-            authorizations,
+            authorizations: authorization_state.authorizations,
             guard,
             dialer,
             audit,
             config,
             permits,
-            reservations,
+            reservations: authorization_state.reservations,
         })
     }
 

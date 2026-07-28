@@ -4004,13 +4004,15 @@ mod tests {
         )
         .await;
         assert_eq!(expired.status, StatusCode::BAD_REQUEST);
-        let events = audit.0.lock().unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|event| { event.method == "http/request" && event.outcome == "denied" })
-        );
-        assert!(events.iter().any(|event| event.method == "session/get"));
+        {
+            let events = audit.0.lock().unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| { event.method == "http/request" && event.outcome == "denied" })
+            );
+            assert!(events.iter().any(|event| event.method == "session/get"));
+        }
 
         cancellation.cancel();
         server.await.unwrap();

@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audit::AuditSink;
 use crate::authorization::AuthorizationCache;
-use crate::connect_broker::{ConnectBroker, ConnectBrokerConfig};
+use crate::connect_broker::{ConnectAuthorizationState, ConnectBroker, ConnectBrokerConfig};
 use crate::dialer::Dialer;
 use crate::dns_broker::{DnsBroker, DnsBrokerConfig};
 use crate::dns_budget::DnsGuard;
@@ -169,15 +169,17 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
         listeners: GatewayListeners,
         cancel: CancellationToken,
     ) -> io::Result<()> {
-        let connect_broker = ConnectBroker::new_with_reservations(
+        let connect_broker = ConnectBroker::new_with_authorization_state(
             Arc::clone(&self.engine),
             Arc::clone(&self.resolver),
-            Arc::clone(&self.authorizations),
+            ConnectAuthorizationState::new(
+                Arc::clone(&self.authorizations),
+                Arc::clone(&self.config.origin_reservations),
+            ),
             Arc::clone(&self.guard),
             Arc::clone(&self.dialer),
             Arc::clone(&self.audit),
             self.config.connect.clone(),
-            Arc::clone(&self.config.origin_reservations),
         );
 
         let mut tasks = Vec::new();

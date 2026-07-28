@@ -740,6 +740,7 @@ fn validate_mcp_gateway_configuration(
         })
         .transpose()?
         .unwrap_or_default();
+    let remote_mcp_active = !remote.is_empty();
     let expected_origins = mcp
         .map(|policy| policy.tool_policy.remote_origins())
         .transpose()
@@ -748,8 +749,8 @@ fn validate_mcp_gateway_configuration(
         .into_iter()
         .collect::<Vec<_>>();
     if egress.reserved_mcp_origins != expected_origins
-        || egress.mcp_gateway_port.is_some() != !remote.is_empty()
-        || egress.deny_direct_ip != !remote.is_empty()
+        || egress.mcp_gateway_port.is_some() != remote_mcp_active
+        || egress.deny_direct_ip != remote_mcp_active
     {
         return Err(GuestError::Runtime(
             "signed egress MCP reservations do not match the MCP policy".to_owned(),
