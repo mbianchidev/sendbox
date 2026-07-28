@@ -73,6 +73,17 @@ pub struct GuestLaunchRequest<'a> {
     pub command: &'a GuestCommand,
     pub environment: &'a [EnvironmentIntent],
     pub secrets: Vec<GuestSecretEnvelope<'a>>,
+    /// Present only for interactive runs; selects the interactive launch
+    /// operation and the workload's initial terminal size.
+    pub terminal: Option<GuestTerminalSize>,
+}
+
+/// Initial terminal geometry and type for an interactive launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GuestTerminalSize {
+    pub columns: u16,
+    pub rows: u16,
+    pub term: String,
 }
 
 impl fmt::Debug for GuestLaunchRequest<'_> {
@@ -82,6 +93,7 @@ impl fmt::Debug for GuestLaunchRequest<'_> {
             .field("command", &self.command.program)
             .field("environment_entries", &self.environment.len())
             .field("secret_envelopes", &self.secrets.len())
+            .field("terminal", &self.terminal)
             .finish()
     }
 }
@@ -160,6 +172,67 @@ pub trait GuestExecution: Send {
         &'a mut self,
         cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), AgentError>>;
+
+    /// Forwards one host terminal command to the guest.
+    ///
+    /// The default rejects the command, so a transport that never negotiated
+    /// an interactive launch fails loudly instead of silently discarding
+    /// keystrokes.
+    fn send_terminal<'a>(
+        &'a mut self,
+        command: HostTerminalCommand,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        let _ = (command, cancellation);
+        Box::pin(async {
+            Err(AgentError::Guest(
+                "this execution does not accept terminal input".to_owned(),
+            ))
+        })
+    }
+}
+
+/// One host-originated terminal command.
+///
+/// Input bytes may contain pasted credentials, so [`fmt::Debug`] reports only
+/// a length.
+#[derive(Clone, PartialEq, Eq)]
+pub enum HostTerminalCommand {
+    Input(Vec<u8>),
+    InputEof,
+    Resize { columns: u16, rows: u16 },
+}
+
+impl fmt::Debug for HostTerminalCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(bytes) => formatter
+                .debug_tuple("Input")
+                .field(&format_args!("<{} bytes>", bytes.len()))
+                .finish(),
+            Self::InputEof => formatter.write_str("InputEof"),
+            Self::Resize { columns, rows } => formatter
+                .debug_struct("Resize")
+                .field("columns", columns)
+                .field("rows", rows)
+                .finish(),
+        }
+    }
+}
+
+/// Source of host terminal commands for an interactive run.
+pub trait TerminalSource: Send + Sync {
+    fn next_command<'a>(&'a self) -> BoxFuture<'a, Option<HostTerminalCommand>>;
+}
+
+/// Terminal source for headless runs, which never produce commands.
+#[derive(Debug, Default)]
+pub struct NoTerminal;
+
+impl TerminalSource for NoTerminal {
+    fn next_command<'a>(&'a self) -> BoxFuture<'a, Option<HostTerminalCommand>> {
+        Box::pin(std::future::pending())
+    }
 }
 
 pub trait OutputSink: Send + Sync {

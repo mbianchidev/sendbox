@@ -78,6 +78,10 @@ pub struct AgentRequest {
     pub mounts: Vec<MountIntent>,
     pub bootstrap_reference: SecretReference,
     pub readiness_timeout: Duration,
+    /// Requests a pseudoterminal for the workload and host keystroke
+    /// forwarding. Runtimes that cannot provide one are rejected during
+    /// compilation, before anything is created or started.
+    pub interactive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +104,7 @@ pub struct RunPlan {
     required_runtime_capabilities: RuntimeCapabilities,
     required_guest_capabilities: CapabilitySet,
     policy_digest: [u8; 32],
+    interactive: bool,
 }
 
 impl RunPlan {
@@ -129,12 +134,16 @@ impl RunPlan {
         };
         let endpoint_kind = select_endpoint(available)?;
         let transport_capability = endpoint_capability(endpoint_kind);
-        let required_runtime_capabilities = RuntimeCapabilities::new([
+        let mut required_capabilities = vec![
             RuntimeCapability::Lifecycle,
             RuntimeCapability::TransportProvisioning,
             RuntimeCapability::BrokeredExec,
             transport_capability,
-        ]);
+        ];
+        if request.interactive {
+            required_capabilities.push(RuntimeCapability::InteractiveTerminal);
+        }
+        let required_runtime_capabilities = RuntimeCapabilities::new(required_capabilities);
         let missing = required_runtime_capabilities.missing_from(available);
         if !missing.is_empty() {
             return Err(AgentError::RuntimeCapabilities(format_capabilities(
@@ -196,7 +205,14 @@ impl RunPlan {
             required_runtime_capabilities,
             required_guest_capabilities: agent_host_required_capabilities(),
             policy_digest,
+            interactive: request.interactive,
         })
+    }
+
+    /// Whether this plan requests a pseudoterminal for the workload.
+    #[must_use]
+    pub const fn interactive(&self) -> bool {
+        self.interactive
     }
 
     #[must_use]

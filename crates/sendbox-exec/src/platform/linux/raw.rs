@@ -41,6 +41,7 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const CHILD_STAGE_SETUP: u8 = 1;
 const CHILD_STAGE_SECCOMP: u8 = 2;
 const CHILD_STAGE_EXEC: u8 = 3;
+const CHILD_STAGE_TERMINAL: u8 = 4;
 
 #[repr(C)]
 struct OpenHow {
@@ -73,18 +74,32 @@ struct ChildExec<'a> {
     capability_last: u32,
     child_filter: &'a [libc::sock_filter],
     close_fds: &'a [RawFd],
-    null_fd: RawFd,
-    stdout_pipe: [RawFd; 2],
-    stderr_pipe: [RawFd; 2],
+    stdio: ChildStdio,
     error_pipe: [RawFd; 2],
+}
+
+/// How the post-clone child wires fds 0/1/2.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ChildStdio {
+    /// Headless: `/dev/null` on stdin, separate pipes for stdout and stderr.
+    Pipes {
+        null_fd: RawFd,
+        stdout_pipe: [RawFd; 2],
+        stderr_pipe: [RawFd; 2],
+    },
+    /// Interactive: a pseudoterminal secondary becomes the controlling
+    /// terminal for all three descriptors.
+    Terminal { secondary_fd: RawFd },
 }
 
 /// Parent-owned descriptors created atomically with the cgroup-placed child.
 #[derive(Debug)]
 pub(crate) struct SpawnedProcess {
     pub(crate) pidfd: OwnedFd,
-    pub(crate) stdout: OwnedFd,
-    pub(crate) stderr: OwnedFd,
+    /// Present only for [`ChildStdio::Pipes`]; terminal workloads report their
+    /// merged output on the pseudoterminal primary held by the caller.
+    pub(crate) stdout: Option<OwnedFd>,
+    pub(crate) stderr: Option<OwnedFd>,
     pub(crate) exec_error: OwnedFd,
 }
 
@@ -164,6 +179,10 @@ pub(crate) fn identity(fd: RawFd) -> Result<FileIdentity, PlatformError> {
 
 /// Creates a child directly in `cgroup_fd` and returns its pidfd and output
 /// descriptors. No fork/spawn fallback exists.
+///
+/// `pty_secondary`, when present, is a pseudoterminal secondary allocated by
+/// the caller *before* the seccomp filter was installed; the child makes it its
+/// controlling terminal instead of creating stdout/stderr pipes.
 pub(crate) fn clone3_exec(
     cgroup_fd: RawFd,
     executable_fd: RawFd,
@@ -171,6 +190,7 @@ pub(crate) fn clone3_exec(
     argv: &[CString],
     environment: &[CString],
     run_as: Option<ExecutionUser>,
+    pty_secondary: Option<RawFd>,
 ) -> Result<SpawnedProcess, PlatformError> {
     if argv.is_empty() {
         return Err(PlatformError::io(
@@ -190,32 +210,28 @@ pub(crate) fn clone3_exec(
     let child_filter = child_clone3_filter()?;
     let capability_last = read_capability_last()?;
 
-    let stdout_pipe = create_pipe()?;
-    let stderr_pipe = create_pipe()?;
     let error_pipe = create_pipe()?;
-    let null_fd = match open_dev_null() {
-        Ok(fd) => fd,
+    let stdio = match prepare_child_stdio(pty_secondary) {
+        Ok(stdio) => stdio,
         Err(error) => {
-            close_pipe(stdout_pipe);
-            close_pipe(stderr_pipe);
             close_pipe(error_pipe);
             return Err(error);
         }
     };
-    let close_fds = match collect_child_close_fds(&[
-        executable_fd,
-        cwd_fd,
-        stdout_pipe[1],
-        stderr_pipe[1],
-        error_pipe[1],
-        null_fd,
-    ]) {
+    let mut preserved = vec![executable_fd, cwd_fd, error_pipe[1]];
+    match stdio {
+        ChildStdio::Pipes {
+            null_fd,
+            stdout_pipe,
+            stderr_pipe,
+        } => preserved.extend_from_slice(&[null_fd, stdout_pipe[1], stderr_pipe[1]]),
+        ChildStdio::Terminal { secondary_fd } => preserved.push(secondary_fd),
+    }
+    let close_fds = match collect_child_close_fds(&preserved) {
         Ok(fds) => fds,
         Err(error) => {
-            close_pipe(stdout_pipe);
-            close_pipe(stderr_pipe);
             close_pipe(error_pipe);
-            close_raw(null_fd);
+            release_child_stdio(stdio);
             return Err(error);
         }
     };
@@ -245,10 +261,8 @@ pub(crate) fn clone3_exec(
         )
     };
     if result < 0 {
-        close_pipe(stdout_pipe);
-        close_pipe(stderr_pipe);
         close_pipe(error_pipe);
-        close_raw(null_fd);
+        release_child_stdio(stdio);
         let source = io::Error::last_os_error();
         if matches!(
             source.raw_os_error(),
@@ -273,22 +287,36 @@ pub(crate) fn clone3_exec(
             capability_last,
             child_filter: &child_filter,
             close_fds: &close_fds,
-            null_fd,
-            stdout_pipe,
-            stderr_pipe,
+            stdio,
             error_pipe,
         });
     }
 
     // Parent branch. Close child-owned pipe ends before wrapping parent ends.
-    close_raw(stdout_pipe[1]);
-    close_raw(stderr_pipe[1]);
     close_raw(error_pipe[1]);
-    close_raw(null_fd);
+    let (stdout, stderr) = match stdio {
+        ChildStdio::Pipes {
+            null_fd,
+            stdout_pipe,
+            stderr_pipe,
+        } => {
+            close_raw(stdout_pipe[1]);
+            close_raw(stderr_pipe[1]);
+            close_raw(null_fd);
+            (Some(stdout_pipe[0]), Some(stderr_pipe[0]))
+        }
+        // The caller owns the secondary and closes it once clone3 returns, so
+        // the primary reports EOF when the workload exits.
+        ChildStdio::Terminal { .. } => (None, None),
+    };
     if pidfd < 0 {
-        close_raw(stdout_pipe[0]);
-        close_raw(stderr_pipe[0]);
         close_raw(error_pipe[0]);
+        if let Some(fd) = stdout {
+            close_raw(fd);
+        }
+        if let Some(fd) = stderr {
+            close_raw(fd);
+        }
         return Err(UnsupportedKernel::new(
             KernelPrimitive::Pidfd,
             None,
@@ -299,10 +327,51 @@ pub(crate) fn clone3_exec(
     // SAFETY: these descriptors are unique and owned by this parent branch.
     Ok(SpawnedProcess {
         pidfd: unsafe { OwnedFd::from_raw_fd(pidfd) },
-        stdout: unsafe { OwnedFd::from_raw_fd(stdout_pipe[0]) },
-        stderr: unsafe { OwnedFd::from_raw_fd(stderr_pipe[0]) },
+        stdout: stdout.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
+        stderr: stderr.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
         exec_error: unsafe { OwnedFd::from_raw_fd(error_pipe[0]) },
     })
+}
+
+fn prepare_child_stdio(pty_secondary: Option<RawFd>) -> Result<ChildStdio, PlatformError> {
+    if let Some(secondary_fd) = pty_secondary {
+        return Ok(ChildStdio::Terminal { secondary_fd });
+    }
+    let stdout_pipe = create_pipe()?;
+    let stderr_pipe = match create_pipe() {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            close_pipe(stdout_pipe);
+            return Err(error);
+        }
+    };
+    match open_dev_null() {
+        Ok(null_fd) => Ok(ChildStdio::Pipes {
+            null_fd,
+            stdout_pipe,
+            stderr_pipe,
+        }),
+        Err(error) => {
+            close_pipe(stdout_pipe);
+            close_pipe(stderr_pipe);
+            Err(error)
+        }
+    }
+}
+
+/// Releases only descriptors this module created; the pseudoterminal secondary
+/// stays owned by the caller.
+fn release_child_stdio(stdio: ChildStdio) {
+    if let ChildStdio::Pipes {
+        null_fd,
+        stdout_pipe,
+        stderr_pipe,
+    } = stdio
+    {
+        close_pipe(stdout_pipe);
+        close_pipe(stderr_pipe);
+        close_raw(null_fd);
+    }
 }
 
 pub(crate) fn pidfd_send_signal(pidfd: RawFd, signal: i32) -> Result<(), PlatformError> {
@@ -624,14 +693,37 @@ fn child_exec(context: ChildExec<'_>) -> ! {
     // SAFETY: only async-signal-safe syscalls are used in this post-clone
     // branch. All pointers and descriptors were prepared before clone3.
     unsafe {
-        libc::close(context.stdout_pipe[0]);
-        libc::close(context.stderr_pipe[0]);
         libc::close(context.error_pipe[0]);
-        if libc::dup2(context.null_fd, libc::STDIN_FILENO) < 0
-            || libc::dup2(context.stdout_pipe[1], libc::STDOUT_FILENO) < 0
-            || libc::dup2(context.stderr_pipe[1], libc::STDERR_FILENO) < 0
-            || libc::fchdir(context.cwd_fd) < 0
-        {
+        match context.stdio {
+            ChildStdio::Pipes {
+                null_fd,
+                stdout_pipe,
+                stderr_pipe,
+            } => {
+                libc::close(stdout_pipe[0]);
+                libc::close(stderr_pipe[0]);
+                if libc::dup2(null_fd, libc::STDIN_FILENO) < 0
+                    || libc::dup2(stdout_pipe[1], libc::STDOUT_FILENO) < 0
+                    || libc::dup2(stderr_pipe[1], libc::STDERR_FILENO) < 0
+                {
+                    child_fail(context.error_pipe[1], CHILD_STAGE_SETUP);
+                }
+            }
+            ChildStdio::Terminal { secondary_fd } => {
+                // A controlling terminal can only be claimed by a session
+                // leader that does not already have one, so setsid must come
+                // first and TIOCSCTTY before any privilege drop.
+                if libc::setsid() < 0
+                    || libc::ioctl(secondary_fd, libc::TIOCSCTTY, 0) < 0
+                    || libc::dup2(secondary_fd, libc::STDIN_FILENO) < 0
+                    || libc::dup2(secondary_fd, libc::STDOUT_FILENO) < 0
+                    || libc::dup2(secondary_fd, libc::STDERR_FILENO) < 0
+                {
+                    child_fail(context.error_pipe[1], CHILD_STAGE_TERMINAL);
+                }
+            }
+        }
+        if libc::fchdir(context.cwd_fd) < 0 {
             child_fail(context.error_pipe[1], CHILD_STAGE_SETUP);
         }
         if let Some(user) = context.run_as {
@@ -651,9 +743,22 @@ fn child_exec(context: ChildExec<'_>) -> ! {
             child_fail(context.error_pipe[1], CHILD_STAGE_SECCOMP);
         }
 
-        libc::close(context.stdout_pipe[1]);
-        libc::close(context.stderr_pipe[1]);
-        libc::close(context.null_fd);
+        match context.stdio {
+            ChildStdio::Pipes {
+                null_fd,
+                stdout_pipe,
+                stderr_pipe,
+            } => {
+                libc::close(stdout_pipe[1]);
+                libc::close(stderr_pipe[1]);
+                libc::close(null_fd);
+            }
+            ChildStdio::Terminal { secondary_fd } => {
+                if secondary_fd > libc::STDERR_FILENO {
+                    libc::close(secondary_fd);
+                }
+            }
+        }
         libc::close(context.cwd_fd);
         for fd in context.close_fds {
             libc::close(*fd);

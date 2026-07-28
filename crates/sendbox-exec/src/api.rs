@@ -147,6 +147,29 @@ pub enum StandardInput {
     /// Connect fd 0 to a freshly opened `/dev/null`.
     #[default]
     Null,
+    /// Allocate a pseudoterminal and make it the workload's controlling
+    /// terminal, so `isatty` succeeds and full-screen agents render normally.
+    ///
+    /// A terminal has a single device for both output streams, so stdout and
+    /// stderr are unavoidably merged and reported as [`StreamKind::Stdout`].
+    Terminal { columns: u16, rows: u16 },
+}
+
+impl StandardInput {
+    /// Reports whether the workload needs a controlling terminal.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Terminal { .. })
+    }
+
+    /// Returns the requested terminal size, if any.
+    #[must_use]
+    pub const fn terminal_size(self) -> Option<(u16, u16)> {
+        match self {
+            Self::Null => None,
+            Self::Terminal { columns, rows } => Some((columns, rows)),
+        }
+    }
 }
 
 /// Opaque per-session bearer material.

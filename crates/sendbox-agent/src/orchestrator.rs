@@ -75,12 +75,19 @@ pub struct AgentReport {
     pub states: Vec<AgentState>,
 }
 
+enum WorkloadStep {
+    Event(Result<GuestEvent, AgentError>),
+    Terminal(Option<crate::HostTerminalCommand>),
+}
+
 pub struct AgentOrchestrator {
     runtime: Arc<dyn RuntimeProvider>,
     secrets: Arc<dyn SecretResolver>,
     connector: Arc<dyn GuestConnector>,
     output: Arc<dyn OutputSink>,
     signals: Arc<dyn SignalSource>,
+    terminal: Arc<dyn crate::TerminalSource>,
+    terminal_size: Option<crate::GuestTerminalSize>,
 }
 
 impl AgentOrchestrator {
@@ -98,7 +105,26 @@ impl AgentOrchestrator {
             connector,
             output,
             signals,
+            terminal: Arc::new(crate::NoTerminal),
+            terminal_size: None,
         }
+    }
+
+    /// Runs the workload on a pseudoterminal fed by `source`.
+    ///
+    /// Both the size and the source are required together: a terminal launch
+    /// without an input source would leave the workload unable to be typed
+    /// into, and an input source without a terminal launch would have nowhere
+    /// to deliver keystrokes.
+    #[must_use]
+    pub fn with_terminal(
+        mut self,
+        size: crate::GuestTerminalSize,
+        source: Arc<dyn crate::TerminalSource>,
+    ) -> Self {
+        self.terminal_size = Some(size);
+        self.terminal = source;
+        self
     }
 
     pub async fn run(
@@ -312,6 +338,7 @@ impl AgentOrchestrator {
                     command: plan.command(),
                     environment: plan.environment(),
                     secrets: guest_secrets,
+                    terminal: self.terminal_size.clone(),
                 },
                 cancellation,
             )
@@ -327,6 +354,7 @@ impl AgentOrchestrator {
         context: &mut RunContext,
     ) -> Result<GuestTerminal, AgentError> {
         let mut signals_open = true;
+        let mut terminal_open = self.terminal_size.is_some();
         loop {
             let execution = context.execution.as_mut().expect("execution was stored");
             tokio::select! {
@@ -345,15 +373,45 @@ impl AgentOrchestrator {
                         }
                     }
                 }
-                event = execution.next_event(cancellation) => {
-                    match event? {
-                        GuestEvent::Output { stream, bytes } => {
-                            self.output.write(stream, &bytes, cancellation).await?;
+                // Guest output and host keystrokes are deliberately *not*
+                // biased against each other: a chatty workload must not starve
+                // typing, and a long paste must not starve the screen.
+                step = Self::next_workload_step(
+                    execution,
+                    self.terminal.as_ref(),
+                    terminal_open,
+                    cancellation,
+                ) => {
+                    match step {
+                        WorkloadStep::Event(event) => match event? {
+                            GuestEvent::Output { stream, bytes } => {
+                                self.output.write(stream, &bytes, cancellation).await?;
+                            }
+                            GuestEvent::Terminal(terminal) => return Ok(terminal),
+                        },
+                        WorkloadStep::Terminal(Some(command)) => {
+                            let ended = matches!(command, crate::HostTerminalCommand::InputEof);
+                            execution.send_terminal(command, cancellation).await?;
+                            if ended {
+                                terminal_open = false;
+                            }
                         }
-                        GuestEvent::Terminal(terminal) => return Ok(terminal),
+                        WorkloadStep::Terminal(None) => terminal_open = false,
                     }
                 }
             }
+        }
+    }
+
+    async fn next_workload_step(
+        execution: &mut Box<dyn GuestExecution>,
+        terminal: &dyn crate::TerminalSource,
+        terminal_open: bool,
+        cancellation: &CancellationToken,
+    ) -> WorkloadStep {
+        tokio::select! {
+            event = execution.next_event(cancellation) => WorkloadStep::Event(event),
+            command = terminal.next_command(), if terminal_open => WorkloadStep::Terminal(command),
         }
     }
 

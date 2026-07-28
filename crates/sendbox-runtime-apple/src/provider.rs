@@ -215,6 +215,7 @@ impl AppleRuntime {
             RuntimeCapability::Health,
             RuntimeCapability::TransportProvisioning,
             RuntimeCapability::BrokeredExec,
+            RuntimeCapability::InteractiveTerminal,
             RuntimeCapability::InheritedStdioControlChannel,
         ])
     }

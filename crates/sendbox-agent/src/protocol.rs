@@ -1,8 +1,10 @@
+use crate::traits::HostTerminalCommand;
 use sendbox_protocol::{
-    AGENT_LAUNCH_OPERATION, BootstrapSecret, CapabilitySet, CloseCode, EnvironmentEntryV2,
-    EventKind, FrameLimits, GracefulClose, HandshakeConfig, HostHandshake, LaunchRequestV2,
-    Message, OPERATION_SCHEMA_VERSION, Request, ResponseStatus, SecretEnvelopeV2, TerminalResultV2,
-    TerminalStateV1, VersionRange,
+    AGENT_LAUNCH_OPERATION, BootstrapSecret, CapabilitySet, CloseCode, EnvironmentEntryV2, Event,
+    EventKind, FrameLimits, GracefulClose, HandshakeConfig, HostHandshake,
+    INTERACTIVE_LAUNCH_OPERATION, INTERACTIVE_OPERATION_SCHEMA_VERSION, InteractiveLaunchRequestV1,
+    LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, Request, ResponseStatus, SecretEnvelopeV2,
+    TerminalResultV2, TerminalSizeV1, TerminalStateV1, VersionRange,
 };
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
 use sendbox_secrets::{
@@ -117,7 +119,7 @@ impl GuestSession for ProtocolGuestSession {
                 &mut self.secret_cipher,
                 &mut self.next_secret_sequence,
             )?;
-            let payload = serde_json::to_vec(&LaunchRequestV2 {
+            let launch = LaunchRequestV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 boundary_plan_digest: self.boundary_plan_digest,
                 program: request.command.program.clone(),
@@ -133,8 +135,36 @@ impl GuestSession for ProtocolGuestSession {
                     .collect(),
                 secrets,
                 timeout_ms: 300_000,
-            })
-            .map_err(|error| AgentError::Guest(format!("encode launch request: {error}")))?;
+            };
+            let interactive = request.terminal.is_some();
+            let (operation, payload) = match request.terminal.as_ref() {
+                None => (
+                    AGENT_LAUNCH_OPERATION,
+                    serde_json::to_vec(&launch).map_err(|error| {
+                        AgentError::Guest(format!("encode launch request: {error}"))
+                    })?,
+                ),
+                Some(terminal) => {
+                    let envelope = InteractiveLaunchRequestV1 {
+                        schema_version: INTERACTIVE_OPERATION_SCHEMA_VERSION,
+                        launch,
+                        terminal: TerminalSizeV1 {
+                            columns: terminal.columns,
+                            rows: terminal.rows,
+                        },
+                        term: terminal.term.clone(),
+                    };
+                    envelope.validate().map_err(|error| {
+                        AgentError::Guest(format!("invalid interactive launch request: {error}"))
+                    })?;
+                    (
+                        INTERACTIVE_LAUNCH_OPERATION,
+                        serde_json::to_vec(&envelope).map_err(|error| {
+                            AgentError::Guest(format!("encode interactive launch request: {error}"))
+                        })?,
+                    )
+                }
+            };
             let mut writer = self
                 .writer
                 .take()
@@ -144,7 +174,7 @@ impl GuestSession for ProtocolGuestSession {
                 cancellation,
                 writer.send(&Message::Request(Request {
                     request_id: REQUEST_ID,
-                    operation: AGENT_LAUNCH_OPERATION.to_owned(),
+                    operation: operation.to_owned(),
                     payload,
                 })),
             )
@@ -155,9 +185,11 @@ impl GuestSession for ProtocolGuestSession {
                 .ok_or_else(|| AgentError::Guest("guest session reader unavailable".to_owned()))?;
             Ok(Box::new(ProtocolGuestExecution {
                 reader,
-                writer,
+                writer: WriterHandle::spawn(writer),
                 terminal: false,
                 cancelled: false,
+                interactive,
+                input_ended: false,
             }) as Box<dyn GuestExecution>)
         })
     }
@@ -255,9 +287,168 @@ fn unix_time_ms() -> Result<u64, AgentError> {
 
 pub struct ProtocolGuestExecution {
     reader: sendbox_protocol::FramedReader<tokio::io::ReadHalf<Box<dyn ControlStream>>>,
-    writer: sendbox_protocol::FramedWriter<tokio::io::WriteHalf<Box<dyn ControlStream>>>,
+    writer: WriterHandle,
     terminal: bool,
     cancelled: bool,
+    interactive: bool,
+    input_ended: bool,
+}
+
+/// Queue depth for control frames (cancellation, close). These must never
+/// queue behind bulk terminal input.
+const WRITER_CONTROL_DEPTH: usize = 4;
+
+/// Queue depth for pending terminal input frames.
+const WRITER_INPUT_DEPTH: usize = 256;
+
+/// How long a keystroke may wait for the writer before it is dropped. Dropping
+/// is what keeps the orchestrator reading guest output: a workload that stops
+/// draining its terminal must never be able to stall the screen.
+const INPUT_OFFER_BOUND: Duration = Duration::from_millis(250);
+
+/// How long a one-shot input signal may wait for the writer. Longer than the
+/// droppable bound because losing it hangs the workload, short enough to stay
+/// well inside the protocol timeout.
+const REQUIRED_INPUT_BOUND: Duration = Duration::from_secs(5);
+
+struct WriterMessage {
+    message: Message,
+    ack: Option<tokio::sync::oneshot::Sender<Result<(), sendbox_protocol::ProtocolError>>>,
+}
+
+/// Owns the guest-facing `FramedWriter` on its own task.
+///
+/// The orchestrator loop must keep draining guest output while it forwards
+/// keystrokes. If it awaited the socket write instead, a host stalled on its
+/// own terminal and a guest stalled writing output would wedge each other:
+/// neither side would read, and both would be blocked writing.
+struct WriterHandle {
+    control: tokio::sync::mpsc::Sender<WriterMessage>,
+    input: tokio::sync::mpsc::Sender<WriterMessage>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl WriterHandle {
+    fn spawn(
+        mut writer: sendbox_protocol::FramedWriter<tokio::io::WriteHalf<Box<dyn ControlStream>>>,
+    ) -> Self {
+        let (control, mut control_receiver) = tokio::sync::mpsc::channel(WRITER_CONTROL_DEPTH);
+        let (input, mut input_receiver) =
+            tokio::sync::mpsc::channel::<WriterMessage>(WRITER_INPUT_DEPTH);
+        let task = tokio::spawn(async move {
+            loop {
+                let queued = tokio::select! {
+                    biased;
+                    control = control_receiver.recv() => match control {
+                        Some(queued) => queued,
+                        None => return,
+                    },
+                    input = input_receiver.recv() => match input {
+                        Some(queued) => queued,
+                        None => continue,
+                    },
+                };
+                let WriterMessage { message, ack } = queued;
+                let result = writer.send(&message).await;
+                let failed = result.is_err();
+                if let Some(ack) = ack {
+                    let _ = ack.send(result);
+                } else if let Err(error) = result {
+                    eprintln!("sendbox: forwarding terminal input to the guest failed: {error}");
+                }
+                if failed {
+                    return;
+                }
+            }
+        });
+        Self {
+            control,
+            input,
+            task,
+        }
+    }
+
+    /// Sends a control frame and waits for it to reach the socket, so callers
+    /// keep the delivery guarantee they had when they owned the writer.
+    async fn send_control(&self, message: Message) -> Result<(), AgentError> {
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        self.control
+            .send(WriterMessage {
+                message,
+                ack: Some(ack),
+            })
+            .await
+            .map_err(|_| AgentError::Guest("guest connection writer stopped".to_owned()))?;
+        acked
+            .await
+            .map_err(|_| AgentError::Guest("guest connection writer stopped".to_owned()))?
+            .map_err(AgentError::Protocol)
+    }
+
+    /// Queues a keystroke without waiting for the socket. Saturation drops the
+    /// keystroke with a diagnostic rather than blocking the caller.
+    async fn offer_input(&self, message: Message) -> Result<(), AgentError> {
+        match self.queue_input(message, INPUT_OFFER_BOUND).await {
+            Ok(()) => Ok(()),
+            Err(InputQueueError::Saturated) => {
+                eprintln!(
+                    "sendbox: guest stopped accepting terminal input for {}ms; dropping input",
+                    INPUT_OFFER_BOUND.as_millis()
+                );
+                Ok(())
+            }
+            Err(InputQueueError::Stopped) => Err(AgentError::Guest(
+                "guest connection writer stopped".to_owned(),
+            )),
+        }
+    }
+
+    /// Queues a one-shot input signal that must not be dropped. End of file
+    /// changes state on both sides — the caller stops sending and the workload
+    /// waits for the terminal's `VEOF` byte — so losing it silently would hang
+    /// the workload until its launch timeout.
+    async fn require_input(&self, message: Message) -> Result<(), AgentError> {
+        self.queue_input(message, REQUIRED_INPUT_BOUND)
+            .await
+            .map_err(|error| match error {
+                InputQueueError::Saturated => AgentError::Guest(format!(
+                    "guest did not accept terminal end of file within {}ms",
+                    REQUIRED_INPUT_BOUND.as_millis()
+                )),
+                InputQueueError::Stopped => {
+                    AgentError::Guest("guest connection writer stopped".to_owned())
+                }
+            })
+    }
+
+    /// Queues on the single input channel so terminal ordering is preserved:
+    /// end of file must never overtake the keystrokes that precede it.
+    async fn queue_input(&self, message: Message, bound: Duration) -> Result<(), InputQueueError> {
+        match self
+            .input
+            .send_timeout(WriterMessage { message, ack: None }, bound)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+                Err(InputQueueError::Saturated)
+            }
+            Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => {
+                Err(InputQueueError::Stopped)
+            }
+        }
+    }
+}
+
+enum InputQueueError {
+    Saturated,
+    Stopped,
+}
+
+impl Drop for WriterHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl GuestExecution for ProtocolGuestExecution {
@@ -317,6 +508,70 @@ impl GuestExecution for ProtocolGuestExecution {
         })
     }
 
+    fn send_terminal<'a>(
+        &'a mut self,
+        command: HostTerminalCommand,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async move {
+            if !self.interactive {
+                return Err(AgentError::Guest(
+                    "terminal input requires an interactive launch".to_owned(),
+                ));
+            }
+            if self.terminal {
+                return Err(AgentError::Guest(
+                    "terminal input requested after terminal response".to_owned(),
+                ));
+            }
+            if self.input_ended {
+                return Err(AgentError::Guest(
+                    "terminal input was already ended".to_owned(),
+                ));
+            }
+            let event = match command {
+                HostTerminalCommand::Input(bytes) => Event {
+                    stream_id: REQUEST_ID,
+                    kind: sendbox_protocol::EventKind::StandardInput,
+                    payload: bytes,
+                },
+                HostTerminalCommand::InputEof => {
+                    let event = Event {
+                        stream_id: REQUEST_ID,
+                        kind: sendbox_protocol::EventKind::StandardInputEof,
+                        payload: Vec::new(),
+                    };
+                    guest_io(
+                        "send guest terminal end of file",
+                        cancellation,
+                        self.writer.require_input(Message::Event(event)),
+                    )
+                    .await?;
+                    self.input_ended = true;
+                    return Ok(());
+                }
+                HostTerminalCommand::Resize { columns, rows } => {
+                    let size = TerminalSizeV1::new(columns, rows).map_err(|error| {
+                        AgentError::Guest(format!("invalid terminal size: {error}"))
+                    })?;
+                    Event {
+                        stream_id: REQUEST_ID,
+                        kind: sendbox_protocol::EventKind::TerminalResize,
+                        payload: serde_json::to_vec(&size).map_err(|error| {
+                            AgentError::Guest(format!("encode terminal resize: {error}"))
+                        })?,
+                    }
+                }
+            };
+            guest_io(
+                "send guest terminal input",
+                cancellation,
+                self.writer.offer_input(Message::Event(event)),
+            )
+            .await
+        })
+    }
+
     fn cancel<'a>(
         &'a mut self,
         cancellation: &'a CancellationToken,
@@ -326,23 +581,24 @@ impl GuestExecution for ProtocolGuestExecution {
                 return Ok(());
             }
             if self.terminal {
-                let _ = protocol_io(
+                let _ = guest_io(
                     "close completed guest execution",
                     cancellation,
-                    self.writer.send(&Message::GracefulClose(GracefulClose {
-                        code: CloseCode::Normal,
-                        reason: "execution complete".to_owned(),
-                    })),
+                    self.writer
+                        .send_control(Message::GracefulClose(GracefulClose {
+                            code: CloseCode::Normal,
+                            reason: "execution complete".to_owned(),
+                        })),
                 )
                 .await;
                 self.cancelled = true;
                 return Ok(());
             }
-            protocol_io(
+            guest_io(
                 "send guest cancellation",
                 cancellation,
                 self.writer
-                    .send(&Message::Cancellation(sendbox_protocol::Cancellation {
+                    .send_control(Message::Cancellation(sendbox_protocol::Cancellation {
                         request_id: REQUEST_ID,
                         reason: Some("agent cancellation".to_owned()),
                     })),
@@ -408,13 +664,22 @@ async fn protocol_io<T>(
     cancellation: &CancellationToken,
     future: impl Future<Output = Result<T, sendbox_protocol::ProtocolError>>,
 ) -> Result<T, AgentError> {
+    guest_io(operation, cancellation, async move {
+        future.await.map_err(AgentError::Protocol)
+    })
+    .await
+}
+
+async fn guest_io<T>(
+    operation: &'static str,
+    cancellation: &CancellationToken,
+    future: impl Future<Output = Result<T, AgentError>>,
+) -> Result<T, AgentError> {
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(AgentError::Cancelled),
         result = tokio::time::timeout(PROTOCOL_IO_TIMEOUT, future) => {
-            result
-                .map_err(|_| AgentError::Guest(format!("{operation} timed out")))?
-                .map_err(AgentError::Protocol)
+            result.map_err(|_| AgentError::Guest(format!("{operation} timed out")))?
         }
     }
 }
@@ -422,6 +687,49 @@ async fn protocol_io<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_event(kind: EventKind) -> Message {
+        Message::Event(Event {
+            stream_id: REQUEST_ID,
+            kind,
+            payload: Vec::new(),
+        })
+    }
+
+    /// A saturated writer must lose keystrokes rather than the orchestrator's
+    /// ability to keep reading, but end of file changes state on both sides:
+    /// losing it silently leaves the workload waiting for a `VEOF` byte that
+    /// can no longer be produced.
+    #[tokio::test(start_paused = true)]
+    async fn a_saturated_writer_drops_keystrokes_but_never_end_of_file() {
+        let (control, _control) = tokio::sync::mpsc::channel(WRITER_CONTROL_DEPTH);
+        let (input, _input) = tokio::sync::mpsc::channel(1);
+        input
+            .send(WriterMessage {
+                message: terminal_event(EventKind::StandardInput),
+                ack: None,
+            })
+            .await
+            .expect("fill the queue");
+        let writer = WriterHandle {
+            control,
+            input,
+            task: tokio::spawn(std::future::pending()),
+        };
+
+        writer
+            .offer_input(terminal_event(EventKind::StandardInput))
+            .await
+            .expect("a dropped keystroke is not a failed run");
+        let error = writer
+            .require_input(terminal_event(EventKind::StandardInputEof))
+            .await
+            .expect_err("end of file must never be dropped silently");
+        assert!(
+            error.to_string().contains("end of file"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn broker_signal_terminal_is_preserved() {

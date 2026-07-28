@@ -6,7 +6,7 @@ use sendbox_exec::{
     RelativePath, RootId, SemanticScope, SessionAuthentication, SessionId, TerminalState,
     UnsupportedExecutionBackend,
 };
-use sendbox_exec::{ExecutionBackend, RequestValidationError};
+use sendbox_exec::{ExecutionBackend, NullInput, RequestValidationError};
 
 fn request() -> ExecutionRequest {
     ExecutionRequest {
@@ -70,7 +70,13 @@ fn unqualified_platform_backend_fails_closed_with_typed_primitive() {
         matched_rule: None,
         semantic_scope: SemanticScope::TopLevelOnly,
     };
-    let result = backend.execute(&request, &decision, &mut sink, &CancellationFlag::default());
+    let result = backend.execute(
+        &request,
+        &decision,
+        &mut sink,
+        &NullInput,
+        &CancellationFlag::default(),
+    );
     assert!(matches!(
         result.terminal,
         TerminalState::LaunchFailed(sendbox_exec::LaunchFailure::UnsupportedKernel(error))

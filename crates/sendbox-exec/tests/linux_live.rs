@@ -24,7 +24,7 @@ use sendbox_exec::session::BrokerSession;
 use sendbox_exec::{
     AdmissionDisposition, Broker, CancellationFlag, ContainmentProfile, CorrelationId,
     DescriptorPath, EnvironmentEntry, ExecutionBackend, ExecutionDecision, ExecutionEvent,
-    ExecutionRequest, ExecutionTimeout, KernelPrimitive, LaunchFailure, RelativePath,
+    ExecutionRequest, ExecutionTimeout, KernelPrimitive, LaunchFailure, NullInput, RelativePath,
     RequestLimits, RootId, SemanticScope, SinkError, TerminalState,
 };
 use sendbox_policy::{Action, CommandPolicy};
@@ -212,6 +212,7 @@ fn atomic_clone_exec_and_output_saturation_are_live_gated() {
                 ..ContainmentProfile::default()
             },
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let (result, _) = invoke_launcher_with_sink_limit(&invocation, Some(0));
@@ -257,6 +258,7 @@ fn production_backend_propagates_client_sink_disconnect() {
             timeout: Duration::from_secs(2),
             containment: ContainmentProfile::default(),
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let backend = launcher_backend(&invocation);
@@ -270,6 +272,7 @@ fn production_backend_propagates_client_sink_disconnect() {
         &invocation.request,
         &invocation.decision,
         &mut sink,
+        &NullInput,
         &CancellationFlag::default(),
     );
     assert_eq!(result.terminal, TerminalState::ClientDisconnected);
@@ -296,6 +299,7 @@ fn production_backend_propagates_explicit_cancellation() {
             timeout: Duration::from_secs(10),
             containment: ContainmentProfile::default(),
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let backend = launcher_backend(&invocation);
@@ -310,6 +314,7 @@ fn production_backend_propagates_explicit_cancellation() {
         &invocation.request,
         &invocation.decision,
         &mut sink,
+        &NullInput,
         &cancellation,
     );
     cancellation_thread.join().expect("cancellation thread");
@@ -337,6 +342,7 @@ fn production_backend_propagates_graceful_broker_shutdown() {
             timeout: Duration::from_secs(10),
             containment: ContainmentProfile::default(),
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let backend = launcher_backend(&invocation);
@@ -351,6 +357,7 @@ fn production_backend_propagates_graceful_broker_shutdown() {
         &invocation.request,
         &invocation.decision,
         &mut sink,
+        &NullInput,
         &cancellation,
     );
     shutdown_thread.join().expect("shutdown thread");
@@ -378,6 +385,7 @@ fn production_backend_propagates_supervisor_death() {
             timeout: Duration::from_secs(10),
             containment: ContainmentProfile::default(),
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let backend = launcher_backend(&invocation);
@@ -392,6 +400,7 @@ fn production_backend_propagates_supervisor_death() {
         &invocation.request,
         &invocation.decision,
         &mut sink,
+        &NullInput,
         &cancellation,
     );
     supervisor_thread.join().expect("supervisor thread");
@@ -419,6 +428,7 @@ fn control_pipe_eof_triggers_supervisor_death_cleanup() {
             timeout: Duration::from_secs(10),
             containment: ContainmentProfile::default(),
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let mut child = Command::new(env!("CARGO_BIN_EXE_sendbox-exec-launcher"))
@@ -485,6 +495,7 @@ fn broker_process_crash_removes_cgroup_subtree() {
             &invocation.request,
             &invocation.decision,
             &mut sink,
+            &NullInput,
             &CancellationFlag::default(),
         );
         return;
@@ -539,6 +550,7 @@ fn descendant_clone3_is_denied_by_child_only_filter() {
             timeout: Duration::from_secs(3),
             containment: ContainmentProfile::default(),
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let (result, output) = invoke_launcher(&invocation);
@@ -582,6 +594,7 @@ fn child_stdin_and_fd_inventory_are_hardened() {
             timeout: Duration::from_secs(3),
             containment: ContainmentProfile::default(),
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let (result, output) = invoke_launcher(&invocation);
@@ -618,6 +631,7 @@ fn broker_configured_environment_is_authoritative_in_launcher() {
             timeout: Duration::from_secs(3),
             containment: ContainmentProfile::default(),
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let broker = Broker::new(
@@ -667,6 +681,7 @@ fn timeout_kills_and_reaps_the_entire_cgroup() {
             timeout: Duration::from_millis(50),
             containment: ContainmentProfile::default(),
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let (result, _) = invoke_launcher(&invocation);
@@ -728,6 +743,7 @@ fn cgroup_process_limit_stops_fork_growth() {
                 ..ContainmentProfile::default()
             },
             output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
         },
     );
     let (result, output) = invoke_launcher(&invocation);
@@ -773,7 +789,7 @@ fn launcher_invocation(
             name: "LANG".into(),
             value: "C".into(),
         }],
-        stdin: sendbox_exec::StandardInput::Null,
+        stdin: case.stdin,
         timeout: ExecutionTimeout::new(case.timeout).expect("timeout"),
         containment: case.containment,
     };
@@ -861,6 +877,7 @@ struct LaunchCase<'a> {
     timeout: Duration,
     containment: ContainmentProfile,
     output_event_limit: Option<u64>,
+    stdin: sendbox_exec::StandardInput,
 }
 
 fn invoke_launcher(invocation: &LauncherInvocation) -> (sendbox_exec::ExecutionResult, Vec<u8>) {
@@ -888,6 +905,7 @@ fn invoke_launcher_with_sink_limit(
         &invocation.request,
         &invocation.decision,
         &mut sink,
+        &NullInput,
         &CancellationFlag::default(),
     );
     (result, streamed_output)
@@ -990,4 +1008,421 @@ fn write_fake_elf(path: &std::path::Path) {
     let mut permissions = file.metadata().expect("metadata").permissions();
     permissions.set_mode(0o755);
     file.set_permissions(permissions).expect("chmod");
+}
+
+const INTERACTIVE_COLUMNS: u16 = 120;
+const INTERACTIVE_ROWS: u16 = 40;
+
+/// Reports whether each standard descriptor is a terminal, then the terminal
+/// size, so one launch covers both the ctty wiring and the initial `TIOCSWINSZ`.
+const TERMINAL_PROBE: &str = "import os, sys, termios, fcntl, struct\n\
+     print('isatty', os.isatty(0), os.isatty(1), os.isatty(2))\n\
+     size = struct.unpack('hh', fcntl.ioctl(0, termios.TIOCGWINSZ, b'\\0' * 4))\n\
+     print('size', size[1], size[0])\n\
+     print('ctty', os.tcgetpgrp(0) == os.getpgrp())\n\
+     sys.stdout.flush()\n";
+
+/// Echoes each line it reads, then reports the terminal size it sees at exit so
+/// a resize delivered mid-run is observable.
+const TERMINAL_ECHO: &str = "import os, sys, termios, fcntl, struct\n\
+     sys.stdout.write('ready\\n')\n\
+     sys.stdout.flush()\n\
+     for line in sys.stdin:\n\
+     \x20   line = line.strip()\n\
+     \x20   if line == 'size':\n\
+     \x20       size = struct.unpack('hh', fcntl.ioctl(0, termios.TIOCGWINSZ, b'\\0' * 4))\n\
+     \x20       sys.stdout.write('size %d %d\\n' % (size[1], size[0]))\n\
+     \x20   elif line == 'quit':\n\
+     \x20       break\n\
+     \x20   else:\n\
+     \x20       sys.stdout.write('echo %s\\n' % line)\n\
+     \x20   sys.stdout.flush()\n\
+     sys.stdout.write('done\\n')\n\
+     sys.stdout.flush()\n";
+
+fn interactive_case<'a>(
+    correlation: &'a str,
+    executable: &'a str,
+    python: &str,
+    script: &str,
+) -> LaunchCase<'a> {
+    LaunchCase {
+        correlation,
+        executable,
+        argv: vec![python.to_owned(), "-c".to_owned(), script.to_owned()],
+        timeout: Duration::from_secs(20),
+        containment: ContainmentProfile::default(),
+        output_event_limit: None,
+        stdin: sendbox_exec::StandardInput::Terminal {
+            columns: INTERACTIVE_COLUMNS,
+            rows: INTERACTIVE_ROWS,
+        },
+    }
+}
+
+#[test]
+fn interactive_launch_gives_the_workload_a_controlling_terminal() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    let invocation = launcher_invocation(
+        &session,
+        parent,
+        interactive_case("live-pty-probe", &executable, &python, TERMINAL_PROBE),
+    );
+    let (result, output) = invoke_launcher(&invocation);
+
+    assert_clean_exit(&result.terminal);
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(
+        rendered.contains("isatty True True True"),
+        "workload did not see a terminal on all three descriptors: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("size {INTERACTIVE_COLUMNS} {INTERACTIVE_ROWS}")),
+        "workload did not see the requested window size: {rendered}"
+    );
+    assert!(
+        rendered.contains("ctty True"),
+        "workload did not own the terminal's foreground process group: {rendered}"
+    );
+}
+
+#[test]
+fn interactive_launch_forwards_input_and_window_size_changes() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    let invocation = launcher_invocation(
+        &session,
+        parent,
+        interactive_case("live-pty-echo", &executable, &python, TERMINAL_ECHO),
+    );
+    let (sender, input) = sendbox_exec::ChannelInput::bounded(16);
+    let bound = Duration::from_secs(5);
+    let feeder = std::thread::spawn(move || {
+        // The workload is line-buffered, so each command needs its own newline.
+        for command in [
+            sendbox_exec::TerminalCommand::Input(b"hello\n".to_vec()),
+            sendbox_exec::TerminalCommand::Resize {
+                columns: 100,
+                rows: 30,
+            },
+            sendbox_exec::TerminalCommand::Input(b"size\n".to_vec()),
+            sendbox_exec::TerminalCommand::Input(b"quit\n".to_vec()),
+        ] {
+            sender
+                .offer(command, bound)
+                .expect("queue terminal command");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let backend = launcher_backend(&invocation);
+    let mut streamed = Vec::new();
+    let mut sink = |event| {
+        if let ExecutionEvent::Output { data, .. } = event {
+            streamed.extend(data);
+        }
+        Ok(())
+    };
+    let result = backend.execute(
+        &invocation.request,
+        &invocation.decision,
+        &mut sink,
+        &input,
+        &CancellationFlag::default(),
+    );
+    feeder.join().expect("input feeder");
+
+    assert_clean_exit(&result.terminal);
+    let rendered = String::from_utf8_lossy(&streamed);
+    assert!(
+        rendered.contains("echo hello"),
+        "workload never echoed forwarded input: {rendered}"
+    );
+    assert!(
+        rendered.contains("size 100 30"),
+        "workload never observed the resize: {rendered}"
+    );
+    assert!(
+        rendered.contains("done"),
+        "workload never reached its clean exit: {rendered}"
+    );
+}
+
+#[test]
+fn interactive_launch_ends_the_workload_when_host_input_ends() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    let invocation = launcher_invocation(
+        &session,
+        parent,
+        interactive_case("live-pty-eof", &executable, &python, TERMINAL_ECHO),
+    );
+    let (sender, input) = sendbox_exec::ChannelInput::bounded(4);
+    let bound = Duration::from_secs(5);
+    let feeder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        sender
+            .offer(sendbox_exec::TerminalCommand::InputEof, bound)
+            .expect("queue end of file");
+    });
+
+    let backend = launcher_backend(&invocation);
+    let mut streamed = Vec::new();
+    let mut sink = |event| {
+        if let ExecutionEvent::Output { data, .. } = event {
+            streamed.extend(data);
+        }
+        Ok(())
+    };
+    let result = backend.execute(
+        &invocation.request,
+        &invocation.decision,
+        &mut sink,
+        &input,
+        &CancellationFlag::default(),
+    );
+    feeder.join().expect("input feeder");
+
+    assert_clean_exit(&result.terminal);
+    let rendered = String::from_utf8_lossy(&streamed);
+    assert!(
+        rendered.contains("done"),
+        "end of file did not close the workload's stdin: {rendered}"
+    );
+}
+
+#[test]
+fn interactive_launch_survives_simultaneous_input_and_heavy_output() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    // Writes continuously while still consuming stdin, which is the shape that
+    // deadlocks a design where input and output share one queue. A single
+    // process keeps the workload within the cgroup pid budget.
+    let script = "import os, select, sys\n\
+         TARGET = 20000\n\
+         os.set_blocking(1, False)\n\
+         pending = b''\n\
+         index = 0\n\
+         seen_quit = False\n\
+         while True:\n\
+         \x20   if not pending and index < TARGET:\n\
+         \x20       pending = (b'%d line of terminal output\\n' % index)\n\
+         \x20       index += 1\n\
+         \x20   if not pending and index >= TARGET and seen_quit:\n\
+         \x20       break\n\
+         \x20   writable = [1] if pending else []\n\
+         \x20   readable, writable, _ = select.select([0], writable, [], 0.1)\n\
+         \x20   if 0 in readable:\n\
+         \x20       data = os.read(0, 4096)\n\
+         \x20       if not data or b'quit' in data:\n\
+         \x20           seen_quit = True\n\
+         \x20   if pending and 1 in writable:\n\
+         \x20       try:\n\
+         \x20           pending = pending[os.write(1, pending):]\n\
+         \x20       except BlockingIOError:\n\
+         \x20           pass\n\
+         os.set_blocking(1, True)\n\
+         os.write(1, b'drained\\n')\n";
+    let invocation = launcher_invocation(
+        &session,
+        parent,
+        interactive_case("live-pty-stress", &executable, &python, script),
+    );
+    let (sender, input) = sendbox_exec::ChannelInput::bounded(64);
+    let bound = Duration::from_secs(10);
+    let feeder = std::thread::spawn(move || {
+        for _ in 0..64 {
+            if sender
+                .offer(
+                    sendbox_exec::TerminalCommand::Input(b"noise\n".to_vec()),
+                    bound,
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = sender.offer(
+            sendbox_exec::TerminalCommand::Input(b"quit\n".to_vec()),
+            bound,
+        );
+    });
+
+    let backend = launcher_backend(&invocation);
+    let mut bytes = 0usize;
+    let mut drained = false;
+    let mut tail = Vec::new();
+    let mut sink = |event| {
+        if let ExecutionEvent::Output { data, .. } = event {
+            bytes = bytes.saturating_add(data.len());
+            if String::from_utf8_lossy(&data).contains("drained") {
+                drained = true;
+            }
+            tail.extend(data);
+            if tail.len() > 4096 {
+                let excess = tail.len() - 4096;
+                tail.drain(..excess);
+            }
+        }
+        Ok(())
+    };
+    let result = backend.execute(
+        &invocation.request,
+        &invocation.decision,
+        &mut sink,
+        &input,
+        &CancellationFlag::default(),
+    );
+    feeder.join().expect("input feeder");
+
+    let rendered = String::from_utf8_lossy(&tail).into_owned();
+    assert!(
+        matches!(&result.terminal, TerminalState::Exited(status) if status.exit_code == Some(0)),
+        "workload did not exit cleanly: {:?}; last output: {rendered}",
+        result.terminal
+    );
+    assert!(
+        bytes > 100_000,
+        "workload output was truncated: {bytes} bytes"
+    );
+    assert!(drained, "workload never reported a clean drain");
+}
+
+#[test]
+fn interactive_launch_is_rejected_when_the_policy_denies_terminal_syscalls() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    let mut case = interactive_case("live-pty-denied", &executable, &python, TERMINAL_PROBE);
+    case.containment.additional_denied_syscalls = vec!["ioctl".to_owned()];
+    let invocation = launcher_invocation(&session, parent, case);
+    let (result, _) = invoke_launcher(&invocation);
+
+    match result.terminal {
+        TerminalState::LaunchFailed(LaunchFailure::PolicySetup { ref message }) => {
+            assert!(
+                message.contains("ioctl"),
+                "rejection did not name the denied syscall: {message}"
+            );
+        }
+        other => panic!("denied terminal syscalls were not rejected: {other:?}"),
+    }
+}
+
+#[test]
+fn interactive_launch_outlives_a_workload_that_never_reads_its_terminal() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    // Puts its terminal in raw mode and then never reads it, so terminal input
+    // backs up, then reports the window size it is eventually resized to. The
+    // in-process `terminal_input_gives_up_on_a_workload_that_never_drains_it`
+    // covers the write bound itself; this covers the end-to-end consequence,
+    // that a command queued behind an undrained backlog still arrives.
+    let script = "import fcntl, struct, sys, termios, time, tty\n\
+         tty.setraw(0)\n\
+         sys.stdout.write('ready\\r\\n')\n\
+         sys.stdout.flush()\n\
+         deadline = time.time() + 12\n\
+         while time.time() < deadline:\n\
+         \x20   rows, columns = struct.unpack('hh', fcntl.ioctl(1, termios.TIOCGWINSZ, b'\\0' * 4))\n\
+         \x20   if columns == 120 and rows == 40:\n\
+         \x20       sys.stdout.write('resized %d %d\\r\\n' % (columns, rows))\n\
+         \x20       sys.stdout.flush()\n\
+         \x20       sys.exit(0)\n\
+         \x20   time.sleep(0.05)\n\
+         sys.stdout.write('timeout\\r\\n')\n\
+         sys.stdout.flush()\n";
+    let invocation = launcher_invocation(
+        &session,
+        parent,
+        interactive_case("live-pty-deaf", &executable, &python, script),
+    );
+    let (sender, input) = sendbox_exec::ChannelInput::bounded(16);
+    let feeder = std::thread::spawn(move || {
+        // One chunk far larger than the terminal can buffer, so a single
+        // `write_all` has to survive the workload never draining it. Give the
+        // workload time to reach raw mode first, otherwise the line discipline
+        // simply discards the flood instead of throttling.
+        std::thread::sleep(Duration::from_millis(500));
+        sender
+            .offer(
+                sendbox_exec::TerminalCommand::Input(vec![b'x'; 256 * 1024]),
+                Duration::from_secs(10),
+            )
+            .expect("queue flood");
+        sender
+            .offer(
+                sendbox_exec::TerminalCommand::Resize {
+                    columns: 120,
+                    rows: 40,
+                },
+                Duration::from_secs(10),
+            )
+            .expect("queue resize");
+    });
+
+    let backend = launcher_backend(&invocation);
+    let mut streamed = Vec::new();
+    let mut sink = |event| {
+        if let ExecutionEvent::Output { data, .. } = event {
+            streamed.extend(data);
+        }
+        Ok(())
+    };
+    let result = backend.execute(
+        &invocation.request,
+        &invocation.decision,
+        &mut sink,
+        &input,
+        &CancellationFlag::default(),
+    );
+    feeder.join().expect("input feeder");
+
+    assert_clean_exit(&result.terminal);
+    let rendered = String::from_utf8_lossy(&streamed);
+    assert!(
+        rendered.contains("resized 120 40"),
+        "a workload that ignores its terminal blocked every later command: {rendered}"
+    );
+}
+
+fn assert_clean_exit(terminal: &TerminalState) {
+    match terminal {
+        TerminalState::Exited(status) => assert_eq!(
+            status.exit_code,
+            Some(0),
+            "workload did not exit cleanly: {status:?}"
+        ),
+        other => panic!("workload did not exit: {other:?}"),
+    }
 }

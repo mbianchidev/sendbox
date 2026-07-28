@@ -349,6 +349,9 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, ProtocolErr
         3 => Ok(EventKind::Audit),
         4 => Ok(EventKind::Health),
         5 => Ok(EventKind::Lifecycle),
+        6 => Ok(EventKind::StandardInput),
+        7 => Ok(EventKind::StandardInputEof),
+        8 => Ok(EventKind::TerminalResize),
         value => Err(ProtocolError::MalformedEncoding(format!(
             "unsupported event kind {value}"
         ))),
@@ -483,5 +486,93 @@ mod tests {
         let mut decoder = Decoder::new(&[0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
         let error = decode_capabilities(&mut decoder).expect_err("huge length must fail");
         assert!(matches!(error, ProtocolError::MalformedEncoding(_)));
+    }
+
+    fn event_message(kind: EventKind, payload: Vec<u8>) -> Message {
+        Message::Event(Event {
+            stream_id: 7,
+            kind,
+            payload,
+        })
+    }
+
+    #[test]
+    fn terminal_event_kinds_round_trip() {
+        for kind in [
+            EventKind::StandardInput,
+            EventKind::StandardInputEof,
+            EventKind::TerminalResize,
+        ] {
+            let message = event_message(kind, vec![0x1b, 0x5b, 0x41]);
+            let encoded = encode_message(&message).expect("encode");
+            let decoded = decode_message(&encoded).expect("decode");
+            assert_eq!(decoded, message);
+        }
+    }
+
+    #[test]
+    fn terminal_event_encoding_is_canonical() {
+        let message = event_message(EventKind::StandardInput, vec![0x61]);
+        let first = encode_message(&message).expect("encode");
+        let second = encode_message(&decode_message(&first).expect("decode")).expect("re-encode");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn headless_event_kinds_keep_their_wire_values() {
+        // A peer that predates interactive support must decode existing kinds
+        // identically, so the discriminants may never be renumbered.
+        for (kind, value) in [
+            (EventKind::StandardOutput, 1_u8),
+            (EventKind::StandardError, 2),
+            (EventKind::Audit, 3),
+            (EventKind::Health, 4),
+            (EventKind::Lifecycle, 5),
+            (EventKind::StandardInput, 6),
+            (EventKind::StandardInputEof, 7),
+            (EventKind::TerminalResize, 8),
+        ] {
+            let encoded = [value];
+            let mut decoder = Decoder::new(&encoded);
+            assert_eq!(decode_event_kind(&mut decoder).expect("decode"), kind);
+        }
+    }
+
+    #[test]
+    fn unknown_event_kinds_are_still_rejected() {
+        let mut decoder = Decoder::new(&[9]);
+        let error = decode_event_kind(&mut decoder).expect_err("kind 9 is unassigned");
+        assert!(matches!(error, ProtocolError::MalformedEncoding(_)));
+    }
+
+    #[test]
+    fn capability_wire_values_are_unchanged_by_interactive_support() {
+        // Interactive admission is negotiated by operation name, never by a new
+        // capability, because the codec rejects unknown capability values and a
+        // new variant would break mixed-version headless runs.
+        assert_eq!(Capability::COUNT, 9);
+        let capabilities = CapabilitySet::from([Capability::StreamedIo, Capability::Signals]);
+        let mut encoder = Encoder::new(Vec::new());
+        encode_capabilities(&mut encoder, &capabilities).expect("encode");
+        let encoded = encoder.into_writer();
+        let mut decoder = Decoder::new(&encoded);
+        assert_eq!(
+            decode_capabilities(&mut decoder).expect("decode"),
+            capabilities
+        );
+    }
+
+    #[test]
+    fn event_debug_redacts_payload_bytes() {
+        let rendered = format!(
+            "{:?}",
+            Event {
+                stream_id: 1,
+                kind: EventKind::StandardInput,
+                payload: b"super-secret-passphrase".to_vec(),
+            }
+        );
+        assert!(!rendered.contains("passphrase"), "rendered: {rendered}");
+        assert!(rendered.contains("<23 bytes>"), "rendered: {rendered}");
     }
 }

@@ -2,9 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use sendbox_protocol::{
     AGENT_LAUNCH_OPERATION, BootstrapSecret, CloseCode, Event, EventKind, FrameLimits,
-    GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, LaunchRequestV2, Message,
-    OPERATION_SCHEMA_VERSION, ProtocolErrorCode, ProtocolErrorMessage, Request, Response,
-    ResponseStatus, TerminalResultV2, TerminalStateV1, VersionRange, agent_guest_capabilities,
+    GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, INTERACTIVE_LAUNCH_OPERATION,
+    InteractiveLaunchRequestV1, LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION,
+    ProtocolErrorCode, ProtocolErrorMessage, Request, Response, ResponseStatus, TerminalResultV2,
+    TerminalSizeV1, TerminalStateV1, VersionRange, agent_guest_capabilities,
     agent_guest_required_capabilities,
 };
 use sendbox_secrets::{
@@ -131,7 +132,10 @@ where
     loop {
         match reader.receive().await? {
             Message::Request(request) if request.operation == AGENT_LAUNCH_OPERATION => {
-                launch(request, &mut reader, &mut writer, &services).await?;
+                launch(request, &mut reader, &mut writer, &services, false).await?;
+            }
+            Message::Request(request) if request.operation == INTERACTIVE_LAUNCH_OPERATION => {
+                launch(request, &mut reader, &mut writer, &services, true).await?;
             }
             Message::Request(request) => {
                 let response =
@@ -210,6 +214,7 @@ async fn launch<S>(
     host_reader: &mut sendbox_protocol::FramedReader<ReadHalf<S>>,
     host_writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
     services: &ProtocolServices,
+    interactive: bool,
 ) -> Result<(), GuestError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -230,8 +235,20 @@ where
         )
         .await;
     };
-    let launch: LaunchRequestV2 = serde_json::from_slice(&request.payload)
-        .map_err(|error| GuestError::Protocol(format!("decoding launch request: {error}")))?;
+    let (launch, terminal) = if interactive {
+        let envelope: InteractiveLaunchRequestV1 = serde_json::from_slice(&request.payload)
+            .map_err(|error| {
+                GuestError::Protocol(format!("decoding interactive launch request: {error}"))
+            })?;
+        if let Err(error) = envelope.validate() {
+            return send_rejection(host_writer, request.request_id, &error.to_string()).await;
+        }
+        (envelope.launch, Some((envelope.terminal, envelope.term)))
+    } else {
+        let launch: LaunchRequestV2 = serde_json::from_slice(&request.payload)
+            .map_err(|error| GuestError::Protocol(format!("decoding launch request: {error}")))?;
+        (launch, None)
+    };
     if launch.schema_version != OPERATION_SCHEMA_VERSION {
         return send_rejection(
             host_writer,
@@ -261,7 +278,7 @@ where
         return send_rejection(host_writer, request.request_id, "readiness-not-available").await;
     }
 
-    let execution = build_execution_request(&launch, broker, &services.secret_decryptor)?;
+    let execution = build_execution_request(&launch, terminal, broker, &services.secret_decryptor)?;
     let stream = UnixStream::connect(&broker.socket_path)
         .await
         .map_err(|error| GuestError::io("connecting execution broker", error))?;
@@ -273,6 +290,76 @@ where
         },
     )
     .await?;
+    // A dedicated writer task owns the broker socket so the loop below never
+    // blocks in send while broker output is still pending. Control frames use
+    // their own channel and are always drained first, so bulk terminal input
+    // can never delay a cancel.
+    let (control_sender, mut control_receiver) = tokio::sync::mpsc::channel(BROKER_CONTROL_DEPTH);
+    let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(BROKER_INPUT_DEPTH);
+    let writer_task = tokio::spawn(async move {
+        loop {
+            let frame = tokio::select! {
+                biased;
+                control = control_receiver.recv() => match control {
+                    Some(frame) => frame,
+                    None => return,
+                },
+                input = input_receiver.recv() => match input {
+                    Some(frame) => frame,
+                    None => continue,
+                },
+            };
+            if send_broker_frame(&mut write, &frame).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut input_ended = false;
+    let result = run_execution_loop(
+        &request,
+        &execution,
+        read,
+        host_reader,
+        host_writer,
+        &control_sender,
+        &input_sender,
+        interactive,
+        &mut input_ended,
+    )
+    .await;
+    drop(control_sender);
+    drop(input_sender);
+    writer_task.abort();
+    result
+}
+
+/// Queue depth for broker control frames (cancel, shutdown).
+/// Terminal type handed to an interactive workload.
+const TERM_ENVIRONMENT: &str = "TERM";
+
+const BROKER_CONTROL_DEPTH: usize = 4;
+/// Queue depth for pending terminal input frames.
+const BROKER_INPUT_DEPTH: usize = 256;
+
+/// How long a terminal input frame may wait for the broker writer before it is
+/// dropped so the execution loop can keep draining broker output.
+const INPUT_OFFER_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[allow(clippy::too_many_arguments)]
+async fn run_execution_loop<S>(
+    request: &Request,
+    execution: &sendbox_exec::ExecutionRequest,
+    read: tokio::net::unix::OwnedReadHalf,
+    host_reader: &mut sendbox_protocol::FramedReader<ReadHalf<S>>,
+    host_writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
+    control_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
+    input_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
+    interactive: bool,
+    input_ended: &mut bool,
+) -> Result<(), GuestError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut broker_reader = BufReader::new(read);
     let mut line = Vec::new();
     loop {
@@ -311,18 +398,34 @@ where
             host_message = host_reader.receive() => {
                 match host_message? {
                     Message::Cancellation(cancellation) if cancellation.request_id == request.request_id => {
-                        send_broker_frame(
-                            &mut write,
-                            &sendbox_exec::service::ClientFrame::Cancel {
+                        let _ = control_sender.send(
+                            sendbox_exec::service::ClientFrame::Cancel {
                                 correlation_id: execution.correlation_id.clone(),
                             },
-                        ).await?;
+                        ).await;
                     }
                     Message::GracefulClose(_) => {
-                        send_broker_frame(
-                            &mut write,
-                            &sendbox_exec::service::ClientFrame::GracefulShutdown,
-                        ).await?;
+                        let _ = control_sender.send(
+                            sendbox_exec::service::ClientFrame::GracefulShutdown,
+                        ).await;
+                    }
+                    Message::Event(event) if event.kind.is_terminal_input() => {
+                        if let Err(detail) = forward_terminal_event(
+                            &event,
+                            request,
+                            execution,
+                            input_sender,
+                            interactive,
+                            input_ended,
+                        ).await {
+                            host_writer.send(&Message::ProtocolError(ProtocolErrorMessage {
+                                code: ProtocolErrorCode::InvalidState,
+                                detail,
+                            })).await?;
+                            return Err(GuestError::Protocol(
+                                "invalid terminal event during execution".to_owned(),
+                            ));
+                        }
                     }
                     other => {
                         host_writer.send(&Message::ProtocolError(ProtocolErrorMessage {
@@ -336,8 +439,65 @@ where
     }
 }
 
+/// Validates and queues one host terminal event.
+///
+/// Input bytes are never logged; failures report only the reason.
+async fn forward_terminal_event(
+    event: &Event,
+    request: &Request,
+    execution: &sendbox_exec::ExecutionRequest,
+    input_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
+    interactive: bool,
+    input_ended: &mut bool,
+) -> Result<(), String> {
+    if !interactive {
+        return Err("terminal input is only accepted for an interactive launch".to_owned());
+    }
+    if event.stream_id != request.request_id {
+        return Err("terminal event referenced an unknown stream".to_owned());
+    }
+    if *input_ended {
+        return Err("terminal input was already ended".to_owned());
+    }
+    let correlation_id = execution.correlation_id.clone();
+    let frame = match event.kind {
+        EventKind::StandardInput => sendbox_exec::service::ClientFrame::Input {
+            correlation_id,
+            data: event.payload.clone(),
+        },
+        EventKind::StandardInputEof => {
+            *input_ended = true;
+            sendbox_exec::service::ClientFrame::InputEof { correlation_id }
+        }
+        EventKind::TerminalResize => {
+            let size: TerminalSizeV1 = serde_json::from_slice(&event.payload)
+                .map_err(|error| format!("decoding terminal resize: {error}"))?;
+            size.validate().map_err(|error| error.to_string())?;
+            sendbox_exec::service::ClientFrame::Resize {
+                correlation_id,
+                columns: size.columns,
+                rows: size.rows,
+            }
+        }
+        _ => return Err("unsupported terminal event kind".to_owned()),
+    };
+    // A bounded wait absorbs bursts such as a large paste. Blocking without a
+    // bound would stop this loop from draining broker output, which is the
+    // very thing the writer task is waiting on -- so saturation drops the frame
+    // loudly rather than deadlocking the session.
+    if let Err(error) = input_sender.send_timeout(frame, INPUT_OFFER_BOUND).await {
+        let dropped = match error {
+            tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => "queue is saturated",
+            tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => "broker writer stopped",
+        };
+        eprintln!("sendbox-guest: dropping terminal input: {dropped}");
+    }
+    Ok(())
+}
+
 fn build_execution_request(
     launch: &LaunchRequestV2,
+    terminal: Option<(TerminalSizeV1, String)>,
     broker: &BrokerClientConfiguration,
     secret_decryptor: &GuestSecretDecryptor,
 ) -> Result<sendbox_exec::ExecutionRequest, GuestError> {
@@ -349,7 +509,17 @@ fn build_execution_request(
     let mut argv = Vec::with_capacity(launch.arguments.len() + 1);
     argv.push(launch.program.clone());
     argv.extend(launch.arguments.clone());
-    let environment = decrypt_environment(launch, secret_decryptor)?;
+    let mut environment = decrypt_environment(launch, secret_decryptor)?;
+    if let Some((_, term)) = terminal.as_ref() {
+        // The host's terminal type is authoritative for an interactive run: a
+        // stale configured TERM would make the workload render for the wrong
+        // terminal on the operator's screen.
+        environment.retain(|entry| entry.name != TERM_ENVIRONMENT);
+        environment.push(sendbox_exec::EnvironmentEntry {
+            name: TERM_ENVIRONMENT.to_owned(),
+            value: term.clone(),
+        });
+    }
     Ok(sendbox_exec::ExecutionRequest {
         session_id: broker.session_id,
         authentication: broker.authentication.clone(),
@@ -366,7 +536,13 @@ fn build_execution_request(
             relative: cwd,
         },
         environment,
-        stdin: sendbox_exec::StandardInput::Null,
+        stdin: match terminal {
+            None => sendbox_exec::StandardInput::Null,
+            Some((size, _)) => sendbox_exec::StandardInput::Terminal {
+                columns: size.columns,
+                rows: size.rows,
+            },
+        },
         timeout,
         containment: sendbox_exec::ContainmentProfile {
             run_as: Some(broker.workload),

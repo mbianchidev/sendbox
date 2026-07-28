@@ -9,6 +9,7 @@ pub mod agent;
 pub mod capabilities;
 pub mod cgroup;
 pub mod launcher;
+pub(crate) mod pty;
 pub mod resolver;
 pub mod rlimits;
 pub mod seccomp;

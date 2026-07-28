@@ -240,6 +240,9 @@ github:
 
   # Forward Copilot CLI authentication into the container.
   # Required if the agent uses GitHub Copilot features.
+  # Resolved on the host from COPILOT_GITHUB_TOKEN, or the legacy
+  # GITHUB_COPILOT_TOKEN when the supported variable is absent. The guest
+  # always receives it as COPILOT_GITHUB_TOKEN.
   # Default: true
   forward_copilot_auth: true
 
