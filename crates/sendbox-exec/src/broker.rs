@@ -2,8 +2,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::api::{
     AdmissionDisposition, CleanupReport, ExecutionDecision, ExecutionEvent, ExecutionRequest,
@@ -267,18 +268,34 @@ impl InputSource for NullInput {
 
 /// Bounded queue of terminal commands fed by a reader thread.
 ///
-/// Producers use [`ChannelInput::offer`], which never blocks past its bound, so
-/// a workload that stops reading its terminal can never stall the control
-/// reader that also carries cancellation.
+/// Input and EOF retain FIFO ordering. EOF has a dedicated reservation, while
+/// resizes are coalesced to the latest value so neither can be crowded out by
+/// bulk input.
 #[derive(Debug)]
 pub struct ChannelInput {
-    receiver: std::sync::Mutex<std::sync::mpsc::Receiver<TerminalCommand>>,
+    shared: Arc<InputQueue>,
 }
 
 /// Producer half of a [`ChannelInput`].
 #[derive(Debug, Clone)]
 pub struct InputSender {
-    sender: std::sync::mpsc::SyncSender<TerminalCommand>,
+    shared: Arc<InputQueue>,
+}
+
+#[derive(Debug)]
+struct InputQueue {
+    capacity: usize,
+    state: Mutex<InputQueueState>,
+    ready: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct InputQueueState {
+    ordered: VecDeque<TerminalCommand>,
+    input_count: usize,
+    input_ended: bool,
+    latest_resize: Option<TerminalCommand>,
+    receiver_alive: bool,
 }
 
 /// Why a terminal command could not be queued.
@@ -294,12 +311,19 @@ impl ChannelInput {
     /// Creates a bounded pair with the given queue depth.
     #[must_use]
     pub fn bounded(depth: usize) -> (InputSender, Self) {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(depth);
+        let shared = Arc::new(InputQueue {
+            capacity: depth,
+            state: Mutex::new(InputQueueState {
+                receiver_alive: true,
+                ..InputQueueState::default()
+            }),
+            ready: Condvar::new(),
+        });
         (
-            InputSender { sender },
-            Self {
-                receiver: std::sync::Mutex::new(receiver),
+            InputSender {
+                shared: Arc::clone(&shared),
             },
+            Self { shared },
         )
     }
 }
@@ -307,12 +331,14 @@ impl ChannelInput {
 impl InputSender {
     /// Queues a command without blocking a control reader.
     pub fn try_offer(&self, command: TerminalCommand) -> Result<(), InputOfferError> {
-        use std::sync::mpsc::TrySendError;
-        match self.sender.try_send(command) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(InputOfferError::Saturated),
-            Err(TrySendError::Disconnected(_)) => Err(InputOfferError::Disconnected),
-        }
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| InputOfferError::Disconnected)?;
+        self.enqueue(&mut state, command)?;
+        self.shared.ready.notify_one();
+        Ok(())
     }
 
     /// Queues a command, giving up after `bound` rather than blocking.
@@ -321,20 +347,71 @@ impl InputSender {
         command: TerminalCommand,
         bound: std::time::Duration,
     ) -> Result<(), InputOfferError> {
-        use std::sync::mpsc::TrySendError;
+        if !matches!(&command, TerminalCommand::Input(_)) {
+            return self.try_offer(command);
+        }
         let deadline = std::time::Instant::now() + bound;
-        let mut pending = command;
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| InputOfferError::Disconnected)?;
         loop {
-            match self.sender.try_send(pending) {
-                Ok(()) => return Ok(()),
-                Err(TrySendError::Disconnected(_)) => return Err(InputOfferError::Disconnected),
-                Err(TrySendError::Full(returned)) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(InputOfferError::Saturated);
-                    }
-                    pending = returned;
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
+            if !state.receiver_alive {
+                return Err(InputOfferError::Disconnected);
+            }
+            if state.input_ended {
+                return Err(InputOfferError::Saturated);
+            }
+            if state.input_count < self.shared.capacity {
+                state.input_count += 1;
+                state.ordered.push_back(command);
+                self.shared.ready.notify_one();
+                return Ok(());
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(InputOfferError::Saturated);
+            }
+            let (next, timeout) = self
+                .shared
+                .ready
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .map_err(|_| InputOfferError::Disconnected)?;
+            state = next;
+            if timeout.timed_out() && state.input_count >= self.shared.capacity {
+                return Err(InputOfferError::Saturated);
+            }
+        }
+    }
+
+    fn enqueue(
+        &self,
+        state: &mut InputQueueState,
+        command: TerminalCommand,
+    ) -> Result<(), InputOfferError> {
+        if !state.receiver_alive {
+            return Err(InputOfferError::Disconnected);
+        }
+        match command {
+            TerminalCommand::Input(_) if state.input_ended => Err(InputOfferError::Saturated),
+            TerminalCommand::Input(_) if state.input_count >= self.shared.capacity => {
+                Err(InputOfferError::Saturated)
+            }
+            command @ TerminalCommand::Input(_) => {
+                state.input_count += 1;
+                state.ordered.push_back(command);
+                Ok(())
+            }
+            TerminalCommand::InputEof if state.input_ended => Err(InputOfferError::Saturated),
+            TerminalCommand::InputEof => {
+                state.input_ended = true;
+                state.ordered.push_back(TerminalCommand::InputEof);
+                Ok(())
+            }
+            command @ TerminalCommand::Resize { .. } => {
+                state.latest_resize = Some(command);
+                Ok(())
             }
         }
     }
@@ -342,8 +419,42 @@ impl InputSender {
 
 impl InputSource for ChannelInput {
     fn poll(&self, bound: std::time::Duration) -> Option<TerminalCommand> {
-        let receiver = self.receiver.lock().ok()?;
-        receiver.recv_timeout(bound).ok()
+        let deadline = std::time::Instant::now() + bound;
+        let mut state = self.shared.state.lock().ok()?;
+        loop {
+            if let Some(resize) = state.latest_resize.take() {
+                return Some(resize);
+            }
+            if let Some(command) = state.ordered.pop_front() {
+                if matches!(&command, TerminalCommand::Input(_)) {
+                    state.input_count -= 1;
+                    self.shared.ready.notify_one();
+                }
+                return Some(command);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (next, timeout) = self
+                .shared
+                .ready
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .ok()?;
+            state = next;
+            if timeout.timed_out() && state.ordered.is_empty() && state.latest_resize.is_none() {
+                return None;
+            }
+        }
+    }
+}
+
+impl Drop for ChannelInput {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.receiver_alive = false;
+            self.shared.ready.notify_all();
+        }
     }
 }
 
@@ -511,6 +622,58 @@ mod tests {
         ContainmentProfile, CorrelationId, DescriptorPath, EnvironmentEntry, ExecutionTimeout,
         RelativePath, RootId,
     };
+
+    #[test]
+    fn terminal_input_queue_reserves_eof_and_coalesces_resizes() {
+        let (sender, queue) = ChannelInput::bounded(2);
+        sender
+            .try_offer(TerminalCommand::Input(vec![b'a']))
+            .expect("first input");
+        sender
+            .try_offer(TerminalCommand::Input(vec![b'b']))
+            .expect("second input");
+        assert_eq!(
+            sender.try_offer(TerminalCommand::Input(vec![b'c'])),
+            Err(InputOfferError::Saturated)
+        );
+
+        sender
+            .try_offer(TerminalCommand::Resize {
+                columns: 80,
+                rows: 24,
+            })
+            .expect("first resize");
+        sender
+            .try_offer(TerminalCommand::Resize {
+                columns: 120,
+                rows: 40,
+            })
+            .expect("replacement resize");
+        sender
+            .try_offer(TerminalCommand::InputEof)
+            .expect("reserved end of file");
+
+        assert_eq!(
+            queue.poll(std::time::Duration::ZERO),
+            Some(TerminalCommand::Resize {
+                columns: 120,
+                rows: 40,
+            })
+        );
+        assert!(matches!(
+            queue.poll(std::time::Duration::ZERO),
+            Some(TerminalCommand::Input(data)) if data == vec![b'a']
+        ));
+        assert!(matches!(
+            queue.poll(std::time::Duration::ZERO),
+            Some(TerminalCommand::Input(data)) if data == vec![b'b']
+        ));
+        assert_eq!(
+            queue.poll(std::time::Duration::ZERO),
+            Some(TerminalCommand::InputEof)
+        );
+        assert_eq!(queue.poll(std::time::Duration::ZERO), None);
+    }
 
     #[derive(Default)]
     struct RecordingBackend {

@@ -12,10 +12,8 @@ use sendbox_agent::{
     AgentError, BoxFuture, GuestTerminalSize, HostTerminalCommand, TerminalSource,
 };
 
-/// Bound on queued host keystrokes. Deeper than a human types and deep enough
-/// for a paste; beyond that the operator is better served by back pressure on
-/// the reader than by unbounded memory growth.
-const INPUT_QUEUE_DEPTH: usize = 256;
+/// The credited input window plus one FIFO reservation for EOF.
+const INPUT_QUEUE_DEPTH: usize = sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + 1;
 
 /// Largest keystroke batch read from the host terminal in one go.
 const INPUT_CHUNK: usize = sendbox_core::TERMINAL_INPUT_CHUNK_BYTES;
@@ -183,12 +181,28 @@ mod imp {
     /// Host keystroke and resize stream handed to the agent orchestrator.
     pub struct CliTerminal {
         commands: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<HostTerminalCommand>>,
+        resizes: tokio::sync::Mutex<tokio::sync::watch::Receiver<Option<(u16, u16)>>>,
+        _resize_keepalive: tokio::sync::watch::Sender<Option<(u16, u16)>>,
         credits: Arc<InputCreditGate>,
     }
 
     impl TerminalSource for CliTerminal {
         fn next_command<'a>(&'a self) -> BoxFuture<'a, Option<HostTerminalCommand>> {
-            Box::pin(async move { self.commands.lock().await.recv().await })
+            Box::pin(async move {
+                let mut commands = self.commands.lock().await;
+                let mut resizes = self.resizes.lock().await;
+                tokio::select! {
+                    command = commands.recv() => command,
+                    changed = resizes.changed() => {
+                        if changed.is_err() {
+                            return commands.recv().await;
+                        }
+                        (*resizes.borrow_and_update()).map(|(columns, rows)| {
+                            HostTerminalCommand::Resize { columns, rows }
+                        })
+                    }
+                }
+            })
         }
 
         fn grant_input_credit(&self, credits: u16) -> Result<(), AgentError> {
@@ -217,17 +231,14 @@ mod imp {
             let guard = Arc::new(RawModeGuard::enter()?);
             let (sender, receiver) = tokio::sync::mpsc::channel(INPUT_QUEUE_DEPTH);
             let (reader, credits) = StdinPump::start(sender.clone())?;
+            let (resize_sender, resize_receiver) =
+                tokio::sync::watch::channel::<Option<(u16, u16)>>(None);
+            let resize_updates = resize_sender.clone();
             let resizes = tokio::spawn(async move {
                 while winch.recv().await.is_some() {
                     match window_size() {
                         Ok(Some((columns, rows))) => {
-                            if sender
-                                .send(HostTerminalCommand::Resize { columns, rows })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
+                            resize_updates.send_replace(Some((columns, rows)));
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -242,6 +253,8 @@ mod imp {
                     guard,
                     source: Arc::new(CliTerminal {
                         commands: tokio::sync::Mutex::new(receiver),
+                        resizes: tokio::sync::Mutex::new(resize_receiver),
+                        _resize_keepalive: resize_sender,
                         credits,
                     }),
                     reader: Some(reader),

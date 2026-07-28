@@ -347,9 +347,8 @@ impl TerminalInputState {
 /// queue behind bulk terminal input.
 const WRITER_CONTROL_DEPTH: usize = 4;
 
-/// Queue depth for pending terminal input frames.
-const WRITER_INPUT_DEPTH: usize =
-    sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + WRITER_CONTROL_DEPTH;
+/// Queue depth for the credited input window plus its FIFO EOF reservation.
+const WRITER_INPUT_DEPTH: usize = sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + 1;
 
 struct WriterMessage {
     message: Message,
@@ -365,6 +364,7 @@ struct WriterMessage {
 struct WriterHandle {
     control: tokio::sync::mpsc::Sender<WriterMessage>,
     input: tokio::sync::mpsc::Sender<WriterMessage>,
+    resize: tokio::sync::watch::Sender<Option<Message>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -375,6 +375,7 @@ impl WriterHandle {
         let (control, mut control_receiver) = tokio::sync::mpsc::channel(WRITER_CONTROL_DEPTH);
         let (input, mut input_receiver) =
             tokio::sync::mpsc::channel::<WriterMessage>(WRITER_INPUT_DEPTH);
+        let (resize, mut resize_receiver) = tokio::sync::watch::channel::<Option<Message>>(None);
         let task = tokio::spawn(async move {
             loop {
                 let queued = tokio::select! {
@@ -382,6 +383,16 @@ impl WriterHandle {
                     control = control_receiver.recv() => match control {
                         Some(queued) => queued,
                         None => return,
+                    },
+                    changed = resize_receiver.changed() => match changed {
+                        Ok(()) => WriterMessage {
+                            message: resize_receiver
+                                .borrow_and_update()
+                                .clone()
+                                .expect("resize notification always carries a message"),
+                            ack: None,
+                        },
+                        Err(_) => continue,
                     },
                     input = input_receiver.recv() => match input {
                         Some(queued) => queued,
@@ -404,6 +415,7 @@ impl WriterHandle {
         Self {
             control,
             input,
+            resize,
             task,
         }
     }
@@ -437,6 +449,12 @@ impl WriterHandle {
                 "guest connection writer stopped".to_owned(),
             )),
         }
+    }
+
+    fn queue_resize(&self, message: Message) -> Result<(), AgentError> {
+        self.resize
+            .send(Some(message))
+            .map_err(|_| AgentError::Guest("guest connection writer stopped".to_owned()))
     }
 }
 
@@ -525,7 +543,7 @@ impl GuestExecution for ProtocolGuestExecution {
     fn send_terminal<'a>(
         &'a mut self,
         command: HostTerminalCommand,
-        cancellation: &'a CancellationToken,
+        _cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
             if !self.interactive {
@@ -539,7 +557,7 @@ impl GuestExecution for ProtocolGuestExecution {
                 ));
             }
             self.input.require_open()?;
-            let event = match command {
+            match command {
                 HostTerminalCommand::Input(bytes) => {
                     if bytes.is_empty() || bytes.len() > sendbox_core::TERMINAL_INPUT_CHUNK_BYTES {
                         return Err(AgentError::TerminalInput(format!(
@@ -563,7 +581,7 @@ impl GuestExecution for ProtocolGuestExecution {
                         }
                         return Err(error);
                     }
-                    return Ok(());
+                    Ok(())
                 }
                 HostTerminalCommand::InputEof => {
                     let event = Event {
@@ -573,23 +591,22 @@ impl GuestExecution for ProtocolGuestExecution {
                     };
                     self.writer.queue_input(Message::Event(event))?;
                     self.input.end()?;
-                    return Ok(());
+                    Ok(())
                 }
                 HostTerminalCommand::Resize { columns, rows } => {
                     let size = TerminalSizeV1::new(columns, rows).map_err(|error| {
                         AgentError::Guest(format!("invalid terminal size: {error}"))
                     })?;
-                    Event {
+                    let event = Event {
                         stream_id: REQUEST_ID,
                         kind: sendbox_protocol::EventKind::TerminalResize,
                         payload: serde_json::to_vec(&size).map_err(|error| {
                             AgentError::Guest(format!("encode terminal resize: {error}"))
                         })?,
-                    }
+                    };
+                    self.writer.queue_resize(Message::Event(event))
                 }
-            };
-            let _ = cancellation;
-            self.writer.queue_input(Message::Event(event))
+            }
         })
     }
 
@@ -718,12 +735,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_credited_window_reserves_writer_capacity_for_end_of_file() {
+    async fn the_credited_window_reserves_eof_and_coalesces_resizes() {
         let (control, _control) = tokio::sync::mpsc::channel(WRITER_CONTROL_DEPTH);
         let (input, mut receiver) = tokio::sync::mpsc::channel(WRITER_INPUT_DEPTH);
+        let (resize, mut resize_receiver) = tokio::sync::watch::channel::<Option<Message>>(None);
         let writer = WriterHandle {
             control,
             input,
+            resize,
             task: tokio::spawn(std::future::pending()),
         };
 
@@ -735,6 +754,30 @@ mod tests {
         writer
             .queue_input(terminal_event(EventKind::StandardInputEof))
             .expect("end of file uses reserved capacity");
+
+        for _ in 0..WRITER_INPUT_DEPTH {
+            writer
+                .queue_resize(terminal_event(EventKind::TerminalResize))
+                .expect("coalesce resize");
+        }
+        resize_receiver
+            .changed()
+            .await
+            .expect("resize notification");
+        assert!(matches!(
+            resize_receiver.borrow_and_update().as_ref(),
+            Some(Message::Event(Event {
+                kind: EventKind::TerminalResize,
+                ..
+            }))
+        ));
+        let error = writer
+            .queue_input(terminal_event(EventKind::StandardInput))
+            .expect_err("full queue must fail without blocking");
+        assert!(
+            error.to_string().contains("credit invariant"),
+            "unexpected error: {error}"
+        );
 
         for _ in 0..sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS {
             let queued = receiver.recv().await.expect("queued input");
@@ -754,19 +797,6 @@ mod tests {
                 ..
             })
         ));
-
-        for _ in 0..WRITER_INPUT_DEPTH {
-            writer
-                .queue_input(terminal_event(EventKind::TerminalResize))
-                .expect("fill writer queue");
-        }
-        let error = writer
-            .queue_input(terminal_event(EventKind::TerminalResize))
-            .expect_err("full queue must fail without blocking");
-        assert!(
-            error.to_string().contains("credit invariant"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]

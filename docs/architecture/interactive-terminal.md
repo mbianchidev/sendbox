@@ -105,17 +105,17 @@ Credit and queue behavior by layer:
 
 | Layer | V2 behavior |
 |---|---|
-| `sendbox-cli` | Starts with zero credit. Its reader polls only the wake pipe at zero and reads at most one 4 KiB chunk per credit. |
-| `sendbox-agent` | Validates grants never exceed 64 outstanding credits. A dedicated writer has a depth-4 priority control channel and a depth-68 FIFO input channel. |
-| Guest protocol | Relays credits without blocking its broker reader. Its priority control channel is depth 4 and its input channel is depth 68. |
-| Exec service | The socket reader uses non-blocking offers into a depth-72 terminal queue, leaving reserved control/EOF capacity. |
-| Launcher | The control monitor uses non-blocking offers into another depth-72 queue. `TerminalWriter` preserves at most 64 chunk boundaries and 256 KiB on an `O_NONBLOCK` primary. |
+| `sendbox-cli` | Starts with zero credit. Its reader polls only the wake pipe at zero, reads at most one 4 KiB chunk per credit, and uses a depth-65 input/EOF FIFO plus a latest-value resize lane. |
+| `sendbox-agent` | Validates grants never exceed 64 outstanding credits. A dedicated writer has a depth-4 priority control channel, a depth-65 input/EOF FIFO, and a latest-value resize lane. |
+| Guest protocol | Relays credits without blocking its broker reader. Its writer has a depth-4 priority control channel, a depth-64 input channel, a dedicated EOF reservation that drains after preceding input, and a latest-value resize lane. |
+| Exec service | The socket reader uses non-blocking offers into a queue with 64 input slots, a dedicated FIFO EOF reservation, and one coalesced resize slot. |
+| Launcher | The control monitor uses the same 64-input/EOF/resize queue shape. `TerminalWriter` preserves at most 64 chunk boundaries and 256 KiB on an `O_NONBLOCK` primary. |
 
 Under valid credit accounting, none of the V2 queues can saturate. Saturation is
 therefore an invariant violation that terminates the session loudly; V2 never
 waits in a shared reader and never discards a chunk. The V1 operation alone keeps
-the old bounded waits and explicit drop diagnostics for mixed-version
-compatibility.
+the old bounded waits and explicit drop diagnostics for bulk input chunks; EOF
+still uses its reservation so a legacy session cannot delay cancellation.
 
 Guest output and host keystrokes are deliberately selected *without* bias
 against each other: a chatty workload must not starve typing, and a long paste
@@ -131,13 +131,15 @@ is one-shot and state-changing on all three sides — the host stops reading
 stdin, the orchestrator closes the terminal, and the guest refuses further input
 — so a silent drop leaves the workload waiting forever for a `VEOF` byte that
 can no longer be produced. EOF consumes no credit and every input queue reserves
-capacity for it. It travels on the same FIFO input path as preceding keystrokes,
-then the launcher appends the configured `VEOF` byte behind its backlog, so it
-cannot overtake input and cannot be refused at zero credit.
+capacity for it. Where EOF has its own transport lane, the writer drains every
+preceding input frame before sending it. The launcher then appends the configured
+`VEOF` byte behind its backlog, so EOF cannot overtake input and cannot be refused
+at zero credit.
 
 Resizes consume no credit. They are `ioctl`s once they reach the launcher, so
 they can overtake bytes already waiting in the PTY backlog; `SIGWINCH` is out of
-band anyway.
+band anyway. Forwarding queues retain only the latest pending resize, preventing
+resize storms from consuming input or EOF capacity.
 
 The pty primary is opened `O_NONBLOCK`, which is what keeps the backlog in user
 space where it can be bounded and where later commands can overtake it.

@@ -33,13 +33,10 @@ use super::{capabilities, raw, rlimits, seccomp};
 
 const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 const OUTPUT_CHANNEL_DEPTH: usize = 16;
-const INPUT_CONTROL_RESERVE: usize = 8;
-const INPUT_CHANNEL_DEPTH: usize =
-    sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + INPUT_CONTROL_RESERVE;
+const INPUT_CHANNEL_DEPTH: usize = sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize;
 /// Hard bound on queuing one terminal command, so the control reader keeps
 /// observing cancellation even while the workload ignores its terminal.
 const INPUT_OFFER_BOUND: Duration = Duration::from_millis(250);
-const REQUIRED_INPUT_BOUND: Duration = Duration::from_secs(5);
 /// How long one pass waits for a non-draining workload to accept more input
 /// before letting the writer thread look at cancellation again.
 const INPUT_WRITE_SLICE: Duration = Duration::from_millis(10);
@@ -658,7 +655,7 @@ fn run(
     drain_after_cleanup(
         &receiver,
         sink,
-        request,
+        &request.correlation_id,
         &mut sequence,
         &mut terminal,
         Duration::from_millis(250),
@@ -824,7 +821,7 @@ fn receive_output(receiver: &Receiver<LauncherEvent>) -> Option<LauncherEvent> {
 fn drain_after_cleanup(
     receiver: &Receiver<LauncherEvent>,
     sink: &mut dyn EventSink,
-    request: &ExecutionRequest,
+    correlation_id: &crate::api::CorrelationId,
     sequence: &mut u64,
     terminal: &mut TerminalState,
     bound: Duration,
@@ -837,11 +834,21 @@ fn drain_after_cleanup(
     }
     let deadline = Instant::now() + bound;
     loop {
-        match receiver.recv_timeout(Duration::from_millis(10)) {
+        let now = Instant::now();
+        if now >= deadline {
+            if matches!(terminal, TerminalState::Exited(_)) {
+                *terminal = TerminalState::OutputSaturated;
+            }
+            return;
+        }
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(10));
+        match receiver.recv_timeout(wait) {
             Ok(LauncherEvent::Output(output)) => {
                 *sequence = sequence.saturating_add(1);
                 if let Err(error) = sink.emit(ExecutionEvent::Output {
-                    correlation_id: request.correlation_id.clone(),
+                    correlation_id: correlation_id.clone(),
                     stream: output.stream,
                     sequence: *sequence,
                     data: output.data,
@@ -852,12 +859,6 @@ fn drain_after_cleanup(
             }
             Ok(LauncherEvent::TerminalInputCredit(_)) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
-                if matches!(terminal, TerminalState::Exited(_)) {
-                    *terminal = TerminalState::OutputSaturated;
-                }
-                return;
-            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
@@ -1176,22 +1177,15 @@ fn offer_terminal(
         cancellation.supervisor_died();
         return false;
     };
-    let required = matches!(command, TerminalCommand::InputEof);
-    let offered = if flow_controlled {
-        sender.try_offer(command)
+    let droppable_input = !flow_controlled && matches!(&command, TerminalCommand::Input(_));
+    let offered = if droppable_input {
+        sender.offer(command, INPUT_OFFER_BOUND)
     } else {
-        sender.offer(
-            command,
-            if required {
-                REQUIRED_INPUT_BOUND
-            } else {
-                INPUT_OFFER_BOUND
-            },
-        )
+        sender.try_offer(command)
     };
     match offered {
         Ok(()) => true,
-        Err(InputOfferError::Saturated) if !flow_controlled && !required => {
+        Err(InputOfferError::Saturated) if droppable_input => {
             eprintln!(
                 "sendbox-launcher: workload stopped reading its terminal for {}ms; dropping input",
                 INPUT_OFFER_BOUND.as_millis()
@@ -1199,9 +1193,7 @@ fn offer_terminal(
             true
         }
         Err(InputOfferError::Saturated) => {
-            eprintln!(
-                "sendbox-launcher: required terminal input could not be queued without blocking control"
-            );
+            eprintln!("sendbox-launcher: terminal input queue invariant failed");
             cancellation.supervisor_died();
             false
         }
@@ -1708,6 +1700,66 @@ mod tests {
         assert!(
             slowest < INPUT_WRITE_SLICE * 8,
             "terminal input parked on a workload that does not read it: {slowest:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_output_drain_honors_its_deadline_under_continuous_output() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let producer_ready = Arc::clone(&ready);
+        let producer = thread::spawn(move || {
+            sender
+                .send(LauncherEvent::Output(OutputChunk {
+                    stream: StreamKind::Stdout,
+                    data: vec![b'x'],
+                }))
+                .expect("seed output");
+            producer_ready.wait();
+            let deadline = Instant::now() + Duration::from_millis(150);
+            while Instant::now() < deadline {
+                if sender
+                    .send(LauncherEvent::Output(OutputChunk {
+                        stream: StreamKind::Stdout,
+                        data: vec![b'x'],
+                    }))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        ready.wait();
+
+        let correlation_id = crate::api::CorrelationId::new("drain-deadline").expect("correlation");
+        let mut sequence = 0;
+        let mut terminal = TerminalState::Exited(crate::api::ExitStatus {
+            exit_code: Some(0),
+            signal: None,
+        });
+        let mut emitted = 0_u64;
+        let mut sink = |_event| {
+            emitted += 1;
+            Ok(())
+        };
+        let started = Instant::now();
+        drain_after_cleanup(
+            &receiver,
+            &mut sink,
+            &correlation_id,
+            &mut sequence,
+            &mut terminal,
+            Duration::from_millis(20),
+        );
+        let elapsed = started.elapsed();
+        drop(receiver);
+        producer.join().expect("output producer");
+
+        assert!(emitted > 0);
+        assert_eq!(terminal, TerminalState::OutputSaturated);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "continuous output bypassed the drain deadline: {elapsed:?}"
         );
     }
 

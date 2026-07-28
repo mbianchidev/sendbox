@@ -365,13 +365,53 @@ where
     // can never delay a cancel.
     let (control_sender, mut control_receiver) = tokio::sync::mpsc::channel(BROKER_CONTROL_DEPTH);
     let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(BROKER_INPUT_DEPTH);
+    let (eof_sender, mut eof_receiver) = tokio::sync::mpsc::channel(1);
+    let (resize_sender, mut resize_receiver) =
+        tokio::sync::watch::channel::<Option<sendbox_exec::service::ClientFrame>>(None);
     let writer_task = tokio::spawn(async move {
+        let mut eof_pending = None;
         loop {
+            if let Some(eof) = eof_pending.take() {
+                if let Ok(control) = control_receiver.try_recv() {
+                    eof_pending = Some(eof);
+                    if send_broker_frame(&mut write, &control).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                match input_receiver.try_recv() {
+                    Ok(input) => {
+                        eof_pending = Some(eof);
+                        if send_broker_frame(&mut write, &input).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        if send_broker_frame(&mut write, &eof).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
             let frame = tokio::select! {
                 biased;
                 control = control_receiver.recv() => match control {
                     Some(frame) => frame,
                     None => return,
+                },
+                eof = eof_receiver.recv() => {
+                    eof_pending = eof;
+                    continue;
+                },
+                changed = resize_receiver.changed() => match changed {
+                    Ok(()) => resize_receiver
+                        .borrow_and_update()
+                        .clone()
+                        .expect("resize notification always carries a frame"),
+                    Err(_) => continue,
                 },
                 input = input_receiver.recv() => match input {
                     Some(frame) => frame,
@@ -391,13 +431,19 @@ where
         host_reader,
         host_writer,
         &control_sender,
-        &input_sender,
+        BrokerInputSenders {
+            input: &input_sender,
+            eof: &eof_sender,
+            resize: &resize_sender,
+        },
         mode,
         &mut input_ended,
     )
     .await;
     drop(control_sender);
     drop(input_sender);
+    drop(eof_sender);
+    drop(resize_sender);
     writer_task.abort();
     result
 }
@@ -407,14 +453,20 @@ where
 const TERM_ENVIRONMENT: &str = "TERM";
 
 const BROKER_CONTROL_DEPTH: usize = 4;
-/// Queue depth for pending terminal input frames.
-const BROKER_INPUT_DEPTH: usize =
-    sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + BROKER_CONTROL_DEPTH;
+/// Queue depth for the credited input window. EOF and resize use independent
+/// reserved lanes.
+const BROKER_INPUT_DEPTH: usize = sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize;
 
 /// How long a terminal input frame may wait for the broker writer before it is
 /// dropped so the execution loop can keep draining broker output.
 const INPUT_OFFER_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
-const REQUIRED_INPUT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+struct BrokerInputSenders<'a> {
+    input: &'a tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
+    eof: &'a tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
+    resize: &'a tokio::sync::watch::Sender<Option<sendbox_exec::service::ClientFrame>>,
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn run_execution_loop<S>(
@@ -424,7 +476,7 @@ async fn run_execution_loop<S>(
     host_reader: &mut sendbox_protocol::FramedReader<ReadHalf<S>>,
     host_writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
     control_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
-    input_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
+    input_senders: BrokerInputSenders<'_>,
     mode: LaunchMode,
     input_ended: &mut bool,
 ) -> Result<(), GuestError>
@@ -508,7 +560,7 @@ where
                             &event,
                             request,
                             execution,
-                            input_sender,
+                            input_senders,
                             mode,
                             input_ended,
                         ).await {
@@ -536,11 +588,24 @@ where
 /// Validates and queues one host terminal event.
 ///
 /// Input bytes are never logged; failures report only the reason.
+fn validate_terminal_input_payload(mode: LaunchMode, payload: &[u8]) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("terminal input chunk must not be empty".to_owned());
+    }
+    if mode.uses_flow_control() && payload.len() > sendbox_core::TERMINAL_INPUT_CHUNK_BYTES {
+        return Err(format!(
+            "terminal input chunk must contain 1..={} bytes",
+            sendbox_core::TERMINAL_INPUT_CHUNK_BYTES
+        ));
+    }
+    Ok(())
+}
+
 async fn forward_terminal_event(
     event: &Event,
     request: &Request,
     execution: &sendbox_exec::ExecutionRequest,
-    input_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
+    input_senders: BrokerInputSenders<'_>,
     mode: LaunchMode,
     input_ended: &mut bool,
 ) -> Result<(), String> {
@@ -554,80 +619,73 @@ async fn forward_terminal_event(
         return Err("terminal input was already ended".to_owned());
     }
     let correlation_id = execution.correlation_id.clone();
-    let (frame, ends_input) = match event.kind {
+    match event.kind {
         EventKind::StandardInput => {
-            if event.payload.is_empty()
-                || event.payload.len() > sendbox_core::TERMINAL_INPUT_CHUNK_BYTES
-            {
-                return Err(format!(
-                    "terminal input chunk must contain 1..={} bytes",
-                    sendbox_core::TERMINAL_INPUT_CHUNK_BYTES
-                ));
+            validate_terminal_input_payload(mode, &event.payload)?;
+            let frame = sendbox_exec::service::ClientFrame::Input {
+                correlation_id,
+                data: event.payload.clone(),
+            };
+            if mode.uses_flow_control() {
+                match input_senders.input.try_send(frame) {
+                    Ok(()) => Ok(()),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(
+                        "terminal input credit invariant failed: broker writer queue is full"
+                            .to_owned(),
+                    ),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        Err("broker writer stopped".to_owned())
+                    }
+                }
+            } else {
+                if let Err(error) = input_senders
+                    .input
+                    .send_timeout(frame, INPUT_OFFER_BOUND)
+                    .await
+                {
+                    let dropped = match error {
+                        tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => {
+                            "queue is saturated"
+                        }
+                        tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => {
+                            "broker writer stopped"
+                        }
+                    };
+                    eprintln!("sendbox-guest: dropping terminal input: {dropped}");
+                }
+                Ok(())
             }
-            (
-                sendbox_exec::service::ClientFrame::Input {
-                    correlation_id,
-                    data: event.payload.clone(),
-                },
-                false,
-            )
         }
-        EventKind::StandardInputEof => (
-            sendbox_exec::service::ClientFrame::InputEof { correlation_id },
-            true,
-        ),
+        EventKind::StandardInputEof => {
+            let frame = sendbox_exec::service::ClientFrame::InputEof { correlation_id };
+            match input_senders.eof.try_send(frame) {
+                Ok(()) => {
+                    *input_ended = true;
+                    Ok(())
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    Err("terminal end-of-file reservation is already occupied".to_owned())
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Err("broker writer stopped".to_owned())
+                }
+            }
+        }
         EventKind::TerminalResize => {
             let size: TerminalSizeV1 = serde_json::from_slice(&event.payload)
                 .map_err(|error| format!("decoding terminal resize: {error}"))?;
             size.validate().map_err(|error| error.to_string())?;
-            (
-                sendbox_exec::service::ClientFrame::Resize {
+            input_senders
+                .resize
+                .send(Some(sendbox_exec::service::ClientFrame::Resize {
                     correlation_id,
                     columns: size.columns,
                     rows: size.rows,
-                },
-                false,
-            )
+                }))
+                .map_err(|_| "broker writer stopped".to_owned())
         }
-        _ => return Err("unsupported terminal event kind".to_owned()),
-    };
-    if mode.uses_flow_control() {
-        match input_sender.try_send(frame) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                return Err(
-                    "terminal input credit invariant failed: broker writer queue is full"
-                        .to_owned(),
-                );
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Err("broker writer stopped".to_owned());
-            }
-        }
-    } else if ends_input {
-        input_sender
-            .send_timeout(frame, REQUIRED_INPUT_BOUND)
-            .await
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => format!(
-                    "broker writer did not accept terminal end of file within {}ms",
-                    REQUIRED_INPUT_BOUND.as_millis()
-                ),
-                tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => {
-                    "broker writer stopped".to_owned()
-                }
-            })?;
-    } else if let Err(error) = input_sender.send_timeout(frame, INPUT_OFFER_BOUND).await {
-        let dropped = match error {
-            tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => "queue is saturated",
-            tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => "broker writer stopped",
-        };
-        eprintln!("sendbox-guest: dropping terminal input: {dropped}");
+        _ => Err("unsupported terminal event kind".to_owned()),
     }
-    if ends_input {
-        *input_ended = true;
-    }
-    Ok(())
 }
 
 fn build_execution_request(
@@ -901,6 +959,70 @@ mod tests {
 
     use super::*;
     use crate::runtime::RuntimeIdentity;
+
+    #[test]
+    fn legacy_terminal_input_keeps_its_pre_v2_frame_size() {
+        let payload = vec![b'x'; sendbox_core::TERMINAL_INPUT_CHUNK_BYTES + 1];
+        validate_terminal_input_payload(LaunchMode::InteractiveV1, &payload)
+            .expect("V1 input remains frame-bounded, not chunk-bounded");
+        assert!(
+            validate_terminal_input_payload(LaunchMode::InteractiveV2, &payload).is_err(),
+            "V2 must enforce the credited chunk size"
+        );
+    }
+
+    #[test]
+    fn broker_writer_reserves_eof_and_coalesces_resizes() {
+        let (input_sender, _input_receiver) = tokio::sync::mpsc::channel(BROKER_INPUT_DEPTH);
+        let (eof_sender, _eof_receiver) = tokio::sync::mpsc::channel(1);
+        let (resize_sender, resize_receiver) =
+            tokio::sync::watch::channel::<Option<sendbox_exec::service::ClientFrame>>(None);
+        let correlation_id =
+            sendbox_exec::CorrelationId::new("queue-reservations").expect("correlation");
+
+        for _ in 0..BROKER_INPUT_DEPTH {
+            input_sender
+                .try_send(sendbox_exec::service::ClientFrame::Input {
+                    correlation_id: correlation_id.clone(),
+                    data: vec![b'x'],
+                })
+                .expect("credited input");
+        }
+        assert!(matches!(
+            input_sender.try_send(sendbox_exec::service::ClientFrame::Input {
+                correlation_id: correlation_id.clone(),
+                data: vec![b'x'],
+            }),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+        eof_sender
+            .try_send(sendbox_exec::service::ClientFrame::InputEof {
+                correlation_id: correlation_id.clone(),
+            })
+            .expect("reserved end of file");
+        resize_sender
+            .send(Some(sendbox_exec::service::ClientFrame::Resize {
+                correlation_id: correlation_id.clone(),
+                columns: 80,
+                rows: 24,
+            }))
+            .expect("first resize");
+        resize_sender
+            .send(Some(sendbox_exec::service::ClientFrame::Resize {
+                correlation_id,
+                columns: 120,
+                rows: 40,
+            }))
+            .expect("replacement resize");
+        assert!(matches!(
+            resize_receiver.borrow().as_ref(),
+            Some(sendbox_exec::service::ClientFrame::Resize {
+                columns: 120,
+                rows: 40,
+                ..
+            })
+        ));
+    }
 
     #[tokio::test]
     async fn handshake_is_unreachable_before_local_readiness() {

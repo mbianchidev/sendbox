@@ -22,13 +22,10 @@ use crate::runtime::{AuthenticatedUnixListener, RuntimeError};
 pub const MAX_SERVICE_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Queue depth for pending terminal commands.
-const INPUT_CHANNEL_DEPTH: usize =
-    sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + INPUT_CONTROL_RESERVE;
-const INPUT_CONTROL_RESERVE: usize = 8;
+const INPUT_CHANNEL_DEPTH: usize = sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize;
 /// Hard bound on queuing one terminal command, so the control reader keeps
 /// observing cancellation even while the workload ignores its terminal.
 const INPUT_OFFER_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
-const REQUIRED_INPUT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Client-to-broker control frames.
 ///
@@ -246,30 +243,21 @@ fn spawn_client_control_reader(
                 cancellation.disconnect();
                 return;
             };
-            let required = matches!(command, TerminalCommand::InputEof);
-            let offered = if flow_controlled {
-                sender.try_offer(command)
+            let droppable_input = !flow_controlled && matches!(&command, TerminalCommand::Input(_));
+            let offered = if droppable_input {
+                sender.offer(command, INPUT_OFFER_BOUND)
             } else {
-                sender.offer(
-                    command,
-                    if required {
-                        REQUIRED_INPUT_BOUND
-                    } else {
-                        INPUT_OFFER_BOUND
-                    },
-                )
+                sender.try_offer(command)
             };
             match offered {
                 Ok(()) => {}
-                Err(InputOfferError::Saturated) if !flow_controlled && !required => {
+                Err(InputOfferError::Saturated) if droppable_input => {
                     eprintln!(
                         "sendbox-broker: workload stopped reading its terminal; dropping input"
                     );
                 }
                 Err(InputOfferError::Saturated) => {
-                    eprintln!(
-                        "sendbox-broker: required terminal input could not be queued without blocking control"
-                    );
+                    eprintln!("sendbox-broker: terminal input queue invariant failed");
                     cancellation.disconnect();
                     return;
                 }
