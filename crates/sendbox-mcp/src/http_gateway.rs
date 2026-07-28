@@ -27,6 +27,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
+use rustls_pki_types::{CertificateDer, pem::PemObject};
 use sendbox_egress::address::{AddressClass, canonicalize, classify};
 use sendbox_egress::dialer::Dialer;
 use sendbox_egress::resolver::UpstreamResolver;
@@ -478,9 +479,8 @@ fn tls_config(remote: &RemoteServerRuntime) -> Result<ClientConfig, HttpGatewayE
         })?;
     }
     for pem in &remote.http.tls.trust_roots_pem {
-        let mut reader = io::Cursor::new(pem.as_bytes());
         let mut count = 0_usize;
-        for certificate in rustls_pemfile::certs(&mut reader) {
+        for certificate in CertificateDer::pem_slice_iter(pem.as_bytes()) {
             roots
                 .add(certificate.map_err(|error| {
                     HttpGatewayError::InvalidConfiguration(format!(

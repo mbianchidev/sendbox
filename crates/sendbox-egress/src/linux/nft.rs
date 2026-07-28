@@ -157,7 +157,7 @@ impl NftConfig {
         let mut ports = vec![self.connect_broker_tcp_port];
         ports.extend(self.dns_broker_port);
         ports.extend(self.mcp_gateway_port);
-        if ports.iter().any(|port| *port == 0)
+        if ports.contains(&0)
             || ports
                 .iter()
                 .collect::<std::collections::BTreeSet<_>>()

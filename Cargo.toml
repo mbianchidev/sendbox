@@ -69,7 +69,7 @@ rlimit = "0.11.0"
 roxmltree = "0.21.1"
 rustls = "0.23.42"
 rustls-native-certs = "0.8.4"
-rustls-pemfile = "2.2.0"
+rustls-pki-types = "1.15.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["raw_value"] }
 serde_yaml_ng = "0.10.0"
