@@ -42,6 +42,9 @@ pub struct SupervisorConfig {
     pub connect_port: u16,
     /// Loopback DNS broker port, or `None` when the policy disables DNS.
     pub dns_port: Option<u16>,
+    /// Optional workload-facing package proxy and registry-only trusted SOCKS.
+    pub registry_proxy_port: Option<u16>,
+    pub trusted_registry_port: Option<u16>,
     /// Cloud metadata addresses dropped for the broker (defaults to the
     /// documented lists).
     pub metadata_v4: Vec<Ipv4Addr>,
@@ -67,6 +70,8 @@ impl SupervisorConfig {
             broker_mark,
             connect_port,
             dns_port: None,
+            registry_proxy_port: None,
+            trusted_registry_port: None,
             metadata_v4: crate::address::METADATA_V4_ADDRESSES.to_vec(),
             metadata_v6: crate::address::METADATA_V6_ADDRESSES.to_vec(),
             fixture_iface: None,
@@ -78,6 +83,13 @@ impl SupervisorConfig {
     #[must_use]
     pub fn with_dns_port(mut self, port: u16) -> Self {
         self.dns_port = Some(port);
+        self
+    }
+
+    #[must_use]
+    pub fn with_registry_proxy(mut self, proxy_port: u16, trusted_port: u16) -> Self {
+        self.registry_proxy_port = Some(proxy_port);
+        self.trusted_registry_port = Some(trusted_port);
         self
     }
 
@@ -94,14 +106,22 @@ impl SupervisorConfig {
         self
     }
 
-    fn nft_config(&self, agent: CgroupIdentity, broker: CgroupIdentity) -> NftConfig {
+    fn nft_config(
+        &self,
+        agent: CgroupIdentity,
+        broker: CgroupIdentity,
+        registry: CgroupIdentity,
+    ) -> NftConfig {
         NftConfig {
             table_name: self.table_name.clone(),
             agent,
             broker,
+            registry,
             broker_mark: self.broker_mark,
             connect_broker_tcp_port: self.connect_port,
             dns_broker_port: self.dns_port,
+            registry_proxy_tcp_port: self.registry_proxy_port,
+            trusted_registry_tcp_port: self.trusted_registry_port,
             metadata_v4_addresses: self.metadata_v4.clone(),
             metadata_v6_addresses: self.metadata_v6.clone(),
             fixture_iface: self.fixture_iface.clone(),
@@ -179,6 +199,7 @@ impl ArmedEgress {
         let nft_config = config.nft_config(
             hierarchy.agent_identity().clone(),
             hierarchy.broker_identity().clone(),
+            hierarchy.registry_identity().clone(),
         );
 
         // 3. Validate the ruleset against the real cgroup paths (fail closed).
@@ -246,6 +267,11 @@ impl ArmedEgress {
         self.hierarchy.broker_identity()
     }
 
+    #[must_use]
+    pub fn registry_identity(&self) -> &CgroupIdentity {
+        self.hierarchy.registry_identity()
+    }
+
     /// Local filesystem path of the agent cgroup's `cgroup.procs` (mount-relative,
     /// never the global nft identity), for a helper that self-places into it.
     #[must_use]
@@ -257,6 +283,11 @@ impl ArmedEgress {
     #[must_use]
     pub fn broker_procs_path(&self) -> std::path::PathBuf {
         self.hierarchy.broker_procs_path()
+    }
+
+    #[must_use]
+    pub fn registry_procs_path(&self) -> std::path::PathBuf {
+        self.hierarchy.registry_procs_path()
     }
 
     /// Controller-enabled parent beneath which `sendbox-exec` creates its
@@ -284,6 +315,14 @@ impl ArmedEgress {
             return Err(SupervisorError::AlreadyTornDown);
         }
         self.hierarchy.place_broker(pid)?;
+        Ok(())
+    }
+
+    pub fn place_registry(&self, pid: u32) -> Result<(), SupervisorError> {
+        if self.teardown_started() {
+            return Err(SupervisorError::AlreadyTornDown);
+        }
+        self.hierarchy.place_registry(pid)?;
         Ok(())
     }
 
