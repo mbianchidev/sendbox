@@ -1,16 +1,20 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::AuditError;
 use crate::policy::{AuditDecision, AuditOutcome};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub const MAX_AUDIT_EVENT_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BoundaryAuditEvent {
     pub schema_version: u32,
     pub timestamp_unix_ms: u128,
@@ -24,7 +28,7 @@ pub struct BoundaryAuditEvent {
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
-    pub outcome: &'static str,
+    pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_rule: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,7 +63,8 @@ impl BoundaryAuditEvent {
                 AuditOutcome::Allowed => "allowed",
                 AuditOutcome::Denied => "denied",
                 AuditOutcome::Dropped => "dropped",
-            },
+            }
+            .to_owned(),
             matched_rule: decision.matched_rule.clone(),
             denial_reason: decision.reason.clone(),
             status: None,
@@ -67,6 +72,58 @@ impl BoundaryAuditEvent {
             response_bytes: None,
             duration_ms: None,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UnixAuditSink {
+    path: std::path::PathBuf,
+    timeout: std::time::Duration,
+}
+
+impl UnixAuditSink {
+    #[must_use]
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            timeout: std::time::Duration::from_secs(2),
+        }
+    }
+}
+
+impl BoundaryAuditSink for UnixAuditSink {
+    fn record(&self, event: &BoundaryAuditEvent) -> Result<(), AuditError> {
+        let encoded = serde_json::to_vec(event).map_err(AuditError::Encode)?;
+        if encoded.len() > MAX_AUDIT_EVENT_BYTES {
+            return Err(AuditError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MCP audit event exceeds the socket protocol limit",
+            )));
+        }
+        let length = u32::try_from(encoded.len()).map_err(|_| {
+            AuditError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MCP audit event length is invalid",
+            ))
+        })?;
+        let mut stream = UnixStream::connect(&self.path).map_err(AuditError::Io)?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
+            .map_err(AuditError::Io)?;
+        stream
+            .write_all(&length.to_be_bytes())
+            .and_then(|()| stream.write_all(&encoded))
+            .map_err(AuditError::Io)?;
+        let mut ack = [0_u8; 1];
+        stream.read_exact(&mut ack).map_err(AuditError::Io)?;
+        if ack != [1] {
+            return Err(AuditError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "MCP audit service rejected the event",
+            )));
+        }
+        Ok(())
     }
 }
 

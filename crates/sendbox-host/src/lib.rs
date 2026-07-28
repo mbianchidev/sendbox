@@ -17,6 +17,7 @@ use sendbox_agent::{
     GuestTerminal, GuestTerminalSize, OutputSink, ProtocolGuestConnector, RunFailure, RunPlan,
     SecretEnvelope, SecretReference, SecretResolver, SignalSource, TerminalSource,
 };
+use sendbox_bootstrap::GatewayCredential;
 use sendbox_boundary::{
     Architecture, ArtifactIdentity, ArtifactKind, BOUNDARY_PLAN_FORMAT, BOUNDARY_PLAN_VERSION,
     BoundaryError, BoundaryPlan, CommandDeclaration, ControlTransport, EnvironmentDeclaration,
@@ -309,6 +310,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .configuration
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
+    validate_reserved_secret_names(&request.configuration)?;
     let workspace_destination = PathBuf::from("/workspace");
     let workload_identity = match selected_runtime {
         ResolvedRuntime::Apple | ResolvedRuntime::Kata => {
@@ -376,6 +378,15 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let resources = runtime_resources(&request.configuration)?;
     let bootstrap_reference =
         SecretReference::new(format!("bootstrap-{session_id}")).map_err(HostError::AgentPlan)?;
+    let gateway_secret_names = request
+        .configuration
+        .policy
+        .boundaries
+        .tool_calls
+        .gateway_secret_names()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let gateway_credentials = resolve_gateway_credentials(&gateway_secret_names)?;
     let secrets = Arc::new(HostSecretResolver::open(
         bootstrap_reference.clone(),
         random_bootstrap_secret()?,
@@ -394,6 +405,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         git_guard_policy.as_ref(),
         mcp_policy.as_ref(),
         egress_policy.as_ref(),
+        &gateway_credentials,
     )?;
     let workload = match selected_runtime {
         ResolvedRuntime::Hyperlight => WorkloadIdentity::GuestBundle {
@@ -440,6 +452,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
             })
             .collect(),
         secrets: request.configuration.secrets.clone(),
+        gateway_secrets: gateway_secret_names,
         resources: ResourceDeclaration {
             cpus: resources.cpus,
             memory_bytes: resources.memory_bytes,
@@ -627,6 +640,7 @@ fn build_runtime(
     git_guard_policy: Option<&GuardPolicyDocument>,
     mcp_policy: Option<&RuntimePolicyDocument>,
     egress_policy: Option<&EgressRuntimePolicyDocument>,
+    gateway_credentials: &[GatewayCredential],
 ) -> Result<RuntimeBuild, HostError> {
     let manifest_path = bundle_root.join("manifest.json");
     let mut artifacts = vec![
@@ -664,6 +678,7 @@ fn build_runtime(
             configuration.git_guard_policy = git_guard_policy.cloned();
             configuration.mcp_policy = mcp_policy.cloned();
             configuration.egress_policy = egress_policy.cloned();
+            configuration.gateway_credentials = gateway_credentials.to_vec();
             configuration.workload_uid = workload_uid;
             configuration.workload_gid = workload_gid;
             configuration.launch.resources.cpus =
@@ -728,6 +743,7 @@ fn build_runtime(
                 git_guard_policy: git_guard_policy.cloned(),
                 mcp_policy: mcp_policy.cloned(),
                 egress_policy: egress_policy.cloned(),
+                gateway_credentials: gateway_credentials.to_vec(),
                 workload_uid,
                 workload_gid,
             };
@@ -1096,7 +1112,12 @@ fn validate_runtime_features(
         ));
     }
     if selected_runtime == ResolvedRuntime::Hyperlight
-        && requires_enforcement(&configuration.policy.network)
+        && (requires_enforcement(&configuration.policy.network)
+            || configuration
+                .policy
+                .boundaries
+                .tool_calls
+                .has_remote_servers())
     {
         return Err(HostError::Invalid(
             "Hyperlight does not support authenticated production egress enforcement".to_owned(),
@@ -1110,7 +1131,8 @@ fn make_egress_policy(
     configuration: &SandboxConfiguration,
     session_id: SessionId,
 ) -> Result<Option<EgressRuntimePolicyDocument>, HostError> {
-    if !requires_enforcement(&configuration.policy.network) {
+    let tool_policy = &configuration.policy.boundaries.tool_calls;
+    if !requires_enforcement(&configuration.policy.network) && !tool_policy.has_remote_servers() {
         return Ok(None);
     }
     if selected_runtime == ResolvedRuntime::Hyperlight {
@@ -1118,8 +1140,12 @@ fn make_egress_policy(
             "Hyperlight does not support authenticated production egress enforcement".to_owned(),
         ));
     }
-    let policy =
-        EgressRuntimePolicyDocument::for_session(session_id, configuration.policy.network.clone());
+    let policy = EgressRuntimePolicyDocument::for_session_with_mcp(
+        session_id,
+        configuration.policy.network.clone(),
+        Some(tool_policy),
+    )
+    .map_err(|error| HostError::Invalid(format!("invalid egress runtime policy: {error}")))?;
     policy
         .validate()
         .map_err(|error| HostError::Invalid(format!("invalid egress runtime policy: {error}")))?;
@@ -1404,6 +1430,18 @@ fn boundary_features(
                 },
             );
         }
+        if policy.tool_policy.has_remote_servers() {
+            features.insert(
+                "mcp_http_gateway".to_owned(),
+                FeatureAdmission {
+                    decision: FeatureDecision::Enforced,
+                    mechanism: format!(
+                        "trusted_streamable_http_gateway_v1:sha256={}",
+                        sha256_hex(&encoded)
+                    ),
+                },
+            );
+        }
     }
     if let Some(policy) = egress_policy {
         let encoded =
@@ -1573,6 +1611,11 @@ fn collect_credential_values(
 }
 
 fn validate_reserved_secret_names(configuration: &SandboxConfiguration) -> Result<(), HostError> {
+    let gateway_names = configuration
+        .policy
+        .boundaries
+        .tool_calls
+        .gateway_secret_names();
     for value in &configuration.secrets {
         let name = SecretName::new(value.clone())?;
         if requires_guarded_github_forwarding(&name) {
@@ -1580,8 +1623,29 @@ fn validate_reserved_secret_names(configuration: &SandboxConfiguration) -> Resul
                 "configured secret `{value}` requires guarded credential forwarding"
             )));
         }
+        if gateway_names.contains(value) {
+            return Err(HostError::Invalid(format!(
+                "configured secret `{value}` cannot also be an HTTP MCP gateway credential"
+            )));
+        }
     }
     Ok(())
+}
+
+fn resolve_gateway_credentials(names: &[String]) -> Result<Vec<GatewayCredential>, HostError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = native_secret_store()?;
+    names
+        .iter()
+        .map(|name| {
+            let secret_name = SecretName::new(name.clone())?;
+            let secret = store.retrieve(&secret_name)?;
+            GatewayCredential::new(name.clone(), secret.value.expose_secret().to_vec())
+                .map_err(|error| HostError::Invalid(error.to_string()))
+        })
+        .collect()
 }
 
 struct SecurityComposition<'a> {

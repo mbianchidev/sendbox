@@ -42,6 +42,8 @@ pub struct SupervisorConfig {
     pub connect_port: u16,
     /// Loopback DNS broker port, or `None` when the policy disables DNS.
     pub dns_port: Option<u16>,
+    /// Loopback HTTP MCP gateway port.
+    pub mcp_gateway_port: Option<u16>,
     /// Cloud metadata addresses dropped for the broker (defaults to the
     /// documented lists).
     pub metadata_v4: Vec<Ipv4Addr>,
@@ -67,6 +69,7 @@ impl SupervisorConfig {
             broker_mark,
             connect_port,
             dns_port: None,
+            mcp_gateway_port: None,
             metadata_v4: crate::address::METADATA_V4_ADDRESSES.to_vec(),
             metadata_v6: crate::address::METADATA_V6_ADDRESSES.to_vec(),
             fixture_iface: None,
@@ -78,6 +81,12 @@ impl SupervisorConfig {
     #[must_use]
     pub fn with_dns_port(mut self, port: u16) -> Self {
         self.dns_port = Some(port);
+        self
+    }
+
+    #[must_use]
+    pub fn with_mcp_gateway_port(mut self, port: u16) -> Self {
+        self.mcp_gateway_port = Some(port);
         self
     }
 
@@ -102,6 +111,7 @@ impl SupervisorConfig {
             broker_mark: self.broker_mark,
             connect_broker_tcp_port: self.connect_port,
             dns_broker_port: self.dns_port,
+            mcp_gateway_port: self.mcp_gateway_port,
             metadata_v4_addresses: self.metadata_v4.clone(),
             metadata_v6_addresses: self.metadata_v6.clone(),
             fixture_iface: self.fixture_iface.clone(),

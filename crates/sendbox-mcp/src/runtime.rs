@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use sendbox_policy::{
-    McpHttpPolicy, McpServerPolicy, ServerToolPolicy, ToolCallPolicy, ToolTransport,
-    normalize_mcp_http_endpoint,
+    DEFAULT_MCP_HTTP_GATEWAY_PORT, McpHttpPolicy, McpServerPolicy, ServerToolPolicy,
+    ToolCallPolicy, ToolTransport, normalize_mcp_http_endpoint,
 };
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
@@ -13,9 +13,10 @@ use crate::policy::{ResolvedServerPolicy, http_fingerprint, resolve_stdio_server
 
 pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const NATIVE_POLICY_PATH: &str = "/run/sendbox-boundary/mcp-policy.json";
+pub const NATIVE_AUDIT_SOCKET_PATH: &str = "/run/sendbox-boundary/audit.sock";
 pub const OBSERVATION_ROOT: &str = "/var/log/sendbox";
 pub const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/sendbox/boundary.log";
-pub const DEFAULT_HTTP_GATEWAY_PORT: u16 = 15_081;
+pub const DEFAULT_HTTP_GATEWAY_PORT: u16 = DEFAULT_MCP_HTTP_GATEWAY_PORT;
 pub const HTTP_GATEWAY_ROUTE_PREFIX: &str = "/mcp/";
 const MAX_FRAME_BYTES: i64 = 16 * 1024 * 1024;
 const MAX_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;

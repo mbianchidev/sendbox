@@ -35,6 +35,7 @@ pub mod domain;
 pub mod fixture_resolver;
 pub mod forwarding_resolver;
 pub mod gateway;
+pub mod origin;
 pub mod policy;
 pub mod resolver;
 pub mod runtime;

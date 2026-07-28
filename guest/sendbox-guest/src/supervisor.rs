@@ -91,6 +91,20 @@ pub async fn run<P: PlatformControls>(
             .map_err(|error| GuestError::Runtime(format!("invalid MCP runtime policy: {error}")))?
             .len();
         mcp_broker::install(policy, &options.artifact_root)?;
+        let service = mcp_broker::audit_service();
+        if bootstrap
+            .services
+            .iter()
+            .any(|existing| existing.id == service.id)
+        {
+            return Err(GuestError::Runtime(
+                "MCP audit service was configured more than once".to_owned(),
+            ));
+        }
+        bootstrap.services.push(service);
+        if !bootstrap.required_services.contains(&ServiceId::Audit) {
+            bootstrap.required_services.push(ServiceId::Audit);
+        }
         audit.lock().expect("audit mutex").record(
             "mcp_broker_installed",
             policy.workspace_root.display().to_string(),
@@ -100,7 +114,20 @@ pub async fn run<P: PlatformControls>(
     let egress_configured = bootstrap.egress_policy.is_some();
     if let Some(policy) = bootstrap.egress_policy.take() {
         let instance_id = policy.instance_id.clone();
-        let service = egress::prepare(runtime.session_dir(), policy)?;
+        let mut service = egress::prepare(
+            runtime.session_dir(),
+            policy,
+            bootstrap
+                .execution_broker
+                .as_ref()
+                .and_then(|broker| broker.mcp_policy.clone()),
+            std::mem::take(&mut bootstrap.gateway_credentials),
+        )?;
+        if bootstrap.required_services.contains(&ServiceId::Audit)
+            && !service.dependencies.contains(&ServiceId::Audit)
+        {
+            service.dependencies.push(ServiceId::Audit);
+        }
         if bootstrap
             .services
             .iter()
@@ -130,6 +157,11 @@ pub async fn run<P: PlatformControls>(
     if let Some((_, service)) = &mut broker_client {
         if egress_configured && !service.dependencies.contains(&ServiceId::Egress) {
             service.dependencies.push(ServiceId::Egress);
+        }
+        if bootstrap.required_services.contains(&ServiceId::Audit)
+            && !service.dependencies.contains(&ServiceId::Audit)
+        {
+            service.dependencies.push(ServiceId::Audit);
         }
         if bootstrap
             .services

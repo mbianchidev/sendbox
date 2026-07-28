@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -14,10 +15,12 @@ use sendbox_protocol::BootstrapSecret;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 2;
-pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
+pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 3;
+pub const MAX_BOOTSTRAP_BYTES: usize = 2 * 1024 * 1024;
+const MAX_GATEWAY_CREDENTIALS: usize = 64;
+const MAX_GATEWAY_CREDENTIAL_BYTES: usize = 64 * 1024;
 pub const REQUIRED_RUNTIME_CONTROLS: [ControlKind; 3] = [
     ControlKind::PrivilegeDrop,
     ControlKind::Capabilities,
@@ -171,6 +174,45 @@ pub struct ExecutionBrokerBootstrap {
     pub mcp_policy: Option<RuntimePolicyDocument>,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayCredential {
+    pub name: String,
+    value: Vec<u8>,
+}
+
+impl GatewayCredential {
+    pub fn new(name: impl Into<String>, value: Vec<u8>) -> Result<Self, BootstrapError> {
+        let credential = Self {
+            name: name.into(),
+            value,
+        };
+        validate_gateway_credential(&credential)?;
+        Ok(credential)
+    }
+
+    #[must_use]
+    pub fn expose_secret(&self) -> &[u8] {
+        &self.value
+    }
+}
+
+impl fmt::Debug for GatewayCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayCredential")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for GatewayCredential {
+    fn drop(&mut self) {
+        self.value.zeroize();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapDocumentConfiguration {
     pub session_id: SessionId,
@@ -184,6 +226,7 @@ pub struct BootstrapDocumentConfiguration {
     pub services: Vec<ServiceSpec>,
     pub execution_broker: Option<ExecutionBrokerConfiguration>,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
+    pub gateway_credentials: Vec<GatewayCredential>,
 }
 
 pub struct BootstrapDocument {
@@ -200,6 +243,7 @@ pub struct BootstrapDocument {
     pub services: Vec<ServiceSpec>,
     pub execution_broker: Option<ExecutionBrokerBootstrap>,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
+    pub gateway_credentials: Vec<GatewayCredential>,
 }
 
 #[derive(Debug, Error)]
@@ -236,6 +280,8 @@ struct BootstrapWire {
     execution_broker: Option<ExecutionBrokerBootstrap>,
     #[serde(default)]
     egress_policy: Option<EgressRuntimePolicyDocument>,
+    #[serde(default)]
+    gateway_credentials: Vec<GatewayCredential>,
 }
 
 struct SecretBytes(Zeroizing<[u8; 32]>);
@@ -336,6 +382,7 @@ pub fn encode_bootstrap_document(
         services: configuration.services,
         execution_broker,
         egress_policy: configuration.egress_policy,
+        gateway_credentials: configuration.gateway_credentials,
     };
     let encoded = serde_json::to_vec(&wire).map_err(BootstrapError::Encode)?;
     if encoded.len() > MAX_BOOTSTRAP_BYTES {
@@ -385,8 +432,30 @@ fn validate_configuration(
         configuration
             .execution_broker
             .as_ref()
+            .and_then(|broker| broker.mcp_policy.as_ref()),
+        configuration
+            .execution_broker
+            .as_ref()
             .map(|broker| &broker.cgroup_parent),
     )?;
+    validate_gateway_credentials(
+        &configuration.gateway_credentials,
+        configuration
+            .execution_broker
+            .as_ref()
+            .and_then(|broker| broker.mcp_policy.as_ref()),
+    )?;
+    if configuration
+        .execution_broker
+        .as_ref()
+        .and_then(|broker| broker.mcp_policy.as_ref())
+        .is_some_and(|policy| policy.tool_policy.has_remote_servers())
+        && configuration.egress_policy.is_none()
+    {
+        return Err(BootstrapError::Invalid(
+            "remote MCP requires authenticated egress enforcement".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -427,8 +496,28 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         wire.egress_policy.as_ref(),
         wire.execution_broker
             .as_ref()
+            .and_then(|broker| broker.mcp_policy.as_ref()),
+        wire.execution_broker
+            .as_ref()
             .map(|broker| &broker.cgroup_parent),
     )?;
+    validate_gateway_credentials(
+        &wire.gateway_credentials,
+        wire.execution_broker
+            .as_ref()
+            .and_then(|broker| broker.mcp_policy.as_ref()),
+    )?;
+    if wire
+        .execution_broker
+        .as_ref()
+        .and_then(|broker| broker.mcp_policy.as_ref())
+        .is_some_and(|policy| policy.tool_policy.has_remote_servers())
+        && wire.egress_policy.is_none()
+    {
+        return Err(BootstrapError::Invalid(
+            "remote MCP requires authenticated egress enforcement".to_owned(),
+        ));
+    }
     let bootstrap_secret = BootstrapSecret::new(wire.bootstrap_secret.0.as_ref().to_vec())
         .map_err(|_| BootstrapError::Invalid("bootstrap secret is invalid".to_owned()))?;
     Ok(BootstrapDocument {
@@ -445,12 +534,14 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         services: wire.services,
         execution_broker: wire.execution_broker,
         egress_policy: wire.egress_policy,
+        gateway_credentials: wire.gateway_credentials,
     })
 }
 
 fn validate_egress(
     session_id: SessionId,
     policy: Option<&EgressRuntimePolicyDocument>,
+    mcp_policy: Option<&RuntimePolicyDocument>,
     cgroup_parent: Option<&PathBuf>,
 ) -> Result<(), BootstrapError> {
     let Some(policy) = policy else {
@@ -459,18 +550,83 @@ fn validate_egress(
     policy
         .validate()
         .map_err(|error| BootstrapError::Invalid(error.to_string()))?;
-    let expected =
-        EgressRuntimePolicyDocument::for_session(session_id, policy.network_policy.clone());
+    let expected = EgressRuntimePolicyDocument::for_session_with_mcp(
+        session_id,
+        policy.network_policy.clone(),
+        mcp_policy.map(|policy| &policy.tool_policy),
+    )
+    .map_err(|error| BootstrapError::Invalid(error.to_string()))?;
     if &expected != policy {
         return Err(BootstrapError::Invalid(
             "egress runtime policy does not match the authenticated session".to_owned(),
         ));
     }
+
     let expected_parent = policy.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
     if cgroup_parent.map(PathBuf::as_path) != Some(expected_parent.as_path()) {
         return Err(BootstrapError::Invalid(
             "execution broker cgroup parent does not match the egress agent hierarchy".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_gateway_credentials(
+    credentials: &[GatewayCredential],
+    mcp_policy: Option<&RuntimePolicyDocument>,
+) -> Result<(), BootstrapError> {
+    if credentials.len() > MAX_GATEWAY_CREDENTIALS {
+        return Err(BootstrapError::Invalid(format!(
+            "gateway credentials may contain at most {MAX_GATEWAY_CREDENTIALS} entries"
+        )));
+    }
+    let mut actual = BTreeSet::new();
+    for credential in credentials {
+        validate_gateway_credential(credential)?;
+        if !actual.insert(credential.name.clone()) {
+            return Err(BootstrapError::Invalid(
+                "gateway credential names must be unique".to_owned(),
+            ));
+        }
+    }
+    let expected = mcp_policy
+        .map(|policy| policy.tool_policy.gateway_secret_names())
+        .unwrap_or_default();
+    if actual != expected {
+        return Err(BootstrapError::Invalid(
+            "gateway credential names do not exactly match the authenticated MCP policy".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gateway_credential(credential: &GatewayCredential) -> Result<(), BootstrapError> {
+    if credential.name.is_empty()
+        || credential.name.len() > 128
+        || credential.name.chars().any(char::is_control)
+    {
+        return Err(BootstrapError::Invalid(
+            "gateway credential names must be printable and between 1 and 128 UTF-8 bytes"
+                .to_owned(),
+        ));
+    }
+    if credential.value.is_empty() || credential.value.len() > MAX_GATEWAY_CREDENTIAL_BYTES {
+        return Err(BootstrapError::Invalid(format!(
+            "gateway credential '{}' must contain between 1 and {MAX_GATEWAY_CREDENTIAL_BYTES} bytes",
+            credential.name
+        )));
+    }
+    let value = std::str::from_utf8(&credential.value).map_err(|_| {
+        BootstrapError::Invalid(format!(
+            "gateway credential '{}' must be UTF-8",
+            credential.name
+        ))
+    })?;
+    if value.chars().any(char::is_control) {
+        return Err(BootstrapError::Invalid(format!(
+            "gateway credential '{}' cannot contain control characters",
+            credential.name
+        )));
     }
     Ok(())
 }
@@ -644,6 +800,7 @@ mod tests {
                 mcp_policy: None,
             }),
             egress_policy: None,
+            gateway_credentials: Vec::new(),
         }
     }
 

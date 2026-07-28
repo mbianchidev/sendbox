@@ -7,6 +7,8 @@ use sendbox_core::{Diagnostic, DiagnosticCode, ValidationFailure};
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
+pub const DEFAULT_MCP_HTTP_GATEWAY_PORT: u16 = 15_081;
+
 const BPFTRACE_STRING_LENGTH: usize = 4096;
 const MAX_SERVER_COMMAND_PARTS: usize = 16;
 const MAX_MCP_SERVERS: usize = 64;
@@ -279,6 +281,31 @@ pub struct HttpAuthorizationPolicy {
     pub bearer_secret: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpHttpOrigin {
+    pub host: String,
+    pub port: u16,
+}
+
+impl McpHttpOrigin {
+    pub fn from_endpoint(value: &str) -> Result<Self, String> {
+        let normalized = normalize_mcp_http_endpoint(value)?;
+        let parsed = Url::parse(&normalized)
+            .map_err(|error| format!("invalid MCP endpoint URL: {error}"))?;
+        let host = match parsed.host() {
+            Some(Host::Domain(domain)) => domain.to_ascii_lowercase(),
+            Some(Host::Ipv4(address)) => address.to_string(),
+            Some(Host::Ipv6(address)) => address.to_string(),
+            None => return Err("MCP endpoint URL must contain a host".to_owned()),
+        };
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| "MCP endpoint URL must have a known port".to_owned())?;
+        Ok(Self { host, port })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpHttpPolicy {
@@ -453,6 +480,22 @@ impl ToolCallPolicy {
             .filter_map(|http| http.authorization.as_ref())
             .map(|authorization| authorization.bearer_secret.clone())
             .collect()
+    }
+
+    pub fn remote_origins(&self) -> Result<BTreeSet<McpHttpOrigin>, String> {
+        let mut origins = BTreeSet::new();
+        for server in self.servers.values() {
+            let Some(url) = server.url() else {
+                continue;
+            };
+            origins.insert(McpHttpOrigin::from_endpoint(url)?);
+            if let Some(http) = server.http() {
+                for redirect in &http.redirect_allowlist {
+                    origins.insert(McpHttpOrigin::from_endpoint(redirect)?);
+                }
+            }
+        }
+        Ok(origins)
     }
 }
 

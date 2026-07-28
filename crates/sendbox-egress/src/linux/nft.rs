@@ -103,6 +103,9 @@ pub struct NftConfig {
     /// the policy disables DNS (`allow_dns = false`), in which case no DNS
     /// accept rule is emitted at all.
     pub dns_broker_port: Option<u16>,
+    /// The loopback HTTP MCP gateway port, or `None` when no remote MCP server
+    /// is configured.
+    pub mcp_gateway_port: Option<u16>,
     /// Cloud metadata IPv4 addresses always dropped for the broker.
     pub metadata_v4_addresses: Vec<Ipv4Addr>,
     /// Cloud metadata IPv6 addresses always dropped for the broker.
@@ -122,6 +125,8 @@ pub enum NftError {
     IdentitiesMustDiffer,
     #[error("broker_mark must be non-zero")]
     ZeroMark,
+    #[error("loopback broker ports must be non-zero and distinct")]
+    InvalidBrokerPorts,
     #[error("invalid fixture interface name '{0}'")]
     InvalidInterface(String),
     #[error("nft command failed to execute: {0}")]
@@ -148,6 +153,18 @@ impl NftConfig {
         }
         if self.broker_mark == 0 {
             return Err(NftError::ZeroMark);
+        }
+        let mut ports = vec![self.connect_broker_tcp_port];
+        ports.extend(self.dns_broker_port);
+        ports.extend(self.mcp_gateway_port);
+        if ports.iter().any(|port| *port == 0)
+            || ports
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != ports.len()
+        {
+            return Err(NftError::InvalidBrokerPorts);
         }
         if let Some(iface) = &self.fixture_iface
             && !is_valid_iface(iface)
@@ -187,6 +204,9 @@ impl NftConfig {
             self.push_loopback_accept(&mut out, "    iif lo", "udp", dns_port);
             self.push_loopback_accept(&mut out, "    iif lo", "tcp", dns_port);
         }
+        if let Some(mcp_port) = self.mcp_gateway_port {
+            self.push_loopback_accept(&mut out, "    iif lo", "tcp", mcp_port);
+        }
         out.push_str("  }\n\n");
 
         // ── output chain ─────────────────────────────────────────────────
@@ -207,6 +227,9 @@ impl NftConfig {
         if let Some(dns_port) = self.dns_broker_port {
             self.push_cgroup_loopback_accept(&mut out, &agent, "udp", dns_port);
             self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", dns_port);
+        }
+        if let Some(mcp_port) = self.mcp_gateway_port {
+            self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", mcp_port);
         }
 
         let broker = self.broker_match();
@@ -435,6 +458,7 @@ mod tests {
             broker_mark: 0x5b0e,
             connect_broker_tcp_port: 15080,
             dns_broker_port: Some(15053),
+            mcp_gateway_port: Some(15081),
             metadata_v4_addresses: crate::address::METADATA_V4_ADDRESSES.to_vec(),
             metadata_v6_addresses: crate::address::METADATA_V6_ADDRESSES.to_vec(),
             fixture_iface: Some("sbxg01".to_owned()),

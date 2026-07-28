@@ -1,8 +1,11 @@
 use sendbox_config::{InspectionTransport, McpInspectionConfiguration};
-use sendbox_policy::{McpServerPolicy, ServerToolPolicy, ToolCallPolicy, ToolTransport};
+use sendbox_policy::{
+    McpHttpPolicy, McpServerPolicy, ServerToolPolicy, ToolCallPolicy, ToolTransport,
+};
 use serde::Serialize;
 
 use crate::policy::{resolve_http_server, resolve_stdio_server};
+use crate::runtime::gateway_url;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct McpBoundaryInspection {
@@ -20,6 +23,10 @@ pub struct McpServerInspection {
     pub executable: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normalized_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_gateway_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http: Option<McpHttpPolicy>,
     pub tools: ServerToolPolicy,
 }
 
@@ -45,11 +52,13 @@ impl McpBoundaryInspection {
                             fingerprint: resolved.identity.fingerprint,
                             executable: command.first().cloned(),
                             normalized_endpoint: None,
+                            local_gateway_url: None,
+                            http: None,
                             tools: resolved.tools,
                         })
                     }
-                    McpServerPolicy::StreamableHttp { .. }
-                    | McpServerPolicy::StreamableHttp2025 { .. } => {
+                    McpServerPolicy::StreamableHttp { http, .. }
+                    | McpServerPolicy::StreamableHttp2025 { http, .. } => {
                         let resolved = resolve_http_server(policy, id)?;
                         Ok(McpServerInspection {
                             server_policy_id: id.clone(),
@@ -57,6 +66,8 @@ impl McpBoundaryInspection {
                             fingerprint: resolved.identity.fingerprint,
                             executable: None,
                             normalized_endpoint: resolved.identity.endpoint,
+                            local_gateway_url: Some(gateway_url(id)),
+                            http: Some(http.clone()),
                             tools: resolved.tools,
                         })
                     }
@@ -74,6 +85,8 @@ impl McpBoundaryInspection {
                         fingerprint: resolved.identity.fingerprint,
                         executable: command.first().cloned(),
                         normalized_endpoint: None,
+                        local_gateway_url: None,
+                        http: None,
                         tools: resolved.tools,
                     })
                 })
@@ -109,7 +122,7 @@ impl NativeObserverArtifact {
             schema_version: 1,
             artifact_kind: "sendbox.native-mcp-observer-description",
             observer: "future C/libbpf ring-buffer metadata producer",
-            authorization_boundary: "local stdio broker only; HTTP/SSE is observation-only",
+            authorization_boundary: "trusted stdio broker and HTTP gateway; native observation never authorizes",
             runtime_integration: "not included",
             enabled: config.enabled,
             transports: config
@@ -154,7 +167,7 @@ mod tests {
                 .to_pretty_json()
                 .unwrap()
         );
-        assert!(artifact.contains("observation-only"));
+        assert!(artifact.contains("native observation never authorizes"));
         assert!(artifact.contains("\"runtime_integration\": \"not included\""));
         assert!(!artifact.contains("#!/"));
         assert!(!artifact.contains("bpftrace"));

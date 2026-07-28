@@ -780,6 +780,21 @@ fn print_policy(policy: &sendbox_policy::PolicyConfiguration) {
                 if let Some(endpoint) = server.normalized_endpoint {
                     println!("    Endpoint: {endpoint}");
                 }
+                if let Some(gateway) = server.local_gateway_url {
+                    println!("    Local gateway: {gateway}");
+                }
+                if let Some(http) = server.http {
+                    println!(
+                        "    HTTP limits: request={} response={} concurrent={}",
+                        http.max_request_bytes,
+                        http.max_response_bytes,
+                        http.max_concurrent_requests
+                    );
+                    println!(
+                        "    Redirects: {} (max {})",
+                        http.allow_redirects, http.max_redirects
+                    );
+                }
                 println!(
                     "    Tool default: {}",
                     action_name(server.tools.default_action)

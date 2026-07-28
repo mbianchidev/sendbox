@@ -16,7 +16,7 @@ use thiserror::Error;
 
 pub const BOUNDARY_PLAN_FORMAT: &str = "sendbox-boundary-plan";
 pub const SIGNED_BOUNDARY_PLAN_FORMAT: &str = "sendbox-signed-boundary-plan";
-pub const BOUNDARY_PLAN_VERSION: u16 = 2;
+pub const BOUNDARY_PLAN_VERSION: u16 = 3;
 pub const MAX_BOUNDARY_PLAN_BYTES: usize = 1024 * 1024;
 pub const MAX_BOUNDARY_PLAN_LIFETIME_SECS: u64 = 60 * 60;
 
@@ -337,6 +337,7 @@ pub struct BoundaryPlan {
     pub mounts: Vec<MountDeclaration>,
     pub environment: Vec<EnvironmentDeclaration>,
     pub secrets: Vec<String>,
+    pub gateway_secrets: Vec<String>,
     pub artifacts: Vec<ArtifactIdentity>,
     pub resources: ResourceDeclaration,
     pub features: BTreeMap<String, FeatureAdmission>,
@@ -372,6 +373,17 @@ impl BoundaryPlan {
         }
         validate_environment(&self.environment)?;
         validate_secret_names(&self.secrets)?;
+        validate_secret_names(&self.gateway_secrets)?;
+        let agent_secrets = self.secrets.iter().collect::<BTreeSet<_>>();
+        if self
+            .gateway_secrets
+            .iter()
+            .any(|name| agent_secrets.contains(name))
+        {
+            return Err(BoundaryError::Invalid(
+                "agent and gateway secret names must be disjoint".to_owned(),
+            ));
+        }
         validate_artifacts(&self.artifacts)?;
         validate_artifact_bindings(&self.workload, &self.provider, &self.artifacts)?;
         if self.resources.cpus == 0 || self.resources.memory_bytes == 0 {
@@ -947,6 +959,7 @@ mod tests {
                 sensitive: false,
             }],
             secrets: vec!["TOKEN".to_owned()],
+            gateway_secrets: Vec::new(),
             artifacts: vec![
                 ArtifactIdentity {
                     kind: ArtifactKind::RuntimeExecutable,

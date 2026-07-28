@@ -93,6 +93,25 @@ fn inspect(arguments: InspectArgs) -> ExitCode {
                 "MCP server: {} ({:?}, {})",
                 server.server_policy_id, server.transport, server.fingerprint
             );
+            if let Some(endpoint) = &server.normalized_endpoint {
+                println!("  upstream endpoint: {endpoint}");
+            }
+            if let Some(gateway) = &server.local_gateway_url {
+                println!("  local gateway: {gateway}");
+            }
+            if let Some(http) = &server.http {
+                println!(
+                    "  HTTP limits: request={} response={} concurrent={} redirects={}",
+                    http.max_request_bytes,
+                    http.max_response_bytes,
+                    http.max_concurrent_requests,
+                    if http.allow_redirects {
+                        http.max_redirects
+                    } else {
+                        0
+                    }
+                );
+            }
         }
         println!("observer artifact: {}", inspection.observer.artifact_kind);
     }

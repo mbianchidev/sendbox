@@ -4,14 +4,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use sendbox_core::SessionId;
-use sendbox_policy::{Action, DnsPolicy, NetworkPolicy};
+use sendbox_policy::{
+    Action, DEFAULT_MCP_HTTP_GATEWAY_PORT, DnsPolicy, McpHttpOrigin, NetworkPolicy, ToolCallPolicy,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::policy::{PolicyEngine, PolicyError};
 
-pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_CONNECT_PORT: u16 = 15_080;
 pub const DEFAULT_DNS_PORT: u16 = 53;
 pub const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -28,6 +30,9 @@ pub struct RuntimePolicyDocument {
     pub broker_mark: u32,
     pub connect_port: u16,
     pub dns_port: Option<u16>,
+    pub mcp_gateway_port: Option<u16>,
+    pub reserved_mcp_origins: Vec<McpHttpOrigin>,
+    pub deny_direct_ip: bool,
     pub network_policy: NetworkPolicy,
     pub proxy_environment: BTreeMap<String, String>,
 }
@@ -46,6 +51,10 @@ pub enum RuntimePolicyError {
     InvalidConnectPort,
     #[error("DNS-enabled egress requires port 53; DNS-disabled egress must omit the DNS port")]
     InvalidDnsPort,
+    #[error("remote MCP egress state does not match the signed reserved origins")]
+    InvalidRemoteMcp,
+    #[error("egress loopback broker ports must be non-zero and distinct")]
+    InvalidLoopbackPorts,
     #[error("egress proxy environment does not match the signed SOCKS5 endpoint")]
     InvalidProxyEnvironment,
     #[error("invalid network policy: {0}")]
@@ -55,6 +64,15 @@ pub enum RuntimePolicyError {
 impl RuntimePolicyDocument {
     #[must_use]
     pub fn for_session(session_id: SessionId, network_policy: NetworkPolicy) -> Self {
+        Self::for_session_with_mcp(session_id, network_policy, None)
+            .expect("an absent MCP policy is always valid")
+    }
+
+    pub fn for_session_with_mcp(
+        session_id: SessionId,
+        network_policy: NetworkPolicy,
+        tool_policy: Option<&ToolCallPolicy>,
+    ) -> Result<Self, RuntimePolicyError> {
         let digest = Sha256::digest(session_id.as_bytes());
         let instance_id = digest[..INSTANCE_ID_HEX_BYTES]
             .iter()
@@ -68,16 +86,27 @@ impl RuntimePolicyDocument {
         ) | 1;
         let connect_port = DEFAULT_CONNECT_PORT;
         let dns_port = network_policy.allow_dns.then_some(DEFAULT_DNS_PORT);
-        Self {
+        let reserved_mcp_origins = tool_policy
+            .map(ToolCallPolicy::remote_origins)
+            .transpose()
+            .map_err(|_| RuntimePolicyError::InvalidRemoteMcp)?
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let remote_mcp_active = !reserved_mcp_origins.is_empty();
+        Ok(Self {
             schema_version: RUNTIME_POLICY_SCHEMA_VERSION,
             instance_id,
             table_name,
             broker_mark,
             connect_port,
             dns_port,
+            mcp_gateway_port: remote_mcp_active.then_some(DEFAULT_MCP_HTTP_GATEWAY_PORT),
+            reserved_mcp_origins,
+            deny_direct_ip: remote_mcp_active,
             network_policy,
             proxy_environment: proxy_environment(connect_port),
-        }
+        })
     }
 
     pub fn validate(&self) -> Result<(), RuntimePolicyError> {
@@ -103,6 +132,42 @@ impl RuntimePolicyDocument {
         }
         if self.dns_port != self.network_policy.allow_dns.then_some(DEFAULT_DNS_PORT) {
             return Err(RuntimePolicyError::InvalidDnsPort);
+        }
+        let remote_mcp_active = !self.reserved_mcp_origins.is_empty();
+        if self.mcp_gateway_port != remote_mcp_active.then_some(DEFAULT_MCP_HTTP_GATEWAY_PORT)
+            || self.deny_direct_ip != remote_mcp_active
+        {
+            return Err(RuntimePolicyError::InvalidRemoteMcp);
+        }
+        if self.mcp_gateway_port == Some(self.connect_port)
+            || self
+                .mcp_gateway_port
+                .is_some_and(|port| self.dns_port == Some(port))
+        {
+            return Err(RuntimePolicyError::InvalidLoopbackPorts);
+        }
+        let origins = self
+            .reserved_mcp_origins
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if origins.len() != self.reserved_mcp_origins.len()
+            || origins.iter().any(|origin| {
+                origin.port == 0
+                    || McpHttpOrigin::from_endpoint(&format!(
+                        "https://{}:{}/",
+                        if origin.host.contains(':') {
+                            format!("[{}]", origin.host)
+                        } else {
+                            origin.host.clone()
+                        },
+                        origin.port
+                    ))
+                    .map(|parsed| parsed != *origin)
+                    .unwrap_or(true)
+            })
+        {
+            return Err(RuntimePolicyError::InvalidRemoteMcp);
         }
         if self.proxy_environment != proxy_environment(self.connect_port) {
             return Err(RuntimePolicyError::InvalidProxyEnvironment);

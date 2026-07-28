@@ -451,6 +451,18 @@ fn validate_boundary_equivalence(
     }
 
     require_equal("secret names", &boundary.secrets, &configuration.secrets)?;
+    let gateway_secrets = configuration
+        .policy
+        .boundaries
+        .tool_calls
+        .gateway_secret_names()
+        .into_iter()
+        .collect::<Vec<_>>();
+    require_equal(
+        "gateway secret names",
+        &boundary.gateway_secrets,
+        &gateway_secrets,
+    )?;
     let cpus = u32::try_from(configuration.resources.cpus)
         .map_err(|_| AgentError::InvalidPlan("resource CPU count is out of range".to_owned()))?;
     let memory_bytes = u64::try_from(configuration.resources.memory_mb)

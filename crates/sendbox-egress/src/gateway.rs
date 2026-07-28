@@ -21,6 +21,7 @@ use crate::connect_broker::{ConnectBroker, ConnectBrokerConfig};
 use crate::dialer::Dialer;
 use crate::dns_broker::{DnsBroker, DnsBrokerConfig};
 use crate::dns_budget::DnsGuard;
+use crate::origin::OriginReservations;
 use crate::policy::PolicyEngine;
 use crate::resolver::UpstreamResolver;
 
@@ -103,10 +104,21 @@ impl GatewayListeners {
 }
 
 /// Configuration for the two brokers a gateway runs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub dns: DnsBrokerConfig,
     pub connect: ConnectBrokerConfig,
+    pub origin_reservations: Arc<OriginReservations>,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            dns: DnsBrokerConfig::default(),
+            connect: ConnectBrokerConfig::default(),
+            origin_reservations: Arc::new(OriginReservations::default()),
+        }
+    }
 }
 
 /// The shared gateway. Holds the pieces every broker must share.
@@ -157,7 +169,7 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
         listeners: GatewayListeners,
         cancel: CancellationToken,
     ) -> io::Result<()> {
-        let connect_broker = ConnectBroker::new(
+        let connect_broker = ConnectBroker::new_with_reservations(
             Arc::clone(&self.engine),
             Arc::clone(&self.resolver),
             Arc::clone(&self.authorizations),
@@ -165,6 +177,7 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
             Arc::clone(&self.dialer),
             Arc::clone(&self.audit),
             self.config.connect.clone(),
+            Arc::clone(&self.config.origin_reservations),
         );
 
         let mut tasks = Vec::new();
