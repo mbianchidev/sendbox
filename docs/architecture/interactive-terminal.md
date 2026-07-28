@@ -81,7 +81,7 @@ never stall cancellation:
 | `sendbox-agent` orchestrator | biased `select!` arm | unbiased against guest output |
 | Guest protocol loop | depth-4 channel, drained first by a `biased` select | depth-256 channel, bounded wait then loud drop |
 | `sendbox-exec` service | control reader loops, never blocks | 250 ms bounded offer |
-| Launcher | dedicated control monitor | `poll`-bounded write to the pty primary |
+| Launcher | dedicated control monitor | 256 KiB backlog on a non-blocking primary, whole chunks dropped |
 
 Guest output and host keystrokes are deliberately selected *without* bias
 against each other: a chatty workload must not starve typing, and a long paste
@@ -97,17 +97,28 @@ Saturation drops keystrokes with an explicit diagnostic rather than deadlocking.
 End-to-end credit-based flow control would remove the drop entirely and is the
 natural follow-up if a real workload ever hits it.
 
-End of file is the one input message that may not be dropped. It is one-shot and
-state-changing on all three sides — the host stops reading stdin, the
-orchestrator closes the terminal, and the guest refuses further input — so a
-silent drop leaves the workload waiting forever for a `VEOF` byte that can no
-longer be produced. It travels on the *input* channel, so it can never overtake
-preceding keystrokes, but with a longer bound and a hard error instead of a drop.
+End of file is the one input message that may not be dropped, at any layer. It
+is one-shot and state-changing on all three sides — the host stops reading
+stdin, the orchestrator closes the terminal, and the guest refuses further input
+— so a silent drop leaves the workload waiting forever for a `VEOF` byte that
+can no longer be produced. Between host and guest it travels on the *input*
+channel, so it can never overtake preceding keystrokes, but with a longer bound
+and a hard error instead of a drop. In the launcher it is appended to the
+backlog regardless of the backlog bound: a workload waiting for end of input is
+by definition still reading, so the byte arrives as soon as what precedes it
+drains.
 
-The pty primary is opened `O_NONBLOCK`. `n_tty_write` on a blocking descriptor
-does not return short counts: it sleeps until every byte fits, so polling for
-writability before a blocking write would bound nothing (`POLLOUT` only promises
-one byte of room). Since `O_NONBLOCK` is file-status state shared by every
+The launcher drops whole chunks rather than truncating one. Agents enable
+bracketed paste, and a chunk cut between `ESC[200~` and `ESC[201~` leaves the
+agent's parser in paste mode, swallowing everything typed afterwards — a wedged
+session rather than a lost keystroke. Resizes are `ioctl`s, so they overtake a
+backlog the workload has not read; `SIGWINCH` is out of band anyway.
+
+The pty primary is opened `O_NONBLOCK`, which is what keeps the backlog in user
+space where it can be bounded and where later commands can overtake it.
+`n_tty_write` on a blocking descriptor does not return short counts: it sleeps
+until every byte fits, so polling for writability first would bound nothing
+(`POLLOUT` only promises one byte of room). Since `O_NONBLOCK` is file-status state shared by every
 descriptor for the same open file, and a pty primary cannot be reopened to get
 an independent file description, the output pump is `poll`-driven too.
 

@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -36,8 +37,11 @@ const INPUT_CHANNEL_DEPTH: usize = 32;
 /// Hard bound on queuing one terminal command, so the control reader keeps
 /// observing cancellation even while the workload ignores its terminal.
 const INPUT_OFFER_BOUND: Duration = Duration::from_millis(250);
-/// Hard bound on writing one terminal chunk to a non-draining workload.
-const INPUT_WRITE_BOUND: Duration = Duration::from_millis(500);
+/// How long one pass waits for a non-draining workload to accept more input
+/// before letting the writer thread look at cancellation again.
+const INPUT_WRITE_SLICE: Duration = Duration::from_millis(10);
+/// Largest terminal backlog held for a workload that is not reading it.
+const MAX_PENDING_INPUT: usize = 256 * 1024;
 /// Largest terminal chunk forwarded in one control frame.
 pub const MAX_TERMINAL_INPUT_BYTES: usize = 4 * 1024;
 pub const MAX_LAUNCHER_FRAME_BYTES: usize = 1024 * 1024;
@@ -1127,17 +1131,14 @@ fn spawn_terminal_writer(
             if !matches!(cancellation.cause(), CancellationCause::None) {
                 return;
             }
+            if let Err(error) = device.pump() {
+                eprintln!("sendbox-launcher: terminal input failed: {error}");
+                return;
+            }
             let Some(command) = input.poll(Duration::from_millis(10)) else {
                 continue;
             };
             if let Err(error) = device.apply(command) {
-                // A workload that stops draining its terminal is a dropped
-                // keystroke, not a broken session: keeping the thread alive is
-                // what lets a later resize or cancel still get through.
-                if error.kind() == io::ErrorKind::TimedOut {
-                    eprintln!("sendbox-launcher: {error}; dropping input");
-                    continue;
-                }
                 eprintln!("sendbox-launcher: terminal input failed: {error}");
                 return;
             }
@@ -1151,6 +1152,7 @@ struct TerminalWriter {
     primary: File,
     end_of_file: u8,
     end_of_file_sent: bool,
+    pending: VecDeque<u8>,
 }
 
 impl TerminalWriter {
@@ -1166,6 +1168,7 @@ impl TerminalWriter {
             primary,
             end_of_file,
             end_of_file_sent: false,
+            pending: VecDeque::new(),
         })
     }
 
@@ -1175,7 +1178,8 @@ impl TerminalWriter {
                 if self.end_of_file_sent {
                     return Ok(());
                 }
-                self.write_all(&data)
+                self.queue(&data);
+                self.pump()
             }
             TerminalCommand::InputEof => {
                 if self.end_of_file_sent {
@@ -1183,9 +1187,15 @@ impl TerminalWriter {
                 }
                 self.end_of_file_sent = true;
                 // Never close the primary here: that would raise SIGHUP and
-                // kill a workload that is still producing output.
-                self.write_all(&[self.end_of_file])
+                // kill a workload that is still producing output. The byte
+                // ignores the backlog bound because a workload waiting for end
+                // of input is by definition still reading, so it will arrive as
+                // soon as the backlog ahead of it drains.
+                self.pending.push_back(self.end_of_file);
+                self.pump()
             }
+            // Resizing is an ioctl, so it overtakes a backlog the workload has
+            // not read yet. `SIGWINCH` is out of band anyway.
             TerminalCommand::Resize { columns, rows } => self
                 .device
                 .resize(columns, rows)
@@ -1193,20 +1203,42 @@ impl TerminalWriter {
         }
     }
 
-    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        let mut offset = 0;
-        let deadline = Instant::now() + INPUT_WRITE_BOUND;
-        while offset < data.len() {
-            match self.primary.write(&data[offset..]) {
+    /// Queues input behind whatever the workload has not read yet. A chunk that
+    /// does not fit is dropped whole: truncating one would cut an escape
+    /// sequence in half, and an agent that loses the tail of a bracketed paste
+    /// stays in paste mode and swallows everything typed afterwards.
+    fn queue(&mut self, data: &[u8]) {
+        if self.pending.len() + data.len() > MAX_PENDING_INPUT {
+            eprintln!(
+                "sendbox-launcher: workload is not reading its terminal; dropping {} bytes of input",
+                data.len()
+            );
+            return;
+        }
+        self.pending.extend(data);
+    }
+
+    /// Writes as much of the backlog as the workload is willing to accept right
+    /// now. Never parks for longer than one slice, so cancellation and resizes
+    /// keep flowing while a workload ignores its terminal.
+    fn pump(&mut self) -> io::Result<()> {
+        while !self.pending.is_empty() {
+            let chunk = self.pending.as_slices().0;
+            match self.primary.write(chunk) {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
-                Ok(written) => offset += written,
+                Ok(written) => {
+                    self.pending.drain(..written);
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 // The primary is non-blocking, so a workload that stops
                 // draining its terminal surfaces here instead of parking this
                 // thread in the kernel for as long as it takes every byte to
-                // fit. That is what makes the bound below real.
+                // fit. That is what keeps the backlog in user space, where it
+                // can be bounded and where later commands can overtake it.
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    Self::wait_writable(&self.primary, deadline)?;
+                    if !Self::writable(&self.primary, INPUT_WRITE_SLICE)? {
+                        return Ok(());
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -1214,35 +1246,22 @@ impl TerminalWriter {
         self.primary.flush()
     }
 
-    fn wait_writable(primary: &File, deadline: Instant) -> io::Result<()> {
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Self::not_draining());
-            }
-            let timeout = rustix::event::Timespec {
-                tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
-                tv_nsec: i64::from(remaining.subsec_nanos()),
-            };
-            let primary = primary.as_fd();
-            let mut fds = [rustix::event::PollFd::new(
-                &primary,
-                rustix::event::PollFlags::OUT,
-            )];
-            match rustix::event::poll(&mut fds, Some(&timeout)) {
-                Ok(0) => return Err(Self::not_draining()),
-                Ok(_) => return Ok(()),
-                Err(rustix::io::Errno::INTR) => {}
-                Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
-            }
+    fn writable(primary: &File, slice: Duration) -> io::Result<bool> {
+        let timeout = rustix::event::Timespec {
+            tv_sec: i64::try_from(slice.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(slice.subsec_nanos()),
+        };
+        let primary = primary.as_fd();
+        let mut fds = [rustix::event::PollFd::new(
+            &primary,
+            rustix::event::PollFlags::OUT,
+        )];
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+            Ok(0) => Ok(false),
+            Ok(_) => Ok(true),
+            Err(rustix::io::Errno::INTR) => Ok(false),
+            Err(error) => Err(io::Error::from_raw_os_error(error.raw_os_error())),
         }
-    }
-
-    fn not_draining() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "workload did not drain its terminal input",
-        )
     }
 }
 
@@ -1445,7 +1464,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_input_gives_up_on_a_workload_that_never_drains_it() {
+    fn terminal_input_never_stalls_on_a_workload_that_does_not_read_it() {
         let device = super::super::pty::PseudoTerminal::open(80, 24).expect("allocate pty");
         // Raw mode is what makes the line discipline throttle instead of
         // silently discarding, which is the shape a full-screen agent has.
@@ -1460,16 +1479,39 @@ mod tests {
         .expect("set raw");
 
         let mut writer = TerminalWriter::new(device).expect("terminal writer");
+        let chunks = (MAX_PENDING_INPUT / MAX_TERMINAL_INPUT_BYTES) * 2;
+        let mut slowest = Duration::ZERO;
+        for _ in 0..chunks {
+            let started = Instant::now();
+            writer
+                .apply(TerminalCommand::Input(vec![b'x'; MAX_TERMINAL_INPUT_BYTES]))
+                .expect("a workload that stops reading is not a broken session");
+            slowest = slowest.max(started.elapsed());
+        }
+        // End of file is one-shot on every layer above, so it has to be
+        // accepted even when the backlog is already at its bound.
         let started = Instant::now();
-        let error = writer
-            .write_all(&vec![b'x'; 1024 * 1024])
-            .expect_err("a terminal nobody reads must not accept a megabyte");
+        writer
+            .apply(TerminalCommand::InputEof)
+            .expect("end of file must never be refused");
+        slowest = slowest.max(started.elapsed());
 
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "unexpected: {error}");
+        assert!(writer.end_of_file_sent);
+        assert_eq!(
+            *writer.pending.back().expect("a queued backlog"),
+            writer.end_of_file,
+            "end of file must stay behind the input it follows"
+        );
         assert!(
-            started.elapsed() < INPUT_WRITE_BOUND * 4,
-            "the write bound was not enforced: {:?}",
-            started.elapsed()
+            writer.pending.len() <= MAX_PENDING_INPUT + 1,
+            "the backlog bound was not enforced: {}",
+            writer.pending.len()
+        );
+        // A blocking primary parks here for as long as the workload declines to
+        // read, which is the whole point of this bound.
+        assert!(
+            slowest < INPUT_WRITE_SLICE * 8,
+            "terminal input parked on a workload that does not read it: {slowest:?}"
         );
     }
 
