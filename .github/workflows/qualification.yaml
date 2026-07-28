@@ -78,7 +78,7 @@ jobs:
             benchmark --profile smoke --rust-binary target/release/sendbox \
             > qualification-smoke.json
           jq -e '
-            .schema_version == 1 and
+            .schema_version == 2 and
             .profile == "smoke" and
             ([.workloads[] | select(.status == "failed")] | length) == 0
           ' qualification-smoke.json
