@@ -24,7 +24,7 @@ use sendbox_exec::session::BrokerSession;
 use sendbox_exec::{
     AdmissionDisposition, Broker, CancellationFlag, ContainmentProfile, CorrelationId,
     DescriptorPath, EnvironmentEntry, ExecutionBackend, ExecutionDecision, ExecutionEvent,
-    ExecutionRequest, ExecutionTimeout, KernelPrimitive, LaunchFailure, RelativePath,
+    ExecutionRequest, ExecutionTimeout, KernelPrimitive, LaunchFailure, NullInput, RelativePath,
     RequestLimits, RootId, SemanticScope, SinkError, TerminalState,
 };
 use sendbox_policy::{Action, CommandPolicy};
@@ -270,6 +270,7 @@ fn production_backend_propagates_client_sink_disconnect() {
         &invocation.request,
         &invocation.decision,
         &mut sink,
+        &NullInput,
         &CancellationFlag::default(),
     );
     assert_eq!(result.terminal, TerminalState::ClientDisconnected);
@@ -310,6 +311,7 @@ fn production_backend_propagates_explicit_cancellation() {
         &invocation.request,
         &invocation.decision,
         &mut sink,
+        &NullInput,
         &cancellation,
     );
     cancellation_thread.join().expect("cancellation thread");
@@ -351,6 +353,7 @@ fn production_backend_propagates_graceful_broker_shutdown() {
         &invocation.request,
         &invocation.decision,
         &mut sink,
+        &NullInput,
         &cancellation,
     );
     shutdown_thread.join().expect("shutdown thread");
@@ -392,6 +395,7 @@ fn production_backend_propagates_supervisor_death() {
         &invocation.request,
         &invocation.decision,
         &mut sink,
+        &NullInput,
         &cancellation,
     );
     supervisor_thread.join().expect("supervisor thread");
@@ -485,6 +489,7 @@ fn broker_process_crash_removes_cgroup_subtree() {
             &invocation.request,
             &invocation.decision,
             &mut sink,
+            &NullInput,
             &CancellationFlag::default(),
         );
         return;
@@ -888,6 +893,7 @@ fn invoke_launcher_with_sink_limit(
         &invocation.request,
         &invocation.decision,
         &mut sink,
+        &NullInput,
         &CancellationFlag::default(),
     );
     (result, streamed_output)

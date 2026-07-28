@@ -20,7 +20,10 @@ use crate::api::{
     CleanupFailure, CleanupReport, CleanupStep, ExecutionDecision, ExecutionEvent,
     ExecutionRequest, ExecutionResult, LaunchFailure, RootId, StreamKind, TerminalState,
 };
-use crate::broker::{CancellationCause, CancellationFlag, EventSink, ExecutionBackend, SinkError};
+use crate::broker::{
+    CancellationCause, CancellationFlag, ChannelInput, EventSink, ExecutionBackend,
+    InputOfferError, InputSender, InputSource, SinkError, TerminalCommand,
+};
 use crate::error::{PlatformError, UnsupportedKernel};
 
 use super::cgroup::{CgroupLeaf, CgroupManager};
@@ -29,6 +32,14 @@ use super::{capabilities, raw, rlimits, seccomp};
 
 const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 const OUTPUT_CHANNEL_DEPTH: usize = 16;
+const INPUT_CHANNEL_DEPTH: usize = 32;
+/// Hard bound on queuing one terminal command, so the control reader keeps
+/// observing cancellation even while the workload ignores its terminal.
+const INPUT_OFFER_BOUND: Duration = Duration::from_millis(250);
+/// Hard bound on writing one terminal chunk to a non-draining workload.
+const INPUT_WRITE_BOUND: Duration = Duration::from_millis(500);
+/// Largest terminal chunk forwarded in one control frame.
+pub const MAX_TERMINAL_INPUT_BYTES: usize = 4 * 1024;
 pub const MAX_LAUNCHER_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Trusted one-shot input sent by the broker to the dedicated launcher
@@ -64,7 +75,10 @@ pub struct LauncherRoot {
 }
 
 /// Bounded line-delimited controls sent over the launcher's stdin pipe.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Input` carries raw terminal bytes, so its [`std::fmt::Debug`] reports only
+/// a length; pasted credentials must never reach a log.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "control", rename_all = "snake_case")]
 pub enum LauncherControl {
     Start {
@@ -81,6 +95,68 @@ pub enum LauncherControl {
     },
     BrokerShutdown,
     SupervisorDied,
+    /// Terminal bytes for an interactive workload.
+    Input {
+        correlation_id: crate::api::CorrelationId,
+        data: Vec<u8>,
+    },
+    /// The host input stream ended.
+    InputEof {
+        correlation_id: crate::api::CorrelationId,
+    },
+    /// The host terminal was resized.
+    Resize {
+        correlation_id: crate::api::CorrelationId,
+        columns: u16,
+        rows: u16,
+    },
+}
+
+impl std::fmt::Debug for LauncherControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Start { invocation } => formatter
+                .debug_struct("Start")
+                .field("invocation", invocation)
+                .finish(),
+            Self::Cancel { correlation_id } => formatter
+                .debug_struct("Cancel")
+                .field("correlation_id", correlation_id)
+                .finish(),
+            Self::ClientDisconnected { correlation_id } => formatter
+                .debug_struct("ClientDisconnected")
+                .field("correlation_id", correlation_id)
+                .finish(),
+            Self::OutputSaturated { correlation_id } => formatter
+                .debug_struct("OutputSaturated")
+                .field("correlation_id", correlation_id)
+                .finish(),
+            Self::BrokerShutdown => formatter.write_str("BrokerShutdown"),
+            Self::SupervisorDied => formatter.write_str("SupervisorDied"),
+            Self::Input {
+                correlation_id,
+                data,
+            } => formatter
+                .debug_struct("Input")
+                .field("correlation_id", correlation_id)
+                .field("data", &format_args!("<{} bytes>", data.len()))
+                .finish(),
+            Self::InputEof { correlation_id } => formatter
+                .debug_struct("InputEof")
+                .field("correlation_id", correlation_id)
+                .finish(),
+            Self::Resize {
+                correlation_id,
+                columns,
+                rows,
+            } => formatter
+                .debug_struct("Resize")
+                .field("correlation_id", correlation_id)
+                .field("columns", columns)
+                .field("rows", rows)
+                .finish(),
+        }
+    }
 }
 
 /// Real broker-side process backend for the dedicated launcher binary.
@@ -123,6 +199,7 @@ impl ExecutionBackend for LauncherProcessBackend {
         request: &ExecutionRequest,
         decision: &ExecutionDecision,
         sink: &mut dyn EventSink,
+        input: &dyn InputSource,
         cancellation: &CancellationFlag,
     ) -> ExecutionResult {
         let mut child = match Command::new(&self.launcher_path)
@@ -184,60 +261,36 @@ impl ExecutionBackend for LauncherProcessBackend {
             request.correlation_id.clone(),
         );
         let mut reader = BufReader::new(events);
-        let mut terminal = None;
-        let mut sink_failed = false;
-        loop {
-            let line = match read_bounded_line(&mut reader) {
-                Ok(Some(line)) => line,
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = send_control_shared(&control, &LauncherControl::BrokerShutdown);
-                    done.store(true, Ordering::Release);
-                    let _ = watcher.join();
-                    let _ = child.wait();
-                    return launcher_lost_failure(&format!("read launcher event frame: {error}"));
-                }
-            };
-            let event: ExecutionEvent = match serde_json::from_slice(&line) {
-                Ok(event) => event,
-                Err(error) => {
-                    let _ = send_control_shared(&control, &LauncherControl::BrokerShutdown);
-                    done.store(true, Ordering::Release);
-                    let _ = watcher.join();
-                    let _ = child.wait();
-                    return launcher_lost_failure(&format!("decode launcher event frame: {error}"));
-                }
-            };
-            if event_correlation(&event) != &request.correlation_id {
-                let _ = send_control_shared(&control, &LauncherControl::BrokerShutdown);
-                break;
+        // Terminal input is forwarded on its own scoped thread so a stalled
+        // workload never delays the cancellation watcher or the event loop.
+        let outcome = thread::scope(|scope| {
+            let forwarder = request.stdin.is_terminal().then(|| {
+                let control = Arc::clone(&control);
+                let done = Arc::clone(&done);
+                let cancellation = cancellation.clone();
+                let correlation_id = request.correlation_id.clone();
+                scope.spawn(move || {
+                    forward_terminal_input(&control, &done, &cancellation, &correlation_id, input);
+                })
+            });
+            let outcome =
+                pump_launcher_events(&mut reader, &control, sink, &request.correlation_id);
+            done.store(true, Ordering::Release);
+            if let Some(forwarder) = forwarder {
+                let _ = forwarder.join();
             }
-            match event {
-                ExecutionEvent::Terminal { result, .. } => {
-                    terminal = Some(result);
-                    break;
-                }
-                other if sink_failed => drop(other),
-                other => {
-                    if let Err(error) = sink.emit(other) {
-                        sink_failed = true;
-                        let control_message = match error {
-                            SinkError::Disconnected => LauncherControl::ClientDisconnected {
-                                correlation_id: request.correlation_id.clone(),
-                            },
-                            SinkError::Saturated => LauncherControl::OutputSaturated {
-                                correlation_id: request.correlation_id.clone(),
-                            },
-                            SinkError::SupervisorDied => LauncherControl::SupervisorDied,
-                        };
-                        let _ = send_control_shared(&control, &control_message);
-                    }
-                }
-            }
-        }
-
-        done.store(true, Ordering::Release);
+            outcome
+        });
         let _ = watcher.join();
+        let terminal = match outcome {
+            LauncherOutcome::Terminal(result) => Some(result),
+            LauncherOutcome::EventStreamEnded => None,
+            LauncherOutcome::Lost(message) => {
+                let _ = child.wait();
+                drop(control);
+                return launcher_lost_failure(&message);
+            }
+        };
         drop(control);
         let status = child.wait();
         let stderr = stderr_thread
@@ -340,6 +393,7 @@ impl ExecutionBackend for DedicatedLauncherBackend {
         request: &ExecutionRequest,
         _decision: &ExecutionDecision,
         sink: &mut dyn EventSink,
+        _input: &dyn InputSource,
         cancellation: &CancellationFlag,
     ) -> ExecutionResult {
         self.execute_inner(request, sink, cancellation, None)
@@ -356,6 +410,22 @@ fn run(
     control: Option<Box<dyn BufRead + Send>>,
 ) -> ExecutionResult {
     if let Err(error) = require_single_threaded_launcher() {
+        return launch_error(error, leaf.remove_unlaunched());
+    }
+    if let Err(error) = admit_terminal_request(request) {
+        return launch_error(error, leaf.remove_unlaunched());
+    }
+    // The pair must exist before the launcher's own seccomp filter is
+    // installed, so a profile that denies ioctl still permits allocation while
+    // failing closed at admission above.
+    let mut terminal_device = match open_terminal_device(request) {
+        Ok(device) => device,
+        Err(error) => return launch_error(error, leaf.remove_unlaunched()),
+    };
+    let mut terminal_input: Option<Arc<ChannelInput>> = None;
+    if let (Some(device), Some(user)) = (terminal_device.as_ref(), request.containment.run_as)
+        && let Err(error) = device.transfer_secondary_to(user)
+    {
         return launch_error(error, leaf.remove_unlaunched());
     }
     if let Err(error) = raw::set_child_subreaper()
@@ -385,6 +455,14 @@ fn run(
         Ok(environment) => environment,
         Err(error) => return launch_error(error, leaf.remove_unlaunched()),
     };
+    let pty_secondary = match terminal_device
+        .as_ref()
+        .map(super::pty::PseudoTerminal::secondary_raw_fd)
+        .transpose()
+    {
+        Ok(fd) => fd,
+        Err(error) => return launch_error(error, leaf.remove_unlaunched()),
+    };
     let process = match raw::clone3_exec(
         leaf.as_raw_fd(),
         resolved.executable_fd.as_raw_fd(),
@@ -392,10 +470,16 @@ fn run(
         &argv,
         &environment,
         request.containment.run_as,
+        pty_secondary,
     ) {
         Ok(process) => process,
         Err(error) => return launch_error(error, leaf.remove_unlaunched()),
     };
+    // Dropping the launcher's secondary is what lets the primary report EOF
+    // once the workload exits; holding it would hang the output pump forever.
+    if let Some(device) = terminal_device.as_mut() {
+        device.release_secondary();
+    }
     let raw::SpawnedProcess {
         pidfd,
         stdout,
@@ -403,10 +487,18 @@ fn run(
         exec_error,
     } = process;
     if let Some(control) = control {
+        let (input_sender, input_queue) = if request.stdin.is_terminal() {
+            let (sender, queue) = ChannelInput::bounded(INPUT_CHANNEL_DEPTH);
+            (Some(sender), Some(Arc::new(queue)))
+        } else {
+            (None, None)
+        };
+        terminal_input = input_queue;
         spawn_launcher_control_monitor(
             control,
             cancellation.clone(),
             request.correlation_id.clone(),
+            input_sender,
         );
     }
 
@@ -430,8 +522,47 @@ fn run(
     }
 
     let (sender, receiver) = mpsc::sync_channel(OUTPUT_CHANNEL_DEPTH);
-    let stdout_thread = spawn_reader(stdout, StreamKind::Stdout, sender.clone());
-    let stderr_thread = spawn_reader(stderr, StreamKind::Stderr, sender);
+    // All pump threads start only after clone3, so the single-thread guard
+    // above still holds for the raw child branch.
+    let mut readers = Vec::new();
+    let writer_done = Arc::new(AtomicBool::new(false));
+    let mut terminal_writer = None;
+    if let Some(device) = terminal_device {
+        let writer = match TerminalWriter::new(device) {
+            Ok(writer) => writer,
+            Err(error) => {
+                let (cleanup, _) = leaf.cleanup(pidfd.as_raw_fd(), cleanup_bound);
+                return launch_error(error, cleanup);
+            }
+        };
+        let primary = match writer.device.primary().try_clone() {
+            Ok(primary) => primary,
+            Err(error) => {
+                let (cleanup, _) = leaf.cleanup(pidfd.as_raw_fd(), cleanup_bound);
+                return launch_error(
+                    PlatformError::io("duplicate pseudoterminal primary", error),
+                    cleanup,
+                );
+            }
+        };
+        readers.push(spawn_reader(primary, StreamKind::Stdout, sender));
+        if let Some(queue) = terminal_input {
+            terminal_writer = Some(spawn_terminal_writer(
+                writer,
+                queue,
+                cancellation.clone(),
+                Arc::clone(&writer_done),
+            ));
+        }
+    } else {
+        if let Some(stdout) = stdout {
+            readers.push(spawn_reader(stdout, StreamKind::Stdout, sender.clone()));
+        }
+        if let Some(stderr) = stderr {
+            readers.push(spawn_reader(stderr, StreamKind::Stderr, sender.clone()));
+        }
+        drop(sender);
+    }
     let deadline = Instant::now() + request.timeout.as_duration();
     let mut sequence = 0u64;
     let mut terminal = loop {
@@ -483,9 +614,51 @@ fn run(
         Duration::from_millis(250),
     );
     drop(receiver);
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
+    writer_done.store(true, Ordering::Release);
+    if let Some(writer) = terminal_writer {
+        let _ = writer.join();
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
     ExecutionResult { terminal, cleanup }
+}
+
+/// Rejects an interactive request whose seccomp profile would make the child's
+/// controlling-terminal setup fail opaquely inside the post-clone branch.
+fn admit_terminal_request(request: &ExecutionRequest) -> Result<(), PlatformError> {
+    if !request.stdin.is_terminal() {
+        return Ok(());
+    }
+    const TERMINAL_SYSCALLS: &[&str] = &["ioctl", "setsid", "dup2", "dup3"];
+    let denied: Vec<&str> = TERMINAL_SYSCALLS
+        .iter()
+        .copied()
+        .filter(|syscall| {
+            request
+                .containment
+                .additional_denied_syscalls
+                .iter()
+                .any(|denied| denied == syscall)
+        })
+        .collect();
+    if denied.is_empty() {
+        return Ok(());
+    }
+    Err(PlatformError::SecuritySetup(format!(
+        "interactive execution needs a controlling terminal, but the command policy denies: {}. \
+         Remove these syscalls from denied_syscalls or run without a terminal",
+        denied.join(", ")
+    )))
+}
+
+fn open_terminal_device(
+    request: &ExecutionRequest,
+) -> Result<Option<super::pty::PseudoTerminal>, PlatformError> {
+    match request.stdin.terminal_size() {
+        None => Ok(None),
+        Some((columns, rows)) => super::pty::PseudoTerminal::open(columns, rows).map(Some),
+    }
 }
 
 #[derive(Debug)]
@@ -517,6 +690,8 @@ fn spawn_reader(
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                // A pseudoterminal primary reports EIO rather than a zero-length
+                // read once the last secondary is closed; that is normal EOF.
                 Err(_) => break,
             }
         }
@@ -600,6 +775,14 @@ fn confirm_exec(descriptor: OwnedFd) -> Result<(), PlatformError> {
                             "execveat(AT_EMPTY_PATH) is unavailable",
                         )
                         .into());
+                    }
+                    if bytes[0] == 4 {
+                        return Err(PlatformError::SecuritySetup(format!(
+                            "child could not claim the pseudoterminal as its controlling \
+                             terminal: {}. Interactive runs require setsid and the TIOCSCTTY \
+                             ioctl to be permitted by the command seccomp profile",
+                            io::Error::from_raw_os_error(errno)
+                        )));
                     }
                     if bytes[0] != 3 {
                         return Err(PlatformError::SecuritySetup(format!(
@@ -758,49 +941,321 @@ fn spawn_cancellation_watcher(
     })
 }
 
+/// Reads launcher controls until a terminal cause arrives.
+///
+/// Terminal input is handed to a separate writer thread through a bounded
+/// queue with a hard offer bound, so a workload that stops reading its terminal
+/// can never stop this loop from observing a later cancel.
 fn spawn_launcher_control_monitor(
     mut reader: Box<dyn BufRead + Send>,
     cancellation: CancellationFlag,
     correlation_id: crate::api::CorrelationId,
+    terminal: Option<InputSender>,
 ) {
     thread::spawn(move || {
-        let control = match read_control_frame(&mut reader) {
-            Ok(Some(control)) => control,
-            Ok(None) | Err(_) => {
-                cancellation.supervisor_died();
-                return;
-            }
-        };
-        match control {
-            LauncherControl::Cancel {
-                correlation_id: requested,
-            } if requested == correlation_id => {
-                cancellation.cancel();
-            }
-            LauncherControl::ClientDisconnected {
-                correlation_id: requested,
-            } if requested == correlation_id => {
-                cancellation.disconnect();
-            }
-            LauncherControl::OutputSaturated {
-                correlation_id: requested,
-            } if requested == correlation_id => {
-                cancellation.saturate();
-            }
-            LauncherControl::BrokerShutdown => {
-                cancellation.shutdown();
-            }
-            LauncherControl::SupervisorDied => {
-                cancellation.supervisor_died();
-            }
-            LauncherControl::Start { .. }
-            | LauncherControl::Cancel { .. }
-            | LauncherControl::ClientDisconnected { .. }
-            | LauncherControl::OutputSaturated { .. } => {
-                cancellation.supervisor_died();
+        loop {
+            let control = match read_control_frame(&mut reader) {
+                Ok(Some(control)) => control,
+                Ok(None) | Err(_) => {
+                    cancellation.supervisor_died();
+                    return;
+                }
+            };
+            match control {
+                LauncherControl::Cancel {
+                    correlation_id: requested,
+                } if requested == correlation_id => {
+                    cancellation.cancel();
+                    return;
+                }
+                LauncherControl::ClientDisconnected {
+                    correlation_id: requested,
+                } if requested == correlation_id => {
+                    cancellation.disconnect();
+                    return;
+                }
+                LauncherControl::OutputSaturated {
+                    correlation_id: requested,
+                } if requested == correlation_id => {
+                    cancellation.saturate();
+                    return;
+                }
+                LauncherControl::BrokerShutdown => {
+                    cancellation.shutdown();
+                    return;
+                }
+                LauncherControl::SupervisorDied => {
+                    cancellation.supervisor_died();
+                    return;
+                }
+                LauncherControl::Input {
+                    correlation_id: requested,
+                    data,
+                } if requested == correlation_id => {
+                    if !offer_terminal(
+                        terminal.as_ref(),
+                        TerminalCommand::Input(data),
+                        &cancellation,
+                    ) {
+                        return;
+                    }
+                }
+                LauncherControl::InputEof {
+                    correlation_id: requested,
+                } if requested == correlation_id => {
+                    if !offer_terminal(terminal.as_ref(), TerminalCommand::InputEof, &cancellation)
+                    {
+                        return;
+                    }
+                }
+                LauncherControl::Resize {
+                    correlation_id: requested,
+                    columns,
+                    rows,
+                } if requested == correlation_id => {
+                    if !offer_terminal(
+                        terminal.as_ref(),
+                        TerminalCommand::Resize { columns, rows },
+                        &cancellation,
+                    ) {
+                        return;
+                    }
+                }
+                LauncherControl::Start { .. }
+                | LauncherControl::Cancel { .. }
+                | LauncherControl::ClientDisconnected { .. }
+                | LauncherControl::OutputSaturated { .. }
+                | LauncherControl::Input { .. }
+                | LauncherControl::InputEof { .. }
+                | LauncherControl::Resize { .. } => {
+                    cancellation.supervisor_died();
+                    return;
+                }
             }
         }
     });
+}
+
+/// Queues one terminal command. Returns `false` when the monitor must stop.
+fn offer_terminal(
+    terminal: Option<&InputSender>,
+    command: TerminalCommand,
+    cancellation: &CancellationFlag,
+) -> bool {
+    let Some(sender) = terminal else {
+        // Terminal traffic for a headless launch is a supervisor protocol bug.
+        eprintln!("sendbox-launcher: terminal control received for a non-interactive launch");
+        cancellation.supervisor_died();
+        return false;
+    };
+    match sender.offer(command, INPUT_OFFER_BOUND) {
+        Ok(()) => true,
+        Err(InputOfferError::Saturated) => {
+            eprintln!(
+                "sendbox-launcher: workload stopped reading its terminal for {}ms; dropping input",
+                INPUT_OFFER_BOUND.as_millis()
+            );
+            true
+        }
+        Err(InputOfferError::Disconnected) => false,
+    }
+}
+
+/// Writes queued terminal commands to the pseudoterminal primary.
+fn spawn_terminal_writer(
+    device: TerminalWriter,
+    input: Arc<ChannelInput>,
+    cancellation: CancellationFlag,
+    done: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut device = device;
+        while !done.load(Ordering::Acquire) {
+            if !matches!(cancellation.cause(), CancellationCause::None) {
+                return;
+            }
+            let Some(command) = input.poll(Duration::from_millis(10)) else {
+                continue;
+            };
+            if let Err(error) = device.apply(command) {
+                eprintln!("sendbox-launcher: terminal input failed: {error}");
+                return;
+            }
+        }
+    })
+}
+
+/// Applies terminal commands to the pseudoterminal primary.
+struct TerminalWriter {
+    device: super::pty::PseudoTerminal,
+    primary: File,
+    end_of_file: u8,
+    end_of_file_sent: bool,
+}
+
+impl TerminalWriter {
+    fn new(device: super::pty::PseudoTerminal) -> Result<Self, PlatformError> {
+        let end_of_file = device.end_of_file_byte()?;
+        let primary = device
+            .primary()
+            .try_clone()
+            .map(File::from)
+            .map_err(|error| PlatformError::io("duplicate pseudoterminal primary", error))?;
+        Ok(Self {
+            device,
+            primary,
+            end_of_file,
+            end_of_file_sent: false,
+        })
+    }
+
+    fn apply(&mut self, command: TerminalCommand) -> io::Result<()> {
+        match command {
+            TerminalCommand::Input(data) => {
+                if self.end_of_file_sent {
+                    return Ok(());
+                }
+                self.write_all(&data)
+            }
+            TerminalCommand::InputEof => {
+                if self.end_of_file_sent {
+                    return Ok(());
+                }
+                self.end_of_file_sent = true;
+                // Never close the primary here: that would raise SIGHUP and
+                // kill a workload that is still producing output.
+                self.write_all(&[self.end_of_file])
+            }
+            TerminalCommand::Resize { columns, rows } => self
+                .device
+                .resize(columns, rows)
+                .map_err(|error| io::Error::other(error.to_string())),
+        }
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        let mut offset = 0;
+        let deadline = Instant::now() + INPUT_WRITE_BOUND;
+        while offset < data.len() {
+            match self.primary.write(&data[offset..]) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(written) => offset += written,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "workload did not drain its terminal input",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.primary.flush()
+    }
+}
+
+/// Result of draining the launcher's event stream.
+enum LauncherOutcome {
+    Terminal(ExecutionResult),
+    /// The launcher closed its event stream without a terminal event.
+    EventStreamEnded,
+    /// The launcher connection itself failed.
+    Lost(String),
+}
+
+fn pump_launcher_events(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    control: &Arc<Mutex<ChildStdin>>,
+    sink: &mut dyn EventSink,
+    correlation_id: &crate::api::CorrelationId,
+) -> LauncherOutcome {
+    let mut sink_failed = false;
+    loop {
+        let line = match read_bounded_line(reader) {
+            Ok(Some(line)) => line,
+            Ok(None) => return LauncherOutcome::EventStreamEnded,
+            Err(error) => {
+                let _ = send_control_shared(control, &LauncherControl::BrokerShutdown);
+                return LauncherOutcome::Lost(format!("read launcher event frame: {error}"));
+            }
+        };
+        let event: ExecutionEvent = match serde_json::from_slice(&line) {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = send_control_shared(control, &LauncherControl::BrokerShutdown);
+                return LauncherOutcome::Lost(format!("decode launcher event frame: {error}"));
+            }
+        };
+        if event_correlation(&event) != correlation_id {
+            let _ = send_control_shared(control, &LauncherControl::BrokerShutdown);
+            return LauncherOutcome::EventStreamEnded;
+        }
+        match event {
+            ExecutionEvent::Terminal { result, .. } => return LauncherOutcome::Terminal(result),
+            other if sink_failed => drop(other),
+            other => {
+                if let Err(error) = sink.emit(other) {
+                    sink_failed = true;
+                    let control_message = match error {
+                        SinkError::Disconnected => LauncherControl::ClientDisconnected {
+                            correlation_id: correlation_id.clone(),
+                        },
+                        SinkError::Saturated => LauncherControl::OutputSaturated {
+                            correlation_id: correlation_id.clone(),
+                        },
+                        SinkError::SupervisorDied => LauncherControl::SupervisorDied,
+                    };
+                    let _ = send_control_shared(control, &control_message);
+                }
+            }
+        }
+    }
+}
+
+/// Relays host terminal commands to the launcher process until the run ends.
+///
+/// Oversized input chunks are split rather than rejected, so a large paste
+/// still reaches the workload without exceeding the control frame bound.
+fn forward_terminal_input(
+    control: &Arc<Mutex<ChildStdin>>,
+    done: &AtomicBool,
+    cancellation: &CancellationFlag,
+    correlation_id: &crate::api::CorrelationId,
+    input: &dyn InputSource,
+) {
+    while !done.load(Ordering::Acquire) {
+        if !matches!(cancellation.cause(), CancellationCause::None) {
+            return;
+        }
+        let Some(command) = input.poll(Duration::from_millis(10)) else {
+            continue;
+        };
+        let messages = match command {
+            TerminalCommand::Input(data) => data
+                .chunks(MAX_TERMINAL_INPUT_BYTES)
+                .map(|chunk| LauncherControl::Input {
+                    correlation_id: correlation_id.clone(),
+                    data: chunk.to_vec(),
+                })
+                .collect(),
+            TerminalCommand::InputEof => vec![LauncherControl::InputEof {
+                correlation_id: correlation_id.clone(),
+            }],
+            TerminalCommand::Resize { columns, rows } => vec![LauncherControl::Resize {
+                correlation_id: correlation_id.clone(),
+                columns,
+                rows,
+            }],
+        };
+        for message in messages {
+            if send_control_shared(control, &message).is_err() {
+                return;
+            }
+        }
+    }
 }
 
 fn spawn_stderr_reader(mut stderr: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {

@@ -215,6 +215,128 @@ impl CancellationFlag {
     }
 }
 
+/// One host-originated terminal command for an interactive workload.
+///
+/// Input bytes may contain pasted credentials, so the [`std::fmt::Debug`]
+/// implementation reports only a length.
+#[derive(Clone, PartialEq, Eq)]
+pub enum TerminalCommand {
+    /// Raw bytes to write to the workload's terminal.
+    Input(Vec<u8>),
+    /// The host input stream ended; write the terminal's configured `VEOF`
+    /// byte once and refuse further input.
+    InputEof,
+    /// The host terminal was resized.
+    Resize { columns: u16, rows: u16 },
+}
+
+impl std::fmt::Debug for TerminalCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input(bytes) => formatter
+                .debug_tuple("Input")
+                .field(&format_args!("<{} bytes>", bytes.len()))
+                .finish(),
+            Self::InputEof => formatter.write_str("InputEof"),
+            Self::Resize { columns, rows } => formatter
+                .debug_struct("Resize")
+                .field("columns", columns)
+                .field("rows", rows)
+                .finish(),
+        }
+    }
+}
+
+/// Source of host-originated terminal commands.
+///
+/// Implementations must never block longer than `bound`, so a backend polling
+/// for input still observes cancellation promptly.
+pub trait InputSource: Send + Sync {
+    fn poll(&self, bound: std::time::Duration) -> Option<TerminalCommand>;
+}
+
+/// Input source for headless runs, which never deliver terminal commands.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NullInput;
+
+impl InputSource for NullInput {
+    fn poll(&self, _bound: std::time::Duration) -> Option<TerminalCommand> {
+        None
+    }
+}
+
+/// Bounded queue of terminal commands fed by a reader thread.
+///
+/// Producers use [`ChannelInput::offer`], which never blocks past its bound, so
+/// a workload that stops reading its terminal can never stall the control
+/// reader that also carries cancellation.
+#[derive(Debug)]
+pub struct ChannelInput {
+    receiver: std::sync::Mutex<std::sync::mpsc::Receiver<TerminalCommand>>,
+}
+
+/// Producer half of a [`ChannelInput`].
+#[derive(Debug, Clone)]
+pub struct InputSender {
+    sender: std::sync::mpsc::SyncSender<TerminalCommand>,
+}
+
+/// Why a terminal command could not be queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InputOfferError {
+    #[error("terminal input queue stayed full")]
+    Saturated,
+    #[error("terminal input consumer is gone")]
+    Disconnected,
+}
+
+impl ChannelInput {
+    /// Creates a bounded pair with the given queue depth.
+    #[must_use]
+    pub fn bounded(depth: usize) -> (InputSender, Self) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(depth);
+        (
+            InputSender { sender },
+            Self {
+                receiver: std::sync::Mutex::new(receiver),
+            },
+        )
+    }
+}
+
+impl InputSender {
+    /// Queues a command, giving up after `bound` rather than blocking.
+    pub fn offer(
+        &self,
+        command: TerminalCommand,
+        bound: std::time::Duration,
+    ) -> Result<(), InputOfferError> {
+        use std::sync::mpsc::TrySendError;
+        let deadline = std::time::Instant::now() + bound;
+        let mut pending = command;
+        loop {
+            match self.sender.try_send(pending) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Disconnected(_)) => return Err(InputOfferError::Disconnected),
+                Err(TrySendError::Full(returned)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(InputOfferError::Saturated);
+                    }
+                    pending = returned;
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+    }
+}
+
+impl InputSource for ChannelInput {
+    fn poll(&self, bound: std::time::Duration) -> Option<TerminalCommand> {
+        let receiver = self.receiver.lock().ok()?;
+        receiver.recv_timeout(bound).ok()
+    }
+}
+
 /// Platform execution boundary. Implementations must not perform policy.
 pub trait ExecutionBackend: Send + Sync {
     fn execute(
@@ -222,6 +344,7 @@ pub trait ExecutionBackend: Send + Sync {
         request: &ExecutionRequest,
         decision: &ExecutionDecision,
         sink: &mut dyn EventSink,
+        input: &dyn InputSource,
         cancellation: &CancellationFlag,
     ) -> ExecutionResult;
 }
@@ -246,6 +369,7 @@ impl ExecutionBackend for UnsupportedExecutionBackend {
         _request: &ExecutionRequest,
         _decision: &ExecutionDecision,
         _sink: &mut dyn EventSink,
+        _input: &dyn InputSource,
         _cancellation: &CancellationFlag,
     ) -> ExecutionResult {
         ExecutionResult {
@@ -316,6 +440,17 @@ impl<B: ExecutionBackend> Broker<B> {
         sink: &mut dyn EventSink,
         cancellation: &CancellationFlag,
     ) -> Result<ExecutionResult, ExecError> {
+        self.execute_with_input(request, sink, &NullInput, cancellation)
+    }
+
+    /// Executes with a live terminal input source for interactive workloads.
+    pub fn execute_with_input(
+        &self,
+        request: &ExecutionRequest,
+        sink: &mut dyn EventSink,
+        input: &dyn InputSource,
+        cancellation: &CancellationFlag,
+    ) -> Result<ExecutionResult, ExecError> {
         let decision = self.decide(request)?;
         if !self.session.register(request.correlation_id.clone()) {
             return Err(ExecError::Authentication("duplicate correlation id".into()));
@@ -346,7 +481,7 @@ impl<B: ExecutionBackend> Broker<B> {
 
         let result = self
             .backend
-            .execute(&sanitized, &decision, sink, cancellation);
+            .execute(&sanitized, &decision, sink, input, cancellation);
         let _ = sink.emit(ExecutionEvent::Terminal {
             correlation_id: request.correlation_id.clone(),
             result: result.clone(),
@@ -378,6 +513,7 @@ mod tests {
             request: &ExecutionRequest,
             _decision: &ExecutionDecision,
             _sink: &mut dyn EventSink,
+            _input: &dyn InputSource,
             _cancellation: &CancellationFlag,
         ) -> ExecutionResult {
             self.environment
@@ -407,6 +543,7 @@ mod tests {
             _request: &ExecutionRequest,
             _decision: &ExecutionDecision,
             _sink: &mut dyn EventSink,
+            _input: &dyn InputSource,
             cancellation: &CancellationFlag,
         ) -> ExecutionResult {
             cancellation.cancel();

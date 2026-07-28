@@ -218,6 +218,7 @@ mod tests {
             request: &ExecutionRequest,
             _decision: &ExecutionDecision,
             sink: &mut dyn EventSink,
+            _input: &dyn crate::broker::InputSource,
             cancellation: &CancellationFlag,
         ) -> ExecutionResult {
             let _ = sink.emit(ExecutionEvent::Started {

@@ -31,8 +31,9 @@ pub use api::{
     SemanticScope, SessionAuthentication, StandardInput, StreamKind, TerminalState,
 };
 pub use broker::{
-    Broker, CancellationCause, CancellationFlag, EventSink, ExecutionBackend, RequestLimits,
-    SinkError, UnsupportedExecutionBackend,
+    Broker, CancellationCause, CancellationFlag, ChannelInput, EventSink, ExecutionBackend,
+    InputOfferError, InputSender, InputSource, NullInput, RequestLimits, SinkError,
+    TerminalCommand, UnsupportedExecutionBackend,
 };
 pub use error::{
     ExecError, KernelPrimitive, PlatformError, RequestValidationError, UnsupportedKernel,
