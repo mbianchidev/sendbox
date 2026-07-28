@@ -347,12 +347,12 @@ async fn process_with_writer(
             continue;
         }
 
-        if let Some(entry) = ledger.entries.get(&record.idempotency_key) {
-            if entry.sequence != record.sequence || entry.tool != tool {
-                return Err(HostError::SafeOutputs(
-                    "ledger entry does not match the authenticated operation".to_owned(),
-                ));
-            }
+        if let Some(entry) = ledger.entries.get(&record.idempotency_key)
+            && (entry.sequence != record.sequence || entry.tool != tool)
+        {
+            return Err(HostError::SafeOutputs(
+                "ledger entry does not match the authenticated operation".to_owned(),
+            ));
         }
         if let Some(entry) = ledger.entries.get(&record.idempotency_key)
             && entry.state == LedgerState::Applied

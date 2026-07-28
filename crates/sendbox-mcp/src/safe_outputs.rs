@@ -1218,7 +1218,7 @@ fn validate_repository_target(
     }
 }
 
-fn canonicalize_strings(values: &mut Vec<String>) -> Result<(), SafeOutputsError> {
+fn canonicalize_strings(values: &mut [String]) -> Result<(), SafeOutputsError> {
     for value in values.iter_mut() {
         *value = value.trim().to_owned();
         if value.is_empty() {

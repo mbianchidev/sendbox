@@ -199,6 +199,15 @@ pub struct PreparedHostRun {
     terminal_source: Option<Arc<dyn TerminalSource>>,
 }
 
+struct RuntimeInputs {
+    execution: HostExecution,
+    secrets: Arc<HostSecretResolver>,
+    safe_outputs: Option<safe_outputs::ProcessingContext>,
+    output: Arc<dyn OutputSink>,
+    signals: Arc<dyn SignalSource>,
+    terminal_source: Option<Arc<dyn TerminalSource>>,
+}
+
 struct EffectiveCredentialSet {
     values: BTreeMap<String, SecretValue>,
     github_https_auth: bool,
@@ -257,20 +266,25 @@ impl PreparedHostRun {
         signals: Arc<dyn SignalSource>,
         cancellation: &CancellationToken,
     ) -> Result<HostRunReport, HostError> {
+        let PreparedHostRun {
+            execution,
+            secrets,
+            security,
+            safe_outputs,
+            signed_plan_path: _,
+            terminal_source,
+        } = self;
+        let runtime_inputs = RuntimeInputs {
+            execution,
+            secrets,
+            safe_outputs,
+            output,
+            signals,
+            terminal_source,
+        };
         security::execute(
-            self.security,
-            move |audit| {
-                execute_runtime(
-                    self.execution,
-                    self.secrets,
-                    self.safe_outputs,
-                    audit,
-                    output,
-                    signals,
-                    self.terminal_source,
-                    cancellation,
-                )
-            },
+            security,
+            move |audit| execute_runtime(runtime_inputs, audit, cancellation),
             cancellation,
         )
         .await
@@ -590,15 +604,18 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
 }
 
 async fn execute_runtime(
-    execution: HostExecution,
-    secrets: Arc<HostSecretResolver>,
-    safe_outputs: Option<safe_outputs::ProcessingContext>,
+    inputs: RuntimeInputs,
     audit: AuditRecorder,
-    output: Arc<dyn OutputSink>,
-    signals: Arc<dyn SignalSource>,
-    terminal_source: Option<Arc<dyn TerminalSource>>,
     cancellation: &CancellationToken,
 ) -> Result<HostRunReport, HostError> {
+    let RuntimeInputs {
+        execution,
+        secrets,
+        safe_outputs,
+        output,
+        signals,
+        terminal_source,
+    } = inputs;
     match execution {
         HostExecution::Persistent {
             provider,
