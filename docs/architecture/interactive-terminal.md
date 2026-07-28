@@ -76,14 +76,22 @@ never stall cancellation:
 
 | Layer | Control path | Input path |
 |---|---|---|
+| `sendbox-cli` stdin reader | shutdown flag observed on every retry | bounded retry into a depth-256 queue |
+| `sendbox-agent` writer task | depth-4 channel, drained first by a `biased` select, acknowledged | depth-256 channel, 250 ms bounded offer then loud drop |
 | `sendbox-agent` orchestrator | biased `select!` arm | unbiased against guest output |
 | Guest protocol loop | depth-4 channel, drained first by a `biased` select | depth-256 channel, bounded wait then loud drop |
 | `sendbox-exec` service | control reader loops, never blocks | 250 ms bounded offer |
-| Launcher | dedicated control monitor | bounded `ChannelInput` |
+| Launcher | dedicated control monitor | `poll`-bounded write to the pty primary |
 
 Guest output and host keystrokes are deliberately selected *without* bias
 against each other: a chatty workload must not starve typing, and a long paste
 must not starve the screen.
+
+The host's guest-facing writer lives on its own task. The orchestrator therefore
+keeps draining guest output while keystrokes are in flight, which is what makes
+the two directions independent: were it to await the socket write instead, a host
+stalled on its own terminal and a guest stalled writing output would wedge each
+other, with neither side reading and both blocked writing.
 
 Saturation drops keystrokes with an explicit diagnostic rather than deadlocking.
 End-to-end credit-based flow control would remove the drop entirely and is the

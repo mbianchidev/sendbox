@@ -18,6 +18,10 @@ const INPUT_QUEUE_DEPTH: usize = 256;
 /// Largest keystroke batch read from the host terminal in one go.
 const INPUT_CHUNK: usize = 4096;
 
+/// How long the reader thread waits before retrying a full input queue. Short
+/// enough that shutdown is prompt, long enough not to spin a core.
+const OFFER_RETRY: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// Default terminal type when the host environment does not set `TERM`.
 const DEFAULT_TERM: &str = "xterm-256color";
 
@@ -58,8 +62,8 @@ impl std::error::Error for TerminalError {}
 mod imp {
     use super::{
         Arc, AtomicBool, BoxFuture, DEFAULT_TERM, GuestTerminalSize, HostTerminalCommand,
-        INPUT_CHUNK, INPUT_QUEUE_DEPTH, MAX_TERM_LENGTH, Ordering, Read, TerminalError,
-        TerminalSource, io,
+        INPUT_CHUNK, INPUT_QUEUE_DEPTH, MAX_TERM_LENGTH, OFFER_RETRY, Ordering, Read,
+        TerminalError, TerminalSource, io,
     };
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
@@ -269,6 +273,7 @@ mod imp {
     /// depends on the operator pressing another key.
     struct StdinPump {
         wake: OwnedFd,
+        stopping: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -278,12 +283,15 @@ mod imp {
         ) -> Result<Self, TerminalError> {
             let (wake_reader, wake_writer) = rustix::pipe::pipe()
                 .map_err(|error| TerminalError::Query(format!("create wake pipe: {error}")))?;
+            let stopping = Arc::new(AtomicBool::new(false));
+            let thread_stopping = Arc::clone(&stopping);
             let handle = std::thread::Builder::new()
                 .name("sendbox-stdin".to_owned())
-                .spawn(move || pump_stdin(&wake_reader, &sender))
+                .spawn(move || pump_stdin(&wake_reader, &sender, &thread_stopping))
                 .map_err(|error| TerminalError::Query(format!("start stdin reader: {error}")))?;
             Ok(Self {
                 wake: wake_writer,
+                stopping,
                 handle: Some(handle),
             })
         }
@@ -292,7 +300,11 @@ mod imp {
             self.shutdown();
         }
 
+        /// Raising the flag before waking is what makes the join below bounded:
+        /// the reader may be parked in `poll` or waiting for room in the input
+        /// queue, and nothing drains that queue once the run is tearing down.
         fn shutdown(&mut self) {
+            self.stopping.store(true, Ordering::Release);
             let _ = rustix::io::write(&self.wake, b"\0");
             if let Some(handle) = self.handle.take()
                 && handle.join().is_err()
@@ -308,7 +320,34 @@ mod imp {
         }
     }
 
-    fn pump_stdin(wake: &OwnedFd, sender: &tokio::sync::mpsc::Sender<HostTerminalCommand>) {
+    /// Hands one command to the async side, giving up as soon as the session
+    /// starts shutting down. Returns `false` when the reader should stop.
+    fn offer(
+        sender: &tokio::sync::mpsc::Sender<HostTerminalCommand>,
+        stopping: &AtomicBool,
+        command: HostTerminalCommand,
+    ) -> bool {
+        let mut pending = command;
+        loop {
+            if stopping.load(Ordering::Acquire) {
+                return false;
+            }
+            match sender.try_send(pending) {
+                Ok(()) => return true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    pending = returned;
+                    std::thread::sleep(OFFER_RETRY);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+    }
+
+    fn pump_stdin(
+        wake: &OwnedFd,
+        sender: &tokio::sync::mpsc::Sender<HostTerminalCommand>,
+        stopping: &AtomicBool,
+    ) {
         let stdin = io::stdin();
         let input = stdin_fd();
         let wake = wake.as_fd();
@@ -334,14 +373,15 @@ mod imp {
             }
             match stdin.lock().read(&mut buffer) {
                 Ok(0) => {
-                    let _ = sender.blocking_send(HostTerminalCommand::InputEof);
+                    offer(sender, stopping, HostTerminalCommand::InputEof);
                     return;
                 }
                 Ok(read) => {
-                    if sender
-                        .blocking_send(HostTerminalCommand::Input(buffer[..read].to_vec()))
-                        .is_err()
-                    {
+                    if !offer(
+                        sender,
+                        stopping,
+                        HostTerminalCommand::Input(buffer[..read].to_vec()),
+                    ) {
                         return;
                     }
                 }
@@ -351,6 +391,39 @@ mod imp {
                     return;
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{AtomicBool, HostTerminalCommand, Ordering, offer};
+        use std::sync::Arc;
+
+        #[test]
+        fn a_full_queue_never_pins_the_reader_past_shutdown() {
+            // The receiver stops draining while the run tears down, so a reader
+            // parked on a full queue would hang the join that restores the
+            // terminal.
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            sender
+                .try_send(HostTerminalCommand::Input(vec![b'a']))
+                .expect("queue starts empty");
+            let stopping = Arc::new(AtomicBool::new(false));
+            let reader_stopping = Arc::clone(&stopping);
+            let reader = std::thread::spawn(move || {
+                offer(
+                    &sender,
+                    &reader_stopping,
+                    HostTerminalCommand::Input(vec![b'b']),
+                )
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(!reader.is_finished(), "offer returned before shutdown");
+            stopping.store(true, Ordering::Release);
+            assert!(
+                !reader.join().expect("reader thread panicked"),
+                "offer should report that the reader must stop"
+            );
         }
     }
 }

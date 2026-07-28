@@ -185,7 +185,7 @@ impl GuestSession for ProtocolGuestSession {
                 .ok_or_else(|| AgentError::Guest("guest session reader unavailable".to_owned()))?;
             Ok(Box::new(ProtocolGuestExecution {
                 reader,
-                writer,
+                writer: WriterHandle::spawn(writer),
                 terminal: false,
                 cancelled: false,
                 interactive,
@@ -287,11 +287,126 @@ fn unix_time_ms() -> Result<u64, AgentError> {
 
 pub struct ProtocolGuestExecution {
     reader: sendbox_protocol::FramedReader<tokio::io::ReadHalf<Box<dyn ControlStream>>>,
-    writer: sendbox_protocol::FramedWriter<tokio::io::WriteHalf<Box<dyn ControlStream>>>,
+    writer: WriterHandle,
     terminal: bool,
     cancelled: bool,
     interactive: bool,
     input_ended: bool,
+}
+
+/// Queue depth for control frames (cancellation, close). These must never
+/// queue behind bulk terminal input.
+const WRITER_CONTROL_DEPTH: usize = 4;
+
+/// Queue depth for pending terminal input frames.
+const WRITER_INPUT_DEPTH: usize = 256;
+
+/// How long a keystroke may wait for the writer before it is dropped. Dropping
+/// is what keeps the orchestrator reading guest output: a workload that stops
+/// draining its terminal must never be able to stall the screen.
+const INPUT_OFFER_BOUND: Duration = Duration::from_millis(250);
+
+struct WriterMessage {
+    message: Message,
+    ack: Option<tokio::sync::oneshot::Sender<Result<(), sendbox_protocol::ProtocolError>>>,
+}
+
+/// Owns the guest-facing `FramedWriter` on its own task.
+///
+/// The orchestrator loop must keep draining guest output while it forwards
+/// keystrokes. If it awaited the socket write instead, a host stalled on its
+/// own terminal and a guest stalled writing output would wedge each other:
+/// neither side would read, and both would be blocked writing.
+struct WriterHandle {
+    control: tokio::sync::mpsc::Sender<WriterMessage>,
+    input: tokio::sync::mpsc::Sender<WriterMessage>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl WriterHandle {
+    fn spawn(
+        mut writer: sendbox_protocol::FramedWriter<tokio::io::WriteHalf<Box<dyn ControlStream>>>,
+    ) -> Self {
+        let (control, mut control_receiver) = tokio::sync::mpsc::channel(WRITER_CONTROL_DEPTH);
+        let (input, mut input_receiver) =
+            tokio::sync::mpsc::channel::<WriterMessage>(WRITER_INPUT_DEPTH);
+        let task = tokio::spawn(async move {
+            loop {
+                let queued = tokio::select! {
+                    biased;
+                    control = control_receiver.recv() => match control {
+                        Some(queued) => queued,
+                        None => return,
+                    },
+                    input = input_receiver.recv() => match input {
+                        Some(queued) => queued,
+                        None => continue,
+                    },
+                };
+                let WriterMessage { message, ack } = queued;
+                let result = writer.send(&message).await;
+                let failed = result.is_err();
+                if let Some(ack) = ack {
+                    let _ = ack.send(result);
+                } else if let Err(error) = result {
+                    eprintln!("sendbox: forwarding terminal input to the guest failed: {error}");
+                }
+                if failed {
+                    return;
+                }
+            }
+        });
+        Self {
+            control,
+            input,
+            task,
+        }
+    }
+
+    /// Sends a control frame and waits for it to reach the socket, so callers
+    /// keep the delivery guarantee they had when they owned the writer.
+    async fn send_control(&self, message: Message) -> Result<(), AgentError> {
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        self.control
+            .send(WriterMessage {
+                message,
+                ack: Some(ack),
+            })
+            .await
+            .map_err(|_| AgentError::Guest("guest connection writer stopped".to_owned()))?;
+        acked
+            .await
+            .map_err(|_| AgentError::Guest("guest connection writer stopped".to_owned()))?
+            .map_err(AgentError::Protocol)
+    }
+
+    /// Queues a keystroke without waiting for the socket. Saturation drops the
+    /// keystroke with a diagnostic rather than blocking the caller.
+    async fn offer_input(&self, message: Message) -> Result<(), AgentError> {
+        match self
+            .input
+            .send_timeout(WriterMessage { message, ack: None }, INPUT_OFFER_BOUND)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+                eprintln!(
+                    "sendbox: guest stopped accepting terminal input for {}ms; dropping input",
+                    INPUT_OFFER_BOUND.as_millis()
+                );
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => Err(AgentError::Guest(
+                "guest connection writer stopped".to_owned(),
+            )),
+        }
+    }
+}
+
+impl Drop for WriterHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl GuestExecution for ProtocolGuestExecution {
@@ -399,10 +514,10 @@ impl GuestExecution for ProtocolGuestExecution {
                     }
                 }
             };
-            protocol_io(
+            guest_io(
                 "send guest terminal input",
                 cancellation,
-                self.writer.send(&Message::Event(event)),
+                self.writer.offer_input(Message::Event(event)),
             )
             .await
         })
@@ -417,23 +532,24 @@ impl GuestExecution for ProtocolGuestExecution {
                 return Ok(());
             }
             if self.terminal {
-                let _ = protocol_io(
+                let _ = guest_io(
                     "close completed guest execution",
                     cancellation,
-                    self.writer.send(&Message::GracefulClose(GracefulClose {
-                        code: CloseCode::Normal,
-                        reason: "execution complete".to_owned(),
-                    })),
+                    self.writer
+                        .send_control(Message::GracefulClose(GracefulClose {
+                            code: CloseCode::Normal,
+                            reason: "execution complete".to_owned(),
+                        })),
                 )
                 .await;
                 self.cancelled = true;
                 return Ok(());
             }
-            protocol_io(
+            guest_io(
                 "send guest cancellation",
                 cancellation,
                 self.writer
-                    .send(&Message::Cancellation(sendbox_protocol::Cancellation {
+                    .send_control(Message::Cancellation(sendbox_protocol::Cancellation {
                         request_id: REQUEST_ID,
                         reason: Some("agent cancellation".to_owned()),
                     })),
@@ -499,13 +615,22 @@ async fn protocol_io<T>(
     cancellation: &CancellationToken,
     future: impl Future<Output = Result<T, sendbox_protocol::ProtocolError>>,
 ) -> Result<T, AgentError> {
+    guest_io(operation, cancellation, async move {
+        future.await.map_err(AgentError::Protocol)
+    })
+    .await
+}
+
+async fn guest_io<T>(
+    operation: &'static str,
+    cancellation: &CancellationToken,
+    future: impl Future<Output = Result<T, AgentError>>,
+) -> Result<T, AgentError> {
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(AgentError::Cancelled),
         result = tokio::time::timeout(PROTOCOL_IO_TIMEOUT, future) => {
-            result
-                .map_err(|_| AgentError::Guest(format!("{operation} timed out")))?
-                .map_err(AgentError::Protocol)
+            result.map_err(|_| AgentError::Guest(format!("{operation} timed out")))?
         }
     }
 }

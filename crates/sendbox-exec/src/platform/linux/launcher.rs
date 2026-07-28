@@ -5,7 +5,7 @@
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1137,23 +1137,50 @@ impl TerminalWriter {
         let mut offset = 0;
         let deadline = Instant::now() + INPUT_WRITE_BOUND;
         while offset < data.len() {
+            Self::wait_writable(&self.primary, deadline)?;
             match self.primary.write(&data[offset..]) {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
                 Ok(written) => offset += written,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "workload did not drain its terminal input",
-                        ));
-                    }
-                    thread::sleep(Duration::from_millis(2));
-                }
                 Err(error) => return Err(error),
             }
         }
         self.primary.flush()
+    }
+
+    /// The primary is a blocking descriptor, so a workload that stops draining
+    /// its terminal would otherwise park this thread in the kernel forever and
+    /// the bound above would never be observed. Waiting for writability first
+    /// makes it real.
+    fn wait_writable(primary: &File, deadline: Instant) -> io::Result<()> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Self::not_draining());
+            }
+            let timeout = rustix::event::Timespec {
+                tv_sec: i64::try_from(remaining.as_secs()).unwrap_or(i64::MAX),
+                tv_nsec: i64::from(remaining.subsec_nanos()),
+            };
+            let primary = primary.as_fd();
+            let mut fds = [rustix::event::PollFd::new(
+                &primary,
+                rustix::event::PollFlags::OUT,
+            )];
+            match rustix::event::poll(&mut fds, Some(&timeout)) {
+                Ok(0) => return Err(Self::not_draining()),
+                Ok(_) => return Ok(()),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
+            }
+        }
+    }
+
+    fn not_draining() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "workload did not drain its terminal input",
+        )
     }
 }
 
