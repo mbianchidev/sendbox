@@ -46,6 +46,27 @@ pub enum IntegrityAlgorithm {
 pub struct IntegrityClaim {
     pub algorithm: IntegrityAlgorithm,
     pub digest: Vec<u8>,
+    pub source: IntegritySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegritySource {
+    Sri,
+    Shasum,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureClaim {
+    pub key_id: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceClaim {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -61,9 +82,13 @@ pub struct ArtifactDescriptor {
     pub identity: PackageIdentity,
     pub source_url: String,
     pub integrity: Vec<IntegrityClaim>,
+    pub signature_integrity: String,
     pub metadata_revision: String,
-    pub signatures_present: bool,
-    pub provenance_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    pub signatures: Vec<SignatureClaim>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceClaim>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

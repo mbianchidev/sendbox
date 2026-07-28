@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{PackageFinding, PackageIdentity, RegistryError, RegistryResult, Verdict};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RawFinding {
     pub kind: PackageFindingKind,
     pub path: Option<String>,

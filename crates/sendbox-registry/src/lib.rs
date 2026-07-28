@@ -1,20 +1,25 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod client;
 mod engine;
 mod model;
+mod npm;
 mod report;
+mod scanner;
 
 pub use adapter::{
     AdapterCapabilities, PackageProvenanceVerifier, RegistryAdapter, TrustMetadata, UpstreamClient,
     UpstreamRequest, UpstreamResponse,
 };
+pub use client::ReqwestUpstreamClient;
 pub use engine::{PolicyDecision, RawFinding, evaluate_findings, package_policy_digest};
 pub use model::{
     ArchiveEntry, ArchiveEntryKind, ArtifactDescriptor, ArtifactDigest, IntegrityAlgorithm,
-    IntegrityClaim, NormalizedManifest, PackageIdentity, RegistryError, RegistryResult,
-    ResolvedMetadata, VerificationEvidence,
+    IntegrityClaim, IntegritySource, NormalizedManifest, PackageIdentity, ProvenanceClaim,
+    RegistryError, RegistryResult, ResolvedMetadata, SignatureClaim, VerificationEvidence,
 };
+pub use npm::{FailClosedPackageProvenanceVerifier, NpmAdapter};
 pub use report::{
     CacheOutcome, PackageFinding, PackageSecurityReport, PackageVerdictRecord, Verdict,
 };

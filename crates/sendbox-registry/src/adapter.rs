@@ -1,10 +1,11 @@
+use std::fmt;
 use std::path::Path;
 
 use async_trait::async_trait;
 use sendbox_policy::PackageEcosystem;
 
 use crate::{
-    ArchiveEntry, ArtifactDescriptor, NormalizedManifest, PackageFinding, PackageIdentity,
+    ArchiveEntry, ArtifactDescriptor, NormalizedManifest, PackageIdentity, RawFinding,
     RegistryResult, ResolvedMetadata, VerificationEvidence,
 };
 
@@ -16,12 +17,27 @@ pub struct AdapterCapabilities {
     pub layered_artifacts: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UpstreamRequest {
     pub url: String,
     pub accept: Option<String>,
     pub authorization: Option<Vec<u8>>,
     pub maximum_bytes: u64,
+}
+
+impl fmt::Debug for UpstreamRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpstreamRequest")
+            .field("url", &self.url)
+            .field("accept", &self.accept)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("maximum_bytes", &self.maximum_bytes)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +58,7 @@ pub trait UpstreamClient: Send + Sync {
 pub struct TrustMetadata {
     pub registry_keys: Vec<u8>,
     pub package_trust_root: Vec<u8>,
+    pub provenance_bundle: Option<Vec<u8>>,
     pub digest: String,
 }
 
@@ -107,5 +124,5 @@ pub trait RegistryAdapter: Send + Sync {
         manifest: &NormalizedManifest,
         entries: &[ArchiveEntry],
         artifact: &Path,
-    ) -> RegistryResult<Vec<PackageFinding>>;
+    ) -> RegistryResult<Vec<RawFinding>>;
 }
