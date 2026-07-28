@@ -467,6 +467,10 @@ These are threats SendBox is designed to defend against:
 | Agent attempts to load malicious kernel modules | `kernel.modules_disabled=1`; `CAP_SYS_MODULE` dropped; seccomp blocks `init_module` |
 | Agent attempts a disallowed MCP tool call | When runtime wiring routes stdio through `sendbox-mcp`, the broker returns `-32001` or drops a denied notification before server delivery |
 | Agent attempts to push or pull a protected selected-repository branch | Root-installed git policy validates current and remote refs; eBPF terminates direct real-git execution |
+| Agent reads back host keystrokes it was never sent | Terminal input is host→guest only; direction binding on the control channel rejects a guest-originated `StandardInput` event |
+| Interactive workload escapes its terminal to reach the launcher | The pseudoterminal secondary is the child's controlling terminal after `setsid`; the launcher keeps the primary and applies the same seccomp, capability and uid drops as a headless launch |
+| Pasted credentials leak through host logs | `Event`, `ClientFrame`, `TerminalCommand`, `LauncherControl` and `HostTerminalCommand` all render input as a byte count, never as content |
+| Agent stalls cancellation by refusing to read its terminal | Control and bulk input use separate bounded paths at every layer; saturated input is dropped with a diagnostic instead of blocking cancellation |
 
 ### Out of Scope
 

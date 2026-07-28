@@ -220,6 +220,55 @@ Tarball users can point these flags at `guest/<architecture>/` inside the
 extracted release directory. A bundled public key is not self-authenticating;
 trust it only after verifying the host or standalone guest archive attestation.
 
+### Interactive terminal sessions
+
+`--interactive` runs the workload on a pseudoterminal inside the sandbox and forwards this
+terminal's keystrokes and window size to it, which is what terminal agents such as GitHub
+Copilot CLI, Claude Code, Codex and Gemini need in order to render and accept input.
+
+```bash
+sendbox run --interactive \
+  --config .sendbox.yaml \
+  --runtime kata \
+  --image registry.example/workload@sha256:<digest> \
+  --bundle /usr/local/share/sendbox/guest/x86_64/bundle \
+  --trust-root /usr/local/share/sendbox/guest/x86_64/release-public.key \
+  -- /usr/bin/copilot
+```
+
+Keystrokes ride the same authenticated control channel as workload output, so they inherit
+its message authentication, replay protection and session binding. No additional port,
+socket or privilege is introduced.
+
+Requirements and behaviour:
+
+- Both stdin and stdout must be a terminal and `sendbox` must be in that terminal's
+  foreground process group. Otherwise the run fails with a clear error instead of silently
+  falling back to a workload with no input.
+- `--interactive` cannot be combined with `--json`; machine-readable output and a raw
+  terminal are mutually exclusive.
+- Only the `apple` and `kata` runtimes provide a terminal. `hyperlight` rejects
+  `--interactive` before anything is created or started.
+- `Ctrl-C`, `Ctrl-Z` and `Ctrl-D` are delivered to the *workload's* terminal, not to
+  `sendbox`. Use the agent's own quit command to end the session.
+- The host `TERM` is authoritative for the workload; it replaces any configured `TERM`.
+- Terminal output merges the workload's stdout and stderr, because a terminal is a single
+  device. Drop `--interactive` when the two streams must stay separate.
+- Window size changes are tracked through `SIGWINCH` for as long as the run lasts.
+
+See [interactive terminals](docs/architecture/interactive-terminal.md) for the design,
+flow-control rules and qualification evidence.
+
+Troubleshooting:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `--interactive requires a terminal but stdin is not one` | `sendbox` is being piped or run from a job runner | Run it from a terminal, or drop `--interactive` |
+| `--interactive requires the foreground process group` | Started with `&` or under a job-control shell in the background | Bring the job to the foreground |
+| `the hyperlight runtime cannot provide an interactive terminal` | `--runtime hyperlight` | Use `--runtime apple` or `--runtime kata` |
+| `interactive execution needs a controlling terminal, but the command policy denies: ioctl` | `policy.boundaries.syscalls.additional_denylist` blocks terminal syscalls | Remove `ioctl`, `setsid`, `dup2` and `dup3` from the denylist, or run without `--interactive` |
+| The agent renders as garbled boxes | The guest image has no terminfo entry for the host `TERM` | Set `TERM=xterm-256color` before running |
+
 ## Configuration
 
 SendBox is configured through YAML. See [config/example-sandbox.yaml](config/example-sandbox.yaml) for the fully annotated reference.
@@ -396,6 +445,18 @@ and never print a credential value.
 | `github.branch_protection.allowed_branch_patterns` | list | Glob patterns allowed for selected-repository push and pull |
 | `observability.mcp_inspection.enabled` | bool | Enable authenticated local stdio MCP observation on Apple or Kata |
 
+### Run flags
+
+| Flag | Description |
+|---|---|
+| `--config PATH` | Sandbox configuration file |
+| `--runtime auto\|apple\|kata\|hyperlight` | Runtime provider selection |
+| `--image IMAGE@sha256:DIGEST` | Digest-pinned workload image for persistent runtimes |
+| `--bundle PATH` | Verified guest bundle directory |
+| `--trust-root PATH` | Release public key used to verify the bundle |
+| `--json` | Emit machine-readable events instead of raw output |
+| `--interactive` | Run the workload on a pseudoterminal; conflicts with `--json` |
+
 ## Architecture
 
 ```
@@ -423,7 +484,8 @@ See the architecture documents for
 [agent orchestration](docs/architecture/agent-orchestration.md),
 [secrets](docs/architecture/secrets-and-credential-broker.md), and
 [session security](docs/architecture/session-security-lifecycle.md),
-[execution brokerage](docs/architecture/execution-broker.md), plus
+[execution brokerage](docs/architecture/execution-broker.md),
+[interactive terminals](docs/architecture/interactive-terminal.md), plus
 [egress enforcement](docs/architecture/egress-enforcement.md).
 
 See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
