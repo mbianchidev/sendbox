@@ -352,6 +352,7 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, ProtocolErr
         6 => Ok(EventKind::StandardInput),
         7 => Ok(EventKind::StandardInputEof),
         8 => Ok(EventKind::TerminalResize),
+        9 => Ok(EventKind::TerminalInputCredit),
         value => Err(ProtocolError::MalformedEncoding(format!(
             "unsupported event kind {value}"
         ))),
@@ -502,6 +503,7 @@ mod tests {
             EventKind::StandardInput,
             EventKind::StandardInputEof,
             EventKind::TerminalResize,
+            EventKind::TerminalInputCredit,
         ] {
             let message = event_message(kind, vec![0x1b, 0x5b, 0x41]);
             let encoded = encode_message(&message).expect("encode");
@@ -531,6 +533,7 @@ mod tests {
             (EventKind::StandardInput, 6),
             (EventKind::StandardInputEof, 7),
             (EventKind::TerminalResize, 8),
+            (EventKind::TerminalInputCredit, 9),
         ] {
             let encoded = [value];
             let mut decoder = Decoder::new(&encoded);
@@ -540,8 +543,8 @@ mod tests {
 
     #[test]
     fn unknown_event_kinds_are_still_rejected() {
-        let mut decoder = Decoder::new(&[9]);
-        let error = decode_event_kind(&mut decoder).expect_err("kind 9 is unassigned");
+        let mut decoder = Decoder::new(&[10]);
+        let error = decode_event_kind(&mut decoder).expect_err("kind 10 is unassigned");
         assert!(matches!(error, ProtocolError::MalformedEncoding(_)));
     }
 
