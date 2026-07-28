@@ -12,18 +12,88 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{CorrelationId, ExecutionEvent, ExecutionRequest, ExecutionResult};
-use crate::broker::{Broker, CancellationFlag, EventSink, ExecutionBackend, SinkError};
+use crate::broker::{
+    Broker, CancellationFlag, ChannelInput, EventSink, ExecutionBackend, InputOfferError,
+    InputSender, NullInput, SinkError, TerminalCommand,
+};
 use crate::error::ExecError;
 use crate::runtime::{AuthenticatedUnixListener, RuntimeError};
 
 pub const MAX_SERVICE_FRAME_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Queue depth for pending terminal commands.
+const INPUT_CHANNEL_DEPTH: usize = 32;
+/// Hard bound on queuing one terminal command, so the control reader keeps
+/// observing cancellation even while the workload ignores its terminal.
+const INPUT_OFFER_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Client-to-broker control frames.
+///
+/// `Input` carries raw terminal bytes, so its [`std::fmt::Debug`] reports only
+/// a length; pasted credentials must never reach a log.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientFrame {
-    Execute { request: Box<ExecutionRequest> },
-    Cancel { correlation_id: CorrelationId },
+    Execute {
+        request: Box<ExecutionRequest>,
+    },
+    Cancel {
+        correlation_id: CorrelationId,
+    },
     GracefulShutdown,
+    /// Terminal bytes for an interactive workload.
+    Input {
+        correlation_id: CorrelationId,
+        data: Vec<u8>,
+    },
+    /// The client's input stream ended.
+    InputEof {
+        correlation_id: CorrelationId,
+    },
+    /// The client terminal was resized.
+    Resize {
+        correlation_id: CorrelationId,
+        columns: u16,
+        rows: u16,
+    },
+}
+
+impl std::fmt::Debug for ClientFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Execute { request } => formatter
+                .debug_struct("Execute")
+                .field("request", request)
+                .finish(),
+            Self::Cancel { correlation_id } => formatter
+                .debug_struct("Cancel")
+                .field("correlation_id", correlation_id)
+                .finish(),
+            Self::GracefulShutdown => formatter.write_str("GracefulShutdown"),
+            Self::Input {
+                correlation_id,
+                data,
+            } => formatter
+                .debug_struct("Input")
+                .field("correlation_id", correlation_id)
+                .field("data", &format_args!("<{} bytes>", data.len()))
+                .finish(),
+            Self::InputEof { correlation_id } => formatter
+                .debug_struct("InputEof")
+                .field("correlation_id", correlation_id)
+                .finish(),
+            Self::Resize {
+                correlation_id,
+                columns,
+                rows,
+            } => formatter
+                .debug_struct("Resize")
+                .field("correlation_id", correlation_id)
+                .field("columns", columns)
+                .field("rows", rows)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,16 +151,33 @@ impl<B: ExecutionBackend + 'static> BrokerService<B> {
 
         let cancellation = CancellationFlag::default();
         let done = Arc::new(AtomicBool::new(false));
+        let interactive = request.stdin.is_terminal();
+        let (input_sender, input_queue) = if interactive {
+            let (sender, queue) = ChannelInput::bounded(INPUT_CHANNEL_DEPTH);
+            (Some(sender), Some(queue))
+        } else {
+            (None, None)
+        };
         spawn_client_control_reader(
             reader,
             cancellation.clone(),
             request.correlation_id.clone(),
             Arc::clone(&done),
+            input_sender,
         );
         let mut sink = ServiceEventSink {
             stream: &mut stream,
         };
-        let result = self.broker.execute(&request, &mut sink, &cancellation)?;
+        let result = match input_queue.as_ref() {
+            Some(queue) => {
+                self.broker
+                    .execute_with_input(&request, &mut sink, queue, &cancellation)?
+            }
+            None => {
+                self.broker
+                    .execute_with_input(&request, &mut sink, &NullInput, &cancellation)?
+            }
+        };
         done.store(true, Ordering::Release);
         let _ = shutdown_stream.shutdown(Shutdown::Both);
         Ok(result)
@@ -107,29 +194,61 @@ impl EventSink for ServiceEventSink<'_> {
     }
 }
 
+/// Reads client control frames until a terminal cause arrives.
+///
+/// Terminal input is queued with a hard offer bound rather than blocking, so a
+/// workload that stops draining its terminal can never stop this loop from
+/// observing a later cancel or disconnect.
 fn spawn_client_control_reader(
     mut reader: BufReader<UnixStream>,
     cancellation: CancellationFlag,
     correlation_id: CorrelationId,
     done: Arc<AtomicBool>,
+    input: Option<InputSender>,
 ) {
     thread::spawn(move || {
-        if !done.load(Ordering::Acquire) {
-            match read_frame(&mut reader) {
+        while !done.load(Ordering::Acquire) {
+            let command = match read_frame(&mut reader) {
                 Ok(Some(ClientFrame::Cancel {
                     correlation_id: requested,
                 })) if requested == correlation_id => {
                     cancellation.cancel();
+                    return;
                 }
                 Ok(Some(ClientFrame::GracefulShutdown)) => {
                     cancellation.shutdown();
+                    return;
                 }
-                Ok(Some(ClientFrame::Execute { .. } | ClientFrame::Cancel { .. })) | Err(_) => {
+                Ok(Some(ClientFrame::Input {
+                    correlation_id: requested,
+                    data,
+                })) if requested == correlation_id => TerminalCommand::Input(data),
+                Ok(Some(ClientFrame::InputEof {
+                    correlation_id: requested,
+                })) if requested == correlation_id => TerminalCommand::InputEof,
+                Ok(Some(ClientFrame::Resize {
+                    correlation_id: requested,
+                    columns,
+                    rows,
+                })) if requested == correlation_id => TerminalCommand::Resize { columns, rows },
+                Ok(Some(_)) | Ok(None) | Err(_) => {
                     cancellation.disconnect();
+                    return;
                 }
-                Ok(None) => {
-                    cancellation.disconnect();
+            };
+            let Some(sender) = input.as_ref() else {
+                // Terminal traffic for a headless run is a client protocol bug.
+                cancellation.disconnect();
+                return;
+            };
+            match sender.offer(command, INPUT_OFFER_BOUND) {
+                Ok(()) => {}
+                Err(InputOfferError::Saturated) => {
+                    eprintln!(
+                        "sendbox-broker: workload stopped reading its terminal; dropping input"
+                    );
                 }
+                Err(InputOfferError::Disconnected) => return,
             }
         }
     });

@@ -1,8 +1,10 @@
+use crate::traits::HostTerminalCommand;
 use sendbox_protocol::{
-    AGENT_LAUNCH_OPERATION, BootstrapSecret, CapabilitySet, CloseCode, EnvironmentEntryV2,
-    EventKind, FrameLimits, GracefulClose, HandshakeConfig, HostHandshake, LaunchRequestV2,
-    Message, OPERATION_SCHEMA_VERSION, Request, ResponseStatus, SecretEnvelopeV2, TerminalResultV2,
-    TerminalStateV1, VersionRange,
+    AGENT_LAUNCH_OPERATION, BootstrapSecret, CapabilitySet, CloseCode, EnvironmentEntryV2, Event,
+    EventKind, FrameLimits, GracefulClose, HandshakeConfig, HostHandshake,
+    INTERACTIVE_LAUNCH_OPERATION, INTERACTIVE_OPERATION_SCHEMA_VERSION, InteractiveLaunchRequestV1,
+    LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, Request, ResponseStatus, SecretEnvelopeV2,
+    TerminalResultV2, TerminalSizeV1, TerminalStateV1, VersionRange,
 };
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
 use sendbox_secrets::{
@@ -117,7 +119,7 @@ impl GuestSession for ProtocolGuestSession {
                 &mut self.secret_cipher,
                 &mut self.next_secret_sequence,
             )?;
-            let payload = serde_json::to_vec(&LaunchRequestV2 {
+            let launch = LaunchRequestV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 boundary_plan_digest: self.boundary_plan_digest,
                 program: request.command.program.clone(),
@@ -133,8 +135,36 @@ impl GuestSession for ProtocolGuestSession {
                     .collect(),
                 secrets,
                 timeout_ms: 300_000,
-            })
-            .map_err(|error| AgentError::Guest(format!("encode launch request: {error}")))?;
+            };
+            let interactive = request.terminal.is_some();
+            let (operation, payload) = match request.terminal.as_ref() {
+                None => (
+                    AGENT_LAUNCH_OPERATION,
+                    serde_json::to_vec(&launch).map_err(|error| {
+                        AgentError::Guest(format!("encode launch request: {error}"))
+                    })?,
+                ),
+                Some(terminal) => {
+                    let envelope = InteractiveLaunchRequestV1 {
+                        schema_version: INTERACTIVE_OPERATION_SCHEMA_VERSION,
+                        launch,
+                        terminal: TerminalSizeV1 {
+                            columns: terminal.columns,
+                            rows: terminal.rows,
+                        },
+                        term: terminal.term.clone(),
+                    };
+                    envelope.validate().map_err(|error| {
+                        AgentError::Guest(format!("invalid interactive launch request: {error}"))
+                    })?;
+                    (
+                        INTERACTIVE_LAUNCH_OPERATION,
+                        serde_json::to_vec(&envelope).map_err(|error| {
+                            AgentError::Guest(format!("encode interactive launch request: {error}"))
+                        })?,
+                    )
+                }
+            };
             let mut writer = self
                 .writer
                 .take()
@@ -144,7 +174,7 @@ impl GuestSession for ProtocolGuestSession {
                 cancellation,
                 writer.send(&Message::Request(Request {
                     request_id: REQUEST_ID,
-                    operation: AGENT_LAUNCH_OPERATION.to_owned(),
+                    operation: operation.to_owned(),
                     payload,
                 })),
             )
@@ -158,6 +188,8 @@ impl GuestSession for ProtocolGuestSession {
                 writer,
                 terminal: false,
                 cancelled: false,
+                interactive,
+                input_ended: false,
             }) as Box<dyn GuestExecution>)
         })
     }
@@ -258,6 +290,8 @@ pub struct ProtocolGuestExecution {
     writer: sendbox_protocol::FramedWriter<tokio::io::WriteHalf<Box<dyn ControlStream>>>,
     terminal: bool,
     cancelled: bool,
+    interactive: bool,
+    input_ended: bool,
 }
 
 impl GuestExecution for ProtocolGuestExecution {
@@ -314,6 +348,63 @@ impl GuestExecution for ProtocolGuestExecution {
                     other.kind()
                 ))),
             }
+        })
+    }
+
+    fn send_terminal<'a>(
+        &'a mut self,
+        command: HostTerminalCommand,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async move {
+            if !self.interactive {
+                return Err(AgentError::Guest(
+                    "terminal input requires an interactive launch".to_owned(),
+                ));
+            }
+            if self.terminal {
+                return Err(AgentError::Guest(
+                    "terminal input requested after terminal response".to_owned(),
+                ));
+            }
+            if self.input_ended {
+                return Err(AgentError::Guest(
+                    "terminal input was already ended".to_owned(),
+                ));
+            }
+            let event = match command {
+                HostTerminalCommand::Input(bytes) => Event {
+                    stream_id: REQUEST_ID,
+                    kind: sendbox_protocol::EventKind::StandardInput,
+                    payload: bytes,
+                },
+                HostTerminalCommand::InputEof => {
+                    self.input_ended = true;
+                    Event {
+                        stream_id: REQUEST_ID,
+                        kind: sendbox_protocol::EventKind::StandardInputEof,
+                        payload: Vec::new(),
+                    }
+                }
+                HostTerminalCommand::Resize { columns, rows } => {
+                    let size = TerminalSizeV1::new(columns, rows).map_err(|error| {
+                        AgentError::Guest(format!("invalid terminal size: {error}"))
+                    })?;
+                    Event {
+                        stream_id: REQUEST_ID,
+                        kind: sendbox_protocol::EventKind::TerminalResize,
+                        payload: serde_json::to_vec(&size).map_err(|error| {
+                            AgentError::Guest(format!("encode terminal resize: {error}"))
+                        })?,
+                    }
+                }
+            };
+            protocol_io(
+                "send guest terminal input",
+                cancellation,
+                self.writer.send(&Message::Event(event)),
+            )
+            .await
         })
     }
 

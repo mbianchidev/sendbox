@@ -81,6 +81,8 @@ pub struct AgentOrchestrator {
     connector: Arc<dyn GuestConnector>,
     output: Arc<dyn OutputSink>,
     signals: Arc<dyn SignalSource>,
+    terminal: Arc<dyn crate::TerminalSource>,
+    terminal_size: Option<crate::GuestTerminalSize>,
 }
 
 impl AgentOrchestrator {
@@ -98,7 +100,26 @@ impl AgentOrchestrator {
             connector,
             output,
             signals,
+            terminal: Arc::new(crate::NoTerminal),
+            terminal_size: None,
         }
+    }
+
+    /// Runs the workload on a pseudoterminal fed by `source`.
+    ///
+    /// Both the size and the source are required together: a terminal launch
+    /// without an input source would leave the workload unable to be typed
+    /// into, and an input source without a terminal launch would have nowhere
+    /// to deliver keystrokes.
+    #[must_use]
+    pub fn with_terminal(
+        mut self,
+        size: crate::GuestTerminalSize,
+        source: Arc<dyn crate::TerminalSource>,
+    ) -> Self {
+        self.terminal_size = Some(size);
+        self.terminal = source;
+        self
     }
 
     pub async fn run(
@@ -312,6 +333,7 @@ impl AgentOrchestrator {
                     command: plan.command(),
                     environment: plan.environment(),
                     secrets: guest_secrets,
+                    terminal: self.terminal_size.clone(),
                 },
                 cancellation,
             )
@@ -327,6 +349,7 @@ impl AgentOrchestrator {
         context: &mut RunContext,
     ) -> Result<GuestTerminal, AgentError> {
         let mut signals_open = true;
+        let mut terminal_open = self.terminal_size.is_some();
         loop {
             let execution = context.execution.as_mut().expect("execution was stored");
             tokio::select! {
@@ -343,6 +366,18 @@ impl AgentOrchestrator {
                         None => {
                             signals_open = false;
                         }
+                    }
+                }
+                command = self.terminal.next_command(), if terminal_open => {
+                    match command {
+                        Some(command) => {
+                            let ended = matches!(command, crate::HostTerminalCommand::InputEof);
+                            execution.send_terminal(command, cancellation).await?;
+                            if ended {
+                                terminal_open = false;
+                            }
+                        }
+                        None => terminal_open = false,
                     }
                 }
                 event = execution.next_event(cancellation) => {
