@@ -1,12 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use sendbox_protocol::{
-    AGENT_LAUNCH_OPERATION, BootstrapSecret, CloseCode, Event, EventKind, FrameLimits,
+    AGENT_LAUNCH_OPERATION, BootstrapSecret, Capability, CloseCode, Event, EventKind, FrameLimits,
     GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, INTERACTIVE_LAUNCH_OPERATION,
     INTERACTIVE_LAUNCH_OPERATION_V2, InteractiveLaunchRequestV1, InteractiveLaunchRequestV2,
     LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, ProtocolErrorCode, ProtocolErrorMessage,
     Request, Response, ResponseStatus, TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1,
-    TerminalStateV1, VersionRange, agent_guest_capabilities, agent_guest_required_capabilities,
+    SAFE_OUTPUTS_COLLECT_OPERATION, SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+    SafeOutputsCollectRequestV1, SafeOutputsCollectionV1, TerminalStateV1, VersionRange,
+    agent_guest_capabilities, agent_guest_required_capabilities,
 };
 use sendbox_secrets::{
     EnvelopeBinding, EnvelopeCipher, RecipientRole, ReplayGuard, SecretName, SessionKeyMaterial,
@@ -19,6 +21,7 @@ use tokio::net::UnixStream;
 use crate::GuestError;
 use crate::broker::BrokerClientConfiguration;
 use crate::runtime::{ReadinessSnapshot, RuntimeSession};
+use crate::safe_outputs::SafeOutputsHandle;
 use crate::service::ReadinessGate;
 use crate::state::{StartupState, StartupStateMachine};
 
@@ -73,6 +76,7 @@ pub(crate) struct ProtocolServices {
     readiness: ReadinessSnapshot,
     broker: Option<BrokerClientConfiguration>,
     secret_decryptor: GuestSecretDecryptor,
+    safe_outputs: Option<SafeOutputsHandle>,
 }
 
 impl ProtocolServices {
@@ -83,6 +87,7 @@ impl ProtocolServices {
         readiness: ReadinessSnapshot,
         broker: Option<BrokerClientConfiguration>,
         secret_decryptor: GuestSecretDecryptor,
+        safe_outputs: Option<SafeOutputsHandle>,
     ) -> Self {
         Self {
             state,
@@ -91,6 +96,7 @@ impl ProtocolServices {
             readiness,
             broker,
             secret_decryptor,
+            safe_outputs,
         }
     }
 }
@@ -113,8 +119,23 @@ where
 
     let mut handshake = GuestHandshake::new(config);
     let connection = handshake.establish(stream).await?;
+    if services.safe_outputs.is_some()
+        && !connection
+            .negotiated()
+            .capabilities
+            .contains(Capability::SafeOutputs)
+    {
+        return Err(GuestError::Protocol(
+            "Safe Outputs capability was not negotiated".to_owned(),
+        ));
+    }
     let (mut reader, mut writer) = connection.into_parts();
-    if !services.service_readiness.verified_live() {
+    if !services.service_readiness.verified_live()
+        || services
+            .safe_outputs
+            .as_ref()
+            .is_some_and(|safe_outputs| !safe_outputs.verified_live())
+    {
         return Err(GuestError::Protocol(
             "mandatory service failed during authenticated handshake".to_owned(),
         ));
@@ -160,6 +181,9 @@ where
                     LaunchMode::InteractiveV2,
                 )
                 .await?;
+            }
+            Message::Request(request) if request.operation == SAFE_OUTPUTS_COLLECT_OPERATION => {
+                collect_safe_outputs(request, &mut writer, &services).await?;
             }
             Message::Request(request) => {
                 let response =
@@ -260,7 +284,12 @@ async fn launch<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if !services.service_readiness.verified_live() {
+    if !services.service_readiness.verified_live()
+        || services
+            .safe_outputs
+            .as_ref()
+            .is_some_and(|safe_outputs| !safe_outputs.verified_live())
+    {
         return send_rejection(
             host_writer,
             request.request_id,
@@ -427,6 +456,7 @@ where
     let result = run_execution_loop(
         &request,
         &execution,
+        services,
         read,
         host_reader,
         host_writer,
@@ -472,6 +502,7 @@ struct BrokerInputSenders<'a> {
 async fn run_execution_loop<S>(
     request: &Request,
     execution: &sendbox_exec::ExecutionRequest,
+    services: &ProtocolServices,
     read: tokio::net::unix::OwnedReadHalf,
     host_reader: &mut sendbox_protocol::FramedReader<ReadHalf<S>>,
     host_writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
@@ -530,7 +561,17 @@ where
                         })).await?;
                     }
                     sendbox_exec::ExecutionEvent::Terminal { result, .. } => {
-                        let payload = serde_json::to_vec(&terminal_result(result))
+                        let terminal = terminal_result(result);
+                        if let Some(safe_outputs) = &services.safe_outputs {
+                            if !terminal.cleanup_complete {
+                                return Err(GuestError::Protocol(
+                                    "Safe Outputs cannot seal before execution cleanup completes"
+                                        .to_owned(),
+                                ));
+                            }
+                            safe_outputs.seal().await?;
+                        }
+                        let payload = serde_json::to_vec(&terminal)
                             .map_err(|error| GuestError::Protocol(format!("encoding terminal result: {error}")))?;
                         host_writer.send(&Message::Response(Response {
                             request_id: request.request_id,
@@ -539,6 +580,7 @@ where
                         })).await?;
                         return Ok(());
                     }
+
                 }
             }
             host_message = host_reader.receive() => {
@@ -583,6 +625,41 @@ where
             }
         }
     }
+}
+
+async fn collect_safe_outputs<S>(
+    request: Request,
+    writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
+    services: &ProtocolServices,
+) -> Result<(), GuestError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let envelope: SafeOutputsCollectRequestV1 = serde_json::from_slice(&request.payload)
+        .map_err(|error| GuestError::Protocol(format!("decoding Safe Outputs collection: {error}")))?;
+    if envelope.schema_version != SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION
+        || envelope.boundary_plan_digest != services.secret_decryptor.boundary_plan_digest
+    {
+        return Err(GuestError::Protocol(
+            "Safe Outputs collection binding is invalid".to_owned(),
+        ));
+    }
+    let safe_outputs = services.safe_outputs.as_ref().ok_or_else(|| {
+        GuestError::Protocol("Safe Outputs collection was not configured".to_owned())
+    })?;
+    let collected = safe_outputs.collect().await?;
+    let collection = SafeOutputsCollectionV1::new(&collected.artifact, &collected.seal)
+        .map_err(|error| GuestError::Protocol(error.to_string()))?;
+    let payload = serde_json::to_vec(&collection)
+        .map_err(|error| GuestError::Protocol(format!("encoding Safe Outputs collection: {error}")))?;
+    writer
+        .send(&Message::Response(Response {
+            request_id: request.request_id,
+            status: ResponseStatus::Ok,
+            payload,
+        }))
+        .await?;
+    Ok(())
 }
 
 /// Validates and queues one host terminal event.
@@ -1066,6 +1143,7 @@ mod tests {
                     BoundaryPlanDigest::from_bytes([0x91; 32]),
                 )
                 .expect("secret decryptor"),
+                None,
             ),
         )
         .await;
@@ -1126,6 +1204,7 @@ mod tests {
                 None,
                 GuestSecretDecryptor::new(session_id, &[8; 32], boundary_plan_digest)
                     .expect("secret decryptor"),
+                None,
             ),
         ));
         let mut host_handshake = HostHandshake::new(

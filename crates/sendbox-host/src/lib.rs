@@ -47,6 +47,7 @@ use sendbox_mcp::config::{NATIVE_BROKER_PATH, PROJECT_CONFIG_PATHS};
 use sendbox_mcp::runtime::{
     RUNTIME_POLICY_SCHEMA_VERSION, RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
+use sendbox_mcp::safe_outputs::{SAFE_OUTPUTS_MCP_PATH, SafeOutputsRuntimePolicy};
 use sendbox_runtime::{
     BootstrapMaterial, CancellationToken, CommandArgument, CommandSpec, ContainerId, CreateRequest,
     InitializeRequest, OutputStream, ProcessOptions, ProcessOutcome, Program, RuntimeError,
@@ -328,6 +329,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     )?;
     let mcp_policy = make_mcp_policy(
         selected_runtime,
+        session_id,
         &request.configuration,
         &workspace_source,
         &workspace_destination,
@@ -1192,6 +1194,7 @@ fn make_git_guard_policy(
 
 fn make_mcp_policy(
     selected_runtime: ResolvedRuntime,
+    session_id: SessionId,
     configuration: &SandboxConfiguration,
     host_workspace: &Path,
     guest_workspace: &Path,
@@ -1206,6 +1209,7 @@ fn make_mcp_policy(
         .as_ref()
         .map(|observability| &observability.mcp_inspection)
         .filter(|inspection| inspection.enabled);
+    let safe_outputs_enabled = configuration.github.safe_outputs.enabled;
     if !has_project_configuration
         && configuration
             .policy
@@ -1214,6 +1218,7 @@ fn make_mcp_policy(
             .allowed_server_commands
             .is_empty()
         && inspection.is_none()
+        && !safe_outputs_enabled
     {
         return Ok(None);
     }
@@ -1233,6 +1238,7 @@ fn make_mcp_policy(
         .tool_calls
         .allowed_server_commands
         .is_empty()
+        && !safe_outputs_enabled
     {
         return Err(HostError::Invalid(
             "MCP composition requires at least one exactly approved server command".to_owned(),
@@ -1288,15 +1294,41 @@ fn make_mcp_policy(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let safe_outputs = safe_outputs_enabled
+        .then(|| {
+            SafeOutputsRuntimePolicy::from_configuration(
+                session_id,
+                &configuration.github.safe_outputs,
+            )
+        })
+        .transpose()
+        .map_err(|error| HostError::Invalid(format!("invalid Safe Outputs policy: {error}")))?;
+    let mut tool_policy = configuration.policy.boundaries.tool_calls.clone();
+    if let Some(safe_outputs) = &safe_outputs {
+        let command = vec![SAFE_OUTPUTS_MCP_PATH.to_owned()];
+        if !tool_policy.allowed_server_commands.contains(&command) {
+            tool_policy.allowed_server_commands.push(command);
+        }
+        for tool in safe_outputs.enabled_tools() {
+            if !tool_policy
+                .allowlist
+                .iter()
+                .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
+            {
+                tool_policy.allowlist.push(tool.name().to_owned());
+            }
+        }
+    }
     let policy = RuntimePolicyDocument {
         schema_version: RUNTIME_POLICY_SCHEMA_VERSION,
         workspace_root: guest_workspace.to_path_buf(),
         workload_uid,
         workload_gid,
-        tool_policy: configuration.policy.boundaries.tool_calls.clone(),
+        tool_policy,
         fixed_environment,
         inherited_environment_keys,
         observation,
+        safe_outputs,
     };
     policy
         .validate()
@@ -1363,7 +1395,7 @@ fn boundary_features(
                 "git_branch_protection".to_owned(),
                 FeatureAdmission {
                     decision: FeatureDecision::Enforced,
-                    mechanism,
+                    mechanism: mechanism.clone(),
                 },
             );
         }
@@ -1385,6 +1417,15 @@ fn boundary_features(
         if policy.observation.is_some() {
             features.insert(
                 "mcp_stdio_observation".to_owned(),
+                FeatureAdmission {
+                    decision: FeatureDecision::Enforced,
+                    mechanism: mechanism.clone(),
+                },
+            );
+        }
+        if policy.safe_outputs.is_some() {
+            features.insert(
+                "github_safe_outputs".to_owned(),
                 FeatureAdmission {
                     decision: FeatureDecision::Enforced,
                     mechanism,
@@ -1646,6 +1687,7 @@ fn validate_security_composition(composition: SecurityComposition<'_>) -> Result
     }
     let expected_mcp_policy = make_mcp_policy(
         selected_runtime,
+        session_id,
         configuration,
         host_workspace,
         guest_workspace,
@@ -2309,6 +2351,7 @@ mod tests {
         inspection.transports = vec![InspectionTransport::Stdio, InspectionTransport::Http];
         let error = make_mcp_policy(
             ResolvedRuntime::Kata,
+            test_session(),
             &mcp,
             temp.path(),
             Path::new("/workspace"),
@@ -2365,6 +2408,7 @@ mod tests {
 
         let policy = make_mcp_policy(
             ResolvedRuntime::Kata,
+            test_session(),
             &configuration,
             temp.path(),
             Path::new("/workspace"),
@@ -2455,6 +2499,7 @@ mod tests {
             vec![vec!["/usr/bin/mcp-server".to_owned(), "--stdio".to_owned()]];
         let error = make_mcp_policy(
             ResolvedRuntime::Kata,
+            test_session(),
             &configuration,
             temp.path(),
             Path::new("/workspace"),
@@ -2496,6 +2541,7 @@ mod tests {
 
         let mcp = make_mcp_policy(
             ResolvedRuntime::Kata,
+            test_session(),
             &configuration,
             temp.path(),
             Path::new("/workspace"),

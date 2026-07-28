@@ -22,6 +22,7 @@ use sendbox_mcp::policy::CompiledToolPolicy;
 use sendbox_mcp::runtime::{
     NATIVE_POLICY_PATH, OBSERVATION_ROOT, RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
+use sendbox_mcp::safe_outputs::SAFE_OUTPUTS_MCP_PATH;
 
 const BOUNDARY_ROOT: &str = "/run/sendbox-boundary";
 const EXIT_DENIED: u8 = 126;
@@ -33,11 +34,20 @@ pub fn install(policy: &RuntimePolicyDocument, artifact_root: &Path) -> Result<(
             root: PathBuf::from(BOUNDARY_ROOT),
             policy: PathBuf::from(NATIVE_POLICY_PATH),
             wrapper: PathBuf::from(NATIVE_BROKER_PATH),
+            safe_outputs_wrapper: PathBuf::from(SAFE_OUTPUTS_MCP_PATH),
             guest_binary: artifact_root.join("bin/sendbox-guest"),
             observation_root: PathBuf::from(OBSERVATION_ROOT),
         },
         0,
     )
+}
+
+pub fn safe_outputs_writer_socket() -> Result<PathBuf, GuestError> {
+    let policy = read_policy(Path::new(NATIVE_POLICY_PATH))?;
+    policy
+        .safe_outputs
+        .map(|safe_outputs| safe_outputs.writer_socket)
+        .ok_or_else(|| GuestError::Runtime("Safe Outputs is not configured".to_owned()))
 }
 
 pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
@@ -118,6 +128,7 @@ struct InstallPaths {
     root: PathBuf,
     policy: PathBuf,
     wrapper: PathBuf,
+    safe_outputs_wrapper: PathBuf,
     guest_binary: PathBuf,
     observation_root: PathBuf,
 }
@@ -147,6 +158,16 @@ fn install_with_paths(
         .map_err(|error| GuestError::Runtime(error.to_string()))?;
     fs::set_permissions(&paths.wrapper, fs::Permissions::from_mode(0o555))
         .map_err(|error| GuestError::io("setting MCP broker wrapper mode", error))?;
+    if policy.safe_outputs.is_some() {
+        guest_binary
+            .copy_to(&paths.safe_outputs_wrapper, 0o555)
+            .map_err(|error| GuestError::Runtime(error.to_string()))?;
+        fs::set_permissions(
+            &paths.safe_outputs_wrapper,
+            fs::Permissions::from_mode(0o555),
+        )
+        .map_err(|error| GuestError::io("setting Safe Outputs MCP wrapper mode", error))?;
+    }
 
     let encoded = serde_json::to_vec(policy)
         .map_err(|error| GuestError::Runtime(format!("encoding MCP policy: {error}")))?;
@@ -196,7 +217,10 @@ fn validate_layout(policy: &RuntimePolicyDocument, paths: &InstallPaths) -> Resu
     if !paths.root.is_absolute()
         || paths.policy.parent() != Some(paths.root.as_path())
         || paths.wrapper.parent() != Some(paths.root.as_path())
+        || paths.safe_outputs_wrapper.parent() != Some(paths.root.as_path())
         || paths.policy == paths.wrapper
+        || paths.policy == paths.safe_outputs_wrapper
+        || paths.wrapper == paths.safe_outputs_wrapper
         || !paths.guest_binary.is_absolute()
         || !paths.observation_root.is_absolute()
         || policy.observation.as_ref().is_some_and(|observation| {
@@ -207,7 +231,10 @@ fn validate_layout(policy: &RuntimePolicyDocument, paths: &InstallPaths) -> Resu
             "MCP installation paths are invalid".to_owned(),
         ));
     }
-    if paths.policy.symlink_metadata().is_ok() || paths.wrapper.symlink_metadata().is_ok() {
+    if paths.policy.symlink_metadata().is_ok()
+        || paths.wrapper.symlink_metadata().is_ok()
+        || paths.safe_outputs_wrapper.symlink_metadata().is_ok()
+    {
         return Err(GuestError::Runtime(
             "MCP policy or wrapper path already exists".to_owned(),
         ));
@@ -432,6 +459,7 @@ mod tests {
             fixed_environment: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
             inherited_environment_keys: BTreeSet::new(),
             observation: None,
+            safe_outputs: None,
         }
     }
 
@@ -448,6 +476,7 @@ mod tests {
                 root: root.clone(),
                 policy: root.join("mcp-policy.json"),
                 wrapper,
+                safe_outputs_wrapper: root.join("safe-outputs-mcp"),
                 guest_binary: temp.path().join("sendbox-guest"),
                 observation_root: temp.path().join("logs"),
             },

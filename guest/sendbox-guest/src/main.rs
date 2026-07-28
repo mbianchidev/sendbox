@@ -151,6 +151,26 @@ enum FixtureMode {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let invocation = invocation_name();
+    if invocation.as_deref() == Some("safe-outputs-mcp") {
+        return match sendbox_guest::mcp_broker::safe_outputs_writer_socket() {
+            Ok(socket) => stdio_bridge(StdioBridgeArgs {
+                socket,
+                connect_timeout_seconds: 30,
+            })
+            .await
+            .map_or_else(
+                |error| {
+                    eprintln!("[sendbox-safe-outputs] {error}");
+                    ExitCode::FAILURE
+                },
+                |()| ExitCode::SUCCESS,
+            ),
+            Err(error) => {
+                eprintln!("[sendbox-safe-outputs] {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if invocation.as_deref() == Some("mcp-broker") {
         let arguments = std::env::args().skip(1).collect::<Vec<_>>();
         return match sendbox_guest::mcp_broker::execute_current(&arguments).await {

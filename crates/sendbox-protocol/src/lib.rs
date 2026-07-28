@@ -20,9 +20,11 @@ pub use operations::{
     INTERACTIVE_OPERATION_SCHEMA_VERSION, INTERACTIVE_OPERATION_SCHEMA_VERSION_V2,
     InteractiveLaunchError, InteractiveLaunchRequestV1, InteractiveLaunchRequestV2,
     LaunchRequestV2, OPERATION_SCHEMA_VERSION, SecretEnvelopeV2, TerminalInputCreditError,
-    TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1, TerminalStateV1,
-    agent_guest_capabilities, agent_guest_required_capabilities, agent_host_capabilities,
-    agent_host_required_capabilities,
+    TerminalInputCreditV1,
+    SAFE_OUTPUTS_COLLECT_OPERATION, SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+    SafeOutputsCollectRequestV1, SafeOutputsCollectionError, SafeOutputsCollectionV1,
+    TerminalResultV2, TerminalSizeV1, TerminalStateV1, agent_guest_capabilities,
+    agent_guest_required_capabilities, agent_host_capabilities, agent_host_required_capabilities,
 };
 pub use types::{
     Cancellation, Capability, CapabilitySet, CloseCode, Event, EventKind, GracefulClose, Hello,

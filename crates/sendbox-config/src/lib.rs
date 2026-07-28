@@ -144,6 +144,162 @@ impl Default for BranchProtectionConfiguration {
     }
 }
 
+pub const SAFE_OUTPUTS_MAX_ARTIFACT_BYTES: usize = 128 * 1024;
+pub const SAFE_OUTPUTS_WRITE_TOKEN_ENVIRONMENT: &str =
+    "SENDBOX_SAFE_OUTPUTS_GITHUB_TOKEN";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafeOutputsMode {
+    #[default]
+    Staged,
+    Apply,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CreateIssueSafeOutputConfiguration {
+    pub enabled: bool,
+    pub max: u32,
+    pub title_prefix: String,
+    pub labels: Vec<String>,
+    pub assignees: Vec<String>,
+}
+
+impl Default for CreateIssueSafeOutputConfiguration {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max: 1,
+            title_prefix: "[sendbox] ".to_owned(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AddCommentSafeOutputConfiguration {
+    pub enabled: bool,
+    pub max: u32,
+}
+
+impl Default for AddCommentSafeOutputConfiguration {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CreatePullRequestSafeOutputConfiguration {
+    pub enabled: bool,
+    pub max: u32,
+    pub title_prefix: String,
+    pub base_branches: Vec<String>,
+    pub allowed_paths: Vec<String>,
+    pub protected_paths: Vec<String>,
+    pub max_changed_files: u32,
+    pub max_patch_bytes: usize,
+}
+
+impl Default for CreatePullRequestSafeOutputConfiguration {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max: 1,
+            title_prefix: "[sendbox] ".to_owned(),
+            base_branches: vec!["main".to_owned()],
+            allowed_paths: Vec::new(),
+            protected_paths: vec![
+                ".git/**".to_owned(),
+                ".github/workflows/**".to_owned(),
+                ".github/actions/**".to_owned(),
+            ],
+            max_changed_files: 50,
+            max_patch_bytes: 512 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LabelSafeOutputConfiguration {
+    pub enabled: bool,
+    pub max: u32,
+    pub max_labels_per_call: u32,
+    pub allowed: Vec<String>,
+    pub blocked: Vec<String>,
+}
+
+impl Default for LabelSafeOutputConfiguration {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max: 3,
+            max_labels_per_call: 3,
+            allowed: Vec::new(),
+            blocked: vec!["~*".to_owned()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SafeOutputsConfiguration {
+    pub enabled: bool,
+    pub mode: SafeOutputsMode,
+    pub write_token_env: String,
+    pub allowed_repositories: Vec<String>,
+    pub allowed_domains: Vec<String>,
+    pub allowed_mentions: Vec<String>,
+    pub max_artifact_bytes: usize,
+    pub create_issue: CreateIssueSafeOutputConfiguration,
+    pub add_comment: AddCommentSafeOutputConfiguration,
+    pub create_pull_request: CreatePullRequestSafeOutputConfiguration,
+    pub add_labels: LabelSafeOutputConfiguration,
+    pub remove_labels: LabelSafeOutputConfiguration,
+}
+
+impl Default for SafeOutputsConfiguration {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: SafeOutputsMode::Staged,
+            write_token_env: SAFE_OUTPUTS_WRITE_TOKEN_ENVIRONMENT.to_owned(),
+            allowed_repositories: Vec::new(),
+            allowed_domains: vec!["github.com".to_owned()],
+            allowed_mentions: Vec::new(),
+            max_artifact_bytes: SAFE_OUTPUTS_MAX_ARTIFACT_BYTES,
+            create_issue: CreateIssueSafeOutputConfiguration::default(),
+            add_comment: AddCommentSafeOutputConfiguration::default(),
+            create_pull_request: CreatePullRequestSafeOutputConfiguration::default(),
+            add_labels: LabelSafeOutputConfiguration::default(),
+            remove_labels: LabelSafeOutputConfiguration::default(),
+        }
+    }
+}
+
+impl SafeOutputsConfiguration {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    #[must_use]
+    pub const fn has_write_tools(&self) -> bool {
+        self.create_issue.enabled
+            || self.add_comment.enabled
+            || self.create_pull_request.enabled
+            || self.add_labels.enabled
+            || self.remove_labels.enabled
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitHubConfiguration {
@@ -155,6 +311,8 @@ pub struct GitHubConfiguration {
     pub branch_protection: BranchProtectionConfiguration,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_key_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "SafeOutputsConfiguration::is_default")]
+    pub safe_outputs: SafeOutputsConfiguration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +452,7 @@ impl SandboxConfiguration {
                 allow_private_repository_access: false,
                 branch_protection,
                 ssh_key_path: None,
+                safe_outputs: SafeOutputsConfiguration::default(),
             },
             observability: Some(ObservabilityConfiguration::default()),
         }
@@ -458,6 +617,208 @@ impl SandboxConfiguration {
                 "branch protection requires policy.boundaries.enabled",
             );
         }
+        self.validate_safe_outputs(diagnostics);
+    }
+
+    fn validate_safe_outputs(&self, diagnostics: &mut Vec<Diagnostic>) {
+        let safe = &self.github.safe_outputs;
+        if safe.max_artifact_bytes == 0
+            || safe.max_artifact_bytes > SAFE_OUTPUTS_MAX_ARTIFACT_BYTES
+        {
+            invalid_value(
+                diagnostics,
+                "github.safe_outputs.max_artifact_bytes",
+                format!(
+                    "must be between 1 and {SAFE_OUTPUTS_MAX_ARTIFACT_BYTES}"
+                ),
+            );
+        }
+        if !valid_environment_name(&safe.write_token_env) {
+            invalid_value(
+                diagnostics,
+                "github.safe_outputs.write_token_env",
+                "must be a valid environment variable name",
+            );
+        }
+        if self
+            .secrets
+            .iter()
+            .any(|name| name == &safe.write_token_env)
+        {
+            incompatible(
+                diagnostics,
+                "github.safe_outputs.write_token_env",
+                "the Safe Outputs write token must not be forwarded as a sandbox secret",
+            );
+        }
+        validate_count(
+            diagnostics,
+            "github.safe_outputs.create_issue.max",
+            safe.create_issue.max,
+        );
+        validate_count(
+            diagnostics,
+            "github.safe_outputs.add_comment.max",
+            safe.add_comment.max,
+        );
+        validate_count(
+            diagnostics,
+            "github.safe_outputs.create_pull_request.max",
+            safe.create_pull_request.max,
+        );
+        validate_label_configuration(
+            diagnostics,
+            "github.safe_outputs.add_labels",
+            &safe.add_labels,
+        );
+        validate_label_configuration(
+            diagnostics,
+            "github.safe_outputs.remove_labels",
+            &safe.remove_labels,
+        );
+        validate_short_prefix(
+            diagnostics,
+            "github.safe_outputs.create_issue.title_prefix",
+            &safe.create_issue.title_prefix,
+        );
+        validate_short_prefix(
+            diagnostics,
+            "github.safe_outputs.create_pull_request.title_prefix",
+            &safe.create_pull_request.title_prefix,
+        );
+        validate_unique_nonempty(
+            diagnostics,
+            "github.safe_outputs.create_issue.labels",
+            &safe.create_issue.labels,
+        );
+        validate_unique_nonempty(
+            diagnostics,
+            "github.safe_outputs.create_issue.assignees",
+            &safe.create_issue.assignees,
+        );
+        for assignee in &safe.create_issue.assignees {
+            if !valid_github_name(assignee) {
+                invalid_value(
+                    diagnostics,
+                    "github.safe_outputs.create_issue.assignees",
+                    format!("`{assignee}` is not a valid GitHub login"),
+                );
+            }
+        }
+        validate_unique_nonempty(
+            diagnostics,
+            "github.safe_outputs.allowed_repositories",
+            &safe.allowed_repositories,
+        );
+        for repository in &safe.allowed_repositories {
+            if !valid_repository(repository) {
+                invalid_value(
+                    diagnostics,
+                    "github.safe_outputs.allowed_repositories",
+                    format!("`{repository}` must use the exact owner/repository form"),
+                );
+            }
+        }
+        validate_unique_nonempty(
+            diagnostics,
+            "github.safe_outputs.allowed_domains",
+            &safe.allowed_domains,
+        );
+        for domain in &safe.allowed_domains {
+            if !valid_domain(domain) {
+                invalid_value(
+                    diagnostics,
+                    "github.safe_outputs.allowed_domains",
+                    format!("`{domain}` must be a lowercase concrete hostname"),
+                );
+            }
+        }
+        validate_unique_nonempty(
+            diagnostics,
+            "github.safe_outputs.allowed_mentions",
+            &safe.allowed_mentions,
+        );
+        for mention in &safe.allowed_mentions {
+            if !valid_github_name(mention) {
+                invalid_value(
+                    diagnostics,
+                    "github.safe_outputs.allowed_mentions",
+                    format!("`{mention}` is not a valid GitHub login"),
+                );
+            }
+        }
+        validate_unique_nonempty(
+            diagnostics,
+            "github.safe_outputs.create_pull_request.base_branches",
+            &safe.create_pull_request.base_branches,
+        );
+        validate_unique_nonempty(
+            diagnostics,
+            "github.safe_outputs.create_pull_request.allowed_paths",
+            &safe.create_pull_request.allowed_paths,
+        );
+        validate_unique_nonempty(
+            diagnostics,
+            "github.safe_outputs.create_pull_request.protected_paths",
+            &safe.create_pull_request.protected_paths,
+        );
+        if safe.create_pull_request.max_changed_files == 0
+            || safe.create_pull_request.max_changed_files > 1_000
+        {
+            invalid_value(
+                diagnostics,
+                "github.safe_outputs.create_pull_request.max_changed_files",
+                "must be between 1 and 1000",
+            );
+        }
+        if safe.create_pull_request.max_patch_bytes == 0
+            || safe.create_pull_request.max_patch_bytes > 10 * 1024 * 1024
+        {
+            invalid_value(
+                diagnostics,
+                "github.safe_outputs.create_pull_request.max_patch_bytes",
+                "must be between 1 and 10485760",
+            );
+        }
+        if safe.enabled {
+            if self.github.forward_auth {
+                incompatible(
+                    diagnostics,
+                    "github.forward_auth",
+                    "must be false when github.safe_outputs.enabled is true",
+                );
+            }
+            if self.github.ssh_key_path.is_some() {
+                incompatible(
+                    diagnostics,
+                    "github.ssh_key_path",
+                    "SSH write authentication is unavailable when Safe Outputs is enabled",
+                );
+            }
+            if !self.policy.boundaries.enabled {
+                incompatible(
+                    diagnostics,
+                    "github.safe_outputs.enabled",
+                    "Safe Outputs requires policy.boundaries.enabled",
+                );
+            }
+            if safe.has_write_tools() && safe.allowed_repositories.is_empty() {
+                invalid_value(
+                    diagnostics,
+                    "github.safe_outputs.allowed_repositories",
+                    "must contain at least one exact repository when a write tool is enabled",
+                );
+            }
+            if safe.create_pull_request.enabled
+                && safe.create_pull_request.allowed_paths.is_empty()
+            {
+                invalid_value(
+                    diagnostics,
+                    "github.safe_outputs.create_pull_request.allowed_paths",
+                    "must contain at least one path pattern when pull-request creation is enabled",
+                );
+            }
+        }
     }
 
     fn validate_observability(&self, diagnostics: &mut Vec<Diagnostic>) {
@@ -487,6 +848,109 @@ impl SandboxConfiguration {
             );
         }
     }
+}
+
+fn validate_count(diagnostics: &mut Vec<Diagnostic>, path: &str, count: u32) {
+    if count == 0 || count > 100 {
+        invalid_value(diagnostics, path, "must be between 1 and 100");
+    }
+}
+
+fn validate_label_configuration(
+    diagnostics: &mut Vec<Diagnostic>,
+    path: &str,
+    configuration: &LabelSafeOutputConfiguration,
+) {
+    validate_count(diagnostics, &format!("{path}.max"), configuration.max);
+    validate_count(
+        diagnostics,
+        &format!("{path}.max_labels_per_call"),
+        configuration.max_labels_per_call,
+    );
+    validate_unique_nonempty(
+        diagnostics,
+        &format!("{path}.allowed"),
+        &configuration.allowed,
+    );
+    validate_unique_nonempty(
+        diagnostics,
+        &format!("{path}.blocked"),
+        &configuration.blocked,
+    );
+}
+
+fn validate_short_prefix(diagnostics: &mut Vec<Diagnostic>, path: &str, prefix: &str) {
+    if prefix.len() > 128 || prefix.as_bytes().contains(&0) {
+        invalid_value(
+            diagnostics,
+            path,
+            "must be at most 128 bytes and contain no NUL",
+        );
+    }
+}
+
+fn validate_unique_nonempty(
+    diagnostics: &mut Vec<Diagnostic>,
+    path: &str,
+    values: &[String],
+) {
+    let mut unique = std::collections::BTreeSet::new();
+    for value in values {
+        if value.trim().is_empty() {
+            invalid_value(diagnostics, path, "entries cannot be empty");
+        } else if !unique.insert(value) {
+            invalid_value(diagnostics, path, format!("duplicate entry `{value}`"));
+        }
+    }
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(first) if first == b'_' || first.is_ascii_alphabetic())
+        && name.len() <= 128
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn valid_repository(repository: &str) -> bool {
+    let Some((owner, name)) = repository.split_once('/') else {
+        return false;
+    };
+    !owner.is_empty()
+        && !name.is_empty()
+        && !name.contains('/')
+        && valid_github_name(owner)
+        && name.len() <= 100
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_github_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn valid_domain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value == value.to_ascii_lowercase()
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && !value.contains('*')
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 #[derive(Debug, Error)]
@@ -560,7 +1024,11 @@ impl ConfigurationError {
     }
 }
 
-fn invalid_value(diagnostics: &mut Vec<Diagnostic>, path: impl Into<String>, message: &str) {
+fn invalid_value(
+    diagnostics: &mut Vec<Diagnostic>,
+    path: impl Into<String>,
+    message: impl Into<String>,
+) {
     diagnostics.push(Diagnostic::new(DiagnosticCode::InvalidValue, path, message));
 }
 

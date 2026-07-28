@@ -119,6 +119,12 @@ pub enum GuestEvent {
     Terminal(GuestTerminal),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedSafeOutputs {
+    pub artifact: Vec<u8>,
+    pub seal: Vec<u8>,
+}
+
 pub trait GuestConnector: Send + Sync {
     fn connect<'a>(
         &'a self,
@@ -176,6 +182,18 @@ pub trait GuestExecution: Send {
         &'a mut self,
         cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), AgentError>>;
+
+    fn collect_safe_outputs<'a>(
+        &'a mut self,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<CollectedSafeOutputs, AgentError>> {
+        let _ = cancellation;
+        Box::pin(async {
+            Err(AgentError::Guest(
+                "this execution did not negotiate Safe Outputs collection".to_owned(),
+            ))
+        })
+    }
 
     /// Forwards one host terminal command to the guest.
     ///

@@ -18,6 +18,8 @@ pub mod platform;
 pub mod protocol;
 #[cfg(feature = "execution-broker")]
 pub mod runtime;
+#[cfg(feature = "execution-broker")]
+pub mod safe_outputs;
 pub mod secure_fs;
 #[cfg(feature = "execution-broker")]
 pub mod service;

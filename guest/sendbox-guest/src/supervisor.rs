@@ -18,6 +18,7 @@ use crate::mcp_broker;
 use crate::platform::PlatformControls;
 use crate::protocol::{ProtocolServices, handshake_config, serve_authenticated};
 use crate::runtime::{ReadinessSnapshot, RuntimeIdentity, RuntimeSession};
+use crate::safe_outputs;
 use crate::secure_fs::{leaf_name, open_directory_no_symlinks, validate_regular_metadata};
 use crate::service::{ServiceId, ServiceManager};
 use crate::state::{StartupState, StartupStateMachine};
@@ -93,6 +94,13 @@ pub async fn run<P: PlatformControls>(
             policy.tool_policy.allowed_server_commands.len().to_string(),
         );
     }
+    let safe_outputs_configuration = bootstrap.execution_broker.as_ref().and_then(|broker| {
+        broker
+            .mcp_policy
+            .as_ref()
+            .and_then(|policy| policy.safe_outputs.clone())
+            .map(|policy| (policy, broker.workload_gid))
+    });
     let egress_configured = bootstrap.egress_policy.is_some();
     if let Some(policy) = bootstrap.egress_policy.take() {
         let instance_id = policy.instance_id.clone();
@@ -198,6 +206,33 @@ pub async fn run<P: PlatformControls>(
             .map_err(|error| GuestError::io("setting private guest root mode", error))
     }
 
+    let (safe_outputs, safe_outputs_task) =
+        if let Some((policy, workload_gid)) = safe_outputs_configuration {
+            let seal_key = sendbox_mcp::safe_outputs::derive_seal_key(
+                bootstrap.bootstrap_secret.expose_for_key_derivation(),
+                bootstrap.session_id,
+            )
+            .map_err(|error| {
+                GuestError::Runtime(format!("deriving Safe Outputs seal key: {error}"))
+            })?;
+            let (handle, task) = safe_outputs::start(
+                policy,
+                bootstrap.boundary_plan_digest,
+                seal_key,
+                identity.uid,
+                identity.gid,
+                workload_gid,
+            )?;
+            audit.lock().expect("audit mutex").record(
+                "safe_outputs_started",
+                bootstrap.session_id.to_string(),
+                "root-owned MCP intent recorder",
+            );
+            (Some(handle), Some(task))
+        } else {
+            (None, None)
+        };
+
     let listener = UnixListener::bind(runtime.socket_path())
         .map_err(|error| GuestError::io("binding guest control socket", error))?;
     let service_readiness = services.readiness_gate();
@@ -244,6 +279,7 @@ pub async fn run<P: PlatformControls>(
                         readiness,
                         broker_client.as_ref().map(|(client, _)| client.clone()),
                         secret_decryptor,
+                        safe_outputs.clone(),
                     ),
                 ) => protocol,
                 failure = services.wait_for_mandatory_failure() => Err(failure),
@@ -252,6 +288,17 @@ pub async fn run<P: PlatformControls>(
         Err(error) => Err(error),
     };
 
+    if let Some(handle) = &safe_outputs {
+        handle.shutdown().await;
+    }
+    let safe_outputs_result = match safe_outputs_task {
+        Some(task) => task
+            .await
+            .map_err(|error| GuestError::Runtime(format!("joining Safe Outputs recorder: {error}")))
+            .and_then(|result| result),
+        None => Ok(()),
+    };
+    let result = result.and(safe_outputs_result);
     service_readiness.revoke();
     runtime.revoke_readiness()?;
     if result.is_err() {

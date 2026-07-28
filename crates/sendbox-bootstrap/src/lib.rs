@@ -665,6 +665,7 @@ mod tests {
             fixed_environment: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
             inherited_environment_keys: BTreeSet::from(["TOKEN".to_owned()]),
             observation: None,
+            safe_outputs: None,
         }
     }
 

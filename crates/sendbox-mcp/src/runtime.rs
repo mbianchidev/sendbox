@@ -5,6 +5,7 @@ use sendbox_policy::ToolCallPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ApprovedCommand, ProjectConfigValidator};
+use crate::safe_outputs::{SAFE_OUTPUTS_MCP_PATH, SafeOutputsRuntimePolicy};
 
 pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 1;
 pub const NATIVE_POLICY_PATH: &str = "/run/sendbox-boundary/mcp-policy.json";
@@ -33,6 +34,8 @@ pub struct RuntimePolicyDocument {
     pub inherited_environment_keys: BTreeSet<String>,
     #[serde(default)]
     pub observation: Option<RuntimeObservationConfiguration>,
+    #[serde(default)]
+    pub safe_outputs: Option<SafeOutputsRuntimePolicy>,
 }
 
 impl RuntimePolicyDocument {
@@ -108,6 +111,44 @@ impl RuntimePolicyDocument {
                 ));
             }
         }
+        if let Some(safe_outputs) = &self.safe_outputs {
+            safe_outputs.validate().map_err(|error| error.to_string())?;
+            let command = vec![SAFE_OUTPUTS_MCP_PATH.to_owned()];
+            if !self
+                .tool_policy
+                .allowed_server_commands
+                .contains(&command)
+            {
+                return Err(
+                    "Safe Outputs MCP command is not in the exact server command allowlist"
+                        .to_owned(),
+                );
+            }
+            for tool in safe_outputs.enabled_tools() {
+                if !self
+                    .tool_policy
+                    .allowlist
+                    .iter()
+                    .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
+                {
+                    return Err(format!(
+                        "Safe Outputs tool `{}` is not admitted by the MCP tool policy",
+                        tool.name()
+                    ));
+                }
+                if self
+                    .tool_policy
+                    .denylist
+                    .iter()
+                    .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
+                {
+                    return Err(format!(
+                        "Safe Outputs tool `{}` is denied by the MCP tool policy",
+                        tool.name()
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -179,6 +220,7 @@ mod tests {
                 max_payload_bytes: 4096,
                 log_path: PathBuf::from("/var/log/sendbox/mcp.log"),
             }),
+            safe_outputs: None,
         }
     }
 

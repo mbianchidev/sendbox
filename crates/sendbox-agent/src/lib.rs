@@ -14,8 +14,8 @@ pub use plan::{
 };
 pub use protocol::{ProtocolGuestConnector, ProtocolGuestExecution, ProtocolGuestSession};
 pub use traits::{
-    AgentSignal, BoxFuture, GuestConnectionConfiguration, GuestConnector, GuestEvent,
-    GuestExecution, GuestLaunchRequest, GuestSecretEnvelope, GuestSession, GuestTerminal,
-    GuestTerminalSize, HostTerminalCommand, NoSignals, NoTerminal, OutputSink, SecretEnvelope,
-    SecretResolver, SignalSource, TerminalSource,
+    AgentSignal, BoxFuture, CollectedSafeOutputs, GuestConnectionConfiguration, GuestConnector,
+    GuestEvent, GuestExecution, GuestLaunchRequest, GuestSecretEnvelope, GuestSession,
+    GuestTerminal, GuestTerminalSize, HostTerminalCommand, NoSignals, NoTerminal, OutputSink,
+    SecretEnvelope, SecretResolver, SignalSource, TerminalSource,
 };

@@ -9,7 +9,7 @@ use sendbox_boundary::{
 };
 use sendbox_config::SandboxConfiguration;
 use sendbox_core::{BoundaryPlanDigest, SessionId};
-use sendbox_protocol::{CapabilitySet, agent_host_required_capabilities};
+use sendbox_protocol::{Capability, CapabilitySet, agent_host_required_capabilities};
 use sendbox_runtime::{
     ContainerId, ControlEndpointKind, RuntimeCapabilities, RuntimeCapability, RuntimeResources,
 };
@@ -105,6 +105,7 @@ pub struct RunPlan {
     required_guest_capabilities: CapabilitySet,
     policy_digest: [u8; 32],
     interactive: bool,
+    safe_outputs: bool,
 }
 
 impl RunPlan {
@@ -167,6 +168,12 @@ impl RunPlan {
         ))
         .or_else(|_| ContainerId::new(format!("sendbox-{}", boundary.session_id)))
         .map_err(AgentError::Runtime)?;
+        let safe_outputs = configuration.github.safe_outputs.enabled;
+        let required_guest_capabilities = CapabilitySet::new(
+            agent_host_required_capabilities()
+                .iter()
+                .chain(safe_outputs.then_some(Capability::SafeOutputs)),
+        );
         Ok(Self {
             verified_boundary_plan: request.boundary_plan,
             resolved_runtime: boundary.selection.selected,
@@ -203,9 +210,10 @@ impl RunPlan {
                 memory_bytes: boundary.resources.memory_bytes,
             },
             required_runtime_capabilities,
-            required_guest_capabilities: agent_host_required_capabilities(),
+            required_guest_capabilities,
             policy_digest,
             interactive: request.interactive,
+            safe_outputs,
         })
     }
 
@@ -213,6 +221,11 @@ impl RunPlan {
     #[must_use]
     pub const fn interactive(&self) -> bool {
         self.interactive
+    }
+
+    #[must_use]
+    pub const fn safe_outputs(&self) -> bool {
+        self.safe_outputs
     }
 
     #[must_use]

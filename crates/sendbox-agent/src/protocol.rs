@@ -5,7 +5,8 @@ use sendbox_protocol::{
     INTERACTIVE_LAUNCH_OPERATION_V2, INTERACTIVE_OPERATION_SCHEMA_VERSION_V2,
     InteractiveLaunchRequestV2, LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, Request,
     ResponseStatus, SecretEnvelopeV2, TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1,
-    TerminalStateV1, VersionRange,
+    SAFE_OUTPUTS_COLLECT_OPERATION, SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+    SafeOutputsCollectRequestV1, SafeOutputsCollectionV1, TerminalStateV1, VersionRange,
 };
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
 use sendbox_secrets::{
@@ -24,6 +25,7 @@ use crate::{
 };
 
 const REQUEST_ID: u64 = 1;
+const SAFE_OUTPUTS_REQUEST_ID: u64 = 2;
 const PROTOCOL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
@@ -193,6 +195,7 @@ impl GuestSession for ProtocolGuestSession {
                 interactive,
                 flow_controlled: interactive,
                 input: TerminalInputState::default(),
+                boundary_plan_digest: self.boundary_plan_digest,
             }) as Box<dyn GuestExecution>)
         })
     }
@@ -296,6 +299,7 @@ pub struct ProtocolGuestExecution {
     interactive: bool,
     flow_controlled: bool,
     input: TerminalInputState,
+    boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
 }
 
 #[derive(Debug, Default)]
@@ -537,6 +541,62 @@ impl GuestExecution for ProtocolGuestExecution {
                     other.kind()
                 ))),
             }
+        })
+    }
+
+    fn collect_safe_outputs<'a>(
+        &'a mut self,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<crate::CollectedSafeOutputs, AgentError>> {
+        Box::pin(async move {
+            if !self.terminal {
+                return Err(AgentError::Guest(
+                    "Safe Outputs collection requires a terminal response".to_owned(),
+                ));
+            }
+            let payload = serde_json::to_vec(&SafeOutputsCollectRequestV1 {
+                schema_version: SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+                boundary_plan_digest: self.boundary_plan_digest,
+            })
+            .map_err(|error| {
+                AgentError::Guest(format!("encode Safe Outputs collection request: {error}"))
+            })?;
+            guest_io(
+                "request Safe Outputs collection",
+                cancellation,
+                self.writer.send_control(Message::Request(Request {
+                    request_id: SAFE_OUTPUTS_REQUEST_ID,
+                    operation: SAFE_OUTPUTS_COLLECT_OPERATION.to_owned(),
+                    payload,
+                })),
+            )
+            .await?;
+            let message = protocol_io(
+                "receive Safe Outputs collection",
+                cancellation,
+                self.reader.receive(),
+            )
+            .await?;
+            let Message::Response(response) = message else {
+                return Err(AgentError::Guest(
+                    "guest omitted the Safe Outputs collection response".to_owned(),
+                ));
+            };
+            if response.request_id != SAFE_OUTPUTS_REQUEST_ID
+                || response.status != ResponseStatus::Ok
+            {
+                return Err(AgentError::Guest(
+                    "guest rejected Safe Outputs collection".to_owned(),
+                ));
+            }
+            let collection: SafeOutputsCollectionV1 = serde_json::from_slice(&response.payload)
+                .map_err(|error| {
+                    AgentError::Guest(format!("decode Safe Outputs collection: {error}"))
+                })?;
+            let (artifact, seal) = collection
+                .decode()
+                .map_err(|error| AgentError::Guest(error.to_string()))?;
+            Ok(crate::CollectedSafeOutputs { artifact, seal })
         })
     }
 

@@ -73,6 +73,7 @@ impl AgentState {
 pub struct AgentReport {
     pub terminal: GuestTerminal,
     pub states: Vec<AgentState>,
+    pub safe_outputs: Option<crate::CollectedSafeOutputs>,
 }
 
 enum WorkloadStep {
@@ -148,7 +149,7 @@ impl AgentOrchestrator {
         let result = self.run_primary(plan, cancellation, &mut context).await;
         let cleanup = self.cleanup(cancellation, &mut context).await;
         match result {
-            Ok(terminal) if cleanup.is_empty() => {
+            Ok((terminal, safe_outputs)) if cleanup.is_empty() => {
                 if let Err(primary) = context.transition(AgentState::Completed) {
                     return Err(RunFailure {
                         primary,
@@ -158,6 +159,7 @@ impl AgentOrchestrator {
                 Ok(AgentReport {
                     terminal,
                     states: context.states,
+                    safe_outputs,
                 })
             }
             Ok(_) => Err(RunFailure {
@@ -173,7 +175,7 @@ impl AgentOrchestrator {
         plan: &RunPlan,
         cancellation: &CancellationToken,
         context: &mut RunContext,
-    ) -> Result<GuestTerminal, AgentError> {
+    ) -> Result<(GuestTerminal, Option<crate::CollectedSafeOutputs>), AgentError> {
         check_cancelled(cancellation)?;
         let preflight = self
             .runtime
@@ -345,7 +347,20 @@ impl AgentOrchestrator {
             .await?;
         context.execution = Some(execution);
         context.transition(AgentState::Running)?;
-        self.monitor(cancellation, context).await
+        let terminal = self.monitor(cancellation, context).await?;
+        let safe_outputs = if plan.safe_outputs() {
+            Some(
+                context
+                    .execution
+                    .as_mut()
+                    .expect("execution was stored")
+                    .collect_safe_outputs(cancellation)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        Ok((terminal, safe_outputs))
     }
 
     async fn monitor(

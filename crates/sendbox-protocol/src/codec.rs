@@ -315,6 +315,7 @@ fn decode_capability(decoder: &mut Decoder<'_>) -> Result<Capability, ProtocolEr
         7 => Ok(Capability::Mcp),
         8 => Ok(Capability::Audit),
         9 => Ok(Capability::Health),
+        10 => Ok(Capability::SafeOutputs),
         value => Err(ProtocolError::MalformedEncoding(format!(
             "unsupported capability {value}"
         ))),
@@ -549,12 +550,16 @@ mod tests {
     }
 
     #[test]
-    fn capability_wire_values_are_unchanged_by_interactive_support() {
+    fn capability_wire_values_are_stable() {
         // Interactive admission is negotiated by operation name, never by a new
-        // capability, because the codec rejects unknown capability values and a
-        // new variant would break mixed-version headless runs.
-        assert_eq!(Capability::COUNT, 9);
-        let capabilities = CapabilitySet::from([Capability::StreamedIo, Capability::Signals]);
+        // capability. Safe Outputs is appended without renumbering existing
+        // values so mixed-version peers reject only the new admission.
+        assert_eq!(Capability::COUNT, 10);
+        let capabilities = CapabilitySet::from([
+            Capability::StreamedIo,
+            Capability::Signals,
+            Capability::SafeOutputs,
+        ]);
         let mut encoder = Encoder::new(Vec::new());
         encode_capabilities(&mut encoder, &capabilities).expect("encode");
         let encoded = encoder.into_writer();
