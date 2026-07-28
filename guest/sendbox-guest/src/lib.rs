@@ -7,6 +7,7 @@ pub mod bootstrap;
 #[cfg(feature = "execution-broker")]
 pub mod broker;
 pub mod error;
+pub mod git_guard;
 pub mod manifest;
 #[cfg(feature = "execution-broker")]
 pub mod platform;

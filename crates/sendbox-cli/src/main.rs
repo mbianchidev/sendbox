@@ -1068,9 +1068,6 @@ fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'sta
     {
         return Some("production run does not yet wire the credential broker");
     }
-    if configuration.github.branch_protection.enabled {
-        return Some("production run does not yet wire the native Git branch guard");
-    }
     let network = &configuration.policy.network;
     if network.default_action != sendbox_policy::Action::Allow
         || !network.allowed_domains.is_empty()
@@ -1091,6 +1088,7 @@ fn host_error_exit_code(error: &HostError) -> u8 {
     match error {
         HostError::Invalid(_)
         | HostError::Boundary(_)
+        | HostError::GitGuard(_)
         | HostError::AgentPlan(_)
         | HostError::Bundle(_) => INVALID_CONFIGURATION_EXIT,
         _ => RUNTIME_EXIT,

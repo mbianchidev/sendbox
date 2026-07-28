@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 use std::{
@@ -140,6 +140,16 @@ enum FixtureMode {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    if invoked_as_git() {
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        return match sendbox_guest::git_guard::execute_current(&arguments) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("[sendbox-git-guard] {error}");
+                ExitCode::from(sendbox_guest::git_guard::denied_exit_code())
+            }
+        };
+    }
     match execute(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -147,6 +157,14 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn invoked_as_git() -> bool {
+    std::env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|name| Path::new(name).file_name())
+        .is_some_and(|name| name == "git")
 }
 
 async fn execute(cli: Cli) -> Result<(), GuestError> {

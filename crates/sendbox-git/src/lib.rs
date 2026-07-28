@@ -8,17 +8,20 @@
 #![forbid(unsafe_code)]
 
 mod argv;
+mod discovery;
 mod error;
 mod identity;
 mod pattern;
 mod process;
 mod service;
+mod standalone;
 mod trusted;
 
 pub use argv::{
     GlobalInvocation, Operation, OperationArguments, parse_alias_words, parse_invocation,
     parse_operation_arguments,
 };
+pub use discovery::discover_repository_identity;
 pub use error::GuardError;
 pub use identity::{RepositoryIdentity, WorkspaceIdentity};
 pub use pattern::{BranchPolicy, BranchPolicyConfiguration, normalize_branch};
@@ -29,4 +32,5 @@ pub use service::{
     Admission, GuardLimits, GuardPolicyDocument, GuardService, PolicySchemaVersion,
     parse_push_refspec,
 };
-pub use trusted::TrustedGitBinary;
+pub use standalone::{execute_guarded_git, read_policy_file};
+pub use trusted::{TrustedExecutable, TrustedGitBinary};

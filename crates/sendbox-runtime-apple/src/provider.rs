@@ -13,6 +13,7 @@ use sendbox_bootstrap::{
     encode_bootstrap_document,
 };
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
+use sendbox_git::GuardPolicyDocument;
 use sendbox_policy::{Action, CommandPolicy};
 use sendbox_runtime::{
     BootstrapDelivery, BoxFuture, CancellationToken, CleanupFailure, CleanupReport, ContainerId,
@@ -56,6 +57,7 @@ pub struct AppleRuntimeConfiguration {
     pub guest_version: String,
     pub minimum_release_sequence: u64,
     pub command_policy: CommandPolicy,
+    pub git_guard_policy: Option<GuardPolicyDocument>,
     pub workload_uid: u32,
     pub workload_gid: u32,
     pub launch: AppleLaunchConfiguration,
@@ -91,6 +93,7 @@ impl AppleRuntimeConfiguration {
                 denylist: Vec::new(),
                 log_blocked: true,
             },
+            git_guard_policy: None,
             workload_uid: 65_534,
             workload_gid: 65_534,
             launch: AppleLaunchConfiguration::default(),
@@ -531,6 +534,7 @@ impl AppleRuntime {
                     workload_uid: self.configuration.workload_uid,
                     workload_gid: self.configuration.workload_gid,
                     command_policy: self.configuration.command_policy.clone(),
+                    git_guard_policy: self.configuration.git_guard_policy.clone(),
                 }),
             },
             channel.bootstrap_material.as_bytes(),

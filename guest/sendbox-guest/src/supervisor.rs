@@ -11,6 +11,7 @@ use crate::GuestError;
 use crate::audit::AuditLog;
 use crate::bootstrap::ImmutableBootstrapSource;
 use crate::broker;
+use crate::git_guard;
 use crate::manifest::{VerifiedManifest, verify_manifest};
 use crate::platform::PlatformControls;
 use crate::protocol::{ProtocolServices, handshake_config, serve_authenticated};
@@ -63,6 +64,18 @@ pub async fn run<P: PlatformControls>(
     runtime.write_state(StartupState::RuntimePrepared)?;
     transition(&state, &audit, StartupState::RuntimePrepared)?;
 
+    if let Some(policy) = bootstrap
+        .execution_broker
+        .as_ref()
+        .and_then(|broker| broker.git_guard_policy.as_ref())
+    {
+        git_guard::install(policy, &options.artifact_root)?;
+        audit.lock().expect("audit mutex").record(
+            "git_guard_installed",
+            policy.selected_repository.to_string(),
+            policy.selected_workspace.display().to_string(),
+        );
+    }
     let broker_client = bootstrap
         .execution_broker
         .take()

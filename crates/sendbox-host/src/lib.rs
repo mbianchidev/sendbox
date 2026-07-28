@@ -20,14 +20,19 @@ use sendbox_agent::{
 use sendbox_boundary::{
     Architecture, ArtifactIdentity, ArtifactKind, BOUNDARY_PLAN_FORMAT, BOUNDARY_PLAN_VERSION,
     BoundaryError, BoundaryPlan, CommandDeclaration, ControlTransport, EnvironmentDeclaration,
-    HostPlatform, MountDeclaration, OperatingSystem, ProviderDeclaration, ResolvedRuntime,
-    ResourceDeclaration, SignedBoundaryPlan, TrustDeclaration, VerifiedBoundaryPlan,
-    WorkloadIdentity, select_runtime, sha256_hex,
+    FeatureAdmission, FeatureDecision, HostPlatform, MountDeclaration, OperatingSystem,
+    ProviderDeclaration, ResolvedRuntime, ResourceDeclaration, SignedBoundaryPlan,
+    TrustDeclaration, VerifiedBoundaryPlan, WorkloadIdentity, select_runtime, sha256_hex,
 };
 use sendbox_bundle::{Architecture as BundleArchitecture, VerifyOptions, verify_bundle};
 use sendbox_config::{RuntimeProvider as ConfiguredRuntime, SandboxConfiguration};
 use sendbox_core::{SessionId, VERSION};
 use sendbox_exec::{AdmissionDisposition, CompiledCommandPolicy};
+use sendbox_git::{
+    BranchPolicyConfiguration, EnvironmentPolicy, GitProcessRunner, GuardError, GuardLimits,
+    GuardPolicyDocument, PolicySchemaVersion, ProcessRequest, SystemGitProcessRunner,
+    TrustedGitBinary, discover_repository_identity,
+};
 use sendbox_policy::{Action, DnsPolicy};
 use sendbox_runtime::{
     BootstrapMaterial, CancellationToken, CommandArgument, CommandSpec, ContainerId, CreateRequest,
@@ -135,6 +140,8 @@ pub enum HostError {
     AgentPlan(#[from] sendbox_agent::AgentError),
     #[error("agent execution: {0}")]
     AgentRun(#[from] RunFailure),
+    #[error("Git guard: {0}")]
+    GitGuard(#[from] GuardError),
     #[error("secret store: {0}")]
     SecretStore(#[from] sendbox_secrets::SecretStoreError),
     #[error("{context} `{path}`: {source}")]
@@ -247,6 +254,12 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
     let policy_sha256 = sha256_hex(&policy_bytes);
     let resources = runtime_resources(&request.configuration)?;
     let workspace_destination = PathBuf::from("/workspace");
+    let git_guard_policy = make_git_guard_policy(
+        selected_runtime,
+        &request.configuration,
+        &workspace_source,
+        &workspace_destination,
+    )?;
     let bootstrap_reference =
         SecretReference::new(format!("bootstrap-{session_id}")).map_err(HostError::AgentPlan)?;
     let secrets = Arc::new(HostSecretResolver::open(
@@ -262,7 +275,9 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
         host,
         resources,
         &workspace_source,
+        git_guard_policy.as_ref(),
     )?;
+    let features = boundary_features(git_guard_policy.as_ref())?;
     let workload = match selected_runtime {
         ResolvedRuntime::Hyperlight => WorkloadIdentity::GuestBundle {
             root: bundle_root.clone(),
@@ -313,7 +328,7 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
         },
         provider: runtime.declaration,
         artifacts: runtime.artifacts,
-        features: BTreeMap::new(),
+        features,
     };
     let signed_plan = SignedBoundaryPlan::sign(plan, &key, now_unix)?;
     let verified_plan = signed_plan.verify(&signer_fingerprint, now_unix)?;
@@ -458,6 +473,7 @@ fn build_runtime(
     host: HostPlatform,
     resources: RuntimeResources,
     workspace_source: &Path,
+    git_guard_policy: Option<&GuardPolicyDocument>,
 ) -> Result<RuntimeBuild, HostError> {
     let manifest_path = bundle_root.join("manifest.json");
     let mut artifacts = vec![
@@ -490,6 +506,7 @@ fn build_runtime(
             );
             configuration.executable = Some(executable.clone());
             configuration.command_policy = request.configuration.policy.commands.clone();
+            configuration.git_guard_policy = git_guard_policy.cloned();
             configuration.workload_uid = workload_uid;
             configuration.workload_gid = workload_gid;
             configuration.launch.resources.cpus =
@@ -549,6 +566,7 @@ fn build_runtime(
                 trust_root_id: request.trust_root_id.clone(),
                 minimum_release_sequence: request.minimum_release_sequence,
                 command_policy: request.configuration.policy.commands.clone(),
+                git_guard_policy: git_guard_policy.cloned(),
                 workload_uid,
                 workload_gid,
             };
@@ -900,9 +918,6 @@ fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'sta
     {
         return Some("production run does not yet wire the credential broker");
     }
-    if configuration.github.branch_protection.enabled {
-        return Some("production run does not yet wire the native Git branch guard");
-    }
     let network = &configuration.policy.network;
     if network.default_action != Action::Allow
         || !network.allowed_domains.is_empty()
@@ -928,7 +943,176 @@ fn validate_runtime_features(
             "Hyperlight does not support authenticated configured-secret delivery".to_owned(),
         ));
     }
+    if selected_runtime == ResolvedRuntime::Hyperlight
+        && configuration.github.branch_protection.enabled
+    {
+        return Err(HostError::Invalid(
+            "Hyperlight does not support the authenticated guest Git guard".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn make_git_guard_policy(
+    selected_runtime: ResolvedRuntime,
+    configuration: &SandboxConfiguration,
+    workspace_source: &Path,
+    workspace_destination: &Path,
+) -> Result<Option<GuardPolicyDocument>, HostError> {
+    if !configuration.github.branch_protection.enabled {
+        return Ok(None);
+    }
+    if selected_runtime == ResolvedRuntime::Hyperlight {
+        return Err(HostError::Invalid(
+            "Hyperlight does not support the authenticated guest Git guard".to_owned(),
+        ));
+    }
+    let git = trusted_host_git()?;
+    let repository = discover_repository_identity(
+        &git,
+        &SystemGitProcessRunner,
+        workspace_source,
+        host_git_environment(),
+    )?;
+    let configured = &configuration.github.branch_protection;
+    let username = configured
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| resolve_github_username(repository.host(), workspace_source));
+    let policy = GuardPolicyDocument {
+        schema_version: PolicySchemaVersion::V1,
+        selected_repository: repository,
+        selected_workspace: workspace_destination.to_path_buf(),
+        branch_protection: BranchPolicyConfiguration {
+            enabled: configured.enabled,
+            username,
+            protected_branches: configured.protected_branches.clone(),
+            allowed_branch_patterns: configured.allowed_branch_patterns.clone(),
+        },
+        environment: EnvironmentPolicy::default(),
+        limits: GuardLimits::default(),
+    };
+    policy.validate()?;
+    Ok(Some(policy))
+}
+
+fn boundary_features(
+    git_guard_policy: Option<&GuardPolicyDocument>,
+) -> Result<BTreeMap<String, FeatureAdmission>, HostError> {
+    let Some(policy) = git_guard_policy else {
+        return Ok(BTreeMap::new());
+    };
+    let encoded =
+        serde_json::to_vec(policy).map_err(|error| HostError::Invalid(error.to_string()))?;
+    Ok(BTreeMap::from([(
+        "git_branch_protection".to_owned(),
+        FeatureAdmission {
+            decision: FeatureDecision::Enforced,
+            mechanism: format!(
+                "authenticated_guest_guard_v1:sha256={}",
+                sha256_hex(&encoded)
+            ),
+        },
+    )]))
+}
+
+fn trusted_host_git() -> Result<TrustedGitBinary, HostError> {
+    [
+        "/usr/bin/git",
+        "/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+    ]
+    .into_iter()
+    .filter_map(|candidate| Path::new(candidate).canonicalize().ok())
+    .find_map(|candidate| TrustedGitBinary::verify(candidate).ok())
+    .ok_or_else(|| HostError::Invalid("a trusted host Git executable was not found".to_owned()))
+}
+
+fn resolve_github_username(host: &str, current_directory: &Path) -> Option<String> {
+    let executable = [
+        "/usr/local/bin/gh",
+        "/opt/homebrew/bin/gh",
+        "/usr/bin/gh",
+        "/bin/gh",
+    ]
+    .into_iter()
+    .filter_map(|candidate| Path::new(candidate).canonicalize().ok())
+    .find_map(|candidate| TrustedGitBinary::verify(candidate).ok())?;
+    let arguments = vec![
+        "api".to_owned(),
+        "--hostname".to_owned(),
+        host.to_owned(),
+        "user".to_owned(),
+        "--jq".to_owned(),
+        ".login".to_owned(),
+    ];
+    let environment = github_cli_environment();
+    let output = SystemGitProcessRunner
+        .query(&ProcessRequest {
+            executable: &executable,
+            arguments: &arguments,
+            environment: &environment,
+            current_directory,
+            timeout: Duration::from_secs(5),
+            output_limit: 4 * 1024,
+        })
+        .ok()?;
+    if output.exit_code != Some(0) {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let mut lines = value.lines().map(str::trim).filter(|line| !line.is_empty());
+    let username = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    Some(username.to_owned())
+}
+
+fn host_git_environment() -> BTreeMap<String, String> {
+    [
+        "GIT_TERMINAL_PROMPT",
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "SSH_AUTH_SOCK",
+        "TERM",
+        "TMPDIR",
+        "USER",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
+    .collect()
+}
+
+fn github_cli_environment() -> BTreeMap<String, String> {
+    let mut environment = [
+        "GH_CONFIG_DIR",
+        "GH_ENTERPRISE_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GITHUB_TOKEN",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "XDG_CONFIG_HOME",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
+    .collect::<BTreeMap<_, _>>();
+    environment.insert(
+        "PATH".to_owned(),
+        "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin".to_owned(),
+    );
+    environment.insert("GH_PROMPT_DISABLED".to_owned(), "1".to_owned());
+    environment.insert("GH_NO_UPDATE_NOTIFIER".to_owned(), "1".to_owned());
+    environment.insert("GH_PAGER".to_owned(), "cat".to_owned());
+    environment.insert("NO_COLOR".to_owned(), "1".to_owned());
+    environment
 }
 
 fn validate_command(command: &[String]) -> Result<(String, Vec<String>), HostError> {
@@ -1374,13 +1558,6 @@ mod tests {
             "production run does not yet wire the credential broker",
         );
 
-        let mut git = supported_configuration(temp.path().to_path_buf());
-        git.github.branch_protection.enabled = true;
-        assert_prepare_rejects(
-            request(&temp, git),
-            "production run does not yet wire the native Git branch guard",
-        );
-
         let mut egress = supported_configuration(temp.path().to_path_buf());
         egress.policy.network.default_action = Action::Deny;
         assert_prepare_rejects(
@@ -1404,6 +1581,52 @@ mod tests {
         ));
         validate_runtime_features(ResolvedRuntime::Kata, &configuration)
             .expect("persistent runtime supports configured secrets");
+
+        configuration.secrets.clear();
+        configuration.github.branch_protection.enabled = true;
+        let error = validate_runtime_features(ResolvedRuntime::Hyperlight, &configuration)
+            .expect_err("Hyperlight Git guard must fail closed");
+        assert!(matches!(
+            error,
+            HostError::Invalid(message)
+                if message == "Hyperlight does not support the authenticated guest Git guard"
+        ));
+        validate_runtime_features(ResolvedRuntime::Kata, &configuration)
+            .expect("persistent runtime supports the Git guard");
+    }
+
+    #[test]
+    fn git_guard_is_admitted_and_bound_into_boundary_features() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.github.branch_protection.enabled = true;
+        assert_eq!(unavailable_run_feature(&configuration), None);
+
+        let policy = GuardPolicyDocument {
+            schema_version: PolicySchemaVersion::V1,
+            selected_repository: sendbox_git::RepositoryIdentity::new(
+                "github.com",
+                "owner",
+                "repository",
+            )
+            .expect("repository"),
+            selected_workspace: PathBuf::from("/workspace"),
+            branch_protection: BranchPolicyConfiguration::default(),
+            environment: EnvironmentPolicy::default(),
+            limits: GuardLimits::default(),
+        };
+        let first = boundary_features(Some(&policy)).expect("features");
+        let second = boundary_features(Some(&policy)).expect("features");
+        assert_eq!(first, second);
+        let admission = first
+            .get("git_branch_protection")
+            .expect("Git feature admission");
+        assert_eq!(admission.decision, FeatureDecision::Enforced);
+        assert!(
+            admission
+                .mechanism
+                .starts_with("authenticated_guest_guard_v1:sha256=")
+        );
     }
 
     #[test]

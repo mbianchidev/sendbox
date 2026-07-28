@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use sendbox_core::{BoundaryPlanDigest, SessionId};
+use sendbox_git::GuardPolicyDocument;
 use sendbox_policy::CommandPolicy;
 use sendbox_protocol::BootstrapSecret;
 use serde::de::{SeqAccess, Visitor};
@@ -143,6 +144,7 @@ pub struct ExecutionBrokerConfiguration {
     pub workload_uid: u32,
     pub workload_gid: u32,
     pub command_policy: CommandPolicy,
+    pub git_guard_policy: Option<GuardPolicyDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +160,8 @@ pub struct ExecutionBrokerBootstrap {
     pub workload_uid: u32,
     pub workload_gid: u32,
     pub command_policy: CommandPolicy,
+    #[serde(default)]
+    pub git_guard_policy: Option<GuardPolicyDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +305,7 @@ pub fn encode_bootstrap_document(
                 workload_uid: configuration.workload_uid,
                 workload_gid: configuration.workload_gid,
                 command_policy: configuration.command_policy,
+                git_guard_policy: configuration.git_guard_policy,
             })
         })
         .transpose()?;
@@ -348,25 +353,17 @@ fn validate_configuration(
         configuration.minimum_release_sequence,
     )?;
     if let Some(broker) = &configuration.execution_broker {
-        if broker.workload_uid == 0 || broker.workload_gid == 0 {
-            return Err(BootstrapError::Invalid(
-                "execution broker workload identity must be non-root".to_owned(),
-            ));
-        }
-        for (name, path) in [
-            ("runtime parent", &broker.runtime_parent),
-            ("socket", &broker.socket_path),
-            ("launcher", &broker.launcher_path),
-            ("cgroup parent", &broker.cgroup_parent),
-            ("workspace root", &broker.workspace_root),
-            ("system root", &broker.system_root),
-        ] {
-            if !path.is_absolute() {
-                return Err(BootstrapError::Invalid(format!(
-                    "execution broker {name} path must be absolute"
-                )));
-            }
-        }
+        validate_broker(
+            broker.workload_uid,
+            broker.workload_gid,
+            &broker.runtime_parent,
+            &broker.socket_path,
+            &broker.launcher_path,
+            &broker.cgroup_parent,
+            &broker.workspace_root,
+            &broker.system_root,
+            broker.git_guard_policy.as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -389,6 +386,19 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         &wire.manifest_path,
         wire.minimum_release_sequence,
     )?;
+    if let Some(broker) = &wire.execution_broker {
+        validate_broker(
+            broker.workload_uid,
+            broker.workload_gid,
+            &broker.runtime_parent,
+            &broker.socket_path,
+            &broker.launcher_path,
+            &broker.cgroup_parent,
+            &broker.workspace_root,
+            &broker.system_root,
+            broker.git_guard_policy.as_ref(),
+        )?;
+    }
     let bootstrap_secret = BootstrapSecret::new(wire.bootstrap_secret.0.as_ref().to_vec())
         .map_err(|_| BootstrapError::Invalid("bootstrap secret is invalid".to_owned()))?;
     Ok(BootstrapDocument {
@@ -405,6 +415,50 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         services: wire.services,
         execution_broker: wire.execution_broker,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_broker(
+    workload_uid: u32,
+    workload_gid: u32,
+    runtime_parent: &Path,
+    socket_path: &Path,
+    launcher_path: &Path,
+    cgroup_parent: &Path,
+    workspace_root: &Path,
+    system_root: &Path,
+    git_guard_policy: Option<&GuardPolicyDocument>,
+) -> Result<(), BootstrapError> {
+    if workload_uid == 0 || workload_gid == 0 {
+        return Err(BootstrapError::Invalid(
+            "execution broker workload identity must be non-root".to_owned(),
+        ));
+    }
+    for (name, path) in [
+        ("runtime parent", runtime_parent),
+        ("socket", socket_path),
+        ("launcher", launcher_path),
+        ("cgroup parent", cgroup_parent),
+        ("workspace root", workspace_root),
+        ("system root", system_root),
+    ] {
+        if !path.is_absolute() {
+            return Err(BootstrapError::Invalid(format!(
+                "execution broker {name} path must be absolute"
+            )));
+        }
+    }
+    if let Some(policy) = git_guard_policy {
+        policy
+            .validate()
+            .map_err(|error| BootstrapError::Invalid(error.to_string()))?;
+        if policy.selected_workspace != workspace_root {
+            return Err(BootstrapError::Invalid(
+                "Git guard workspace must match the execution broker workspace".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_common(
@@ -512,6 +566,7 @@ mod tests {
                     denylist: Vec::new(),
                     log_blocked: true,
                 },
+                git_guard_policy: None,
             }),
         }
     }

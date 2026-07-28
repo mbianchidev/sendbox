@@ -15,6 +15,7 @@ sendbox-bundle = { path = "../sendbox-bundle" }
 sendbox-config = { path = "../sendbox-config" }
 sendbox-core = { path = "../sendbox-core" }
 sendbox-exec = { path = "../sendbox-exec" }
+sendbox-git = { path = "../sendbox-git" }
 sendbox-policy = { path = "../sendbox-policy" }
 sendbox-runtime = { path = "../sendbox-runtime" }
 sendbox-runtime-apple = { path = "../sendbox-runtime-apple" }

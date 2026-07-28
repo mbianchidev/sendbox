@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 getrandom.workspace = true
 sendbox-core = { path = "../sendbox-core" }
+sendbox-git = { path = "../sendbox-git" }
 sendbox-policy = { path = "../sendbox-policy" }
 sendbox-protocol = { path = "../sendbox-protocol" }
 serde.workspace = true
