@@ -55,7 +55,7 @@ enum Command {
     Init(InitArgs),
     Mcp(mcp::McpArgs),
     Policy(PolicyArgs),
-    /// Run one exact argv workload through the experimental Rust Kata runtime.
+    /// Run one exact argv workload through an authenticated runtime boundary.
     Run(RunArgs),
     Secrets(secrets::SecretsArgs),
 }
@@ -377,10 +377,6 @@ async fn run(arguments: RunArgs) -> ExitCode {
             INVALID_CONFIGURATION_EXIT,
             "guest command must use an absolute executable path",
         );
-        return ExitCode::from(INVALID_CONFIGURATION_EXIT);
-    }
-    if let Some(error) = unavailable_run_feature(&configuration) {
-        emit_run_error(arguments.json, INVALID_CONFIGURATION_EXIT, error);
         return ExitCode::from(INVALID_CONFIGURATION_EXIT);
     }
     let state_root = match runtime_state_directory() {
@@ -1052,31 +1048,6 @@ fn runtime_state_directory() -> Result<PathBuf, String> {
             .map_err(|error| format!("set {} permissions: {error}", path.display()))?;
     }
     Ok(path)
-}
-
-fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'static str> {
-    if configuration
-        .observability
-        .as_ref()
-        .is_some_and(|value| value.mcp_inspection.enabled)
-    {
-        return Some("production run does not yet wire the native MCP subsystem");
-    }
-
-    let network = &configuration.policy.network;
-    if network.default_action != sendbox_policy::Action::Allow
-        || !network.allowed_domains.is_empty()
-        || !network.blocked_domains.is_empty()
-        || !network.allowed_networks.is_empty()
-        || !network.blocked_networks.is_empty()
-        || !network.allowed_ports.is_empty()
-        || !network.allow_dns
-        || network.max_connections.is_some()
-        || network.dns != sendbox_policy::DnsPolicy::default()
-    {
-        return Some("production run does not yet wire production egress enforcement");
-    }
-    None
 }
 
 fn host_error_exit_code(error: &HostError) -> u8 {
