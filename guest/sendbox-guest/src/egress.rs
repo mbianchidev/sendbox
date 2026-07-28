@@ -847,7 +847,7 @@ pub async fn run_registry_proxy(config_path: PathBuf) -> Result<(), GuestError> 
     use sendbox_exec::platform::linux::{capabilities, rlimits, seccomp};
     use sendbox_policy::PackageEcosystem;
     use sendbox_registry::{
-        FailClosedPackageProvenanceVerifier, NpmAdapter, RegistryProxy,
+        NpmAdapter, NpmPackageProvenanceVerifier, RegistryProxy,
         RegistryProxyConfiguration as RuntimeRegistryConfiguration, ReqwestUpstreamClient,
     };
     use tokio::net::{TcpListener, UnixListener};
@@ -962,7 +962,7 @@ pub async fn run_registry_proxy(config_path: PathBuf) -> Result<(), GuestError> 
         },
         adapter,
         upstream,
-        Arc::new(FailClosedPackageProvenanceVerifier),
+        Arc::new(NpmPackageProvenanceVerifier),
     )
     .map_err(|error| GuestError::Runtime(format!("preparing registry proxy: {error}")))?;
 

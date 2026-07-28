@@ -6,6 +6,7 @@ mod client;
 mod engine;
 mod model;
 mod npm;
+mod provenance;
 mod report;
 mod scanner;
 mod service;
@@ -22,7 +23,8 @@ pub use model::{
     IntegrityClaim, IntegritySource, NormalizedManifest, PackageIdentity, ProvenanceClaim,
     RegistryError, RegistryResult, ResolvedMetadata, SignatureClaim, VerificationEvidence,
 };
-pub use npm::{FailClosedPackageProvenanceVerifier, NpmAdapter};
+pub use npm::NpmAdapter;
+pub use provenance::NpmPackageProvenanceVerifier;
 pub use report::{
     CacheOutcome, PackageFinding, PackageSecurityReport, PackageVerdictRecord, Verdict,
 };

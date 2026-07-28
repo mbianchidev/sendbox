@@ -56,6 +56,7 @@ http = "1.4.0"
 hkdf = "0.13.0"
 hmac = { version = "0.13.0", features = ["zeroize"] }
 ipnet = "2.11.0"
+jiff = "0.2.35"
 jsonc-parser = { version = "0.33.0", features = ["serde"] }
 libc = "0.2.177"
 libbpf-rs = "0.26.2"
@@ -70,9 +71,12 @@ rlimit = "0.11.0"
 roxmltree = "0.21.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["raw_value"] }
+serde_json_canonicalizer = "0.3.2"
 serde_yaml_ng = "0.10.0"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
+sigstore-merkle = "0.11.0"
+sigstore-verify = { version = "0.11.0", default-features = false }
 socket2 = { version = "0.6.5", features = ["all"] }
 tempfile = "3.27.0"
 tar = { version = "0.4.46", default-features = false }

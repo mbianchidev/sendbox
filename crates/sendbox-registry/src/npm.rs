@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use sigstore_verify::trust_root::SIGSTORE_PRODUCTION_TRUSTED_ROOT;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use url::Url;
@@ -155,12 +156,13 @@ impl NpmAdapter {
         let mut digest = Sha256::new();
         digest.update(b"sendbox-npm-trust-metadata-v1\0");
         digest.update(&registry_keys);
+        digest.update(SIGSTORE_PRODUCTION_TRUSTED_ROOT.as_bytes());
         if let Some(bundle) = provenance_bundle.as_deref() {
             digest.update(bundle);
         }
         Ok(TrustMetadata {
             registry_keys,
-            package_trust_root: Vec::new(),
+            package_trust_root: SIGSTORE_PRODUCTION_TRUSTED_ROOT.as_bytes().to_vec(),
             provenance_bundle,
             digest: format!("sha256:{}", encode_hex(&digest.finalize())),
         })
@@ -520,25 +522,6 @@ impl RegistryAdapter for NpmAdapter {
             entries,
             &self.package_policy.limits,
         )
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct FailClosedPackageProvenanceVerifier;
-
-#[async_trait]
-impl PackageProvenanceVerifier for FailClosedPackageProvenanceVerifier {
-    async fn verify(
-        &self,
-        _identity: &crate::PackageIdentity,
-        _artifact_digest: &str,
-        _bundle: &[u8],
-        _trust_root: &[u8],
-    ) -> RegistryResult<Vec<String>> {
-        Err(RegistryError::Unsupported(
-            "npm provenance bundle verification is unavailable because the Rust verifier does not validate every required transparency-log proof"
-                .to_owned(),
-        ))
     }
 }
 
@@ -999,7 +982,7 @@ mod tests {
                 &descriptor,
                 &artifact,
                 &trust,
-                &FailClosedPackageProvenanceVerifier,
+                &crate::NpmPackageProvenanceVerifier,
             )
             .await
             .unwrap();
@@ -1008,7 +991,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_integrity_mismatch_and_advertised_provenance() {
+    async fn rejects_integrity_mismatch_and_invalid_advertised_provenance() {
         let directory = tempdir().unwrap();
         let artifact = directory.path().join("artifact.tgz");
         std::fs::write(&artifact, b"tampered").unwrap();
@@ -1043,7 +1026,7 @@ mod tests {
                     &descriptor,
                     &artifact,
                     &trust,
-                    &FailClosedPackageProvenanceVerifier,
+                    &crate::NpmPackageProvenanceVerifier,
                 )
                 .await
                 .is_err()
@@ -1065,7 +1048,7 @@ mod tests {
                     &descriptor,
                     &artifact,
                     &trust,
-                    &FailClosedPackageProvenanceVerifier,
+                    &crate::NpmPackageProvenanceVerifier,
                 )
                 .await
                 .is_err()

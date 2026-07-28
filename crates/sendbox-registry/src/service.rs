@@ -916,8 +916,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        FailClosedPackageProvenanceVerifier, NpmAdapter, PackageFinding, UpstreamRequest,
-        UpstreamResponse,
+        NpmAdapter, NpmPackageProvenanceVerifier, PackageFinding, UpstreamRequest, UpstreamResponse,
     };
 
     #[derive(Debug)]
@@ -1022,7 +1021,7 @@ mod tests {
             },
             Arc::new(adapter),
             upstream,
-            Arc::new(FailClosedPackageProvenanceVerifier),
+            Arc::new(NpmPackageProvenanceVerifier),
         )
         .unwrap()
     }
