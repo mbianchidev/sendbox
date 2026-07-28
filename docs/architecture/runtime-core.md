@@ -1,9 +1,9 @@
 # Runtime Core Contract
 
-Status: **pre-1.0 foundation**. `sendbox-runtime` defines the behavior shared by
-future Apple, Kata, Hyperlight, and other adapters. It does not implement an
-adapter, guest service, egress control, execution broker, project analyzer, or
-security store.
+`sendbox-runtime` defines the behavior shared by the production Apple, Kata, and
+Hyperlight adapters. Provider-specific launch code remains in dedicated crates;
+`sendbox-host` composes those adapters with guest services, egress, execution,
+credentials, MCP, project analysis, and security stores.
 
 `sendbox-config::RuntimeProvider` is the configured provider **kind**. The
 `sendbox_runtime::RuntimeProvider` trait is the object-safe asynchronous behavior

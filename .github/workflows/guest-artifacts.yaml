@@ -6,6 +6,7 @@ on:
     paths:
       - ".cargo/config.toml"
       - ".github/workflows/guest-artifacts.yaml"
+      - ".github/workflows/release.yaml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/sendbox-bpf/**"
@@ -15,12 +16,16 @@ on:
       - "guest/sendbox-guest/**"
       - "native/bpf/**"
       - "packaging/guest/**"
+      - "packaging/release/**"
+      - "scripts/qualify-setup-release.sh"
+      - "setup.sh"
       - "docs/architecture/guest-artifact-bundles.md"
   pull_request:
     branches: [main]
     paths:
       - ".cargo/config.toml"
       - ".github/workflows/guest-artifacts.yaml"
+      - ".github/workflows/release.yaml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/sendbox-bpf/**"
@@ -30,6 +35,9 @@ on:
       - "guest/sendbox-guest/**"
       - "native/bpf/**"
       - "packaging/guest/**"
+      - "packaging/release/**"
+      - "scripts/qualify-setup-release.sh"
+      - "setup.sh"
       - "docs/architecture/guest-artifact-bundles.md"
   workflow_dispatch:
     inputs:
@@ -133,6 +141,30 @@ jobs:
           fi
           cat "dist/${{ matrix.architecture }}/first/sendbox-guest.static.txt"
           cat "dist/${{ matrix.architecture }}/first/sendbox-exec-launcher.static.txt"
+
+      - name: Verify installed bundle as an unprivileged host user
+        run: |
+          output="dist/${{ matrix.architecture }}/first"
+          mkdir "$RUNNER_TEMP/installed-bundle"
+          tar -xf "$output/sendbox-guest-rootfs.tar" \
+            -C "$RUNNER_TEMP/installed-bundle"
+          sudo chown -R 0:0 "$RUNNER_TEMP/installed-bundle"
+          sudo chown 0:0 "$output/release-public.key"
+          test "$(stat -c '%a' "$RUNNER_TEMP/installed-bundle/bin/sendbox-guest")" = 555
+          test "$(stat -c '%a' "$RUNNER_TEMP/installed-bundle/manifest.json")" = 444
+          test "$(stat -c '%a' "$output/release-public.key")" = 444
+          case "${{ matrix.architecture }}" in
+            amd64) architecture=x86_64 ;;
+            arm64) architecture=aarch64 ;;
+          esac
+          cargo run --locked -p sendbox-bundle -- verify \
+            --root "$RUNNER_TEMP/installed-bundle" \
+            --public-key "$output/release-public.key" \
+            --architecture "$architecture" \
+            --trust-root-id external-release-root \
+            --host-version 0.1.0 \
+            --guest-version 0.1.0 \
+            --minimum-release-sequence 1
 
       - name: Build OCI image layout
         run: |

@@ -1,8 +1,7 @@
 # Authenticated Host/Guest Protocol
 
-Status: **pre-1.0 foundation**. This document defines the protocol invariants
-implemented by `sendbox-protocol`. Runtime-specific transports and operational
-message schemas remain subject to qualification.
+This document defines the protocol invariants implemented by
+`sendbox-protocol` and qualified through the Apple and Kata runtime transports.
 
 ## Security boundary
 
@@ -17,8 +16,8 @@ encrypt general payloads. Runtime adapters must provide transport confidentialit
 for ordinary confidential messages. Secret values are never placed directly in
 frames: `agent.launch` carries XChaCha20-Poly1305 envelopes bound to the session,
 guest role, secret name, sequence, expiry, and policy digest.
-Long-lived trust roots, release signing, policy signing, and key rotation remain
-part of ADR-005 qualification.
+Long-lived trust roots, release signing, policy signing, and rollback floors are
+separate versioned trust domains rather than protocol-session keys.
 
 Apple and Kata bootstrap also carry the session-derived egress runtime policy
 and the exact delegated execution cgroup parent. The guest validates both before

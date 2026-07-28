@@ -1,9 +1,10 @@
 # Host Agent Orchestration
 
-Status: **transport-neutral orchestration foundation**. `sendbox-agent` owns an
-immutable run plan and the pure host-side state machine. It does not provide CLI
-`run`, a concrete Apple/Kata/Hyperlight adapter, guest platform controls, MCP, or
-security persistence.
+Status: **production transport-neutral orchestration**. `sendbox-agent` owns an
+immutable run plan and the pure host-side state machine. `sendbox-host` composes
+it with CLI `run`, concrete Apple/Kata/Hyperlight adapters, guest platform
+controls, MCP, and security persistence without adding those dependencies to the
+orchestration crate.
 
 ## Run sequence
 

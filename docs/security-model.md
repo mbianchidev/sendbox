@@ -6,7 +6,9 @@
 
 ## Architecture Overview
 
-SendBox has two runtime providers. Both give the workload a dedicated Linux kernel, but their host control planes and operational responsibilities differ.
+SendBox has two persistent guest-service runtime providers. Both give the
+workload a dedicated Linux kernel, but their host control planes and operational
+responsibilities differ.
 
 | Property | Apple provider | Kata provider |
 |----------|----------------|---------------|
@@ -21,6 +23,10 @@ SendBox has two runtime providers. Both give the workload a dedicated Linux kern
 **Key insight:** The workload does not share the host kernel. A guest-kernel compromise is contained by the selected hypervisor boundary, while host runtime and hypervisor components still require normal patching and hardening.
 
 The detailed SandboxEscapeBench analysis below describes the Apple provider. The Kata provider relies on Kata's VM boundary and the security configuration of containerd, the Kata shim, and the selected hypervisor; SendBox does not claim architectural immunity from vulnerabilities in those host components.
+
+Hyperlight is an explicit-only, authenticated one-shot provider. It uses a
+separately signed Unikraft bundle and intentionally rejects persistent guest
+services, secret delivery, MCP, and network-policy composition.
 
 ### Production execution mediation
 
@@ -49,15 +55,17 @@ CONNECT injection, TLS interception, wildcard binds, cross-target redirects,
 ambiguous HTTP framing, and unapproved restricted DNS answers are rejected.
 GitHub repository tokens use a separate metadata and repository-scope
 authorization path; cross-organization non-public scope is always denied and a
-token is retrieved only after complete pagination succeeds. Runtime lifecycle
-wiring is not part of this library yet.
+token is retrieved only after complete pagination succeeds. Apple and Kata runs
+deliver approved credentials through authenticated, policy-bound secret
+envelopes.
 
 ### Production guest artifacts and BPF observation
 
 Production static guest binaries, the execution launcher, CO-RE BPF objects,
 inventory, and SBOM metadata are packaged in reproducible signed bundles. The
-signing key remains external to the repository and build image, and runtime
-trust-root provisioning remains a separate integration responsibility. See
+signing key remains external to the repository and build image. Release
+artifacts include the matching public key, but operators must verify GitHub
+artifact provenance before treating it as a trust root. See
 [Production guest BPF and artifact bundles](architecture/guest-artifact-bundles.md).
 
 The current BPF programs are cgroup-scoped observation only. They cannot permit
@@ -316,9 +324,8 @@ program and, when supported by the kernel, the seccomp audit log.
 
 ### Layer 5: MCP Tool Boundary
 
-The native `sendbox-mcp` library defines the framing-aware stdio authorization
-boundary. Runtime/guest installation is not part of this PR, so these guarantees
-apply when a runtime wires client stdio through the broker:
+The native `sendbox-mcp` library and authenticated guest bootstrap define the
+framing-aware stdio authorization boundary for Apple and Kata runs:
 
 - Complete bounded newline or `Content-Length` JSON-RPC messages are parsed
   before forwarding.
@@ -329,24 +336,31 @@ apply when a runtime wires client stdio through the broker:
   project-defined `env`/`cwd` overrides are rejected.
 - Child death, malformed frames, output saturation, cancellation, and cleanup
   failure are fail-closed outcomes.
-- Legacy bpftrace records remain readable, while the new versioned observation
-  format is designed for a future native C/libbpf metadata producer.
+- Legacy bpftrace records remain readable, while the guest broker emits the
+  versioned native observation format.
 - Remote HTTP/SSE MCP remains observation-only and is never presented as
   authorization.
 
-Runtime controls that prevent direct unbrokered server launch remain future
-integration work and are not claimed by `sendbox-mcp`.
+Project MCP configuration must route each approved local server through the
+trusted guest broker with an exact allowlisted executable and argv. Unbrokered,
+remote, shell, package-runner, environment, and working-directory overrides fail
+closed.
 
 ### Layer 6: Network Firewall
 
-Network access is controlled by a domain-level firewall implemented via iptables rules generated per-VM:
+Network access is controlled by the authenticated guest egress service:
 
 - **Default-deny:** All outbound traffic is blocked unless explicitly allowed
-- **Domain allowlist:** Only specific domains (e.g., `github.com`, `registry.npmjs.org`) are permitted
-- **DNS filtering:** DNS resolution is configured to use specific resolvers; domains not in the allowlist cannot be resolved
-- **Rate limiting:** Configurable per-minute connection limit to prevent abuse
-- **Logging:** Dropped packets are logged with `[SENDBOX DROP]` prefix for audit
-- **No host access:** The VM cannot reach host services by default — the NAT network only routes to the internet through allowed domains
+- **Domain and address policy:** DNS answers are canonicalized, classified, and
+  checked against exact domain, wildcard, CIDR, and restricted-address rules
+- **Connection mediation:** Workload TCP flows use the mandatory DNS/SOCKS5
+  gateway with configured connection and DNS budgets
+- **Kernel containment:** nftables and cgroup v2 bind policy to the exact
+  delegated execution hierarchy, including nested descendants
+- **Fail-closed lifecycle:** Egress readiness gates Exec startup; service failure
+  revokes readiness and reverse-order shutdown stops Exec before network teardown
+- **No host access:** loopback, link-local, metadata, private, multicast, and
+  other restricted destinations require explicit policy
 
 ### Layer 7: Command Filtering
 
@@ -369,20 +383,20 @@ Selected-repository Git operations are guarded before the real git binary execut
 - Uses eBPF to terminate direct execution of the hidden real git binary
 - Does not replace GitHub server-side rulesets, which remain necessary against direct API ref mutation or alternate Git clients
 
-The independent Rust migration component lives in `sendbox-git`. It replaces
-generated Python policy logic with typed repository/workspace identity, bounded
-Git probes, supported argv/refspec parsing, one clean environment for probes and
-final execution, and native process replacement through a pre-verified absolute
-Git binary. It is not yet connected to the runtime path. Ambiguous remotes,
+`sendbox-git` replaces generated policy scripts with typed
+repository/workspace identity, bounded Git probes, supported argv/refspec
+parsing, one clean environment for probes and final execution, and native
+process replacement through a pre-verified absolute Git binary. Apple and Kata
+deliver the signed Git policy through authenticated bootstrap and install
+trusted wrapper copies before workload launch. Ambiguous remotes,
 multiple effective push URLs, shell aliases, broad ref updates, unsafe
 configuration injection, and unsupported transports fail closed for the
 selected repository.
 
 Git admission is not an atomic remote authorization boundary: repository state
-can change between local inspection and Git's own reads, and agents can use
-alternate clients or hosting-provider APIs unless later broker, credential, and
-egress controls prevent that. GitHub rulesets or equivalent server-side branch
-protection are mandatory.
+can change between local inspection and Git's own reads. Credential and egress
+controls narrow alternate clients and hosting-provider APIs, but GitHub rulesets
+or equivalent server-side branch protection remain mandatory.
 
 ### Layer 9: Secrets Protection
 

@@ -1,9 +1,9 @@
-# Experimental Rust Kata runtime
+# Kata runtime architecture
 
-`sendbox-runtime-kata` is the first production-oriented Rust runtime vertical
-slice. It is intentionally limited to Linux/KVM and one digest-pinned workload
-executed through the production broker. It does not establish Apple,
-Hyperlight, egress, MCP, secrets, audit, or complete Swift parity.
+`sendbox-runtime-kata` is the production Linux/KVM runtime adapter.
+`sendbox-host` composes it with the production broker, authenticated guest
+bootstrap, egress, MCP, secrets, credentials, Git policy, audit, snapshots, and
+session-security lifecycle.
 
 ## Lifecycle and trust
 

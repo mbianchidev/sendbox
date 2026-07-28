@@ -1,8 +1,8 @@
-# Rust CLI parity
+# Rust CLI
 
-Until the final package cutover, Cargo emits the migration binary as
-`sendbox-rs`. Its clap command name, help, JSON contracts, generated
-completions, and complete supported surface already use `sendbox`.
+Cargo emits the production binary as `sendbox`. Its clap command name, help,
+JSON contracts, generated completions, install paths, and release artifacts use
+the same name.
 
 ## Implemented command groups
 

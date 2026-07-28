@@ -246,7 +246,7 @@ impl AppleRuntime {
             .await?;
         ensure_complete_output(&version, "Apple container version")?;
         let version = String::from_utf8_lossy(&version.stdout.bytes);
-        if !version.contains(&format!("container CLI version {SUPPORTED_VERSION}")) {
+        if parse_container_cli_version(&version) != Some(SUPPORTED_VERSION) {
             return Err(RuntimeError::Unavailable {
                 runtime: self.runtime_id.clone(),
                 reason: format!(
@@ -1222,6 +1222,12 @@ fn find_status(value: &serde_json::Value) -> Option<&str> {
     }
 }
 
+fn parse_container_cli_version(output: &str) -> Option<&str> {
+    let value = output.trim().strip_prefix("container CLI version ")?;
+    let version = value.split_once(' ').map_or(value, |(version, _)| version);
+    (!version.is_empty()).then_some(version)
+}
+
 fn provider_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::Provider(message.into())
 }
@@ -1244,6 +1250,26 @@ mod tests {
         RuntimeResources, StartRequest,
     };
     use sendbox_testkit::{RuntimeConformanceScenario, run_runtime_conformance};
+
+    #[test]
+    fn container_version_requires_an_exact_release_token() {
+        assert_eq!(
+            parse_container_cli_version(
+                "container CLI version 0.10.0 (build: release, commit: fixture)"
+            ),
+            Some("0.10.0")
+        );
+        assert_ne!(
+            parse_container_cli_version(
+                "container CLI version 0.10.0-rc.1 (build: release, commit: fixture)"
+            ),
+            Some(SUPPORTED_VERSION)
+        );
+        assert_eq!(
+            parse_container_cli_version("wrapper container CLI version 0.10.0"),
+            None
+        );
+    }
 
     fn fixture_runtime() -> (tempfile::TempDir, AppleRuntime) {
         let temporary = tempfile::tempdir_in(std::env::current_dir().expect("current directory"))

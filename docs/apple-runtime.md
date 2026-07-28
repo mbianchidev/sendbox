@@ -4,7 +4,7 @@
 official Apple `container` CLI and service. It invokes the executable directly
 with exact argv, clears the inherited environment, supplies only `PATH`,
 `LANG`, `LC_ALL`, and explicitly marked secret variables, and never invokes a
-shell or Swift bridge.
+shell or language bridge.
 
 ## Requirements
 
@@ -18,6 +18,11 @@ shell or Swift bridge.
   pass `sendbox-bundle` verification
 - an explicit Linux arm64 image and any configured kernel, mounts, network,
   DNS, CPU, memory, and ulimit values
+
+`setup.sh` installs only the qualified 0.10.0 signed package and verifies its
+pinned SHA-256 digest plus package signature before invoking the installer.
+Already-installed later versions fail preflight rather than being accepted
+optimistically.
 
 Preflight is non-mutating. It queries version, complete command help, and
 `container system status --format json`. It never runs `container system

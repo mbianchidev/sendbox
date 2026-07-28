@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "sendbox-rs"
+name = "sendbox"
 path = "src/main.rs"
 
 [dependencies]

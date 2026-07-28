@@ -178,7 +178,8 @@ remain rejected. SSH private keys use an owner-only runtime file only while the
 trusted SSH child runs and are removed afterward. Hyperlight rejects these
 features because it does not provide persistent secret delivery.
 
-## Remaining integration
+## Remaining qualification
 
 - Connect generic explicit-base-URL credential rules to compatible agents.
-- Run signed Keychain ACL qualification before the Rust CLI replaces Swift.
+- Run the ignored Keychain ACL qualification whenever the production signing
+  identity or Keychain service identity changes.

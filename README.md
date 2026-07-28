@@ -42,9 +42,10 @@ provider with a narrower capability set.
   provider dispatch. The authenticated guest starts mandatory security services
   before workload execution and rejects session, policy, feature, or cgroup
   drift.
-- **Supply Chain Provenance** — Boundary plans and guest bundles use Ed25519
-  signatures, versioned trust metadata, rollback floors, inventory, and SBOM
-  evidence.
+- **Supply Chain Provenance** — Boundary plans and reproducible guest bundles
+  use Ed25519 signatures, versioned trust metadata, rollback floors, inventory,
+  and SBOM evidence. Host archives and installers receive GitHub artifact
+  attestations.
 - **Runtime Supervisor** — Permission grants use an explicit persisted and
   auditable state machine with one-time, session, pattern, and permanent-deny
   decisions.
@@ -57,6 +58,7 @@ provider with a narrower capability set.
 | Scope | Dependency | Minimum |
 |---|---|---|
 | Source build | Rust | 1.93.1 (pinned by `rust-toolchain.toml`) |
+| Linux source build | Native compiler and headers | `build-essential clang cmake libelf-dev libseccomp-dev libzstd-dev pkg-config zlib1g-dev` on Debian/Ubuntu |
 | Apple runtime | macOS | 26 (Tahoe) |
 | Apple runtime | Hardware | Apple Silicon |
 | Apple runtime | Xcode | 26 |
@@ -65,6 +67,7 @@ provider with a narrower capability set.
 | Kata runtime | Kata Containers | 3.28 |
 | Kata runtime | containerd | 1.7 |
 | Kata runtime | nerdctl and CNI plugins | Current compatible releases |
+| Linux host binary | libseccomp, libelf, zlib, and zstd runtime libraries | Distribution packages such as `libseccomp2`, `libelf1`, `zlib1g`, and `libzstd1` |
 | Hyperlight runtime | Operator-pinned `hyperlight-unikraft`, signed Unikraft bundle, and KVM | See [docs/hyperlight.md](docs/hyperlight.md) |
 
 Production [guest artifact bundles](docs/architecture/guest-artifact-bundles.md)
@@ -82,26 +85,52 @@ enforcement.
 
 ### Install
 
-**From releases (prebuilt macOS artifacts):**
+#### Release artifacts
 
-Download the latest `.pkg`, `.dmg`, or tarball from [Releases](https://github.com/mbianchidev/sendbox/releases).
+Download the matching artifact from
+[Releases](https://github.com/mbianchidev/sendbox/releases):
+
+| Host | Artifacts |
+|---|---|
+| macOS arm64 | tarball, unsigned `.pkg`, unsigned `.dmg` |
+| Linux x86_64 | tarball |
+| Linux aarch64 | tarball |
+
+Each host archive and macOS installer contains the production `sendbox` binary,
+configuration examples, setup helper, and matching signed guest bundle. The
+release also publishes standalone guest-bundle archives.
+
+Verify GitHub provenance before trusting the embedded guest public key, then
+verify the adjacent checksum:
 
 ```bash
-# .pkg — double-click or:
-sudo installer -pkg sendbox-*-macos-arm64.pkg -target /
+gh attestation verify sendbox-<version>-<platform>.tar.gz \
+  -R mbianchidev/sendbox
+shasum -a 256 -c sendbox-<version>-<platform>.tar.gz.sha256
 
-# Tarball:
-tar xzf sendbox-*-macos-arm64.tar.gz
-sudo cp sendbox-*/sendbox /usr/local/bin/
+# Install a verified tarball into a root-owned runtime location
+sudo tar xzf sendbox-<version>-<platform>.tar.gz -C /opt
+sudo install -m 0755 /opt/sendbox-<version>-<platform>/sendbox \
+  /usr/local/bin/sendbox
+
+# Or install the verified macOS package
+sudo installer -pkg sendbox-<version>-macos-arm64.pkg -target /
 ```
 
-**From source:**
+Run `/opt/sendbox-<version>-<platform>/setup.sh` as your normal user. The
+root-owned extraction preserves the runtime trust boundary for the bundled guest
+artifacts; do not copy them into a user-writable directory before launch.
+
+#### From source
 
 ```bash
 git clone https://github.com/mbianchidev/sendbox.git
 cd sendbox
 make install
 ```
+
+Source installs require a separately attested signed guest bundle and trust root;
+tagged host artifacts already include the matching pair.
 
 For an interactive runtime preflight and configuration flow:
 
@@ -111,11 +140,10 @@ For an interactive runtime preflight and configuration flow:
 
 Kata installation and containerd configuration are documented in [docs/kata-containers.md](docs/kata-containers.md).
 
-### Rust production implementation
+### Production implementation
 
-During the final packaging cutover the Cargo binary is still emitted as
-`sendbox-rs`, while its command name, help, JSON contracts, and generated
-completions are already `sendbox`. It implements `run`, `init`, `analyze`,
+The Rust workspace emits the production `sendbox` binary. It implements
+`run`, `init`, `analyze`,
 `devcontainer`, `policy`, `secrets`, `mcp`, `boundary`, and `completions`.
 
 `sendbox run` resolves and verifies one signed boundary plan before provider
@@ -131,14 +159,14 @@ See [authenticated guest protocol](docs/architecture/authenticated-guest-protoco
 [secrets and credential brokering](docs/architecture/secrets-and-credential-broker.md).
 
 ```bash
-make rust-build
-make rust-test
-./target/debug/sendbox-rs --version
-./target/debug/sendbox-rs init --project .
-./target/debug/sendbox-rs policy show --json
-./target/debug/sendbox-rs policy validate --config config/example-sandbox.yaml
-./target/debug/sendbox-rs policy validate --config config/example-sandbox.yaml --json
-./target/debug/sendbox-rs completions print --shell zsh
+make build
+make test
+./target/debug/sendbox --version
+./target/debug/sendbox init --project .
+./target/debug/sendbox policy show --json
+./target/debug/sendbox policy validate --config config/example-sandbox.yaml
+./target/debug/sendbox policy validate --config config/example-sandbox.yaml --json
+./target/debug/sendbox completions print --shell zsh
 ```
 
 Rust-generated configuration uses deterministic snake_case YAML, validates
@@ -148,31 +176,27 @@ configuration returns `2`; analysis failures return `3`; write failures and
 no-overwrite refusals return `4`. Text diagnostics use stderr, while `--json`
 failures use stdout only.
 
-### Running Unsigned macOS Releases
+### Unsigned macOS packages
 
-Releases are **not code-signed**. macOS Gatekeeper will block the binary on first run.
-Use one of these methods to allow it:
+The `.pkg` and `.dmg` are not Apple-signed or notarized. Verify their GitHub
+attestation and checksum before installation. If Gatekeeper blocks a verified
+download, approve that artifact in Finder or System Settings, or remove only its
+quarantine attribute:
 
 ```bash
-# Option 1 (recommended) — Remove the quarantine attribute
-xattr -dr com.apple.quarantine /usr/local/bin/sendbox
-
-# Option 2 — Right-click the binary in Finder → Open (one-time approval)
-
-# Option 3 — Allow in System Settings
-#   System Settings → Privacy & Security → scroll to "sendbox was blocked" → Allow Anyway
-
-# Option 4 (not recommended) — Disable Gatekeeper globally
-sudo spctl --master-disable
-# Re-enable after:  sudo spctl --master-enable
+xattr -dr com.apple.quarantine sendbox-<version>-macos-arm64.pkg
 ```
 
-> **Note:** The `.pkg` installer runs `xattr -dr` automatically during post-install, so
-> the quarantine attribute is removed for you.
+Do not disable Gatekeeper globally. The package removes quarantine from the
+installed `/usr/local/bin/sendbox` only after the installer has been approved.
+The DMG `install.sh` replaces the shared payload through a fresh staging
+directory, removes stale upgrade files, and enforces root ownership with `0555`
+guest executables and `0444` bundle metadata and trust roots.
 
 ### Configure
 
-Create a `sendbox.yaml` in your project root (see [Configuration](#configuration) below), then:
+Generate `.sendbox.yaml` in the project root, then edit it as needed using the
+[Configuration](#configuration) reference:
 
 ```bash
 sendbox init --project .
@@ -187,10 +211,14 @@ sendbox run \
   --config .sendbox.yaml \
   --runtime kata \
   --image registry.example/workload@sha256:<digest> \
-  --bundle /opt/sendbox/bundle \
-  --trust-root /opt/sendbox/release-public.key \
+  --bundle /usr/local/share/sendbox/guest/x86_64/bundle \
+  --trust-root /usr/local/share/sendbox/guest/x86_64/release-public.key \
   -- /usr/bin/true
 ```
+
+Tarball users can point these flags at `guest/<architecture>/` inside the
+extracted release directory. A bundled public key is not self-authenticating;
+trust it only after verifying the host or standalone guest archive attestation.
 
 ## Configuration
 
@@ -424,8 +452,8 @@ sendbox init
 # Run with the Kata backend
 sendbox run --config .sendbox.yaml --runtime kata \
   --image registry.example/workload@sha256:<digest> \
-  --bundle /opt/sendbox/bundle \
-  --trust-root /opt/sendbox/release-public.key \
+  --bundle /usr/local/share/sendbox/guest/x86_64/bundle \
+  --trust-root /usr/local/share/sendbox/guest/x86_64/release-public.key \
   -- /usr/bin/true
 
 # Generate devcontainer spec

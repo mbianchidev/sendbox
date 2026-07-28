@@ -1,10 +1,11 @@
 # Production Execution Broker
 
-Status: **production Rust component, runtime integration pending**.
+Status: **production runtime integration**.
 
 `sendbox-exec` implements ADR-001's execution-mediation contract without
-integrating a guest supervisor or runtime adapter. The historical
-`spikes/exec-broker` crate remains unchanged as the Phase 1 qualification record.
+depending on a guest supervisor or runtime adapter. `sendbox-guest` and
+`sendbox-host` integrate it into authenticated Apple and Kata sessions. The
+historical `spikes/exec-broker` crate remains the Phase 1 qualification record.
 
 ## Security boundary
 
@@ -132,9 +133,9 @@ with mode `0600`. Existing paths are never unlinked or reused. Both peers check
 socket type, owner, and mode; accepted and connected streams are authenticated
 with Linux `SO_PEERCRED`.
 
-The current service is intentionally one-session and one-execution. Frames are
-bounded typed JSON records. Runtime-specific authenticated host/guest transport
-remains the responsibility of `sendbox-protocol` and future guest integration.
+The service is session-scoped. Frames are bounded typed records.
+`sendbox-protocol`, the production guest supervisor, and the Apple/Kata
+adapters provide the authenticated host/guest transport.
 
 ## Required Linux primitives
 
@@ -156,4 +157,4 @@ or `SO_PEERCRED`.
 | Recursive semantic authorization of descendant commands | Remaining by design |
 | Safe voluntary lockdown by an arbitrary malicious agent binary | Remaining; trusted bootstrap is mandatory |
 | Complete guest/VM containment | Remaining; runtime and VM integration are separate layers |
-| Guest supervisor and runtime-adapter wiring | Remaining and explicitly outside this component |
+| Guest supervisor and runtime-adapter wiring | Closed by production guest supervisor and Apple/Kata composition |

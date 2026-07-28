@@ -285,10 +285,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sendbox-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "sendbox-git"
 version = "0.1.0"
 dependencies = [
  "rustix",
+ "sendbox-core",
  "serde",
  "serde_json",
  "thiserror",

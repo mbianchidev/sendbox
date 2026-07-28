@@ -2,12 +2,9 @@
   "schema_version": 1,
   "root": {
     "command_name": "sendbox",
-    "binary_during_migration": "sendbox-rs",
+    "binary": "sendbox",
     "implemented_commands": ["analyze", "boundary", "completions", "devcontainer", "init", "mcp", "policy", "run", "secrets"],
-    "remaining_production_wiring": [
-      "provider-neutral secure run composition",
-      "signed runtime-plan boundary inspection"
-    ]
+    "remaining_production_wiring": []
   },
   "exit_codes": {
     "success": 0,
@@ -61,9 +58,9 @@
     "script_generation": false
   },
   "boundary": {
-    "inspection": "deterministic structured configuration and native observer artifact description",
+    "inspection": "deterministic structured configuration, native observer artifact description, and verified production runtime-plan binding",
     "generated_executables": false,
-    "remaining": "accept and inspect signed provider runtime plans once production run composition emits them"
+    "remaining": null
   },
   "completions": {
     "shells": ["bash", "zsh", "fish"],

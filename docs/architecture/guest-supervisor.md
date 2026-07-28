@@ -1,9 +1,11 @@
 # Guest Bootstrap and Supervisor
 
-Status: **production foundation**. This document defines the trust, bootstrap,
+Status: **production runtime integration**. This document defines the trust, bootstrap,
 readiness, service, and fail-closed semantics implemented by
-`guest/sendbox-guest`. The Kata slice integrates the production exec broker;
-MCP, DNS, egress, audit, and BPF service implementations remain outside it.
+`guest/sendbox-guest`. Apple and Kata integrate the production execution broker,
+mandatory DNS/SOCKS5 egress service, and authenticated MCP policy. The host
+session lifecycle owns audit and snapshot persistence; BPF activation remains
+explicit guest policy.
 
 ## Process and command model
 

@@ -1,18 +1,26 @@
 {
   "schema_version": 1,
   "surfaces": [
-    "setup.sh interactive preflight",
-    "Makefile install",
-    "Makefile install-completions",
-    "bash completion",
-    "zsh completion",
-    "fish completion",
-    "macOS tarball",
-    "macOS pkg",
-    "macOS dmg",
-    "GitHub release workflow",
-    "copilot-bridge npm build"
+    "Rust-only setup.sh preflight, source build, configuration, and launch",
+    "Makefile Rust build, test, lint, install, and install-completions",
+    "secure bash, zsh, and fish completion installation",
+    "macOS arm64 host tarball with signed aarch64 guest bundle",
+    "unsigned macOS arm64 pkg with explicit signing status",
+    "unsigned macOS arm64 dmg with explicit signing status",
+    "Linux x86_64 host tarball with signed x86_64 guest bundle",
+    "Linux aarch64 host tarball with signed aarch64 guest bundle",
+    "standalone signed x86_64 and aarch64 guest bundle archives",
+    "GitHub provenance attestations and checksums",
+    "GHCR OCI release artifact",
+    "cross-platform executable setup, staged Make install, archive, pkg, and dmg smoke"
   ],
-  "contract": "capture and validate only; do not install, mutate host configuration, or start services"
+  "contracts": {
+    "production_binary": "sendbox",
+    "source_install": "staged installs never mutate the invoking user home; live installs may install user completions",
+    "release_assets": "host archives contain the matching guest bundle and public key; the key is trusted only after artifact attestation verification",
+    "installed_bundle_modes": "root-owned guest executables are 0555 and public metadata, signatures, BPF objects, and trust roots are 0444 so the unprivileged host CLI can verify but not modify them",
+    "macos_signing": "pkg and dmg are explicitly unsigned and never recommend disabling Gatekeeper globally",
+    "release_key": "a protected base64-encoded 32-byte Ed25519 seed is required only in the tag release job and is passed to BuildKit as a secret",
+    "legacy_dependencies": "no Swift toolchain, Package.swift, Node.js, npm, or copilot bridge is required"
+  }
 }
-

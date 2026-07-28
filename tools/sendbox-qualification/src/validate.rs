@@ -1,16 +1,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::model::{
     BenchmarkSpecification, ConformanceManifest, Disposition, FeatureInventory, FixtureStatus,
-    Oracle, QualificationState, ValidationReport,
+    QualificationState, ValidationReport,
 };
 
 const SCHEMA_VERSION: u32 = 1;
+const HISTORICAL_EVIDENCE_MANIFEST: &str = "Tests/qualification/historical/swift-to-rust.v1.json";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalEvidenceManifest {
+    schema_version: u32,
+    migration: String,
+    source_revision: String,
+    removed_paths: BTreeSet<String>,
+    blob_ids: BTreeMap<String, String>,
+}
 
 #[derive(Debug, Error)]
 pub enum QualificationError {
@@ -72,26 +85,26 @@ pub fn validate_all(
             )),
             Err(error) => errors.push(format!("fixture {} is invalid: {error}", fixture.id)),
         }
-        if fixture.oracle == Oracle::SwiftObservationOnly && fixture.swift_observation.is_none() {
-            errors.push(format!(
-                "fixture {} marks Swift as observation but has no observation metadata",
-                fixture.id
-            ));
-        }
-        if let Some(observation) = &fixture.swift_observation {
-            require_path(root, &observation.evidence_path, &mut errors);
-            if observation.note.trim().is_empty() {
-                errors.push(format!(
-                    "fixture {} has an empty observation note",
-                    fixture.id
-                ));
-            }
-        }
     }
 
     let mut entry_ids = BTreeSet::new();
     let mut evidence_paths = BTreeSet::new();
     let mut dispositions = BTreeMap::new();
+    let historical_evidence = load_historical_evidence(root, &mut errors);
+    let live_target_modules: BTreeSet<&str> = inventory
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.category == "source_module"
+                && entry.conformance.status == FixtureStatus::Implemented
+                && entry.evidence.iter().any(|evidence| {
+                    evidence
+                        .split_once('#')
+                        .is_some_and(|(path, _)| path != HISTORICAL_EVIDENCE_MANIFEST)
+                })
+        })
+        .map(|entry| entry.target_crate.as_str())
+        .collect();
     for entry in &inventory.entries {
         unique(&mut entry_ids, &entry.id, "inventory entry", &mut errors);
         require_id(&entry.id, "inventory entry", &mut errors);
@@ -107,6 +120,7 @@ pub fn validate_all(
         if entry.evidence.is_empty() {
             errors.push(format!("inventory entry {} has no evidence", entry.id));
         }
+        let mut has_live_evidence = false;
         for evidence in &entry.evidence {
             let Some((path, anchor)) = evidence.split_once('#') else {
                 errors.push(format!(
@@ -116,13 +130,32 @@ pub fn validate_all(
                 continue;
             };
             require_path(root, Path::new(path), &mut errors);
-            evidence_paths.insert(path.to_owned());
             if anchor.trim().is_empty() {
                 errors.push(format!(
                     "inventory entry {} has an empty evidence anchor",
                     entry.id
                 ));
             }
+            if path == HISTORICAL_EVIDENCE_MANIFEST {
+                validate_historical_anchor(
+                    &entry.id,
+                    anchor,
+                    historical_evidence.as_ref(),
+                    &mut errors,
+                );
+            } else {
+                has_live_evidence = true;
+                evidence_paths.insert(path.to_owned());
+            }
+        }
+        if entry.conformance.status == FixtureStatus::Implemented
+            && !has_live_evidence
+            && !live_target_modules.contains(entry.target_crate.as_str())
+        {
+            errors.push(format!(
+                "implemented inventory entry {} requires live repository or target-module evidence",
+                entry.id
+            ));
         }
         for fixture_id in &entry.conformance.fixture_ids {
             if !fixture_ids.contains(fixture_id) {
@@ -185,6 +218,150 @@ pub fn validate_all(
         benchmark_workloads: benchmark.workloads.len(),
         unqualified_workloads,
         errors,
+    }
+}
+
+fn load_historical_evidence(
+    root: &Path,
+    errors: &mut Vec<String>,
+) -> Option<HistoricalEvidenceManifest> {
+    let path = root.join(HISTORICAL_EVIDENCE_MANIFEST);
+    let manifest = match load_json::<HistoricalEvidenceManifest>(&path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            errors.push(format!("historical evidence manifest is invalid: {error}"));
+            return None;
+        }
+    };
+    if manifest.schema_version != SCHEMA_VERSION {
+        errors.push("historical evidence schema_version must be 1".to_owned());
+    }
+    if manifest.migration != "swift-to-rust" {
+        errors.push("historical evidence migration must be swift-to-rust".to_owned());
+    }
+    if manifest.source_revision.len() != 40
+        || !manifest
+            .source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        errors.push("historical evidence source_revision must be a full Git object id".to_owned());
+    }
+    if manifest.removed_paths.is_empty() {
+        errors.push("historical evidence must list removed paths".to_owned());
+    }
+    validate_historical_repository(root, &manifest, errors);
+    Some(manifest)
+}
+
+fn validate_historical_repository(
+    root: &Path,
+    manifest: &HistoricalEvidenceManifest,
+    errors: &mut Vec<String>,
+) {
+    let blob_paths: BTreeSet<&str> = manifest.blob_ids.keys().map(String::as_str).collect();
+    let removed_paths: BTreeSet<&str> = manifest.removed_paths.iter().map(String::as_str).collect();
+    if blob_paths != removed_paths {
+        errors
+            .push("historical evidence blob_ids must exactly cover every removed path".to_owned());
+    }
+    for path in &manifest.removed_paths {
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            errors.push(format!(
+                "historical evidence path must be repository-relative: {path}"
+            ));
+        }
+        if root.join(relative).exists() {
+            errors.push(format!(
+                "historical evidence path still exists in the current tree: {path}"
+            ));
+        }
+    }
+
+    let revision = format!("{}^{{commit}}", manifest.source_revision);
+    let Ok(resolved_revision) = git_output(root, &["rev-parse", "--verify", &revision]) else {
+        errors.push(format!(
+            "historical evidence source revision is unavailable: {}",
+            manifest.source_revision
+        ));
+        return;
+    };
+    if resolved_revision != manifest.source_revision {
+        errors.push(format!(
+            "historical evidence source revision resolved to {resolved_revision}, expected {}",
+            manifest.source_revision
+        ));
+        return;
+    }
+
+    for (path, expected_blob) in &manifest.blob_ids {
+        if expected_blob.len() != 40 || !expected_blob.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            errors.push(format!(
+                "historical evidence blob id for {path} must be a full Git object id"
+            ));
+            continue;
+        }
+        let object = format!("{}:{path}", manifest.source_revision);
+        match git_output(root, &["rev-parse", "--verify", &object]) {
+            Ok(actual_blob) if actual_blob == *expected_blob => {}
+            Ok(actual_blob) => errors.push(format!(
+                "historical evidence blob mismatch for {path}: expected {expected_blob}, found {actual_blob}"
+            )),
+            Err(error) => errors.push(format!(
+                "historical evidence path is unavailable at {}: {path} ({error})",
+                manifest.source_revision
+            )),
+        }
+    }
+}
+
+fn git_output(root: &Path, arguments: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|error| error.to_string())
+}
+
+fn validate_historical_anchor(
+    entry_id: &str,
+    anchor: &str,
+    manifest: Option<&HistoricalEvidenceManifest>,
+    errors: &mut Vec<String>,
+) {
+    let Some((removed_path, claim)) = anchor.split_once('#') else {
+        errors.push(format!(
+            "inventory entry {entry_id} historical evidence must use removed-path#symbol-or-claim"
+        ));
+        return;
+    };
+    if claim.trim().is_empty() {
+        errors.push(format!(
+            "inventory entry {entry_id} has an empty historical evidence claim"
+        ));
+    }
+    if manifest.is_some_and(|manifest| !manifest.removed_paths.contains(removed_path)) {
+        errors.push(format!(
+            "inventory entry {entry_id} references an unlisted historical path: {removed_path}"
+        ));
     }
 }
 
@@ -344,8 +521,6 @@ mod tests {
             status: FixtureStatus::Specified,
             negative_case: false,
             data_path: "missing.json".into(),
-            swift_observation: None,
-            command: None,
         };
         let report = validate_all(
             Path::new("."),
@@ -417,6 +592,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn historical_repository_rejects_blob_mismatch() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut manifest: HistoricalEvidenceManifest =
+            load_json(&root.join(HISTORICAL_EVIDENCE_MANIFEST)).expect("historical manifest");
+        manifest.blob_ids.insert(
+            "Package.swift".to_owned(),
+            "0000000000000000000000000000000000000000".to_owned(),
+        );
+        let mut errors = Vec::new();
+
+        validate_historical_repository(&root, &manifest, &mut errors);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("blob mismatch for Package.swift"))
+        );
+    }
+
     fn minimal_benchmark() -> BenchmarkSpecification {
         BenchmarkSpecification {
             schema_version: 1,
@@ -434,7 +629,6 @@ mod tests {
             },
             build_controls: BuildControls {
                 rust_profile: "release".to_owned(),
-                swift_configuration: "release".to_owned(),
                 c_optimization: "-O3".to_owned(),
                 linker: QualificationValue {
                     status: QualificationState::Unqualified,

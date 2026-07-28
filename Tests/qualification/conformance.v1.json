@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "fixture_version": "1.0.0",
+  "fixture_version": "2.0.0",
   "fixtures": [
     {
       "id": "cli.contracts",
@@ -9,43 +9,25 @@
       "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": false,
-      "data_path": "Tests/qualification/fixtures/cli.v1.json",
-      "swift_observation": null,
-      "command": null
+      "data_path": "Tests/qualification/fixtures/cli.v1.json"
     },
     {
       "id": "cli.policy-validate-common",
       "area": "cli",
-      "description": "Common policy validation invocation available in the current Swift and Rust CLIs.",
-      "oracle": "swift_observation_only",
+      "description": "Production Rust policy validation invocation and output contract.",
+      "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": false,
-      "data_path": "Tests/qualification/fixtures/cli-policy-validate.v1.json",
-      "swift_observation": {
-        "evidence_path": "Sources/sendbox/SendBox.swift",
-        "note": "Swift output is recorded only to identify intentional preserved behavior; it is not the intended-behavior oracle."
-      },
-      "command": {
-        "args": ["policy", "validate", "--config", "config/example-sandbox.yaml"],
-        "timeout_ms": 5000,
-        "output_cap_bytes": 1048576,
-        "replacements": [],
-        "redact_json_keys": []
-      }
+      "data_path": "Tests/qualification/fixtures/cli-policy-validate.v1.json"
     },
     {
       "id": "cli.parity-subset",
       "area": "cli",
-      "description": "Runtime-independent Rust CLI parity for root help, init, analysis/devcontainer generation, secret management, MCP observation parsing/reporting, policy show, boundary artifact description, and completion print/install.",
+      "description": "Complete runtime-independent CLI behavior for root help, init, analysis, devcontainer generation, secret management, MCP observation parsing and reporting, policy inspection, boundary description, and completions.",
       "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": false,
-      "data_path": "Tests/qualification/fixtures/cli-parity-subset.v1.json",
-      "swift_observation": {
-        "evidence_path": "Sources/sendbox/SendBox.swift",
-        "note": "Swift command names, presets, and install paths are retained where safe; Rust adds strict validation, JSON, stable exits, and direct clap generation."
-      },
-      "command": null
+      "data_path": "Tests/qualification/fixtures/cli-parity-subset.v1.json"
     },
     {
       "id": "config.contracts",
@@ -54,20 +36,16 @@
       "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": false,
-      "data_path": "Tests/qualification/fixtures/config.v1.json",
-      "swift_observation": null,
-      "command": null
+      "data_path": "Tests/qualification/fixtures/config.v1.json"
     },
     {
       "id": "policy.decisions",
       "area": "policy",
-      "description": "Intended command, network, MCP, and repository decisions independent of current defects.",
+      "description": "Intended command, network, MCP, and repository decisions independent of historical defects.",
       "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": false,
-      "data_path": "Tests/qualification/fixtures/policy-decisions.v1.json",
-      "swift_observation": null,
-      "command": null
+      "data_path": "Tests/qualification/fixtures/policy-decisions.v1.json"
     },
     {
       "id": "mcp.contracts",
@@ -76,9 +54,7 @@
       "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": false,
-      "data_path": "Tests/qualification/fixtures/mcp.v1.json",
-      "swift_observation": null,
-      "command": null
+      "data_path": "Tests/qualification/fixtures/mcp.v1.json"
     },
     {
       "id": "protocol.contracts",
@@ -87,9 +63,7 @@
       "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": false,
-      "data_path": "Tests/qualification/fixtures/protocol.v1.json",
-      "swift_observation": null,
-      "command": null
+      "data_path": "Tests/qualification/fixtures/protocol.v1.json"
     },
     {
       "id": "runtime.contracts",
@@ -98,9 +72,7 @@
       "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": false,
-      "data_path": "Tests/qualification/fixtures/runtime-contracts.v1.json",
-      "swift_observation": null,
-      "command": null
+      "data_path": "Tests/qualification/fixtures/runtime-contracts.v1.json"
     },
     {
       "id": "persisted.formats",
@@ -109,34 +81,25 @@
       "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": false,
-      "data_path": "Tests/qualification/fixtures/persisted-formats.v1.json",
-      "swift_observation": null,
-      "command": null
+      "data_path": "Tests/qualification/fixtures/persisted-formats.v1.json"
     },
     {
       "id": "known-defects.negative",
       "area": "negative",
-      "description": "Known misleading or unsafe current behavior that must not be preserved.",
+      "description": "Misleading or unsafe historical behavior that must not reappear.",
       "oracle": "intended_behavior",
       "status": "implemented",
       "negative_case": true,
-      "data_path": "Tests/qualification/fixtures/known-defects.v1.json",
-      "swift_observation": {
-        "evidence_path": "README.md",
-        "note": "Claims are observations of current documentation and are explicitly not accepted as an implementation oracle."
-      },
-      "command": null
+      "data_path": "Tests/qualification/fixtures/known-defects.v1.json"
     },
     {
       "id": "setup.release",
       "area": "setup_release",
-      "description": "Setup, completion, packaging, and release contracts.",
+      "description": "Rust-only setup, completion, packaging, signed guest artifact, and attested release contracts.",
       "oracle": "intended_behavior",
-      "status": "specified",
+      "status": "implemented",
       "negative_case": false,
-      "data_path": "Tests/qualification/fixtures/setup-release.v1.json",
-      "swift_observation": null,
-      "command": null
+      "data_path": "Tests/qualification/fixtures/setup-release.v1.json"
     }
   ]
 }

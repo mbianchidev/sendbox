@@ -13,7 +13,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn run(arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_sendbox-rs"))
+    Command::new(env!("CARGO_BIN_EXE_sendbox"))
         .current_dir(workspace_root())
         .args(arguments)
         .output()
@@ -21,7 +21,7 @@ fn run(arguments: &[&str]) -> Output {
 }
 
 fn run_in(arguments: &[&str], current_dir: &std::path::Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_sendbox-rs"))
+    Command::new(env!("CARGO_BIN_EXE_sendbox"))
         .current_dir(current_dir)
         .args(arguments)
         .output()
@@ -485,7 +485,6 @@ fn completion_scripts_are_generated_from_the_sendbox_command_tree() {
         assert!(script.contains("policy"), "{shell}");
         assert!(script.contains("init"), "{shell}");
         assert!(script.contains("run"), "{shell}");
-        assert!(!script.contains("sendbox-rs"), "{shell}");
     }
 }
 
@@ -496,7 +495,7 @@ fn completion_install_uses_stable_path_and_permissions() {
 
     let home = tempdir().unwrap();
     let canonical_home = home.path().canonicalize().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_sendbox-rs"))
+    let output = Command::new(env!("CARGO_BIN_EXE_sendbox"))
         .args(["completions", "install", "--shell", "fish", "--json"])
         .env("HOME", &canonical_home)
         .env("SHELL", "/bin/fish")
@@ -529,7 +528,7 @@ fn completion_install_detects_shell_without_spawning_it() {
     let home = home.path().canonicalize().unwrap();
     let fake_shell = home.join("zsh");
     std::fs::write(&fake_shell, "this is not executable\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_sendbox-rs"))
+    let output = Command::new(env!("CARGO_BIN_EXE_sendbox"))
         .args(["completions", "install", "--json"])
         .env("HOME", &home)
         .env("SHELL", &fake_shell)
@@ -543,7 +542,7 @@ fn completion_install_detects_shell_without_spawning_it() {
 fn completion_detection_falls_back_to_zsh_and_explicit_unknown_shell_is_rejected() {
     let home = tempdir().unwrap();
     let home = home.path().canonicalize().unwrap();
-    let fallback = Command::new(env!("CARGO_BIN_EXE_sendbox-rs"))
+    let fallback = Command::new(env!("CARGO_BIN_EXE_sendbox"))
         .args(["completions", "install", "--json"])
         .env("HOME", &home)
         .env("SHELL", "/bin/tcsh")
@@ -735,7 +734,7 @@ fn generates_and_merges_devcontainer_with_typed_overrides() {
         }"#,
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_sendbox-rs"))
+    let output = Command::new(env!("CARGO_BIN_EXE_sendbox"))
         .args([
             "devcontainer",
             "generate",
@@ -786,7 +785,7 @@ fn secrets_round_trip_never_prints_secret_values() {
     let second_secret = "never-print-this-updated-secret";
 
     let command = |arguments: &[&str]| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sendbox-rs"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sendbox"));
         command
             .args(arguments)
             .env("SENDBOX_SECRET_SERVICE", &service);

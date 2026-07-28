@@ -1,9 +1,9 @@
 # Production guest BPF and artifact bundles
 
 This document defines the production build and trust boundary for the guest
-artifacts that future runtime adapters will consume. This surface does not
-select a runtime, launch a guest, orchestrate agents, or configure guest
-`PlatformControls`.
+artifacts consumed by the Apple and Kata runtime adapters. Bundle construction
+is separate from runtime selection, guest launch, agent orchestration, and
+guest `PlatformControls`.
 
 ## Artifact flow
 
@@ -41,15 +41,23 @@ report are covered by the separately versioned
 avoids silently extending the guest manifest v1 wire contract.
 The signer receives the verified BTF archive digest and the freshly generated
 `vmlinux.h` digest from the build stages; it does not infer or hardcode them.
-`release-public.key` in exported build artifacts is informational and useful
-for CI; it is not a trust anchor. Runtime adapters must provision the expected
-public key and `trust_root_id` through an independent trusted channel.
+`release-public.key` is not self-authenticating merely because it is stored
+beside the bundle. Tag releases sign bundles with the protected
+`SENDBOX_RELEASE_SIGNING_KEY_BASE64` secret, publish the matching public key,
+and attest the complete host and standalone guest archives through GitHub OIDC.
+Operators must verify that artifact attestation against this repository before
+using the embedded key as a runtime trust root.
 
 Release sequence, minimum accepted sequence, host version, guest version,
 architecture, SHA-256 digest, mode, uid, gid, regular-file type, and single-link
 expectations are verified before launch. Verification is descriptor-relative
 and rejects symlinks, hardlinks, wrong architecture, rollback, tampering, and
 mode or owner drift.
+
+Installed bundles are root-owned and non-writable. Executables use mode `0555`;
+public metadata, signatures, BPF objects, and the release public key use mode
+`0444`. These artifacts contain no secret material, so the unprivileged host CLI
+can verify them without weakening the root-owned trust boundary.
 
 ## BPF boundary
 
@@ -90,7 +98,7 @@ Runtime requirements:
 - `sched:sched_process_exec` and `raw_syscalls:sys_enter` in tracefs;
 - `CAP_BPF` plus `CAP_PERFMON`, or legacy `CAP_SYS_ADMIN`;
 - a runtime policy that permits the `bpf` syscall;
-- a cgroup v2 identity supplied by the future runtime adapter.
+- a cgroup v2 identity supplied by the runtime adapter.
 
 Build inputs:
 
@@ -109,14 +117,14 @@ checks for `.BTF`, `.BTF.ext`, and both required tracepoint sections.
 `bpftool gen min_core_btf` resolves the object's CO-RE relocation requirements
 against the pinned architecture BTF and emits a reproducible proof digest.
 
-## Runtime integration API
+## Runtime integration
 
-A future runtime adapter must:
+The Apple and Kata runtime adapters:
 
 1. verify the bundle with an independently provisioned Ed25519 public key,
    expected versions, architecture, and rollback floor;
 2. retain verified executable descriptors from the guest manifest verifier;
-3. probe the target guest kernel before launch;
+3. probe the target guest kernel before attaching observation;
 4. identify the sandbox cgroup v2 id;
 5. call `EventStream::attach(object_bytes, AttachConfig { target_cgroup_id })`;
 6. poll bounded batches, record `LossSnapshot`, and keep the `EventStream` alive
@@ -124,7 +132,8 @@ A future runtime adapter must:
 7. treat any required observation failure according to explicit runtime policy,
    without upgrading observation into an enforcement claim.
 
-No runtime adapter is wired by this change.
+Hyperlight uses its separately signed one-shot Unikraft bundle and does not
+consume this persistent guest-service bundle.
 
 ## Reproduce locally
 
@@ -144,3 +153,7 @@ docker buildx build \
 Use `linux/amd64` for x86_64. Never place a production private key in the build
 context, image, repository, CI variables exposed to pull requests, or command
 line.
+
+The release secret is a base64 encoding of an exact 32-byte Ed25519 seed. It is
+decoded only on the tag-release runner, checked for length, mounted into
+BuildKit as a required secret, and never uploaded as an artifact.

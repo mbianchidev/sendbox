@@ -12,118 +12,12 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build & Test
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Select latest Xcode
-        run: |
-          XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
-          if [ -z "$XCODE_PATH" ]; then
-            echo "No Xcode found, using default"
-          else
-            echo "Using $XCODE_PATH"
-            sudo xcode-select -s "${XCODE_PATH}/Contents/Developer"
-          fi
-
-      - name: Swift version
-        run: swift --version
-
-      - name: Resolve dependencies
-        run: swift package resolve
-
-      - name: Build (debug)
-        run: swift build
-
-      - name: Run tests
-        run: swift test
-
-      - name: Build (release)
-        run: swift build -c release
-
-      - name: Verify binary runs
-        run: .build/release/sendbox --help
-
-  linux-build-and-test:
-    name: Linux Build & Test
-    runs-on: ubuntu-latest
-    container: swift:6.2@sha256:dd349c6dfc3cd3040910a84ab3e5bd5d08efdd547e5fb9f77b765abed16fe5ff
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: "3.14.6"
-
-      - name: Swift version
-        run: swift --version
-
-      - name: Resolve dependencies
-        run: swift package resolve
-
-      - name: Build (debug)
-        run: swift build
-
-      - name: Run tests
-        run: swift test
-
-      - name: Build (release)
-        run: swift build -c release
-
-      - name: Verify binary runs
-        run: .build/release/sendbox --help
-
-  lint:
-    name: Lint
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Select latest Xcode
-        run: |
-          XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
-          if [ -n "$XCODE_PATH" ]; then
-            sudo xcode-select -s "${XCODE_PATH}/Contents/Developer"
-          fi
-
-      - name: Check formatting
-        run: |
-          if command -v swift-format &>/dev/null; then
-            swift-format lint --recursive Sources/ Tests/ || true
-          else
-            echo "swift-format not available, skipping"
-          fi
-
-  copilot-bridge:
-    name: Copilot Bridge
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: copilot-bridge
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
-        with:
-          node-version: "22"
-
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Audit dependencies
-        run: npm audit --audit-level=high
-
-      - name: Build
-        run: npm run build
-
-  rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-latest]
+        os: [macos-15, ubuntu-24.04]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -132,7 +26,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
+            build-essential \
             clang \
+            cmake \
             libelf-dev \
             libseccomp-dev \
             libzstd-dev \
@@ -146,64 +42,79 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
 
-      - name: Compile security fuzz targets
-        run: cargo check --manifest-path fuzz/security/Cargo.toml --bins
-
-      - name: Compile Git guard fuzz targets
-        run: cargo check --manifest-path fuzz/git/Cargo.toml --bins
-        
-      - name: Compile secrets and credential fuzz targets
+      - name: Compile fuzz targets
         run: |
-          cargo check --manifest-path fuzz/secrets/Cargo.toml --bins
-          cargo check --manifest-path fuzz/credentials/Cargo.toml --bins
+          cargo check --locked --manifest-path fuzz/security/Cargo.toml --bins
+          cargo check --locked --manifest-path fuzz/git/Cargo.toml --bins
+          cargo check --locked --manifest-path fuzz/secrets/Cargo.toml --bins
+          cargo check --locked --manifest-path fuzz/credentials/Cargo.toml --bins
+          cargo check --locked --manifest-path fuzz/mcp/Cargo.toml --bins
+          cargo check --locked --manifest-path fuzz/bpf/Cargo.toml --bins
+          cargo check --locked --manifest-path fuzz/project/Cargo.toml
+          cargo check --locked --manifest-path fuzz/config/Cargo.toml
 
-      - name: Compile MCP fuzz targets
-        run: cargo check --manifest-path fuzz/mcp/Cargo.toml --bins
-
-      - name: Compile BPF and bundle fuzz targets
-        run: cargo check --manifest-path fuzz/bpf/Cargo.toml --bins
-
-      - name: Build (debug)
-        run: cargo build --workspace
-
-      - name: Build (release)
-        run: cargo build --workspace --release
-
-      - name: Verify experimental CLI
+      - name: Build debug and release workspaces
         run: |
-          ./target/release/sendbox-rs --version
-          ./target/release/sendbox-rs policy validate --config config/example-sandbox.yaml
-          ./target/release/sendbox-rs policy validate --config config/example-sandbox.yaml --json
-          ./target/release/sendbox-rs policy show --json
-          ./target/release/sendbox-rs completions print --shell bash >/dev/null
-          ./target/release/sendbox-rs analyze --project crates/sendbox-project/tests/fixtures/node-ts --json
+          cargo build --locked --workspace
+          cargo build --locked --workspace --release
+
+      - name: Verify production CLI
+        run: |
+          ./target/release/sendbox --version
+          ./target/release/sendbox policy validate \
+            --config config/example-sandbox.yaml
+          ./target/release/sendbox policy validate \
+            --config config/example-sandbox.yaml \
+            --json
+          ./target/release/sendbox policy show --json
+          ./target/release/sendbox completions print --shell bash >/dev/null
+          ./target/release/sendbox analyze \
+            --project crates/sendbox-project/tests/fixtures/node-ts \
+            --json
           project="$(mktemp -d)"
-          printf '{"dependencies":{"react":"19"}}\n' > "$project/package.json"
-          ./target/release/sendbox-rs devcontainer generate --project "$project" --json
-          ./target/release/sendbox-rs init --project "$project" --json
+          printf '{"dependencies":{"react":"19"}}\n' >"$project/package.json"
+          ./target/release/sendbox devcontainer generate \
+            --project "$project" \
+            --json
+          ./target/release/sendbox init --project "$project" --json
           mkdir "$project/home"
           home="$(cd "$project/home" && pwd -P)"
-          HOME="$home" ./target/release/sendbox-rs completions install --shell fish --json
+          HOME="$home" ./target/release/sendbox completions install \
+            --shell fish \
+            --json
 
-      - name: Check project parser fuzz targets
-        run: cargo check --manifest-path fuzz/project/Cargo.toml
+      - name: Verify staged Cargo installation
+        run: |
+          raw_root="$(mktemp -d)"
+          trap 'rm -rf "$raw_root"' EXIT
+          install_root="$(cd "$raw_root" && pwd -P)"
+          cargo install \
+            --locked \
+            --path crates/sendbox-cli \
+            --root "$install_root"
+          mkdir -m 0700 "$install_root/home"
+          "$install_root/bin/sendbox" --version
+          HOME="$install_root/home" \
+            "$install_root/bin/sendbox" completions install \
+              --shell fish \
+              --json
+          test -f \
+            "$install_root/home/.config/fish/completions/sendbox.fish"
 
-      - name: Check configuration fuzz target
-        run: cargo check --manifest-path fuzz/config/Cargo.toml
+      - name: Qualify setup and release packaging
+        env:
+          SENDBOX_REQUIRE_SUDO: "1"
+        run: ./scripts/qualify-setup-release.sh
 
-  rust-audit:
-    name: Rust Dependency Audit (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, ubuntu-latest]
+  dependency-audit:
+    name: Rust dependency audit
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -211,4 +122,4 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Audit dependencies
-        run: cargo audit
+        run: cargo audit --deny warnings

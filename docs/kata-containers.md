@@ -1,11 +1,11 @@
 # Kata Containers Runtime
 
-## Authenticated Rust runtime path
+## Authenticated runtime path
 
-The Rust CLI now exposes one deliberately thin command:
+The production CLI exposes the authenticated runtime command:
 
 ```bash
-sendbox-rs run \
+sendbox run \
   --config /absolute/path/.sendbox.yaml \
   --runtime kata \
   --image registry.example/workload@sha256:<digest> \
@@ -27,8 +27,6 @@ host paths, and the project path in the configuration must be absolute and
 owned by a non-root uid/gid. The bundle must contain the signed static
 `bin/sendbox-guest` and `bin/sendbox-exec-launcher` artifacts produced by
 `packaging/guest/Dockerfile`.
-
-This command never invokes or falls back to Swift.
 
 Before image pull or VM launch, the command resolves one immutable signed
 boundary plan. Configured secrets, repository-scoped GitHub/Copilot/SSH
@@ -99,11 +97,10 @@ runtime:
     # configuration_path: /etc/kata-containers/configuration.toml
 ```
 
-The historical Swift command remains outside this slice. Use the explicit Rust
-command and all trust inputs shown above:
+Use the explicit runtime and all trust inputs shown above:
 
 ```bash
-sendbox-rs run --config .sendbox.yaml --runtime kata \
+sendbox run --config .sendbox.yaml --runtime kata \
   --image "$IMAGE_DIGEST" --bundle "$BUNDLE" --trust-root "$TRUST_ROOT" \
   -- /usr/bin/true
 ```

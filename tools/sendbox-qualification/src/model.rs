@@ -69,41 +69,12 @@ pub struct ConformanceFixture {
     pub status: FixtureStatus,
     pub negative_case: bool,
     pub data_path: PathBuf,
-    pub swift_observation: Option<SwiftObservation>,
-    pub command: Option<ComparisonCommand>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Oracle {
     IntendedBehavior,
-    SwiftObservationOnly,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SwiftObservation {
-    pub evidence_path: PathBuf,
-    pub note: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ComparisonCommand {
-    pub args: Vec<String>,
-    pub timeout_ms: u64,
-    pub output_cap_bytes: usize,
-    #[serde(default)]
-    pub replacements: Vec<Replacement>,
-    #[serde(default)]
-    pub redact_json_keys: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Replacement {
-    pub find: String,
-    pub replace: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,7 +136,6 @@ pub struct Methodology {
 #[serde(deny_unknown_fields)]
 pub struct BuildControls {
     pub rust_profile: String,
-    pub swift_configuration: String,
     pub c_optimization: String,
     pub linker: QualificationValue,
     pub allocator: QualificationValue,
@@ -234,24 +204,6 @@ pub struct ValidationReport {
     pub benchmark_workloads: usize,
     pub unqualified_workloads: Vec<String>,
     pub errors: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct CommandComparison {
-    pub schema_version: u32,
-    pub fixture_id: String,
-    pub matched: bool,
-    pub swift: ComparableOutcome,
-    pub rust: ComparableOutcome,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ComparableOutcome {
-    pub status: String,
-    pub exit_code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

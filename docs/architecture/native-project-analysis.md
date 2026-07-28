@@ -18,18 +18,18 @@ are:
 | Manifest bytes read | 8 MiB |
 | Bytes per manifest | 1 MiB |
 
-`sendbox-rs analyze` exposes each limit as a flag. Limit hits, symlinks,
+`sendbox analyze` exposes each limit as a flag. Limit hits, symlinks,
 permission failures, files changed during scanning, and malformed manifests are
 reported in `scan.skipped` or `scan.errors`; they are not converted into a
 success-shaped fallback.
 
 The analyzer safely parses JSON, TOML, XML, and bounded static text for the
-languages and tools detected by the temporary TypeScript bridge: Node.js and
+languages and tools supported by the pre-rewrite analysis schema: Node.js and
 TypeScript, Python, Rust, Go, Java and Kotlin, Ruby, C and C++, .NET, PHP,
 Elixir, and Swift. `Package.swift`, Gradle files, Gemfiles, and `mix.exs` are
 inspected as text only and are never executed.
 
-## Bridge compatibility
+## Analysis compatibility
 
 The native `ProjectAnalysis` keeps the bridge field names and meanings:
 
@@ -50,8 +50,8 @@ Intentional native differences:
 - `refinement.status` is always present and is `not_requested`, `applied`, or
   `failed`.
 
-Checked-in fixtures compare representative native output with expected bridge
-JSON without making live model calls.
+Checked-in fixtures lock the compatibility field names and representative
+native output without making live model calls.
 
 ## Optional refinement
 
@@ -63,7 +63,7 @@ Copilot implementation is required by the Rust crate.
 
 ## Devcontainer generation
 
-Generation starts with the bridge-compatible image, features, extensions,
+Generation starts with the compatibility image, features, extensions,
 settings, ports, remote user, and post-create command. Merge precedence is:
 
 1. generated native defaults;
@@ -84,20 +84,20 @@ symlinks are rejected. The parent directory is created with private permissions
 on Unix, and a mode `0600` temporary file is flushed, synchronized, and atomically
 renamed into place.
 
-## Experimental CLI
+## CLI
 
 ```bash
 # Human-readable summary
-sendbox-rs analyze --project .
+sendbox analyze --project .
 
 # Complete deterministic JSON
-sendbox-rs analyze --project . --json
+sendbox analyze --project . --json
 
 # Generate or merge .devcontainer/devcontainer.json
-sendbox-rs devcontainer generate --project . --json
+sendbox devcontainer generate --project . --json
 
 # Apply typed overrides
-sendbox-rs devcontainer generate \
+sendbox devcontainer generate \
   --project . \
   --image mcr.microsoft.com/devcontainers/rust:1-bookworm \
   --feature 'ghcr.io/devcontainers/features/github-cli:1={}' \
@@ -115,5 +115,5 @@ Automation exit codes are scoped to these commands:
 | 3 | Project root or analysis failure |
 | 4 | Devcontainer parse, merge, or output failure |
 
-The Node `copilot-bridge` remains checked in only for migration and differential
-fixtures. Rust analysis and generation do not invoke it.
+Project analysis and devcontainer generation are fully native and require no
+Node.js process or external refinement service.
