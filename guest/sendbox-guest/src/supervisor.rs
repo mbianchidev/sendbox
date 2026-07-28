@@ -11,6 +11,7 @@ use crate::GuestError;
 use crate::audit::AuditLog;
 use crate::bootstrap::ImmutableBootstrapSource;
 use crate::broker;
+use crate::egress;
 use crate::git_guard;
 use crate::manifest::{VerifiedManifest, verify_manifest};
 use crate::mcp_broker;
@@ -92,14 +93,40 @@ pub async fn run<P: PlatformControls>(
             policy.tool_policy.allowed_server_commands.len().to_string(),
         );
     }
-    let broker_client = bootstrap
+    let egress_configured = bootstrap.egress_policy.is_some();
+    if let Some(policy) = bootstrap.egress_policy.take() {
+        let instance_id = policy.instance_id.clone();
+        let service = egress::prepare(runtime.session_dir(), policy)?;
+        if bootstrap
+            .services
+            .iter()
+            .any(|existing| existing.id == service.id)
+        {
+            return Err(GuestError::Runtime(
+                "egress service was configured more than once".to_owned(),
+            ));
+        }
+        bootstrap.services.push(service);
+        if !bootstrap.required_services.contains(&ServiceId::Egress) {
+            bootstrap.required_services.push(ServiceId::Egress);
+        }
+        audit.lock().expect("audit mutex").record(
+            "egress_policy_prepared",
+            instance_id,
+            "authenticated cgroup and nftables enforcement",
+        );
+    }
+    let mut broker_client = bootstrap
         .execution_broker
         .take()
         .map(|configuration| {
             broker::prepare(bootstrap.session_id, runtime.session_dir(), configuration)
         })
         .transpose()?;
-    if let Some((_, service)) = &broker_client {
+    if let Some((_, service)) = &mut broker_client {
+        if egress_configured && !service.dependencies.contains(&ServiceId::Egress) {
+            service.dependencies.push(ServiceId::Egress);
+        }
         if bootstrap
             .services
             .iter()

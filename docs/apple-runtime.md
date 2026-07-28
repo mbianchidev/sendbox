@@ -95,10 +95,11 @@ identities and always attempts channel cleanup, stop, and targeted delete.
 - Apple CLI 0.10.0 has no hostname option. Container identity remains the
   session-unique container name rather than claiming a separately configured
   kernel hostname.
-- Runtime `Network` capability means Apple network/DNS configuration only. It
-  does not claim domain egress enforcement; that requires the signed guest
-  egress controls and must fail policy validation when those controls are not
-  present.
+- Runtime `Network` capability covers Apple network/DNS provisioning.
+  Restrictive policy is a separate signed guest admission: the provider binds
+  the authenticated egress policy and delegated execution cgroup parent into
+  bootstrap, and Exec cannot start until the guest DNS/SOCKS5 gateway reports
+  readiness.
 - Bundle and trust-root mounts depend on official CLI bind-mount semantics and
   are fail-closed by guest-side mode, owner, digest, version, and rollback
   checks.

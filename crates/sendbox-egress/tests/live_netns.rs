@@ -20,12 +20,12 @@
 //! empty, then verifies every resource is absent.
 //!
 //! The kernel-enforcement scenarios proven here — cgroup identity isolation, the
-//! mark requirement, sibling/identity-spoof denial, direct-egress bypass,
-//! non-vacuous IPv6/UDP denial with reachable positive controls, an unprivileged
-//! agent with all capabilities cleared and raw sockets denied, marked upstream
-//! DNS with UDP-truncation → TCP fallback, apply-time-failure rollback, and
-//! broker restart — are the ones that cannot be shown in the portable
-//! `gateway_integration` suite.
+//! mark requirement, nested execution-leaf confinement, sibling/identity-spoof
+//! denial, direct-egress bypass, non-vacuous IPv6/UDP denial with reachable
+//! positive controls, an unprivileged agent with all capabilities cleared and
+//! raw sockets denied, marked upstream DNS with UDP-truncation → TCP fallback,
+//! apply-time-failure rollback, and broker restart — are the ones that cannot be
+//! shown in the portable `gateway_integration` suite.
 
 #![cfg(target_os = "linux")]
 
@@ -208,6 +208,10 @@ struct LiveEnvironment {
     /// so they cannot be swapped, and explicitly closed (with absence
     /// assertions) in teardown.
     temp_files: Vec<tempfile::NamedTempFile>,
+    /// Descendant execution cgroups created by the live proof, parent-first.
+    /// Teardown removes them in reverse order before asking the supervisor to
+    /// remove its agent ancestor.
+    execution_dirs: Vec<PathBuf>,
     children: Vec<Child>,
 }
 
@@ -221,6 +225,7 @@ impl LiveEnvironment {
             remove_candidate: Arc::new(AtomicBool::new(false)),
             candidate_dir,
             temp_files: Vec::new(),
+            execution_dirs: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -250,6 +255,16 @@ impl LiveEnvironment {
 
     fn track(&mut self, child: Child) {
         self.children.push(child);
+    }
+
+    fn create_nested_execution_leaf(&mut self, agent_parent: &Path) -> PathBuf {
+        let session = agent_parent.join("live-session");
+        std::fs::create_dir(&session).expect("create execution session cgroup");
+        self.execution_dirs.push(session.clone());
+        let command = session.join("live-command");
+        std::fs::create_dir(&command).expect("create execution command cgroup");
+        self.execution_dirs.push(command.clone());
+        command.join("cgroup.procs")
     }
 
     fn kill_children(&mut self) {
@@ -290,6 +305,16 @@ impl LiveEnvironment {
         let mut errors = Vec::new();
         self.kill_children();
         thread::sleep(Duration::from_millis(250));
+        for directory in self.execution_dirs.drain(..).rev() {
+            match std::fs::remove_dir(&directory) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => errors.push(format!(
+                    "execution cgroup remove {}: {e}",
+                    directory.display()
+                )),
+            }
+        }
         // Remove the fix-G candidate cgroup first if it lingers (e.g. a panic
         // before the runner deleted it), so it does not keep the owned base
         // cgroup non-empty and block the supervisor's teardown. Absent-safe; a
@@ -420,7 +445,8 @@ fn live_netns_injected_failure_cleanup() {
         setup_namespace_and_veth(&env.topo);
         let config = SupervisorConfig::new(&env.topo.instance_id, BROKER_MARK, CONNECT_PORT)
             .with_dns_port(DNS_PORT)
-            .with_fixture_iface(&env.topo.veth_guest);
+            .with_fixture_iface(&env.topo.veth_guest)
+            .with_execution_delegation();
         let runner: Box<dyn NftRunner> = Box::new(NetnsNftRunner {
             ns_name: env.topo.ns_name.clone(),
         });
@@ -495,7 +521,8 @@ fn run_live_suite(env: &mut LiveEnvironment) {
     // `remove_candidate` stays false during the ordinary scenarios.
     let config = SupervisorConfig::new(&env.topo.instance_id, BROKER_MARK, CONNECT_PORT)
         .with_dns_port(DNS_PORT)
-        .with_fixture_iface(&env.topo.veth_guest);
+        .with_fixture_iface(&env.topo.veth_guest)
+        .with_execution_delegation();
     let runner: Box<dyn NftRunner> = Box::new(CandidateRemovingRunner {
         inner: NetnsNftRunner {
             ns_name: env.topo.ns_name.clone(),
@@ -508,9 +535,22 @@ fn run_live_suite(env: &mut LiveEnvironment) {
     // Use the supervisor's mount-relative `cgroup.procs` accessors, never the
     // global nft identity path (which carries the process's own cgroup prefix
     // and would not resolve when joined onto the mounted root).
-    let agent_procs = armed.agent_procs_path();
     let broker_procs = armed.broker_procs_path();
     env.armed = Some(armed);
+    let execution_parent = env.armed.as_ref().unwrap().execution_cgroup_parent();
+    let agent_procs = env.create_nested_execution_leaf(&execution_parent);
+    assert!(
+        agent_procs.ends_with("agent/live-session/live-command/cgroup.procs"),
+        "agent probes must run in a nested execution leaf"
+    );
+    assert!(
+        env.armed
+            .as_ref()
+            .unwrap()
+            .place_agent(std::process::id())
+            .is_err(),
+        "delegated mode must reject direct placement in the agent ancestor"
+    );
 
     let allowed_v4 = SocketAddr::new(IpAddr::V4(env.topo.host_v4), allowed_v4_port);
     let denied_v4 = SocketAddr::new(IpAddr::V4(env.topo.host_v4), denied_v4_port);
@@ -543,7 +583,8 @@ fn run_live_suite(env: &mut LiveEnvironment) {
     env.track(gateway);
     wait_for_gateway_ready(&env.topo, &agent_procs, true);
 
-    // ── Scenario 1: brokered allow round-trips (v4 + v6), agent unprivileged.
+    // ── Scenario 1: a nested execution leaf may reach the loopback broker, and
+    // brokered allow round-trips succeed (v4 + v6) with the agent unprivileged.
     let v4 = connect_attempt(&env.topo, &agent_procs, "allowed.fixture", allowed_v4_port);
     assert_eq!(v4["outcome"], "ok", "brokered v4: {v4}");
     assert_eq!(v4["echo_verified"], true, "brokered v4 echo: {v4}");
@@ -555,7 +596,8 @@ fn run_live_suite(env: &mut LiveEnvironment) {
     );
     assert_eq!(v6["outcome"], "ok", "brokered v6: {v6}");
 
-    // ── Scenario 2: agent direct bypass of the allowed address is blocked.
+    // ── Scenario 2: the same nested execution leaf cannot bypass the broker by
+    // connecting directly to an otherwise allowed external address.
     let bypass = agent_raw(&env.topo, &agent_procs, "tcp", allowed_v4);
     assert_eq!(
         bypass["outcome"], "blocked_or_unreachable",

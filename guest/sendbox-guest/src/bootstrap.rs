@@ -197,6 +197,7 @@ mod tests {
                 required_services: Vec::new(),
                 services: Vec::new(),
                 execution_broker: None,
+                egress_policy: None,
             },
             &secret,
         )

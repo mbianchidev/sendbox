@@ -15,6 +15,7 @@ sendbox-bundle = { path = "../sendbox-bundle" }
 sendbox-config = { path = "../sendbox-config" }
 sendbox-core = { path = "../sendbox-core" }
 sendbox-credentials = { path = "../sendbox-credentials" }
+sendbox-egress = { path = "../sendbox-egress" }
 sendbox-exec = { path = "../sendbox-exec" }
 sendbox-git = { path = "../sendbox-git" }
 sendbox-mcp = { path = "../sendbox-mcp" }

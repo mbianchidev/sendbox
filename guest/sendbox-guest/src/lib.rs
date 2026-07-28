@@ -6,6 +6,8 @@ pub mod audit;
 pub mod bootstrap;
 #[cfg(feature = "execution-broker")]
 pub mod broker;
+#[cfg(feature = "execution-broker")]
+pub mod egress;
 pub mod error;
 pub mod git_guard;
 pub mod manifest;

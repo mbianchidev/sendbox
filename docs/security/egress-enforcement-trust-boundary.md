@@ -1,6 +1,6 @@
 # Egress enforcement trust boundary and runtime integration contract
 
-Status: **production foundation**. Companion to
+Status: **production runtime integration**. Companion to
 [`docs/architecture/egress-enforcement.md`](../architecture/egress-enforcement.md).
 This document defines the trust boundary of `sendbox-egress`, its threat model,
 the residual risks it does *not* close, and the contract a runtime supervisor
@@ -13,8 +13,8 @@ must satisfy to integrate it.
 │                                                                                  │
 │  UNTRUSTED                          TRUSTED (this crate)                          │
 │  ┌───────────────┐   loopback only  ┌──────────────────────────────────────┐     │
-│  │ agent process │ ───────────────▶ │ egress gateway (DNS + CONNECT brokers)│──┐  │
-│  │ (agent cgroup)│ ◀─────────────── │ (broker cgroup + SO_MARK)             │  │  │
+│  │ exec descendants│───────────────▶│ egress gateway (DNS + CONNECT brokers)│──┐  │
+│  │ (agent ancestor)│◀───────────────│ (broker cgroup + SO_MARK)             │  │  │
 │  └───────────────┘                  └──────────────────────────────────────┘  │  │
 │         │  ▲  everything else dropped by nftables default policy               │  │
 │         ▼  │  (cgroup identity + mark enforced in the kernel)                  ▼  │
@@ -22,8 +22,9 @@ must satisfy to integrate it.
 └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Untrusted:** the agent process and anything it spawns. It is confined to the
-  agent cgroup and may reach *only* the loopback DNS and CONNECT broker ports.
+- **Untrusted:** every workload process beneath the delegated agent ancestor. It
+  runs in nested execution leaves and may reach *only* the loopback DNS and
+  CONNECT broker ports.
 - **Trusted:** the broker/gateway (in the broker cgroup, marking its external
   sockets) and the supervisor that arms enforcement. The broker enforces
   `PolicyEngine` in userspace; nftables enforces identity + reachability in the
@@ -79,7 +80,7 @@ must satisfy to integrate it.
 
 | Threat | Mitigation |
 |---|---|
-| Direct outbound bypassing the broker | Kernel default-drop; agent cgroup reaches only loopback broker ports. |
+| Direct outbound bypassing the broker | Kernel default-drop; the agent ancestor match confines every nested execution leaf to loopback broker ports. |
 | Sharing the broker's identity to egress | cgroup v2 identity + required `SO_MARK`; a sibling process is denied. |
 | DNS rebinding | Expiring `(name, ip)` authorization pins the exact validated address. |
 | SSRF to cloud metadata | Address-class denial in policy **and** an explicit kernel drop for the broker. |
@@ -135,9 +136,9 @@ A runtime supervisor integrating this crate must:
    the CONNECT front end (`ConnectFrontend::Custom` or `Socks5`) to match the
    agent toolchain (e.g. SOCKS5 when the agent honors `ALL_PROXY=socks5h://…`);
    the choice is fixed configuration, never negotiated from client bytes.
-5. Only **after** the guard is armed and verified, place and start the **agent**
-   in the agent cgroup (`place_agent`). Never start the agent behind an
-   unverified ruleset.
+5. For production execution, arm with controller delegation, keep the agent
+   ancestor empty, and start workloads only in descendant execution leaves.
+   Direct `place_agent` is deliberately rejected in delegated mode.
 6. Run the agent unprivileged with `CAP_NET_RAW` dropped (raw sockets are out of
    the `inet` hooks' scope) and `no_new_privs` set.
 7. Keep the broker cgroup stable across broker process restarts — re-place the
@@ -148,6 +149,7 @@ A runtime supervisor integrating this crate must:
    a surfaced error means enforcement was deliberately retained and must be
    logged and retried, not ignored.
 
-The crate deliberately does **not** integrate any specific runtime or guest
-supervisor, implement credentials or TLS interception, or use BPF or seccomp;
-those remain the responsibility of the surrounding system.
+The crate remains provider-neutral. Production integration lives in
+`sendbox-host`, authenticated bootstrap, the Apple/Kata providers, and the guest
+Egress service. Hyperlight rejects restrictive egress policy because it does
+not implement this persistent guest boundary.

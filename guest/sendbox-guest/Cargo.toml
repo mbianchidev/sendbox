@@ -9,7 +9,7 @@ publish = false
 
 [features]
 default = ["execution-broker"]
-execution-broker = ["dep:sendbox-exec", "dep:sendbox-policy"]
+execution-broker = ["dep:sendbox-egress", "dep:sendbox-exec", "dep:sendbox-policy"]
 
 [dependencies]
 clap.workspace = true
@@ -19,6 +19,7 @@ libc.workspace = true
 rustix.workspace = true
 sendbox-bootstrap = { path = "../../crates/sendbox-bootstrap" }
 sendbox-core = { path = "../../crates/sendbox-core" }
+sendbox-egress = { path = "../../crates/sendbox-egress", optional = true }
 sendbox-exec = { path = "../../crates/sendbox-exec", optional = true }
 sendbox-git = { path = "../../crates/sendbox-git" }
 sendbox-mcp = { path = "../../crates/sendbox-mcp" }
@@ -30,6 +31,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "net", "rt-multi-thread", "signal"] }
+tokio-util.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

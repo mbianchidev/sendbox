@@ -48,6 +48,9 @@ pub struct SupervisorConfig {
     pub metadata_v6: Vec<Ipv6Addr>,
     /// Optional fixture veth interface for ICMPv6 neighbor discovery.
     pub fixture_iface: Option<String>,
+    /// Enables `pids`/`memory` delegation through the agent cgroup. When set,
+    /// workloads must run only in descendant execution leaves.
+    pub delegate_execution_controllers: bool,
 }
 
 impl SupervisorConfig {
@@ -67,6 +70,7 @@ impl SupervisorConfig {
             metadata_v4: crate::address::METADATA_V4_ADDRESSES.to_vec(),
             metadata_v6: crate::address::METADATA_V6_ADDRESSES.to_vec(),
             fixture_iface: None,
+            delegate_execution_controllers: false,
         }
     }
 
@@ -81,6 +85,12 @@ impl SupervisorConfig {
     #[must_use]
     pub fn with_fixture_iface(mut self, iface: impl Into<String>) -> Self {
         self.fixture_iface = Some(iface.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_execution_delegation(mut self) -> Self {
+        self.delegate_execution_controllers = true;
         self
     }
 
@@ -113,6 +123,8 @@ pub enum SupervisorError {
     TableNameChanged,
     #[error("egress guard already torn down")]
     AlreadyTornDown,
+    #[error("direct agent placement is forbidden when the agent cgroup delegates controllers")]
+    DirectAgentPlacementForbidden,
 }
 
 /// The armed egress guard. Holding it is the precondition for starting the
@@ -127,6 +139,7 @@ pub struct ArmedEgress {
     /// from `cgroups_torn_down` so a teardown whose nft cleanup fails can be
     /// retried by a later call without re-running (or skipping) the cgroup step.
     nft_torn_down: bool,
+    execution_delegated: bool,
 }
 
 impl ArmedEgress {
@@ -155,6 +168,14 @@ impl ArmedEgress {
         //    failure must not tear its cgroups (or table) down.
         let hierarchy = CgroupHierarchy::create_under(root, &config.instance_id)?;
         let preexisting = hierarchy.preexisting();
+        if config.delegate_execution_controllers
+            && let Err(error) = hierarchy.delegate_execution_controllers()
+        {
+            if !preexisting {
+                let _ = hierarchy.teardown();
+            }
+            return Err(SupervisorError::Cgroup(error));
+        }
         let nft_config = config.nft_config(
             hierarchy.agent_identity().clone(),
             hierarchy.broker_identity().clone(),
@@ -211,6 +232,7 @@ impl ArmedEgress {
             config: nft_config,
             cgroups_torn_down: false,
             nft_torn_down: false,
+            execution_delegated: config.delegate_execution_controllers,
         })
     }
 
@@ -235,6 +257,13 @@ impl ArmedEgress {
     #[must_use]
     pub fn broker_procs_path(&self) -> std::path::PathBuf {
         self.hierarchy.broker_procs_path()
+    }
+
+    /// Controller-enabled parent beneath which `sendbox-exec` creates its
+    /// per-session and per-command leaves.
+    #[must_use]
+    pub fn execution_cgroup_parent(&self) -> std::path::PathBuf {
+        self.hierarchy.agent_dir()
     }
 
     #[must_use]
@@ -263,6 +292,9 @@ impl ArmedEgress {
     pub fn place_agent(&self, pid: u32) -> Result<(), SupervisorError> {
         if self.teardown_started() {
             return Err(SupervisorError::AlreadyTornDown);
+        }
+        if self.execution_delegated {
+            return Err(SupervisorError::DirectAgentPlacementForbidden);
         }
         self.hierarchy.place_agent(pid)?;
         Ok(())
@@ -455,6 +487,35 @@ mod tests {
         // cgroups were created at the mount-relative path.
         assert!(root.path().join("sendbox/inst01/agent").is_dir());
         drop(armed);
+    }
+
+    #[test]
+    fn delegated_agent_parent_refuses_direct_process_placement() {
+        let root = tempfile::tempdir().unwrap();
+        let hierarchy = CgroupHierarchy::create_under(root.path(), "inst01").unwrap();
+        for rel in ["", "sendbox", "sendbox/inst01", "sendbox/inst01/agent"] {
+            let dir = root.path().join(rel);
+            std::fs::write(dir.join("cgroup.controllers"), "pids memory\n").unwrap();
+            std::fs::write(dir.join("cgroup.subtree_control"), "").unwrap();
+            if !rel.is_empty() {
+                std::fs::write(dir.join("cgroup.procs"), "").unwrap();
+            }
+        }
+        drop(hierarchy);
+        let armed = ArmedEgress::arm_under(
+            root.path(),
+            Box::new(ScriptRunner::ok()),
+            config().with_execution_delegation(),
+        )
+        .unwrap();
+        assert!(matches!(
+            armed.place_agent(42),
+            Err(SupervisorError::DirectAgentPlacementForbidden)
+        ));
+        assert_eq!(
+            armed.execution_cgroup_parent(),
+            root.path().join("sendbox/inst01/agent")
+        );
     }
 
     #[test]

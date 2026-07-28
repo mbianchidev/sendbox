@@ -13,6 +13,9 @@ use sendbox_bootstrap::{
     encode_bootstrap_document,
 };
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
+use sendbox_egress::runtime::{
+    DEFAULT_CGROUP_ROOT, RuntimePolicyDocument as EgressRuntimePolicyDocument,
+};
 use sendbox_git::GuardPolicyDocument;
 use sendbox_mcp::runtime::RuntimePolicyDocument;
 use sendbox_policy::{Action, CommandPolicy};
@@ -60,6 +63,7 @@ pub struct AppleRuntimeConfiguration {
     pub command_policy: CommandPolicy,
     pub git_guard_policy: Option<GuardPolicyDocument>,
     pub mcp_policy: Option<RuntimePolicyDocument>,
+    pub egress_policy: Option<EgressRuntimePolicyDocument>,
     pub workload_uid: u32,
     pub workload_gid: u32,
     pub launch: AppleLaunchConfiguration,
@@ -97,6 +101,7 @@ impl AppleRuntimeConfiguration {
             },
             git_guard_policy: None,
             mcp_policy: None,
+            egress_policy: None,
             workload_uid: 65_534,
             workload_gid: 65_534,
             launch: AppleLaunchConfiguration::default(),
@@ -125,6 +130,11 @@ impl AppleRuntimeConfiguration {
             return Err(provider_error(
                 "Apple trust metadata and non-root workload identity must be configured",
             ));
+        }
+        if let Some(policy) = &self.egress_policy {
+            policy
+                .validate()
+                .map_err(|error| provider_error(format!("invalid egress policy: {error}")))?;
         }
         if self.command_timeout.is_zero() || self.output_limit_bytes == 0 {
             return Err(provider_error(
@@ -513,6 +523,10 @@ impl AppleRuntime {
                     "Apple authenticated run requires a writable mount containing the working directory",
                 )
             })?;
+        let cgroup_parent = self.configuration.egress_policy.as_ref().map_or_else(
+            || PathBuf::from(GUEST_CGROUP_PARENT),
+            |policy| policy.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT)),
+        );
         encode_bootstrap_document(
             BootstrapDocumentConfiguration {
                 session_id: channel.session_id,
@@ -531,7 +545,7 @@ impl AppleRuntime {
                         channel.session_id
                     )),
                     launcher_path: PathBuf::from(format!("{GUEST_BUNDLE_ROOT}/{BUNDLE_LAUNCHER}")),
-                    cgroup_parent: PathBuf::from(GUEST_CGROUP_PARENT),
+                    cgroup_parent,
                     workspace_root: workspace.destination.clone(),
                     system_root: PathBuf::from("/"),
                     workload_uid: self.configuration.workload_uid,
@@ -540,6 +554,7 @@ impl AppleRuntime {
                     git_guard_policy: self.configuration.git_guard_policy.clone(),
                     mcp_policy: self.configuration.mcp_policy.clone(),
                 }),
+                egress_policy: self.configuration.egress_policy.clone(),
             },
             channel.bootstrap_material.as_bytes(),
         )
@@ -1355,6 +1370,23 @@ esac
     #[test]
     fn apple_provider_builds_the_shared_guest_bootstrap_document() {
         let (temporary, runtime) = fixture_runtime();
+        let egress = EgressRuntimePolicyDocument::for_session(
+            SessionId::from_bytes([7; 16]),
+            sendbox_policy::NetworkPolicy {
+                default_action: Action::Deny,
+                allowed_domains: vec!["example.com".to_owned()],
+                blocked_domains: Vec::new(),
+                allow_dns: true,
+                max_connections: None,
+                allowed_networks: Vec::new(),
+                blocked_networks: Vec::new(),
+                allowed_ports: Vec::new(),
+                dns: sendbox_policy::DnsPolicy::default(),
+            },
+        );
+        let mut configuration = runtime.configuration.clone();
+        configuration.egress_policy = Some(egress.clone());
+        let runtime = AppleRuntime::new(configuration).expect("egress runtime");
         let workspace = temporary.path().join("workspace");
         fs::create_dir(&workspace).expect("workspace");
         let mut create = create_request("apple-bootstrap", "fixture:image");
@@ -1390,10 +1422,15 @@ esac
             &[9; 32]
         );
         assert_eq!(decoded.required_controls, REQUIRED_RUNTIME_CONTROLS);
+        assert_eq!(decoded.egress_policy, Some(egress.clone()));
         let broker = decoded.execution_broker.expect("execution broker");
         assert_eq!(broker.workspace_root, Path::new("/project"));
         assert_eq!(broker.workload_uid, runtime.configuration.workload_uid);
         assert_eq!(broker.command_policy, runtime.configuration.command_policy);
+        assert_eq!(
+            broker.cgroup_parent,
+            egress.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT))
+        );
     }
 
     #[tokio::test]

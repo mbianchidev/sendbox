@@ -4,6 +4,9 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use sendbox_core::{BoundaryPlanDigest, SessionId};
+use sendbox_egress::runtime::{
+    DEFAULT_CGROUP_ROOT, RuntimePolicyDocument as EgressRuntimePolicyDocument,
+};
 use sendbox_git::GuardPolicyDocument;
 use sendbox_mcp::runtime::RuntimePolicyDocument;
 use sendbox_policy::CommandPolicy;
@@ -180,6 +183,7 @@ pub struct BootstrapDocumentConfiguration {
     pub required_services: Vec<ServiceId>,
     pub services: Vec<ServiceSpec>,
     pub execution_broker: Option<ExecutionBrokerConfiguration>,
+    pub egress_policy: Option<EgressRuntimePolicyDocument>,
 }
 
 pub struct BootstrapDocument {
@@ -195,6 +199,7 @@ pub struct BootstrapDocument {
     pub required_services: Vec<ServiceId>,
     pub services: Vec<ServiceSpec>,
     pub execution_broker: Option<ExecutionBrokerBootstrap>,
+    pub egress_policy: Option<EgressRuntimePolicyDocument>,
 }
 
 #[derive(Debug, Error)]
@@ -229,6 +234,8 @@ struct BootstrapWire {
     services: Vec<ServiceSpec>,
     #[serde(default)]
     execution_broker: Option<ExecutionBrokerBootstrap>,
+    #[serde(default)]
+    egress_policy: Option<EgressRuntimePolicyDocument>,
 }
 
 struct SecretBytes(Zeroizing<[u8; 32]>);
@@ -328,6 +335,7 @@ pub fn encode_bootstrap_document(
         required_services: configuration.required_services,
         services: configuration.services,
         execution_broker,
+        egress_policy: configuration.egress_policy,
     };
     let encoded = serde_json::to_vec(&wire).map_err(BootstrapError::Encode)?;
     if encoded.len() > MAX_BOOTSTRAP_BYTES {
@@ -371,6 +379,14 @@ fn validate_configuration(
             broker.mcp_policy.as_ref(),
         )?;
     }
+    validate_egress(
+        configuration.session_id,
+        configuration.egress_policy.as_ref(),
+        configuration
+            .execution_broker
+            .as_ref()
+            .map(|broker| &broker.cgroup_parent),
+    )?;
     Ok(())
 }
 
@@ -406,6 +422,13 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
             broker.mcp_policy.as_ref(),
         )?;
     }
+    validate_egress(
+        wire.session_id,
+        wire.egress_policy.as_ref(),
+        wire.execution_broker
+            .as_ref()
+            .map(|broker| &broker.cgroup_parent),
+    )?;
     let bootstrap_secret = BootstrapSecret::new(wire.bootstrap_secret.0.as_ref().to_vec())
         .map_err(|_| BootstrapError::Invalid("bootstrap secret is invalid".to_owned()))?;
     Ok(BootstrapDocument {
@@ -421,7 +444,35 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         required_services: wire.required_services,
         services: wire.services,
         execution_broker: wire.execution_broker,
+        egress_policy: wire.egress_policy,
     })
+}
+
+fn validate_egress(
+    session_id: SessionId,
+    policy: Option<&EgressRuntimePolicyDocument>,
+    cgroup_parent: Option<&PathBuf>,
+) -> Result<(), BootstrapError> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    policy
+        .validate()
+        .map_err(|error| BootstrapError::Invalid(error.to_string()))?;
+    let expected =
+        EgressRuntimePolicyDocument::for_session(session_id, policy.network_policy.clone());
+    if &expected != policy {
+        return Err(BootstrapError::Invalid(
+            "egress runtime policy does not match the authenticated session".to_owned(),
+        ));
+    }
+    let expected_parent = policy.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
+    if cgroup_parent.map(PathBuf::as_path) != Some(expected_parent.as_path()) {
+        return Err(BootstrapError::Invalid(
+            "execution broker cgroup parent does not match the egress agent hierarchy".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -592,6 +643,7 @@ mod tests {
                 git_guard_policy: None,
                 mcp_policy: None,
             }),
+            egress_policy: None,
         }
     }
 
@@ -689,5 +741,42 @@ mod tests {
             .expect("execution broker")
             .mcp_policy = Some(policy);
         assert!(encode_bootstrap_document(configuration, &[4; 32]).is_err());
+    }
+
+    #[test]
+    fn authenticated_bootstrap_binds_egress_policy_and_exec_parent() {
+        let mut config = configuration();
+        let network = sendbox_policy::NetworkPolicy {
+            default_action: Action::Deny,
+            allowed_domains: vec!["example.com".to_owned()],
+            blocked_domains: Vec::new(),
+            allow_dns: true,
+            max_connections: None,
+            allowed_networks: Vec::new(),
+            blocked_networks: Vec::new(),
+            allowed_ports: Vec::new(),
+            dns: sendbox_policy::DnsPolicy::default(),
+        };
+        let policy = EgressRuntimePolicyDocument::for_session(config.session_id, network.clone());
+        config
+            .execution_broker
+            .as_mut()
+            .expect("execution broker")
+            .cgroup_parent = policy.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
+        config.egress_policy = Some(policy.clone());
+        let encoded = encode_bootstrap_document(config, &[5; 32]).expect("encode bootstrap");
+        let decoded = decode_bootstrap_document(&encoded).expect("decode bootstrap");
+        assert_eq!(decoded.egress_policy, Some(policy));
+
+        let mut config = configuration();
+        let drifted =
+            EgressRuntimePolicyDocument::for_session(SessionId::from_bytes([9; 16]), network);
+        config
+            .execution_broker
+            .as_mut()
+            .expect("execution broker")
+            .cgroup_parent = drifted.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
+        config.egress_policy = Some(drifted);
+        assert!(encode_bootstrap_document(config, &[5; 32]).is_err());
     }
 }

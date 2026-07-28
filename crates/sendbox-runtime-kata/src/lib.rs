@@ -16,6 +16,9 @@ use sendbox_bootstrap::{
     encode_bootstrap_document,
 };
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
+use sendbox_egress::runtime::{
+    DEFAULT_CGROUP_ROOT, RuntimePolicyDocument as EgressRuntimePolicyDocument,
+};
 use sendbox_git::GuardPolicyDocument;
 use sendbox_mcp::runtime::RuntimePolicyDocument;
 use sendbox_policy::CommandPolicy;
@@ -61,6 +64,7 @@ pub struct KataProviderConfiguration {
     pub command_policy: CommandPolicy,
     pub git_guard_policy: Option<GuardPolicyDocument>,
     pub mcp_policy: Option<RuntimePolicyDocument>,
+    pub egress_policy: Option<EgressRuntimePolicyDocument>,
     pub workload_uid: u32,
     pub workload_gid: u32,
 }
@@ -986,6 +990,10 @@ fn bootstrap_payload(
         .iter()
         .find(|mount| mount.destination == Path::new("/workspace"))
         .ok_or_else(|| RuntimeError::Provider("Kata run requires a /workspace mount".to_owned()))?;
+    let cgroup_parent = configuration.egress_policy.as_ref().map_or_else(
+        || PathBuf::from(GUEST_CGROUP_PARENT),
+        |policy| policy.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT)),
+    );
     let bootstrap = encode_bootstrap_document(
         BootstrapDocumentConfiguration {
             session_id: channel.session_id,
@@ -1004,7 +1012,7 @@ fn bootstrap_payload(
                     channel.session_id
                 )),
                 launcher_path: PathBuf::from(format!("{GUEST_BUNDLE_ROOT}/{BUNDLE_LAUNCHER}")),
-                cgroup_parent: PathBuf::from(GUEST_CGROUP_PARENT),
+                cgroup_parent,
                 workspace_root: workspace.destination.clone(),
                 system_root: PathBuf::from("/"),
                 workload_uid: configuration.workload_uid,
@@ -1013,6 +1021,7 @@ fn bootstrap_payload(
                 git_guard_policy: configuration.git_guard_policy.clone(),
                 mcp_policy: configuration.mcp_policy.clone(),
             }),
+            egress_policy: configuration.egress_policy.clone(),
         },
         secret,
     )
@@ -1374,6 +1383,7 @@ mod tests {
             },
             git_guard_policy: None,
             mcp_policy: None,
+            egress_policy: None,
             workload_uid: 65_534,
             workload_gid: 65_534,
         }
@@ -1420,12 +1430,27 @@ mod tests {
         let temporary = tempdir().expect("temporary");
         let workspace = temporary.path().join("workspace");
         fs::create_dir(&workspace).expect("workspace");
-        let configuration = configuration(
+        let mut configuration = configuration(
             &temporary.path().join("nerdctl"),
             &temporary.path().join("bundle"),
             &temporary.path().join("trust.key"),
         );
         let create = request(&workspace);
+        let egress = EgressRuntimePolicyDocument::for_session(
+            create.session_id,
+            sendbox_policy::NetworkPolicy {
+                default_action: Action::Deny,
+                allowed_domains: vec!["example.com".to_owned()],
+                blocked_domains: Vec::new(),
+                allow_dns: true,
+                max_connections: None,
+                allowed_networks: Vec::new(),
+                blocked_networks: Vec::new(),
+                allowed_ports: Vec::new(),
+                dns: sendbox_policy::DnsPolicy::default(),
+            },
+        );
+        configuration.egress_policy = Some(egress.clone());
         let channel = ControlChannelRequest {
             session_id: create.session_id,
             container_id: create.container_id.clone(),
@@ -1454,12 +1479,12 @@ mod tests {
             &[9; 32]
         );
         assert_eq!(decoded.required_controls, REQUIRED_RUNTIME_CONTROLS);
+        assert_eq!(decoded.egress_policy, Some(egress.clone()));
+        let broker = decoded.execution_broker.expect("execution broker");
+        assert_eq!(broker.workspace_root, Path::new("/workspace"));
         assert_eq!(
-            decoded
-                .execution_broker
-                .expect("execution broker")
-                .workspace_root,
-            Path::new("/workspace")
+            broker.cgroup_parent,
+            egress.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT))
         );
     }
 

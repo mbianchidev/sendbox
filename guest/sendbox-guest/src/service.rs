@@ -303,13 +303,26 @@ impl ServiceManager {
 
     pub async fn shutdown(&mut self) -> Result<(), GuestError> {
         self.readiness.revoke();
+        let mut failures = Vec::new();
         for id in self.order.iter().rev() {
             if let Some(mut service) = self.running.remove(id) {
-                terminate_service(&mut service).await?;
-                self.record("service_stopped", *id, "process group reaped");
+                match terminate_service(&mut service).await {
+                    Ok(()) => self.record("service_stopped", *id, "process group reaped"),
+                    Err(error) => {
+                        self.record("service_stop_failed", *id, error.to_string());
+                        failures.push(format!("{id}: {error}"));
+                    }
+                }
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GuestError::Runtime(format!(
+                "service shutdown failures: {}",
+                failures.join("; ")
+            )))
+        }
     }
 
     async fn recheck_dependents(&mut self, dependency: ServiceId) -> Result<(), GuestError> {
@@ -544,30 +557,56 @@ async fn check_health(service: &mut RunningService) -> Result<(), GuestError> {
 
 async fn terminate_service(service: &mut RunningService) -> Result<(), GuestError> {
     signal_group(service.process_group, Signal::TERM)?;
-    if timeout(
+    match timeout(
         Duration::from_millis(service.spec.graceful_shutdown_ms),
         service.child.wait(),
     )
     .await
-    .is_err()
     {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Err(GuestError::Service {
+                service: service.spec.id.to_string(),
+                detail: format!("reaping process after SIGTERM: {error}"),
+            });
+        }
+        Err(_) => {
+            signal_group(service.process_group, Signal::KILL)?;
+            timeout(
+                Duration::from_millis(service.spec.forced_shutdown_ms),
+                service.child.wait(),
+            )
+            .await
+            .map_err(|_| GuestError::Service {
+                service: service.spec.id.to_string(),
+                detail: "process group did not terminate after SIGKILL".to_owned(),
+            })?
+            .map_err(|error| GuestError::Service {
+                service: service.spec.id.to_string(),
+                detail: format!("reaping process after SIGKILL: {error}"),
+            })?;
+        }
+    }
+    if test_kill_process_group(service.process_group).is_ok() {
         signal_group(service.process_group, Signal::KILL)?;
         timeout(
             Duration::from_millis(service.spec.forced_shutdown_ms),
-            service.child.wait(),
+            wait_for_process_group_exit(service.process_group),
         )
         .await
         .map_err(|_| GuestError::Service {
             service: service.spec.id.to_string(),
-            detail: "process group did not terminate after SIGKILL".to_owned(),
-        })?
-        .map_err(|error| GuestError::Service {
-            service: service.spec.id.to_string(),
-            detail: format!("reaping process: {error}"),
+            detail: "service descendants remained live after SIGKILL".to_owned(),
         })?;
     }
     abort_log_tasks(service);
     Ok(())
+}
+
+async fn wait_for_process_group_exit(group: Pid) {
+    while test_kill_process_group(group).is_ok() {
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn signal_group(group: Pid, signal: Signal) -> Result<(), GuestError> {

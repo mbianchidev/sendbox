@@ -50,6 +50,10 @@ enum Commands {
     #[command(hide = true)]
     ExecBroker(ExecBrokerArgs),
     #[command(hide = true)]
+    EgressSupervisor(EgressProcessArgs),
+    #[command(hide = true)]
+    EgressGateway(EgressProcessArgs),
+    #[command(hide = true)]
     Tunnel(TunnelArgs),
     #[command(hide = true)]
     InjectBootstrap(InjectBootstrapArgs),
@@ -111,6 +115,12 @@ struct BootstrapInstallArgs {
 
 #[derive(Debug, Args)]
 struct ExecBrokerArgs {
+    #[arg(long)]
+    config: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct EgressProcessArgs {
     #[arg(long)]
     config: PathBuf,
 }
@@ -230,6 +240,10 @@ async fn execute(cli: Cli) -> Result<(), GuestError> {
         Commands::StdioBridge(args) => stdio_bridge(args).await,
         Commands::BootstrapInstall(args) => bootstrap_install(args).await,
         Commands::ExecBroker(args) => sendbox_guest::broker::run(args.config).await,
+        Commands::EgressSupervisor(args) => {
+            sendbox_guest::egress::run_supervisor(args.config).await
+        }
+        Commands::EgressGateway(args) => sendbox_guest::egress::run_gateway(args.config).await,
         Commands::Tunnel(args) => tunnel(args).await,
         Commands::InjectBootstrap(args) => inject_bootstrap(args).await,
     };

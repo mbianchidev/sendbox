@@ -33,6 +33,9 @@ use sendbox_credentials::{
     CredentialBrokerError, GhMetadataClient, GhProcessConfiguration, GitHubSessionCredentials,
     RepositoryIdentity as CredentialRepositoryIdentity, authorize_github,
 };
+use sendbox_egress::runtime::{
+    RuntimePolicyDocument as EgressRuntimePolicyDocument, requires_enforcement,
+};
 use sendbox_exec::{AdmissionDisposition, CompiledCommandPolicy};
 use sendbox_git::{
     BranchPolicyConfiguration, EnvironmentPolicy, GITHUB_TOKEN_ENVIRONMENT, GitProcessRunner,
@@ -44,7 +47,6 @@ use sendbox_mcp::config::{NATIVE_BROKER_PATH, PROJECT_CONFIG_PATHS};
 use sendbox_mcp::runtime::{
     RUNTIME_POLICY_SCHEMA_VERSION, RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
-use sendbox_policy::{Action, DnsPolicy};
 use sendbox_runtime::{
     BootstrapMaterial, CancellationToken, CommandArgument, CommandSpec, ContainerId, CreateRequest,
     InitializeRequest, OutputStream, ProcessOptions, ProcessOutcome, Program, RuntimeError,
@@ -236,9 +238,6 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
     validate_reserved_secret_names(&request.configuration)?;
-    if let Some(error) = unavailable_run_feature(&request.configuration) {
-        return Err(HostError::Invalid(error.to_owned()));
-    }
     let command = validate_command(&request.command)?;
     validate_command_policy(&request.configuration.policy.commands, &request.command)?;
     let host = current_host()?;
@@ -285,6 +284,8 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         }
         ResolvedRuntime::Hyperlight => None,
     };
+    let session_id = random_session_id()?;
+    let egress_policy = make_egress_policy(selected_runtime, &request.configuration, session_id)?;
     let git_guard_policy = make_git_guard_policy(
         selected_runtime,
         &request.configuration,
@@ -299,12 +300,14 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         &workspace_source,
         &workspace_destination,
         workload_identity,
+        egress_policy.as_ref(),
     )?;
-    let environment = runtime_environment(mcp_policy.as_ref());
+    let environment = runtime_environment(mcp_policy.as_ref(), egress_policy.as_ref());
     let features = boundary_features(
         &request.configuration,
         git_guard_policy.as_ref(),
         mcp_policy.as_ref(),
+        egress_policy.as_ref(),
         &credentials,
     )?;
     validate_security_composition(SecurityComposition {
@@ -314,15 +317,16 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         host_workspace: &workspace_source,
         guest_workspace: &workspace_destination,
         workload_identity,
+        session_id,
         git_guard_policy: git_guard_policy.as_ref(),
         mcp_policy: mcp_policy.as_ref(),
+        egress_policy: egress_policy.as_ref(),
         credentials: &credentials,
         features: &features,
     })?;
 
     ensure_private_directory(&request.state_root)?;
     let state_root = canonical_file_or_directory(&request.state_root, "runtime state root")?;
-    let session_id = random_session_id()?;
     let prospective_state_directory = state_root.join("sessions").join(session_id.to_string());
     security::validate_state_workspace_disjoint(&workspace_source, &prospective_state_directory)?;
     let state_directory = create_session_directory(&state_root, session_id)?;
@@ -357,6 +361,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         workload_identity,
         git_guard_policy.as_ref(),
         mcp_policy.as_ref(),
+        egress_policy.as_ref(),
     )?;
     let workload = match selected_runtime {
         ResolvedRuntime::Hyperlight => WorkloadIdentity::GuestBundle {
@@ -563,6 +568,7 @@ fn build_runtime(
     workload_identity: Option<(u32, u32)>,
     git_guard_policy: Option<&GuardPolicyDocument>,
     mcp_policy: Option<&RuntimePolicyDocument>,
+    egress_policy: Option<&EgressRuntimePolicyDocument>,
 ) -> Result<RuntimeBuild, HostError> {
     let manifest_path = bundle_root.join("manifest.json");
     let mut artifacts = vec![
@@ -599,6 +605,7 @@ fn build_runtime(
             configuration.command_policy = request.configuration.policy.commands.clone();
             configuration.git_guard_policy = git_guard_policy.cloned();
             configuration.mcp_policy = mcp_policy.cloned();
+            configuration.egress_policy = egress_policy.cloned();
             configuration.workload_uid = workload_uid;
             configuration.workload_gid = workload_gid;
             configuration.launch.resources.cpus =
@@ -662,6 +669,7 @@ fn build_runtime(
                 command_policy: request.configuration.policy.commands.clone(),
                 git_guard_policy: git_guard_policy.cloned(),
                 mcp_policy: mcp_policy.cloned(),
+                egress_policy: egress_policy.cloned(),
                 workload_uid,
                 workload_gid,
             };
@@ -1010,23 +1018,6 @@ fn bundle_architecture(architecture: Architecture) -> BundleArchitecture {
     }
 }
 
-fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'static str> {
-    let network = &configuration.policy.network;
-    if network.default_action != Action::Allow
-        || !network.allowed_domains.is_empty()
-        || !network.blocked_domains.is_empty()
-        || !network.allowed_networks.is_empty()
-        || !network.blocked_networks.is_empty()
-        || !network.allowed_ports.is_empty()
-        || !network.allow_dns
-        || network.max_connections.is_some()
-        || network.dns != DnsPolicy::default()
-    {
-        return Some("production run does not yet wire production egress enforcement");
-    }
-    None
-}
-
 fn validate_runtime_features(
     selected_runtime: ResolvedRuntime,
     configuration: &SandboxConfiguration,
@@ -1046,7 +1037,35 @@ fn validate_runtime_features(
             "Hyperlight does not support authenticated Git or credential delivery".to_owned(),
         ));
     }
+    if selected_runtime == ResolvedRuntime::Hyperlight
+        && requires_enforcement(&configuration.policy.network)
+    {
+        return Err(HostError::Invalid(
+            "Hyperlight does not support authenticated production egress enforcement".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn make_egress_policy(
+    selected_runtime: ResolvedRuntime,
+    configuration: &SandboxConfiguration,
+    session_id: SessionId,
+) -> Result<Option<EgressRuntimePolicyDocument>, HostError> {
+    if !requires_enforcement(&configuration.policy.network) {
+        return Ok(None);
+    }
+    if selected_runtime == ResolvedRuntime::Hyperlight {
+        return Err(HostError::Invalid(
+            "Hyperlight does not support authenticated production egress enforcement".to_owned(),
+        ));
+    }
+    let policy =
+        EgressRuntimePolicyDocument::for_session(session_id, configuration.policy.network.clone());
+    policy
+        .validate()
+        .map_err(|error| HostError::Invalid(format!("invalid egress runtime policy: {error}")))?;
+    Ok(Some(policy))
 }
 
 fn make_git_guard_policy(
@@ -1119,6 +1138,7 @@ fn make_mcp_policy(
     host_workspace: &Path,
     guest_workspace: &Path,
     workload_identity: Option<(u32, u32)>,
+    egress_policy: Option<&EgressRuntimePolicyDocument>,
 ) -> Result<Option<RuntimePolicyDocument>, HostError> {
     let has_project_configuration = PROJECT_CONFIG_PATHS
         .iter()
@@ -1190,7 +1210,7 @@ fn make_mcp_policy(
             })
         })
         .transpose()?;
-    let fixed_environment = BTreeMap::from([
+    let mut fixed_environment = BTreeMap::from([
         ("HOME".to_owned(), guest_workspace.display().to_string()),
         ("LANG".to_owned(), "C.UTF-8".to_owned()),
         ("LOGNAME".to_owned(), "sendbox".to_owned()),
@@ -1202,6 +1222,9 @@ fn make_mcp_policy(
         ("TMPDIR".to_owned(), "/tmp".to_owned()),
         ("USER".to_owned(), "sendbox".to_owned()),
     ]);
+    if let Some(egress_policy) = egress_policy {
+        fixed_environment.extend(egress_policy.proxy_environment.clone());
+    }
     let inherited_environment_keys = configuration
         .secrets
         .iter()
@@ -1230,20 +1253,36 @@ fn make_mcp_policy(
     Ok(Some(policy))
 }
 
-fn runtime_environment(mcp_policy: Option<&RuntimePolicyDocument>) -> Vec<EnvironmentIntent> {
-    mcp_policy.map_or_else(Vec::new, |_| {
-        vec![EnvironmentIntent {
+fn runtime_environment(
+    mcp_policy: Option<&RuntimePolicyDocument>,
+    egress_policy: Option<&EgressRuntimePolicyDocument>,
+) -> Vec<EnvironmentIntent> {
+    let mut environment = egress_policy.map_or_else(Vec::new, |policy| {
+        policy
+            .proxy_environment
+            .iter()
+            .map(|(name, value)| EnvironmentIntent {
+                name: name.clone(),
+                value: value.clone(),
+                sensitive: false,
+            })
+            .collect()
+    });
+    if mcp_policy.is_some() {
+        environment.push(EnvironmentIntent {
             name: MCP_PROXY_ENVIRONMENT.to_owned(),
             value: NATIVE_BROKER_PATH.to_owned(),
             sensitive: false,
-        }]
-    })
+        });
+    }
+    environment
 }
 
 fn boundary_features(
     configuration: &SandboxConfiguration,
     git_guard_policy: Option<&GuardPolicyDocument>,
     mcp_policy: Option<&RuntimePolicyDocument>,
+    egress_policy: Option<&EgressRuntimePolicyDocument>,
     credentials: &EffectiveCredentialSet,
 ) -> Result<BTreeMap<String, FeatureAdmission>, HostError> {
     let mut features = BTreeMap::new();
@@ -1288,6 +1327,30 @@ fn boundary_features(
         if policy.observation.is_some() {
             features.insert(
                 "mcp_stdio_observation".to_owned(),
+                FeatureAdmission {
+                    decision: FeatureDecision::Enforced,
+                    mechanism,
+                },
+            );
+        }
+    }
+    if let Some(policy) = egress_policy {
+        let encoded =
+            serde_json::to_vec(policy).map_err(|error| HostError::Invalid(error.to_string()))?;
+        let mechanism = format!(
+            "authenticated_guest_egress_v1:sha256={}",
+            sha256_hex(&encoded)
+        );
+        features.insert(
+            "network_egress_enforcement".to_owned(),
+            FeatureAdmission {
+                decision: FeatureDecision::Enforced,
+                mechanism: mechanism.clone(),
+            },
+        );
+        if policy.dns_port.is_some() {
+            features.insert(
+                "network_dns_broker".to_owned(),
                 FeatureAdmission {
                     decision: FeatureDecision::Enforced,
                     mechanism,
@@ -1454,8 +1517,10 @@ struct SecurityComposition<'a> {
     host_workspace: &'a Path,
     guest_workspace: &'a Path,
     workload_identity: Option<(u32, u32)>,
+    session_id: SessionId,
     git_guard_policy: Option<&'a GuardPolicyDocument>,
     mcp_policy: Option<&'a RuntimePolicyDocument>,
+    egress_policy: Option<&'a EgressRuntimePolicyDocument>,
     credentials: &'a EffectiveCredentialSet,
     features: &'a BTreeMap<String, FeatureAdmission>,
 }
@@ -1468,8 +1533,10 @@ fn validate_security_composition(composition: SecurityComposition<'_>) -> Result
         host_workspace,
         guest_workspace,
         workload_identity,
+        session_id,
         git_guard_policy,
         mcp_policy,
+        egress_policy,
         credentials,
         features,
     } = composition;
@@ -1510,12 +1577,19 @@ fn validate_security_composition(composition: SecurityComposition<'_>) -> Result
             .validate()
             .map_err(|error| HostError::Invalid(format!("invalid MCP composition: {error}")))?;
     }
+    let expected_egress_policy = make_egress_policy(selected_runtime, configuration, session_id)?;
+    if expected_egress_policy.as_ref() != egress_policy {
+        return Err(HostError::Invalid(
+            "authenticated egress policy does not match the signed run configuration".to_owned(),
+        ));
+    }
     let expected_mcp_policy = make_mcp_policy(
         selected_runtime,
         configuration,
         host_workspace,
         guest_workspace,
         workload_identity,
+        egress_policy,
     )?;
     if expected_mcp_policy.as_ref() != mcp_policy {
         return Err(HostError::Invalid(
@@ -1538,8 +1612,13 @@ fn validate_security_composition(composition: SecurityComposition<'_>) -> Result
             "signed secret names do not match prepared credentials".to_owned(),
         ));
     }
-    let expected_features =
-        boundary_features(configuration, git_guard_policy, mcp_policy, credentials)?;
+    let expected_features = boundary_features(
+        configuration,
+        git_guard_policy,
+        mcp_policy,
+        egress_policy,
+        credentials,
+    )?;
     if &expected_features != features {
         return Err(HostError::Invalid(
             "signed feature admissions do not match prepared credentials".to_owned(),
@@ -2088,6 +2167,7 @@ fn current_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use sendbox_config::{PolicyPreset, RuntimeProvider as ConfigRuntimeProvider};
+    use sendbox_policy::Action;
     use tempfile::TempDir;
 
     use super::*;
@@ -2106,35 +2186,15 @@ mod tests {
         if let Some(observability) = &mut configuration.observability {
             observability.mcp_inspection.enabled = false;
         }
-        assert_eq!(unavailable_run_feature(&configuration), None);
         configuration
     }
 
-    fn request(temp: &TempDir, configuration: SandboxConfiguration) -> HostRunRequest {
-        HostRunRequest {
-            requested_runtime: RequestedRuntime::Auto,
-            configuration,
-            image: None,
-            bundle_root: temp.path().join("missing-bundle"),
-            trust_root: temp.path().join("missing-trust-root"),
-            trust_root_id: "test-root".to_owned(),
-            minimum_release_sequence: 1,
-            command: vec!["/bin/true".to_owned()],
-            state_root: temp.path().join("state"),
-            readiness_timeout: Duration::from_secs(1),
-        }
+    fn test_session() -> SessionId {
+        SessionId::from_bytes([0x42; 16])
     }
 
-    async fn assert_prepare_rejects(request: HostRunRequest, expected: &str) {
-        let error = match prepare(request).await {
-            Ok(_) => panic!("unsupported feature must be rejected"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, HostError::Invalid(message) if message == expected));
-    }
-
-    #[tokio::test]
-    async fn direct_host_api_rejects_uncomposed_security_features() {
+    #[test]
+    fn host_security_policies_fail_closed_or_compose() {
         let temp = TempDir::new().expect("temp dir");
 
         let mut mcp = supported_configuration(temp.path().to_path_buf());
@@ -2153,6 +2213,7 @@ mod tests {
             temp.path(),
             Path::new("/workspace"),
             Some((1000, 1000)),
+            None,
         )
         .expect_err("HTTP inspection must be rejected");
         assert!(matches!(
@@ -2162,17 +2223,13 @@ mod tests {
                     == "HTTP/SSE MCP inspection is not available in the authenticated native runtime; configure stdio inspection only"
         ));
 
-        let mut credentials = supported_configuration(temp.path().to_path_buf());
-        credentials.github.forward_auth = true;
-        assert_eq!(unavailable_run_feature(&credentials), None);
-
         let mut egress = supported_configuration(temp.path().to_path_buf());
         egress.policy.network.default_action = Action::Deny;
-        assert_prepare_rejects(
-            request(&temp, egress),
-            "production run does not yet wire production egress enforcement",
-        )
-        .await;
+        let policy = make_egress_policy(ResolvedRuntime::Kata, &egress, test_session())
+            .expect("egress policy")
+            .expect("restrictive network");
+        assert_eq!(policy.network_policy, egress.policy.network);
+        assert!(make_egress_policy(ResolvedRuntime::Hyperlight, &egress, test_session()).is_err());
     }
 
     #[test]
@@ -2212,12 +2269,13 @@ mod tests {
             temp.path(),
             Path::new("/workspace"),
             Some((1000, 1000)),
+            None,
         )
         .expect("MCP policy")
         .expect("MCP composition");
         assert_eq!(policy.workspace_root, Path::new("/workspace"));
         assert_eq!(
-            runtime_environment(Some(&policy))[0].value,
+            runtime_environment(Some(&policy), None)[0].value,
             NATIVE_BROKER_PATH
         );
         let credentials = EffectiveCredentialSet {
@@ -2226,7 +2284,7 @@ mod tests {
             copilot_auth: false,
             git_ssh_auth: false,
         };
-        let features = boundary_features(&configuration, None, Some(&policy), &credentials)
+        let features = boundary_features(&configuration, None, Some(&policy), None, &credentials)
             .expect("MCP features");
         assert!(features.contains_key("mcp_stdio_broker"));
         assert!(features.contains_key("mcp_stdio_observation"));
@@ -2237,8 +2295,10 @@ mod tests {
             host_workspace: temp.path(),
             guest_workspace: Path::new("/workspace"),
             workload_identity: Some((1000, 1000)),
+            session_id: test_session(),
             git_guard_policy: None,
             mcp_policy: Some(&policy),
+            egress_policy: None,
             credentials: &credentials,
             features: &features,
         })
@@ -2249,7 +2309,7 @@ mod tests {
             .fixed_environment
             .insert("PATH".to_owned(), "/tmp/bin".to_owned());
         let drifted_features =
-            boundary_features(&configuration, None, Some(&drifted), &credentials)
+            boundary_features(&configuration, None, Some(&drifted), None, &credentials)
                 .expect("drifted features");
         assert!(
             validate_security_composition(SecurityComposition {
@@ -2259,8 +2319,10 @@ mod tests {
                 host_workspace: temp.path(),
                 guest_workspace: Path::new("/workspace"),
                 workload_identity: Some((1000, 1000)),
+                session_id: test_session(),
                 git_guard_policy: None,
                 mcp_policy: Some(&drifted),
+                egress_policy: None,
                 credentials: &credentials,
                 features: &drifted_features,
             })
@@ -2297,12 +2359,127 @@ mod tests {
             temp.path(),
             Path::new("/workspace"),
             Some((1000, 1000)),
+            None,
         )
         .expect_err("unbrokered MCP must fail");
         assert!(matches!(
             error,
             HostError::Invalid(message) if message.contains("approved broker prefix")
         ));
+    }
+
+    #[test]
+    fn authenticated_egress_binds_runtime_mcp_features_and_drift() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.policy.network.default_action = Action::Deny;
+        configuration
+            .policy
+            .boundaries
+            .tool_calls
+            .allowed_server_commands = vec![vec!["/usr/bin/mcp-server".to_owned()]];
+        let egress = make_egress_policy(ResolvedRuntime::Kata, &configuration, test_session())
+            .expect("egress policy")
+            .expect("restrictive network");
+        let credentials = EffectiveCredentialSet {
+            values: BTreeMap::new(),
+            github_https_auth: false,
+            copilot_auth: false,
+            git_ssh_auth: false,
+        };
+
+        let egress_only =
+            boundary_features(&configuration, None, None, Some(&egress), &credentials)
+                .expect("egress features");
+        assert!(egress_only.contains_key("network_egress_enforcement"));
+        assert!(egress_only.contains_key("network_dns_broker"));
+
+        let mcp = make_mcp_policy(
+            ResolvedRuntime::Kata,
+            &configuration,
+            temp.path(),
+            Path::new("/workspace"),
+            Some((1000, 1000)),
+            Some(&egress),
+        )
+        .expect("MCP policy")
+        .expect("MCP composition");
+        for (name, value) in &egress.proxy_environment {
+            assert_eq!(mcp.fixed_environment.get(name), Some(value));
+        }
+        let environment = runtime_environment(Some(&mcp), Some(&egress))
+            .into_iter()
+            .map(|entry| (entry.name, entry.value))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(MCP_PROXY_ENVIRONMENT).map(String::as_str),
+            Some(NATIVE_BROKER_PATH)
+        );
+        for (name, value) in &egress.proxy_environment {
+            assert_eq!(environment.get(name), Some(value));
+        }
+
+        let features = boundary_features(
+            &configuration,
+            None,
+            Some(&mcp),
+            Some(&egress),
+            &credentials,
+        )
+        .expect("composed features");
+        let admission = features
+            .get("network_egress_enforcement")
+            .expect("egress feature");
+        assert_eq!(
+            admission.mechanism,
+            format!(
+                "authenticated_guest_egress_v1:sha256={}",
+                sha256_hex(&serde_json::to_vec(&egress).expect("egress JSON"))
+            )
+        );
+        validate_security_composition(SecurityComposition {
+            selected_runtime: ResolvedRuntime::Kata,
+            configuration: &configuration,
+            selected_repository: None,
+            host_workspace: temp.path(),
+            guest_workspace: Path::new("/workspace"),
+            workload_identity: Some((1000, 1000)),
+            session_id: test_session(),
+            git_guard_policy: None,
+            mcp_policy: Some(&mcp),
+            egress_policy: Some(&egress),
+            credentials: &credentials,
+            features: &features,
+        })
+        .expect("consistent egress composition");
+
+        let mut drifted = egress.clone();
+        drifted.broker_mark ^= 2;
+        let drifted_features = boundary_features(
+            &configuration,
+            None,
+            Some(&mcp),
+            Some(&drifted),
+            &credentials,
+        )
+        .expect("drifted features");
+        assert!(
+            validate_security_composition(SecurityComposition {
+                selected_runtime: ResolvedRuntime::Kata,
+                configuration: &configuration,
+                selected_repository: None,
+                host_workspace: temp.path(),
+                guest_workspace: Path::new("/workspace"),
+                workload_identity: Some((1000, 1000)),
+                session_id: test_session(),
+                git_guard_policy: None,
+                mcp_policy: Some(&mcp),
+                egress_policy: Some(&drifted),
+                credentials: &credentials,
+                features: &drifted_features,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -2339,7 +2516,6 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let mut configuration = supported_configuration(temp.path().to_path_buf());
         configuration.github.branch_protection.enabled = true;
-        assert_eq!(unavailable_run_feature(&configuration), None);
 
         let policy = GuardPolicyDocument {
             schema_version: PolicySchemaVersion::V1,
@@ -2362,10 +2538,10 @@ mod tests {
             copilot_auth: false,
             git_ssh_auth: false,
         };
-        let first =
-            boundary_features(&configuration, Some(&policy), None, &credentials).expect("features");
-        let second =
-            boundary_features(&configuration, Some(&policy), None, &credentials).expect("features");
+        let first = boundary_features(&configuration, Some(&policy), None, None, &credentials)
+            .expect("features");
+        let second = boundary_features(&configuration, Some(&policy), None, None, &credentials)
+            .expect("features");
         assert_eq!(first, second);
         let admission = first
             .get("git_branch_protection")
@@ -2474,8 +2650,9 @@ mod tests {
             &credentials,
         )
         .expect("policy");
-        let mut features = boundary_features(&configuration, policy.as_ref(), None, &credentials)
-            .expect("features");
+        let mut features =
+            boundary_features(&configuration, policy.as_ref(), None, None, &credentials)
+                .expect("features");
         validate_security_composition(SecurityComposition {
             selected_runtime: ResolvedRuntime::Kata,
             configuration: &configuration,
@@ -2483,8 +2660,10 @@ mod tests {
             host_workspace: &workspace,
             guest_workspace: Path::new("/workspace"),
             workload_identity: None,
+            session_id: test_session(),
             git_guard_policy: policy.as_ref(),
             mcp_policy: None,
+            egress_policy: None,
             credentials: &credentials,
             features: &features,
         })
@@ -2499,8 +2678,10 @@ mod tests {
                 host_workspace: &workspace,
                 guest_workspace: Path::new("/workspace"),
                 workload_identity: None,
+                session_id: test_session(),
                 git_guard_policy: policy.as_ref(),
                 mcp_policy: None,
+                egress_policy: None,
                 credentials: &credentials,
                 features: &features,
             })
@@ -2515,11 +2696,19 @@ mod tests {
                 host_workspace: &workspace,
                 guest_workspace: Path::new("/workspace"),
                 workload_identity: None,
+                session_id: test_session(),
                 git_guard_policy: policy.as_ref(),
                 mcp_policy: None,
+                egress_policy: None,
                 credentials: &credentials,
-                features: &boundary_features(&configuration, policy.as_ref(), None, &credentials,)
-                    .expect("features"),
+                features: &boundary_features(
+                    &configuration,
+                    policy.as_ref(),
+                    None,
+                    None,
+                    &credentials,
+                )
+                .expect("features"),
             })
             .is_err()
         );

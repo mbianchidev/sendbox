@@ -20,6 +20,11 @@ guest role, secret name, sequence, expiry, and policy digest.
 Long-lived trust roots, release signing, policy signing, and key rotation remain
 part of ADR-005 qualification.
 
+Apple and Kata bootstrap also carry the session-derived egress runtime policy
+and the exact delegated execution cgroup parent. The guest validates both before
+starting mandatory services, starts Egress before Exec, and exposes readiness
+only after the DNS/SOCKS5 gateway and kernel rules are armed.
+
 ## Roles and versions
 
 - `HostClient` initiates the handshake.
