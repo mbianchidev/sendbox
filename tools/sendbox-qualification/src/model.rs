@@ -220,7 +220,6 @@ pub struct HostMetadata {
     pub os: String,
     pub architecture: String,
     pub rustc: String,
-    pub swift: String,
     pub qualification_tool: String,
 }
 

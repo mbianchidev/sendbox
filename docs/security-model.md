@@ -504,18 +504,26 @@ The following CVEs are directly addressed by the Apple provider's architecture. 
 
 ## Verification
 
-To verify SendBox's security posture programmatically, use the `ContainerHardening.securityReport()` method, which generates a comprehensive report covering all 18 SandboxEscapeBench scenarios and their mitigation status.
+The boundary a configuration produces is inspected statically, without generating or running any
+executable:
 
-```swift
-let hardening = ContainerHardening(profile: .benchmark)
-let report = hardening.securityReport()
-print(report)
+```bash
+sendbox boundary inspect --config config/example-sandbox.yaml --json
 ```
 
-The automated test suite (`ContainerHardeningTests`) verifies that:
+The inspection is deterministic and reports the resolved runtime, resources, command and network
+policy, secret names, devcontainer and GitHub settings, plus the MCP observer boundary
+(transports, authorization boundary, runtime integration, and allowed server command patterns).
+
+The workspace test suite verifies that:
 - Each sysctl parameter is correctly set
 - Each dangerous capability is dropped
 - Each dangerous syscall is blocked by seccomp
-- Each benchmark scenario is listed as mitigated in the security report
-- The hardening script is a valid bash script
+- Egress rules, the Git guard, and the MCP broker reject the denied cases
 - Configuration validation catches unsafe settings
+
+```bash
+make lint
+make test
+cargo run --locked --manifest-path tools/sendbox-qualification/Cargo.toml -- validate
+```

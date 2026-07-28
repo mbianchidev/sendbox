@@ -35,6 +35,12 @@ The text after the second `#` is a stable semantic claim label rather than a
 source-code selector. Implemented entries must also resolve to live repository
 evidence directly or through their implemented target source module.
 
+Inventory coverage scans `crates/*/src` only; the Swift package and the
+TypeScript copilot bridge no longer exist. Validation therefore rejects the tree
+outright if `Package.swift`, `Package.resolved`, `Sources/`, or
+`copilot-bridge/` reappears, and still flags any non-Rust source module that
+turns up inside a crate.
+
 For a PR, changed behavior must update the corresponding inventory and fixture.
 Cutover requires every preserved entry to have a passing implementation test
 and every redesign to have its compatibility note satisfied.
@@ -83,7 +89,9 @@ egress, BPF decode, guest bootstrap, RSS/binary release measurements, and
 vendor runtime paths remain explicit hooks until stable production interfaces
 and reference hosts exist.
 
-The harness emits raw samples and summaries. Shared-runner smoke tests only
+The harness emits raw samples and summaries at benchmark report schema version 2,
+which records host OS, architecture, `rustc`, and the qualification tool version.
+Shared-runner smoke tests only
 check execution and output shape; they never enforce noisy latency thresholds.
 Qualification enforcement is reserved for declared reference hosts:
 

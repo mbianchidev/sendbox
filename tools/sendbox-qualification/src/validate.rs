@@ -14,6 +14,12 @@ use crate::model::{
 
 const SCHEMA_VERSION: u32 = 1;
 const HISTORICAL_EVIDENCE_MANIFEST: &str = "Tests/qualification/historical/swift-to-rust.v1.json";
+const REMOVED_IMPLEMENTATION_PATHS: [&str; 4] = [
+    "Package.swift",
+    "Package.resolved",
+    "Sources",
+    "copilot-bridge",
+];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -194,6 +200,7 @@ pub fn validate_all(
         errors.push("inventory must contain entries".to_owned());
     }
     validate_source_coverage(root, &evidence_paths, &mut errors);
+    validate_cutover(root, &mut errors);
 
     validate_benchmark(benchmark, &mut errors);
     let unqualified_workloads = benchmark
@@ -371,12 +378,6 @@ fn validate_source_coverage(
     errors: &mut Vec<String>,
 ) {
     let mut source_directories = BTreeSet::new();
-    for relative_root in ["Sources", "copilot-bridge/src"] {
-        let directory = root.join(relative_root);
-        if directory.is_dir() {
-            source_directories.insert(directory);
-        }
-    }
     if let Ok(entries) = fs::read_dir(root.join("crates")) {
         for entry in entries.flatten() {
             let source_directory = entry.path().join("src");
@@ -416,6 +417,19 @@ fn collect_source_files(directory: &Path, files: &mut BTreeSet<std::path::PathBu
             Some("swift" | "rs" | "ts")
         ) {
             files.insert(path);
+        }
+    }
+}
+
+/// The Swift package and the TypeScript copilot bridge were deleted at cutover. Their roots are no
+/// longer scanned for inventory coverage, so reintroducing one must fail loudly instead of silently
+/// escaping the gate.
+fn validate_cutover(root: &Path, errors: &mut Vec<String>) {
+    for relative in REMOVED_IMPLEMENTATION_PATHS {
+        if root.join(relative).exists() {
+            errors.push(format!(
+                "pre-cutover implementation path is present again: {relative}"
+            ));
         }
     }
 }
@@ -554,20 +568,11 @@ mod tests {
 
     #[test]
     fn source_coverage_checks_each_file_once() {
-        let root = std::env::temp_dir().join(format!(
-            "sendbox-qualification-source-coverage-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        let swift_source = root.join("Sources/Example.swift");
+        let root = temporary_root("source-coverage");
+        let swift_source = root.join("crates/example/src/legacy.swift");
         let rust_source = root.join("crates/example/src/lib.rs");
-        fs::create_dir_all(swift_source.parent().expect("Swift source parent"))
-            .expect("create Swift source directory");
-        fs::create_dir_all(rust_source.parent().expect("Rust source parent"))
-            .expect("create Rust source directory");
+        fs::create_dir_all(rust_source.parent().expect("source parent"))
+            .expect("create source directory");
         fs::write(&swift_source, "").expect("write Swift source");
         fs::write(&rust_source, "").expect("write Rust source");
 
@@ -586,10 +591,55 @@ mod tests {
         assert_eq!(
             errors
                 .iter()
-                .filter(|error| error.contains("Sources/Example.swift"))
+                .filter(|error| error.contains("crates/example/src/legacy.swift"))
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn cutover_rejects_reintroduced_implementation_paths() {
+        let root = temporary_root("cutover");
+        fs::create_dir_all(root.join("Sources")).expect("create Sources");
+        fs::create_dir_all(root.join("copilot-bridge/src")).expect("create copilot-bridge");
+        fs::write(root.join("Package.swift"), "").expect("write Package.swift");
+
+        let mut errors = Vec::new();
+        validate_cutover(&root, &mut errors);
+
+        fs::remove_dir_all(&root).expect("remove cutover fixture");
+        assert_eq!(errors.len(), 3);
+        for relative in ["Sources", "copilot-bridge", "Package.swift"] {
+            assert_eq!(
+                errors
+                    .iter()
+                    .filter(|error| error
+                        .contains(&format!("implementation path is present again: {relative}")))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn cutover_accepts_the_current_tree() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut errors = Vec::new();
+
+        validate_cutover(&root, &mut errors);
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    fn temporary_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "sendbox-qualification-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ))
     }
 
     #[test]

@@ -16,6 +16,7 @@ use crate::process::{CommandSpec, CommandStatus, run_command};
 use crate::stats::summarize;
 
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const REPORT_SCHEMA_VERSION: u32 = 2;
 const SECRET: [u8; 32] = [0x6c; 32];
 
 pub struct BenchmarkOptions<'a> {
@@ -66,7 +67,7 @@ pub fn run_benchmarks(
         options.enforce_thresholds && options.profile != "smoke",
     );
     BenchmarkReport {
-        schema_version: 1,
+        schema_version: REPORT_SCHEMA_VERSION,
         specification_version: specification.specification_version.clone(),
         profile: options.profile.to_owned(),
         host: host_metadata(),
@@ -381,7 +382,6 @@ fn host_metadata() -> HostMetadata {
         os: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
         rustc: tool_version(PathBuf::from("rustc"), &["--version"]),
-        swift: tool_version(PathBuf::from("/usr/bin/swift"), &["--version"]),
         qualification_tool: TOOL_VERSION.to_owned(),
     }
 }
