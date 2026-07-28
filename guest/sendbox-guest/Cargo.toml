@@ -9,7 +9,12 @@ publish = false
 
 [features]
 default = ["execution-broker"]
-execution-broker = ["dep:sendbox-egress", "dep:sendbox-exec", "dep:sendbox-policy"]
+execution-broker = [
+    "dep:sendbox-egress",
+    "dep:sendbox-exec",
+    "dep:sendbox-policy",
+    "dep:sendbox-registry",
+]
 
 [dependencies]
 clap.workspace = true
@@ -25,6 +30,7 @@ sendbox-git = { path = "../../crates/sendbox-git" }
 sendbox-mcp = { path = "../../crates/sendbox-mcp" }
 sendbox-policy = { path = "../../crates/sendbox-policy", optional = true }
 sendbox-protocol = { path = "../../crates/sendbox-protocol" }
+sendbox-registry = { path = "../../crates/sendbox-registry", optional = true }
 sendbox-secrets = { path = "../../crates/sendbox-secrets" }
 serde.workspace = true
 serde_json.workspace = true

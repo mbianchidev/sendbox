@@ -22,6 +22,9 @@ pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 pub const MAX_REGISTRY_CREDENTIALS: usize = 16;
 pub const MAX_REGISTRY_CREDENTIAL_BYTES: usize = 16 * 1024;
 pub const MAX_REGISTRY_CREDENTIAL_TOTAL_BYTES: usize = 32 * 1024;
+pub const DEFAULT_REGISTRY_UID: u32 = 65_532;
+pub const DEFAULT_REGISTRY_GID: u32 = 65_532;
+pub const DEFAULT_REGISTRY_CACHE_ROOT: &str = "/var/lib/sendbox/package-cache";
 pub const REQUIRED_RUNTIME_CONTROLS: [ControlKind; 3] = [
     ControlKind::PrivilegeDrop,
     ControlKind::Capabilities,
@@ -247,6 +250,8 @@ pub struct RegistryProxyConfiguration {
     pub trusted_upstream_port: u16,
     pub cache_root: PathBuf,
     pub report_path: PathBuf,
+    pub proxy_uid: u32,
+    pub proxy_gid: u32,
     #[serde(default)]
     pub credentials: Vec<RegistryCredential>,
 }
@@ -475,6 +480,10 @@ fn validate_configuration(
     validate_registry_proxy(
         configuration.registry_proxy.as_ref(),
         configuration.egress_policy.as_ref(),
+        configuration
+            .execution_broker
+            .as_ref()
+            .map(|broker| (broker.workload_uid, broker.workload_gid)),
     )?;
     Ok(())
 }
@@ -518,7 +527,13 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
             .as_ref()
             .map(|broker| &broker.cgroup_parent),
     )?;
-    validate_registry_proxy(wire.registry_proxy.as_ref(), wire.egress_policy.as_ref())?;
+    validate_registry_proxy(
+        wire.registry_proxy.as_ref(),
+        wire.egress_policy.as_ref(),
+        wire.execution_broker
+            .as_ref()
+            .map(|broker| (broker.workload_uid, broker.workload_gid)),
+    )?;
     let bootstrap_secret = BootstrapSecret::new(wire.bootstrap_secret.0.as_ref().to_vec())
         .map_err(|_| BootstrapError::Invalid("bootstrap secret is invalid".to_owned()))?;
     Ok(BootstrapDocument {
@@ -542,6 +557,7 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
 fn validate_registry_proxy(
     registry: Option<&RegistryProxyConfiguration>,
     egress: Option<&EgressRuntimePolicyDocument>,
+    workload: Option<(u32, u32)>,
 ) -> Result<(), BootstrapError> {
     let Some(registry) = registry else {
         return Ok(());
@@ -558,6 +574,9 @@ fn validate_registry_proxy(
     let egress = egress.ok_or_else(|| {
         BootstrapError::Invalid("registry proxy requires authenticated egress policy".to_owned())
     })?;
+    let registry_egress = egress.registry.as_ref().ok_or_else(|| {
+        BootstrapError::Invalid("registry proxy requires registry egress isolation".to_owned())
+    })?;
     if registry.proxy_port == 0
         || registry.trusted_upstream_port == 0
         || registry.proxy_port == registry.trusted_upstream_port
@@ -569,6 +588,21 @@ fn validate_registry_proxy(
     {
         return Err(BootstrapError::Invalid(
             "registry proxy ports must be non-zero and distinct from egress ports".to_owned(),
+        ));
+    }
+    if registry.proxy_port != registry_egress.proxy_port
+        || registry.trusted_upstream_port != registry_egress.trusted_upstream_port
+    {
+        return Err(BootstrapError::Invalid(
+            "registry proxy ports do not match authenticated egress policy".to_owned(),
+        ));
+    }
+    if registry.proxy_uid == 0
+        || registry.proxy_gid == 0
+        || workload.is_some_and(|workload| workload == (registry.proxy_uid, registry.proxy_gid))
+    {
+        return Err(BootstrapError::Invalid(
+            "registry proxy requires a dedicated non-root identity".to_owned(),
         ));
     }
     for (name, path) in [
@@ -660,8 +694,15 @@ fn validate_egress(
     policy
         .validate()
         .map_err(|error| BootstrapError::Invalid(error.to_string()))?;
-    let expected =
+    let mut expected =
         EgressRuntimePolicyDocument::for_session(session_id, policy.network_policy.clone());
+    if let Some(registry) = &policy.registry {
+        expected = expected.with_registry(
+            registry.proxy_port,
+            registry.trusted_upstream_port,
+            registry.upstream_network_policy.clone(),
+        );
+    }
     if &expected != policy {
         return Err(BootstrapError::Invalid(
             "egress runtime policy does not match the authenticated session".to_owned(),
@@ -996,7 +1037,8 @@ mod tests {
             allowed_ports: Vec::new(),
             dns: sendbox_policy::DnsPolicy::default(),
         };
-        let egress = EgressRuntimePolicyDocument::for_session(config.session_id, network);
+        let egress = EgressRuntimePolicyDocument::for_session(config.session_id, network.clone())
+            .with_registry(15_081, 15_082, network);
         config
             .execution_broker
             .as_mut()
@@ -1018,6 +1060,8 @@ mod tests {
             trusted_upstream_port: 15_082,
             cache_root: PathBuf::from("/var/cache/sendbox/packages"),
             report_path: PathBuf::from("/run/sendbox/package-report.json"),
+            proxy_uid: DEFAULT_REGISTRY_UID,
+            proxy_gid: DEFAULT_REGISTRY_GID,
             credentials: vec![
                 RegistryCredential::new("PRIVATE_NPM_TOKEN", b"top-secret".to_vec()).unwrap(),
             ],
@@ -1051,7 +1095,8 @@ mod tests {
             allowed_ports: Vec::new(),
             dns: sendbox_policy::DnsPolicy::default(),
         };
-        let egress = EgressRuntimePolicyDocument::for_session(config.session_id, network);
+        let egress = EgressRuntimePolicyDocument::for_session(config.session_id, network.clone())
+            .with_registry(15_081, 15_082, network);
         config
             .execution_broker
             .as_mut()
@@ -1071,6 +1116,8 @@ mod tests {
             trusted_upstream_port: 15_082,
             cache_root: PathBuf::from("/var/cache/sendbox/packages"),
             report_path: PathBuf::from("/run/sendbox/package-report.json"),
+            proxy_uid: DEFAULT_REGISTRY_UID,
+            proxy_gid: DEFAULT_REGISTRY_GID,
             credentials: Vec::new(),
         });
         assert!(encode_bootstrap_document(config, &[6; 32]).is_err());

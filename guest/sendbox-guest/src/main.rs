@@ -54,6 +54,8 @@ enum Commands {
     #[command(hide = true)]
     EgressGateway(EgressProcessArgs),
     #[command(hide = true)]
+    RegistryProxy(EgressProcessArgs),
+    #[command(hide = true)]
     Tunnel(TunnelArgs),
     #[command(hide = true)]
     InjectBootstrap(InjectBootstrapArgs),
@@ -244,6 +246,9 @@ async fn execute(cli: Cli) -> Result<(), GuestError> {
             sendbox_guest::egress::run_supervisor(args.config).await
         }
         Commands::EgressGateway(args) => sendbox_guest::egress::run_gateway(args.config).await,
+        Commands::RegistryProxy(args) => {
+            sendbox_guest::egress::run_registry_proxy(args.config).await
+        }
         Commands::Tunnel(args) => tunnel(args).await,
         Commands::InjectBootstrap(args) => inject_bootstrap(args).await,
     };

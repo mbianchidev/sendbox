@@ -11,9 +11,11 @@ use thiserror::Error;
 
 use crate::policy::{PolicyEngine, PolicyError};
 
-pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_CONNECT_PORT: u16 = 15_080;
 pub const DEFAULT_DNS_PORT: u16 = 53;
+pub const DEFAULT_REGISTRY_PROXY_PORT: u16 = 14_873;
+pub const DEFAULT_TRUSTED_REGISTRY_PORT: u16 = 15_081;
 pub const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const INSTANCE_ID_HEX_BYTES: usize = 12;
 const TABLE_PREFIX: &str = "sbxeg_";
@@ -29,7 +31,17 @@ pub struct RuntimePolicyDocument {
     pub connect_port: u16,
     pub dns_port: Option<u16>,
     pub network_policy: NetworkPolicy,
+    #[serde(default)]
+    pub registry: Option<RegistryEgressPolicy>,
     pub proxy_environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryEgressPolicy {
+    pub proxy_port: u16,
+    pub trusted_upstream_port: u16,
+    pub upstream_network_policy: NetworkPolicy,
 }
 
 #[derive(Debug, Error)]
@@ -46,7 +58,9 @@ pub enum RuntimePolicyError {
     InvalidConnectPort,
     #[error("DNS-enabled egress requires port 53; DNS-disabled egress must omit the DNS port")]
     InvalidDnsPort,
-    #[error("egress proxy environment does not match the signed SOCKS5 endpoint")]
+    #[error("registry egress ports must be non-zero and distinct from other loopback services")]
+    InvalidRegistryPorts,
+    #[error("egress proxy environment does not match the signed endpoints")]
     InvalidProxyEnvironment,
     #[error("invalid network policy: {0}")]
     InvalidNetworkPolicy(#[from] PolicyError),
@@ -76,8 +90,25 @@ impl RuntimePolicyDocument {
             connect_port,
             dns_port,
             network_policy,
-            proxy_environment: proxy_environment(connect_port),
+            registry: None,
+            proxy_environment: proxy_environment(connect_port, None),
         }
+    }
+
+    #[must_use]
+    pub fn with_registry(
+        mut self,
+        proxy_port: u16,
+        trusted_upstream_port: u16,
+        upstream_network_policy: NetworkPolicy,
+    ) -> Self {
+        self.registry = Some(RegistryEgressPolicy {
+            proxy_port,
+            trusted_upstream_port,
+            upstream_network_policy,
+        });
+        self.proxy_environment = proxy_environment(self.connect_port, Some(proxy_port));
+        self
     }
 
     pub fn validate(&self) -> Result<(), RuntimePolicyError> {
@@ -104,7 +135,27 @@ impl RuntimePolicyDocument {
         if self.dns_port != self.network_policy.allow_dns.then_some(DEFAULT_DNS_PORT) {
             return Err(RuntimePolicyError::InvalidDnsPort);
         }
-        if self.proxy_environment != proxy_environment(self.connect_port) {
+        if let Some(registry) = &self.registry {
+            let mut ports = vec![
+                self.connect_port,
+                registry.proxy_port,
+                registry.trusted_upstream_port,
+            ];
+            if let Some(port) = self.dns_port {
+                ports.push(port);
+            }
+            ports.sort_unstable();
+            if ports.first() == Some(&0) || ports.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(RuntimePolicyError::InvalidRegistryPorts);
+            }
+            PolicyEngine::compile(&registry.upstream_network_policy)?;
+        }
+        if self.proxy_environment
+            != proxy_environment(
+                self.connect_port,
+                self.registry.as_ref().map(|registry| registry.proxy_port),
+            )
+        {
             return Err(RuntimePolicyError::InvalidProxyEnvironment);
         }
         PolicyEngine::compile(&self.network_policy)?;
@@ -134,14 +185,27 @@ pub fn requires_enforcement(network: &NetworkPolicy) -> bool {
 }
 
 #[must_use]
-pub fn proxy_environment(connect_port: u16) -> BTreeMap<String, String> {
+pub fn proxy_environment(
+    connect_port: u16,
+    registry_proxy_port: Option<u16>,
+) -> BTreeMap<String, String> {
     let proxy = format!("socks5h://127.0.0.1:{connect_port}");
-    BTreeMap::from([
+    let mut environment = BTreeMap::from([
         ("ALL_PROXY".to_owned(), proxy.clone()),
         ("NO_PROXY".to_owned(), NO_PROXY_VALUE.to_owned()),
         ("all_proxy".to_owned(), proxy),
         ("no_proxy".to_owned(), NO_PROXY_VALUE.to_owned()),
-    ])
+    ]);
+    if let Some(port) = registry_proxy_port {
+        let registry = format!("http://127.0.0.1:{port}/");
+        environment.extend([
+            ("NPM_CONFIG_IGNORE_SCRIPTS".to_owned(), "true".to_owned()),
+            ("NPM_CONFIG_REGISTRY".to_owned(), registry.clone()),
+            ("npm_config_ignore_scripts".to_owned(), "true".to_owned()),
+            ("npm_config_registry".to_owned(), registry),
+        ]);
+    }
+    environment
 }
 
 #[cfg(test)]
@@ -174,6 +238,7 @@ mod tests {
         assert_eq!(first.instance_id.len(), 24);
         assert_eq!(first.table_name.len(), 30);
         assert_ne!(first.broker_mark, 0);
+        assert!(first.registry.is_none());
         assert_eq!(
             first.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT)),
             Path::new(DEFAULT_CGROUP_ROOT)
@@ -182,6 +247,27 @@ mod tests {
                 .join("agent")
         );
         first.validate().expect("valid policy");
+    }
+
+    #[test]
+    fn registry_policy_adds_only_local_npm_environment() {
+        let original = network_policy();
+        let policy =
+            RuntimePolicyDocument::for_session(SessionId::from_bytes([9; 16]), original.clone())
+                .with_registry(
+                    DEFAULT_REGISTRY_PROXY_PORT,
+                    DEFAULT_TRUSTED_REGISTRY_PORT,
+                    original,
+                );
+        policy.validate().unwrap();
+        assert_eq!(
+            policy.proxy_environment["npm_config_registry"],
+            "http://127.0.0.1:14873/"
+        );
+        assert_eq!(
+            policy.proxy_environment["NPM_CONFIG_IGNORE_SCRIPTS"],
+            "true"
+        );
     }
 
     #[test]

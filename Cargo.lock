@@ -2336,6 +2336,7 @@ dependencies = [
  "sendbox-mcp",
  "sendbox-policy",
  "sendbox-protocol",
+ "sendbox-registry",
  "sendbox-secrets",
  "serde",
  "serde_json",
@@ -2354,6 +2355,7 @@ dependencies = [
  "getrandom 0.3.4",
  "rustix",
  "sendbox-agent",
+ "sendbox-bootstrap",
  "sendbox-boundary",
  "sendbox-bundle",
  "sendbox-config",
@@ -2376,6 +2378,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "url",
  "zeroize",
 ]
 

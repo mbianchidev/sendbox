@@ -94,9 +94,15 @@ pub async fn run<P: PlatformControls>(
         );
     }
     let egress_configured = bootstrap.egress_policy.is_some();
+    let registry_proxy = bootstrap.registry_proxy.take();
     if let Some(policy) = bootstrap.egress_policy.take() {
         let instance_id = policy.instance_id.clone();
-        let service = egress::prepare(runtime.session_dir(), policy)?;
+        let service = egress::prepare(
+            runtime.session_dir(),
+            bootstrap.session_id,
+            policy,
+            registry_proxy,
+        )?;
         if bootstrap
             .services
             .iter()
