@@ -654,6 +654,7 @@ fn run(
         terminal = TerminalState::Exited(status);
     }
 
+    terminal_io_done.store(true, Ordering::Release);
     drain_after_cleanup(
         &receiver,
         sink,
@@ -663,7 +664,6 @@ fn run(
         Duration::from_millis(250),
     );
     drop(receiver);
-    terminal_io_done.store(true, Ordering::Release);
     if let Some(writer) = terminal_writer {
         let _ = writer.join();
     }
@@ -770,7 +770,7 @@ fn spawn_terminal_reader(
     thread::spawn(move || {
         let mut file = File::from(descriptor);
         let mut buffer = vec![0u8; OUTPUT_CHUNK_BYTES];
-        while !done.load(Ordering::Acquire) {
+        loop {
             match file.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(length) => {
