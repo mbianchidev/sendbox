@@ -2193,6 +2193,14 @@ mod tests {
         SessionId::from_bytes([0x42; 16])
     }
 
+    fn secure_tempdir() -> TempDir {
+        let base = std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical test base");
+        tempfile::tempdir_in(base).expect("secure temporary directory")
+    }
+
     #[test]
     fn host_security_policies_fail_closed_or_compose() {
         let temp = TempDir::new().expect("temp dir");
@@ -2716,8 +2724,8 @@ mod tests {
 
     #[test]
     fn ssh_private_keys_require_owner_only_files_and_execution_size() {
-        let temp = TempDir::new().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temporary");
+        let temp = secure_tempdir();
+        let root = temp.path();
         let key = root.join("id");
         fs::write(
             &key,

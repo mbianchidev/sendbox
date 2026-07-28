@@ -218,7 +218,9 @@ if [[ "$PLATFORM" == macos-* ]]; then
             "$INSTALL_ROOT/usr/local/bin/sendbox" \
             "$INSTALLED_SHARE/setup.sh" >/dev/null
     ORIGINAL_BINARY_HASH="$(shasum -a 256 "$INSTALL_ROOT/usr/local/bin/sendbox" | awk '{print $1}')"
-    ORIGINAL_SETUP_HASH="$(shasum -a 256 "$INSTALLED_SHARE/setup.sh" | awk '{print $1}')"
+    ORIGINAL_SETUP_HASH="$(
+        install_as_root shasum -a 256 "$INSTALLED_SHARE/setup.sh" | awk '{print $1}'
+    )"
     if install_as_root env \
         SENDBOX_INSTALL_ROOT="$INSTALL_ROOT" \
         SENDBOX_INSTALL_NO_SUDO=1 \
@@ -229,7 +231,7 @@ if [[ "$PLATFORM" == macos-* ]]; then
     fi
     test "$(shasum -a 256 "$INSTALL_ROOT/usr/local/bin/sendbox" | awk '{print $1}')" \
         = "$ORIGINAL_BINARY_HASH"
-    test "$(shasum -a 256 "$INSTALLED_SHARE/setup.sh" | awk '{print $1}')" \
+    test "$(install_as_root shasum -a 256 "$INSTALLED_SHARE/setup.sh" | awk '{print $1}')" \
         = "$ORIGINAL_SETUP_HASH"
     test "$(stat -f '%Lp' "$INSTALLED_SHARE/setup.sh")" = 600
     test -z "$(find "$INSTALL_ROOT/usr/local" \
