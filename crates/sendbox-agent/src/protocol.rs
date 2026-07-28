@@ -306,6 +306,11 @@ const WRITER_INPUT_DEPTH: usize = 256;
 /// draining its terminal must never be able to stall the screen.
 const INPUT_OFFER_BOUND: Duration = Duration::from_millis(250);
 
+/// How long a one-shot input signal may wait for the writer. Longer than the
+/// droppable bound because losing it hangs the workload, short enough to stay
+/// well inside the protocol timeout.
+const REQUIRED_INPUT_BOUND: Duration = Duration::from_secs(5);
+
 struct WriterMessage {
     message: Message,
     ack: Option<tokio::sync::oneshot::Sender<Result<(), sendbox_protocol::ProtocolError>>>,
@@ -383,24 +388,61 @@ impl WriterHandle {
     /// Queues a keystroke without waiting for the socket. Saturation drops the
     /// keystroke with a diagnostic rather than blocking the caller.
     async fn offer_input(&self, message: Message) -> Result<(), AgentError> {
-        match self
-            .input
-            .send_timeout(WriterMessage { message, ack: None }, INPUT_OFFER_BOUND)
-            .await
-        {
+        match self.queue_input(message, INPUT_OFFER_BOUND).await {
             Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+            Err(InputQueueError::Saturated) => {
                 eprintln!(
                     "sendbox: guest stopped accepting terminal input for {}ms; dropping input",
                     INPUT_OFFER_BOUND.as_millis()
                 );
                 Ok(())
             }
-            Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => Err(AgentError::Guest(
+            Err(InputQueueError::Stopped) => Err(AgentError::Guest(
                 "guest connection writer stopped".to_owned(),
             )),
         }
     }
+
+    /// Queues a one-shot input signal that must not be dropped. End of file
+    /// changes state on both sides — the caller stops sending and the workload
+    /// waits for the terminal's `VEOF` byte — so losing it silently would hang
+    /// the workload until its launch timeout.
+    async fn require_input(&self, message: Message) -> Result<(), AgentError> {
+        self.queue_input(message, REQUIRED_INPUT_BOUND)
+            .await
+            .map_err(|error| match error {
+                InputQueueError::Saturated => AgentError::Guest(format!(
+                    "guest did not accept terminal end of file within {}ms",
+                    REQUIRED_INPUT_BOUND.as_millis()
+                )),
+                InputQueueError::Stopped => {
+                    AgentError::Guest("guest connection writer stopped".to_owned())
+                }
+            })
+    }
+
+    /// Queues on the single input channel so terminal ordering is preserved:
+    /// end of file must never overtake the keystrokes that precede it.
+    async fn queue_input(&self, message: Message, bound: Duration) -> Result<(), InputQueueError> {
+        match self
+            .input
+            .send_timeout(WriterMessage { message, ack: None }, bound)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+                Err(InputQueueError::Saturated)
+            }
+            Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => {
+                Err(InputQueueError::Stopped)
+            }
+        }
+    }
+}
+
+enum InputQueueError {
+    Saturated,
+    Stopped,
 }
 
 impl Drop for WriterHandle {
@@ -494,12 +536,19 @@ impl GuestExecution for ProtocolGuestExecution {
                     payload: bytes,
                 },
                 HostTerminalCommand::InputEof => {
-                    self.input_ended = true;
-                    Event {
+                    let event = Event {
                         stream_id: REQUEST_ID,
                         kind: sendbox_protocol::EventKind::StandardInputEof,
                         payload: Vec::new(),
-                    }
+                    };
+                    guest_io(
+                        "send guest terminal end of file",
+                        cancellation,
+                        self.writer.require_input(Message::Event(event)),
+                    )
+                    .await?;
+                    self.input_ended = true;
+                    return Ok(());
                 }
                 HostTerminalCommand::Resize { columns, rows } => {
                     let size = TerminalSizeV1::new(columns, rows).map_err(|error| {
@@ -638,6 +687,49 @@ async fn guest_io<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_event(kind: EventKind) -> Message {
+        Message::Event(Event {
+            stream_id: REQUEST_ID,
+            kind,
+            payload: Vec::new(),
+        })
+    }
+
+    /// A saturated writer must lose keystrokes rather than the orchestrator's
+    /// ability to keep reading, but end of file changes state on both sides:
+    /// losing it silently leaves the workload waiting for a `VEOF` byte that
+    /// can no longer be produced.
+    #[tokio::test(start_paused = true)]
+    async fn a_saturated_writer_drops_keystrokes_but_never_end_of_file() {
+        let (control, _control) = tokio::sync::mpsc::channel(WRITER_CONTROL_DEPTH);
+        let (input, _input) = tokio::sync::mpsc::channel(1);
+        input
+            .send(WriterMessage {
+                message: terminal_event(EventKind::StandardInput),
+                ack: None,
+            })
+            .await
+            .expect("fill the queue");
+        let writer = WriterHandle {
+            control,
+            input,
+            task: tokio::spawn(std::future::pending()),
+        };
+
+        writer
+            .offer_input(terminal_event(EventKind::StandardInput))
+            .await
+            .expect("a dropped keystroke is not a failed run");
+        let error = writer
+            .require_input(terminal_event(EventKind::StandardInputEof))
+            .await
+            .expect_err("end of file must never be dropped silently");
+        assert!(
+            error.to_string().contains("end of file"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn broker_signal_terminal_is_preserved() {

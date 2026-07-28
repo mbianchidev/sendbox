@@ -1334,6 +1334,88 @@ fn interactive_launch_is_rejected_when_the_policy_denies_terminal_syscalls() {
     }
 }
 
+#[test]
+fn interactive_launch_outlives_a_workload_that_never_reads_its_terminal() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    // Puts its terminal in raw mode and then never reads it, so terminal input
+    // backs up, then reports the window size it is eventually resized to. The
+    // in-process `terminal_input_gives_up_on_a_workload_that_never_drains_it`
+    // covers the write bound itself; this covers the end-to-end consequence,
+    // that a command queued behind an undrained backlog still arrives.
+    let script = "import fcntl, struct, sys, termios, time, tty\n\
+         tty.setraw(0)\n\
+         sys.stdout.write('ready\\r\\n')\n\
+         sys.stdout.flush()\n\
+         deadline = time.time() + 12\n\
+         while time.time() < deadline:\n\
+         \x20   rows, columns = struct.unpack('hh', fcntl.ioctl(1, termios.TIOCGWINSZ, b'\\0' * 4))\n\
+         \x20   if columns == 120 and rows == 40:\n\
+         \x20       sys.stdout.write('resized %d %d\\r\\n' % (columns, rows))\n\
+         \x20       sys.stdout.flush()\n\
+         \x20       sys.exit(0)\n\
+         \x20   time.sleep(0.05)\n\
+         sys.stdout.write('timeout\\r\\n')\n\
+         sys.stdout.flush()\n";
+    let invocation = launcher_invocation(
+        &session,
+        parent,
+        interactive_case("live-pty-deaf", &executable, &python, script),
+    );
+    let (sender, input) = sendbox_exec::ChannelInput::bounded(16);
+    let feeder = std::thread::spawn(move || {
+        // One chunk far larger than the terminal can buffer, so a single
+        // `write_all` has to survive the workload never draining it. Give the
+        // workload time to reach raw mode first, otherwise the line discipline
+        // simply discards the flood instead of throttling.
+        std::thread::sleep(Duration::from_millis(500));
+        sender
+            .offer(
+                sendbox_exec::TerminalCommand::Input(vec![b'x'; 256 * 1024]),
+                Duration::from_secs(10),
+            )
+            .expect("queue flood");
+        sender
+            .offer(
+                sendbox_exec::TerminalCommand::Resize {
+                    columns: 120,
+                    rows: 40,
+                },
+                Duration::from_secs(10),
+            )
+            .expect("queue resize");
+    });
+
+    let backend = launcher_backend(&invocation);
+    let mut streamed = Vec::new();
+    let mut sink = |event| {
+        if let ExecutionEvent::Output { data, .. } = event {
+            streamed.extend(data);
+        }
+        Ok(())
+    };
+    let result = backend.execute(
+        &invocation.request,
+        &invocation.decision,
+        &mut sink,
+        &input,
+        &CancellationFlag::default(),
+    );
+    feeder.join().expect("input feeder");
+
+    assert_clean_exit(&result.terminal);
+    let rendered = String::from_utf8_lossy(&streamed);
+    assert!(
+        rendered.contains("resized 120 40"),
+        "a workload that ignores its terminal blocked every later command: {rendered}"
+    );
+}
+
 fn assert_clean_exit(terminal: &TerminalState) {
     match terminal {
         TerminalState::Exited(status) => assert_eq!(

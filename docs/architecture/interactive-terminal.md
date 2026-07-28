@@ -77,7 +77,7 @@ never stall cancellation:
 | Layer | Control path | Input path |
 |---|---|---|
 | `sendbox-cli` stdin reader | shutdown flag observed on every retry | bounded retry into a depth-256 queue |
-| `sendbox-agent` writer task | depth-4 channel, drained first by a `biased` select, acknowledged | depth-256 channel, 250 ms bounded offer then loud drop |
+| `sendbox-agent` writer task | depth-4 channel, drained first by a `biased` select, acknowledged | depth-256 channel, 250 ms bounded offer then loud drop; end of file waits 5 s and fails loudly |
 | `sendbox-agent` orchestrator | biased `select!` arm | unbiased against guest output |
 | Guest protocol loop | depth-4 channel, drained first by a `biased` select | depth-256 channel, bounded wait then loud drop |
 | `sendbox-exec` service | control reader loops, never blocks | 250 ms bounded offer |
@@ -96,6 +96,20 @@ other, with neither side reading and both blocked writing.
 Saturation drops keystrokes with an explicit diagnostic rather than deadlocking.
 End-to-end credit-based flow control would remove the drop entirely and is the
 natural follow-up if a real workload ever hits it.
+
+End of file is the one input message that may not be dropped. It is one-shot and
+state-changing on all three sides — the host stops reading stdin, the
+orchestrator closes the terminal, and the guest refuses further input — so a
+silent drop leaves the workload waiting forever for a `VEOF` byte that can no
+longer be produced. It travels on the *input* channel, so it can never overtake
+preceding keystrokes, but with a longer bound and a hard error instead of a drop.
+
+The pty primary is opened `O_NONBLOCK`. `n_tty_write` on a blocking descriptor
+does not return short counts: it sleeps until every byte fits, so polling for
+writability before a blocking write would bound nothing (`POLLOUT` only promises
+one byte of room). Since `O_NONBLOCK` is file-status state shared by every
+descriptor for the same open file, and a pty primary cannot be reopened to get
+an independent file description, the output pump is `poll`-driven too.
 
 ## End of file
 

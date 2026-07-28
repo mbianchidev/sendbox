@@ -545,7 +545,7 @@ fn run(
                 );
             }
         };
-        readers.push(spawn_reader(primary, StreamKind::Stdout, sender));
+        readers.push(spawn_terminal_reader(primary, sender));
         if let Some(queue) = terminal_input {
             terminal_writer = Some(spawn_terminal_writer(
                 writer,
@@ -696,6 +696,59 @@ fn spawn_reader(
             }
         }
     })
+}
+
+/// Reads merged pseudoterminal output.
+///
+/// The primary is non-blocking so the writer's bound is real, which means this
+/// reader has to wait for readiness itself. `poll` returns on hangup too, so
+/// the following read still reports the EIO that ends the stream.
+fn spawn_terminal_reader(
+    descriptor: OwnedFd,
+    sender: SyncSender<OutputChunk>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut file = File::from(descriptor);
+        let mut buffer = vec![0u8; OUTPUT_CHUNK_BYTES];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(length) => {
+                    if sender
+                        .send(OutputChunk {
+                            stream: StreamKind::Stdout,
+                            data: buffer[..length].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if !wait_readable(&file) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn wait_readable(primary: &File) -> bool {
+    let primary = primary.as_fd();
+    let mut fds = [rustix::event::PollFd::new(
+        &primary,
+        rustix::event::PollFlags::IN,
+    )];
+    loop {
+        match rustix::event::poll(&mut fds, None) {
+            Ok(_) => return true,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return false,
+        }
+    }
 }
 
 fn receive_output(receiver: &Receiver<OutputChunk>) -> Option<OutputChunk> {
@@ -1078,6 +1131,13 @@ fn spawn_terminal_writer(
                 continue;
             };
             if let Err(error) = device.apply(command) {
+                // A workload that stops draining its terminal is a dropped
+                // keystroke, not a broken session: keeping the thread alive is
+                // what lets a later resize or cancel still get through.
+                if error.kind() == io::ErrorKind::TimedOut {
+                    eprintln!("sendbox-launcher: {error}; dropping input");
+                    continue;
+                }
                 eprintln!("sendbox-launcher: terminal input failed: {error}");
                 return;
             }
@@ -1137,21 +1197,23 @@ impl TerminalWriter {
         let mut offset = 0;
         let deadline = Instant::now() + INPUT_WRITE_BOUND;
         while offset < data.len() {
-            Self::wait_writable(&self.primary, deadline)?;
             match self.primary.write(&data[offset..]) {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
                 Ok(written) => offset += written,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                // The primary is non-blocking, so a workload that stops
+                // draining its terminal surfaces here instead of parking this
+                // thread in the kernel for as long as it takes every byte to
+                // fit. That is what makes the bound below real.
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Self::wait_writable(&self.primary, deadline)?;
+                }
                 Err(error) => return Err(error),
             }
         }
         self.primary.flush()
     }
 
-    /// The primary is a blocking descriptor, so a workload that stops draining
-    /// its terminal would otherwise park this thread in the kernel forever and
-    /// the bound above would never be observed. Waiting for writability first
-    /// makes it real.
     fn wait_writable(primary: &File, deadline: Instant) -> io::Result<()> {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1381,6 +1443,35 @@ fn platform_launch_failure(error: PlatformError) -> LaunchFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_input_gives_up_on_a_workload_that_never_drains_it() {
+        let device = super::super::pty::PseudoTerminal::open(80, 24).expect("allocate pty");
+        // Raw mode is what makes the line discipline throttle instead of
+        // silently discarding, which is the shape a full-screen agent has.
+        let secondary = device.secondary().expect("secondary");
+        let mut attributes = rustix::termios::tcgetattr(secondary).expect("read attributes");
+        attributes.make_raw();
+        rustix::termios::tcsetattr(
+            secondary,
+            rustix::termios::OptionalActions::Now,
+            &attributes,
+        )
+        .expect("set raw");
+
+        let mut writer = TerminalWriter::new(device).expect("terminal writer");
+        let started = Instant::now();
+        let error = writer
+            .write_all(&vec![b'x'; 1024 * 1024])
+            .expect_err("a terminal nobody reads must not accept a megabyte");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "unexpected: {error}");
+        assert!(
+            started.elapsed() < INPUT_WRITE_BOUND * 4,
+            "the write bound was not enforced: {:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn bounded_channel_classifies_output_saturation() {

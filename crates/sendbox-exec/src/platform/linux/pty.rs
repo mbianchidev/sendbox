@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 
 use std::io;
+#[cfg(test)]
+use std::os::fd::BorrowedFd;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
@@ -58,6 +60,12 @@ impl PseudoTerminal {
         // path could be replaced between resolution and open.
         let secondary = ioctl_tiocgptpeer(&primary, flags)
             .map_err(|error| pty_error("open pseudoterminal secondary", error))?;
+        // The primary is non-blocking so a workload that stops draining its
+        // terminal cannot park the launcher's writer thread in the kernel: a
+        // blocking `write` sleeps until every byte fits, which no readiness
+        // check can bound. The reader waits for readiness itself. The child's
+        // secondary is a separate description and stays blocking.
+        set_nonblocking(&primary)?;
         let terminal = Self {
             primary,
             secondary: Some(secondary),
@@ -125,6 +133,12 @@ impl PseudoTerminal {
         Ok(self.secondary_fd()?.as_raw_fd())
     }
 
+    /// Borrowed secondary, for tests that stay in safe rustix.
+    #[cfg(test)]
+    pub(crate) fn secondary(&self) -> Result<BorrowedFd<'_>, PlatformError> {
+        Ok(self.secondary_fd()?.as_fd())
+    }
+
     /// Closes the launcher's copy of the secondary.
     ///
     /// This must happen right after `clone3`, otherwise the primary never
@@ -151,6 +165,13 @@ impl AsFd for PseudoTerminal {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.primary.as_fd()
     }
+}
+
+fn set_nonblocking(primary: &OwnedFd) -> Result<(), PlatformError> {
+    let flags = rustix::fs::fcntl_getfl(primary)
+        .map_err(|error| pty_error("read pseudoterminal primary flags", error))?;
+    rustix::fs::fcntl_setfl(primary, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|error| pty_error("set pseudoterminal primary non-blocking", error))
 }
 
 fn pty_error(operation: &'static str, error: rustix::io::Errno) -> PlatformError {
