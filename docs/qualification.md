@@ -18,11 +18,12 @@ crate and phase, and a conformance status. Redesigns also require a
 compatibility note. Validation fails on duplicate IDs, missing evidence,
 unknown fields, missing fixtures, or an unresolved disposition.
 
-The phase 9 security records now include library-level evidence for the
-adapter-neutral session lifecycle, audit anchoring, snapshot rollback, secret
-envelopes, provenance verification, permission grants, and bounded migration
-reports. These entries do not claim host agent, runtime, CLI, MCP, credential
-listener, or guest enforcement integration.
+The production Rust records include adapter-neutral session lifecycle, audit
+anchoring, snapshot rollback, secret envelopes, provenance verification,
+permission grants, and bounded migration reports. `sendbox-host` now composes
+those records with verified runtime plans and authenticated Apple/Kata guest
+services. The only remaining specified fixture is `setup.release`, which is
+resolved by the final package and installer cutover.
 
 For a PR, changed behavior must update the corresponding inventory and fixture.
 Cutover requires every preserved entry to have a passing implementation test
@@ -41,18 +42,17 @@ setup/release behavior, and known-defect negative cases. Existing config and
 protocol fixtures remain the executable implementation tests where available;
 qualification fixtures define the cross-implementation contract.
 
-The native Git guard implements the protected-branch policy slice with typed
-Rust decisions and real-Git integration tests. Its evidence covers
-repository/workspace identity, aliases, options, remote rewrites, refspecs,
-timeouts, output limits, environment/config injection, trusted binary paths, and
-native exit preservation. The broader `policy.decisions` fixture remains
-specified until every command, network, MCP, and repository decision slice has
-a pure Rust implementation.
+`policy.decisions` is implemented across the native command broker, egress
+engine, MCP broker, repository-scope authorization, and Git guard. The Git
+evidence covers repository/workspace identity, aliases, options, remote
+rewrites, refspecs, timeouts, output limits, environment/config injection,
+trusted binary paths, and native exit preservation.
 
-`mcp.contracts` records the native framing, JSON-RPC, policy, exact-command,
-project-validation, legacy-trace, versioned-observation, redaction, backpressure,
-and cancellation contracts. It deliberately excludes guest/runtime integration
-and remote HTTP authorization.
+`mcp.contracts` records native framing, JSON-RPC, policy, exact-command,
+project-validation, authenticated guest delivery, legacy-trace,
+versioned-observation, redaction, backpressure, and cancellation contracts.
+Remote HTTP/SSE authorization remains intentionally unsupported and fails
+closed.
 
 The comparison runner invokes binaries directly, never through a shell. It
 normalizes declared paths and JSON fields, enforces a timeout and combined
@@ -98,8 +98,8 @@ cargo run --manifest-path tools/sendbox-qualification/Cargo.toml -- \
 ```
 
 The portable harness never starts Apple container services, containerd, Kata,
-Hyperlight, guest services, or BPF programs. The experimental Rust Kata slice
-adds a separate, non-skipping self-hosted gate:
+Hyperlight, guest services, or BPF programs. Production Kata has a separate,
+non-skipping self-hosted gate:
 
 ```bash
 SENDBOX_KATA_LIVE=1 \

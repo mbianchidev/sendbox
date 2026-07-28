@@ -2,8 +2,10 @@
 
 `crates/sendbox-runtime-hyperlight` is the production Rust
 `RuntimeProvider` for the official `hyperlight-unikraft` host CLI. It is
-Linux/KVM-only and deliberately models Hyperlight as a one-shot runtime. This
-crate is not wired into the Rust CLI run command.
+Linux/KVM-only and deliberately models Hyperlight as a one-shot runtime.
+`sendbox run --runtime hyperlight` dispatches through
+`execute_authenticated_once`; it never pretends to provide the persistent guest
+session used by Apple and Kata.
 
 ## Trust and preflight
 

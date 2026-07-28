@@ -1,8 +1,13 @@
 # Security Records Architecture
 
-`sendbox-security` provides persistence foundations for audit records, provenance,
-and workspace snapshots. These APIs are intentionally not wired into
-`sendbox-rs run`, runtime adapters, guest services, secrets, or credential handling.
+`sendbox-security` provides the persistence foundation for audit records,
+provenance, and workspace snapshots. `sendbox-host` composes these records
+through `sendbox-session-security` around persistent Apple and Kata runs:
+trusted inputs are verified, the before-state snapshot is captured, permission
+state is anchored, secret envelopes are prepared, completion or failure is
+finalized, excluded-path mutations are quarantined or rolled back, and the
+final audit head is published. Guest enforcement and credential transport
+remain separate authenticated services rather than persistence concerns.
 
 ## Secure filesystem boundary
 

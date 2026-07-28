@@ -1,35 +1,62 @@
 # SendBox
 
-**Secure, hardware-isolated agent sandboxing on macOS and Linux.**
+**Authenticated, VM-backed agent sandboxing on macOS and Linux.**
 
-SendBox runs AI agents inside dedicated Linux virtual machines. It uses Apple's [Containerization](https://github.com/apple/containerization) framework on Apple silicon and [Kata Containers](https://katacontainers.io/) through nerdctl/containerd on Linux.
+SendBox runs AI agents through a signed, fail-closed runtime plan. Persistent
+sessions use Apple's [Containerization](https://github.com/apple/containerization)
+on Apple silicon or [Kata Containers](https://katacontainers.io/) through
+nerdctl/containerd on Linux. Hyperlight is an explicit Linux/KVM one-shot
+provider with a narrower capability set.
 
 ---
 
 ## Features
 
-- **File Isolation** — Mount only the directories an agent needs. Everything else is invisible.
-- **Command Filtering** — Allowlist or denylist which binaries an agent may execute inside the sandbox.
-- **Network Firewall** — Restrict outbound traffic to specific hosts, ports, or protocols.
-- **Runtime Providers** — Select Apple Containerization, Kata Containers, or Hyperlight through one lifecycle API and `--runtime`.
-- **Hyperlight Execution** — The Rust runtime adapter runs verified one-shot commands in Hyperlight/Unikraft micro-VMs on Linux; persistent agent/MCP transport is rejected.
-- **Credential Injection** — Secrets and repository-scoped GitHub/Copilot credentials use authenticated, encrypted host-to-guest envelopes. SSH keys are staged only in an owner-only runtime directory for the trusted SSH child and removed afterward.
-- **Undo & Rollback** — Content-addressed SHA-256 snapshots capture workspace state before every session. Restore, diff, verify, or prune snapshots at any time.
-- **Audit Trail** — Merkle-tree-committed session logs with cryptographic integrity verification. Every command, file access, and network connection is recorded in a tamper-evident hash chain.
-- **Native MCP Core** — Safe Rust framing, strict JSON-RPC validation, deny-first stdio tool policy, exact-command brokering, config validation, legacy trace parsing, and versioned native observation records. Runtime/guest wiring remains separate. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
-- **Boundary Enforcement** — Existing runtime paths retain their current boundary implementation while the native MCP broker is integrated. The Rust library itself does not claim guest installation or direct-launch prevention.
-- **Supply Chain Provenance** — Ed25519 signing for config and policy files ensures they were authored by trusted identities. Multi-signer support with a configurable trust store.
-- **Runtime Supervisor** — Dynamic permission expansion with approval workflows. Agents start restricted and earn broader permissions through supervised interaction (one-time, session-wide, or pattern-based grants).
-- **VM Hardening** — Defense-in-depth sysctl lockdown, capability dropping, and seccomp profiles covering all 18 [SandboxEscapeBench](https://arxiv.org/abs/2603.02277) scenarios.
+- **File Isolation** — Host visibility is limited to explicitly configured
+  runtime mounts; state and workspace roots must be disjoint.
+- **Command Filtering** — Deny-first semantic policy applies to the brokered
+  top-level argv. Descendants inherit kernel containment rather than an
+  unprovable recursive shell-policy claim.
+- **Network Firewall** — Apple and Kata sessions route DNS and TCP CONNECT
+  through loopback brokers backed by cgroup-v2 identity, `SO_MARK`, and atomic
+  nftables rules. UDP/QUIC and direct external agent traffic are denied.
+- **Runtime Providers** — `auto` selects Apple on macOS arm64 and Kata on Linux.
+  Explicit Apple, Kata, and Hyperlight requests never fall back silently.
+- **Hyperlight Execution** — Verified one-shot commands run in
+  Hyperlight/Unikraft micro-VMs on Linux; unsupported persistent guest, MCP,
+  credential, Git-guard, and restrictive-egress features are rejected.
+- **Credential Injection** — Secrets and repository-scoped GitHub/Copilot
+  credentials use authenticated encrypted host-to-guest envelopes. SSH keys are
+  staged only for a trusted SSH child in an owner-only runtime directory and are
+  removed afterward.
+- **Undo & Rollback** — Descriptor-safe, content-addressed SHA-256 snapshots
+  support capture, verify, restore, diff, and prune with versioned formats.
+- **Audit Trail** — Lifecycle operations and security decisions are committed to
+  versioned hash-chained records with Merkle summaries and externally verifiable
+  heads.
+- **Native MCP Boundary** — Apple and Kata guests install a root-owned stdio
+  broker with bounded framing, strict JSON-RPC validation, deny-first tool
+  policy, exact server commands, a cleared environment, and versioned
+  observation records. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
+- **Boundary Enforcement** — The host signs one immutable runtime plan before
+  provider dispatch. The authenticated guest starts mandatory security services
+  before workload execution and rejects session, policy, feature, or cgroup
+  drift.
+- **Supply Chain Provenance** — Boundary plans and guest bundles use Ed25519
+  signatures, versioned trust metadata, rollback floors, inventory, and SBOM
+  evidence.
+- **Runtime Supervisor** — Permission grants use an explicit persisted and
+  auditable state machine with one-time, session, pattern, and permanent-deny
+  decisions.
+- **VM Hardening** — Dedicated service profiles apply no-new-privileges,
+  capability removal, resource limits, and architecture-aware TSYNC seccomp.
 - **Devcontainer Generation** — Export sandbox configurations as [devcontainer](https://containers.dev/) specs for reproducible environments.
 
 ## Requirements
 
 | Scope | Dependency | Minimum |
 |---|---|---|
-| Common | Swift | 6.2 |
-| Common | Node.js | 20+ for `copilot-bridge` |
-| Experimental validator | Rust | 1.93.1 (pinned by `rust-toolchain.toml`) |
+| Source build | Rust | 1.93.1 (pinned by `rust-toolchain.toml`) |
 | Apple runtime | macOS | 26 (Tahoe) |
 | Apple runtime | Hardware | Apple Silicon |
 | Apple runtime | Xcode | 26 |
@@ -84,35 +111,24 @@ For an interactive runtime preflight and configuration flow:
 
 Kata installation and containerd configuration are documented in [docs/kata-containers.md](docs/kata-containers.md).
 
-### Experimental Rust CLI subset
+### Rust production implementation
 
-The parallel Rust foundation builds an experimental `sendbox-rs` binary whose
-command name and generated completions are `sendbox`. The Rust CLI currently
-supports configuration initialization, policy show/validation, native project
-analysis, devcontainer generation, and bash/zsh/fish completion print/install.
-Sandbox execution, secrets, MCP, boundary, and release installation remain on
-the production Swift `sendbox` binary.
+During the final packaging cutover the Cargo binary is still emitted as
+`sendbox-rs`, while its command name, help, JSON contracts, and generated
+completions are already `sendbox`. It implements `run`, `init`, `analyze`,
+`devcontainer`, `policy`, `secrets`, `mcp`, `boundary`, and `completions`.
 
-The workspace also includes focused production Rust components that are not yet
-wired into `sendbox run`. `sendbox-git` provides typed selected-repository
-push/pull admission and the `sendbox-git-guard` native execution shim for later
-exec-broker/guest integration. See
-[docs/architecture/git-branch-guard.md](docs/architecture/git-branch-guard.md).
+`sendbox run` resolves and verifies one signed boundary plan before provider
+construction or image acquisition. Persistent Apple and Kata sessions bind the
+plan digest into authenticated bootstrap, then start egress, MCP, Git,
+credential, audit, snapshot, supervisor, and execution controls before the
+guest accepts the workload. Hyperlight uses an authenticated one-shot path and
+rejects unsupported composition.
 
-The workspace also contains the pre-1.0 `sendbox-protocol` foundation for
-bounded, authenticated host/guest communication. `sendbox-runtime` owns the
-transport-neutral channel provisioning contract, `sendbox-agent` owns
-orchestration, and `sendbox-runtime-apple` implements the official Apple
-`container` 0.10.0 lifecycle on macOS arm64. See
-[authenticated guest protocol](docs/architecture/authenticated-guest-protocol.md)
-and [agent orchestration](docs/architecture/agent-orchestration.md).
-
-The pre-1.0 `sendbox-credentials` production library provides explicit
-loopback credential endpoints and guarded GitHub repository authorization. It
-requires agents to support API base-URL overrides and intentionally does not
-intercept TLS or support CONNECT injection. Runtime/CLI lifecycle wiring is
-deferred. See
-[docs/architecture/secrets-and-credential-broker.md](docs/architecture/secrets-and-credential-broker.md).
+See [authenticated guest protocol](docs/architecture/authenticated-guest-protocol.md),
+[agent orchestration](docs/architecture/agent-orchestration.md),
+[Git branch guard](docs/architecture/git-branch-guard.md), and
+[secrets and credential brokering](docs/architecture/secrets-and-credential-broker.md).
 
 ```bash
 make rust-build
@@ -159,16 +175,21 @@ sudo spctl --master-disable
 Create a `sendbox.yaml` in your project root (see [Configuration](#configuration) below), then:
 
 ```bash
-sendbox init
-sendbox init --runtime kata
+sendbox init --project .
+sendbox init --project . --runtime kata
 ```
 
 ### Run
 
 ```bash
-# Launch an agent inside the sandbox
-sendbox run --config sendbox.yaml
-sendbox run --config sendbox.yaml --runtime kata
+# Launch one exact argv workload through a verified guest bundle
+sendbox run \
+  --config .sendbox.yaml \
+  --runtime kata \
+  --image registry.example/workload@sha256:<digest> \
+  --bundle /opt/sendbox/bundle \
+  --trust-root /opt/sendbox/release-public.key \
+  -- /usr/bin/true
 ```
 
 ## Configuration
@@ -301,7 +322,7 @@ signed environment and fixed workspace. Optional stdio observation is written be
 |---|---|---|
 | `name` | string | Human-readable sandbox name |
 | `project_path` | string | Host project directory mounted into the guest |
-| `runtime.provider` | enum | `auto`, `apple`, or `kata` |
+| `runtime.provider` | enum | `auto`, `apple`, `kata`, or `hyperlight` |
 | `runtime.kata.runtime_handler` | string | Kata containerd runtime v2 handler |
 | `runtime.kata.namespace` | string | containerd namespace |
 | `runtime.kata.configuration_path` | string | Absolute Kata config path on the containerd host |
@@ -325,7 +346,7 @@ signed environment and fixed workspace. Optional stdio observation is written be
 | `github.branch_protection.username` | string | Username used to expand `{username}` patterns; auto-detected by default |
 | `github.branch_protection.protected_branches` | list | Branch names that push and pull can never target |
 | `github.branch_protection.allowed_branch_patterns` | list | Glob patterns allowed for selected-repository push and pull |
-| `observability.mcp_inspection.enabled` | bool | Enable configured MCP observation (current runtime wiring remains provider-specific) |
+| `observability.mcp_inspection.enabled` | bool | Enable authenticated local stdio MCP observation on Apple or Kata |
 
 ## Architecture
 
@@ -343,23 +364,12 @@ signed environment and fixed workspace. Optional stdio observation is written be
                   Dedicated Linux guest VM
 ```
 
-**SendBoxKit** is the core library organized into four modules:
+The Rust workspace separates immutable boundary planning, provider-neutral
+orchestration, runtime adapters, authenticated guest services, and
+security-record persistence. The CLI depends on native project analysis and
+devcontainer generation; no production path requires Node.js or Copilot.
 
-| Module | Responsibility |
-|---|---|
-| `Config` | Parse and validate YAML configuration |
-| `Security` | Enforce command filtering, network rules, and secret injection |
-| `Container` | Select and manage Apple or Kata VM runtimes |
-| `Agent` | Coordinate agent process execution and I/O |
-
-The **copilot-bridge** is a temporary Node.js migration bridge. New project
-analysis and devcontainer generation are native Rust and do not require Node.js
-or Copilot.
-
-The Rust workspace contains shared domain/error types, strict configuration and
-policy validation, native project analysis, runtime and credential primitives,
-an adapter-neutral session security lifecycle, and production Linux execution
-and egress enforcement. See the architecture documents for
+See the architecture documents for
 [project analysis](docs/architecture/native-project-analysis.md),
 [runtime core](docs/architecture/runtime-core.md),
 [agent orchestration](docs/architecture/agent-orchestration.md),
@@ -378,20 +388,17 @@ The earlier isolated evidence remains in
 
 SendBox follows a **deny-by-default** security posture:
 
-1. **Filesystem** — Only explicitly mounted paths are visible inside the VM. The host filesystem is never exposed wholesale.
-2. **Commands** — By default no binaries are available. Use `allowlist` mode to grant access to specific tools, or `denylist` mode to start permissive and lock down selectively.
-3. **Network** — Outbound connections are blocked unless a matching `allow` rule exists. DNS resolution is restricted to permitted hosts.
-4. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when their private-repository scope matches policy. Credentials are never persisted in the guest filesystem. Host storage uses Keychain on macOS and mode-restricted files on Linux.
-5. **Isolation** — Each sandbox runs in its own lightweight VM. A compromised agent cannot affect the host or other sandboxes.
-6. **Boundaries** — The agent runs as the invoking non-root host UID under seccomp. Stdio MCP tool calls must pass through the root-owned proxy; direct server launches are terminated by eBPF.
-7. **Branches** — A root-installed git guard and eBPF bypass detector restrict selected-repository pushes and pulls to configured feature branch patterns.
+1. **Filesystem** — Only explicitly configured host paths are mounted into the guest. State and workspace roots cannot overlap.
+2. **Commands** — Deny rules win over allow rules for the brokered top-level argv. Descendants are constrained by the guest execution boundary, not recursively reinterpreted as shell text.
+3. **Network** — Persistent workloads can reach only the loopback DNS and SOCKS5 brokers. Kernel rules deny direct external agent traffic and unmarked broker traffic.
+4. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when repository scope matches policy. Secret values use authenticated envelopes and temporary owner-only guest files where a child process requires a file.
+5. **Isolation** — Apple and Kata provide persistent Linux VMs; Hyperlight provides explicit Linux/KVM one-shot isolation. Missing host or runtime capabilities are errors, never silent fallbacks.
+6. **Boundaries** — Signed guest services must become ready before execution. Local stdio MCP calls must traverse the installed broker; HTTP/SSE, direct project-server configuration, and unsupported transports fail closed.
+7. **Branches** — Trusted Git wrappers restrict selected-repository push and pull operations. Alternate clients and direct hosting-provider APIs remain outside this local guard, so server-side rules stay required.
 
 ## CLI Reference
 
-The table below is the intended complete `sendbox` surface. The experimental
-Rust binary currently implements `init`, `analyze`, `devcontainer`, `policy`,
-and `completions`. `run`, `secrets`, `mcp`, and `boundary` remain Swift-only
-until their runtime/security dependencies are cut over.
+The Rust CLI implements the complete supported `sendbox` surface:
 
 ```
 USAGE: sendbox <subcommand> [options]
@@ -402,8 +409,8 @@ SUBCOMMANDS:
   analyze       Analyze a project and generate a devcontainer spec
   secrets       Add, remove, or list stored secrets
   policy        Show or validate policies
-  mcp           Inspect Model Context Protocol calls via eBPF
-  boundary      Inspect generated proxy, eBPF, seccomp, or bootstrap artifacts
+  mcp           Parse and summarize native or legacy MCP observations
+  boundary      Inspect the structured native boundary plan
   completions   Install or print shell completions
   help          Show help for any subcommand
 ```
@@ -415,7 +422,11 @@ SUBCOMMANDS:
 sendbox init
 
 # Run with the Kata backend
-sendbox run --config sendbox.yaml --runtime kata
+sendbox run --config .sendbox.yaml --runtime kata \
+  --image registry.example/workload@sha256:<digest> \
+  --bundle /opt/sendbox/bundle \
+  --trust-root /opt/sendbox/release-public.key \
+  -- /usr/bin/true
 
 # Generate devcontainer spec
 sendbox analyze --project . --output .devcontainer/
@@ -430,18 +441,18 @@ sendbox policy show --config sendbox.yaml --json
 sendbox completions print --shell zsh
 sendbox completions install --shell fish
 
-# Experimental native analysis with automation JSON
+# Native analysis with automation JSON
 cargo run -p sendbox-cli -- analyze --project . --json
 
-# Experimental native devcontainer generation
+# Native devcontainer generation
 cargo run -p sendbox-cli -- devcontainer generate --project . --json
-
-# Print the eBPF program SendBox uses to inspect MCP calls
-sendbox mcp script
 
 # Parse a captured trace log and summarise MCP activity
 sendbox mcp parse /var/log/sendbox/mcp-trace.log
 sendbox mcp report /var/log/sendbox/mcp-trace.log
+
+# Inspect the structured boundary declaration without generating scripts
+sendbox boundary inspect --config .sendbox.yaml --json
 ```
 
 ## Contributing

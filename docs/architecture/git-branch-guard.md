@@ -1,9 +1,10 @@
 # Native Git branch guard
 
 `sendbox-git` is the native Rust admission engine for selected-repository
-`git push` and `git pull` operations. It is independent of runtime, CLI-run,
-guest platform-control, and other migration branches so the later execution
-broker can consume a small policy API.
+`git push` and `git pull` operations. `sendbox-host` resolves the selected
+repository, signs the guard policy into the boundary plan, and Apple/Kata guests
+install trusted wrapper copies before workload execution. The crate remains
+usable as a small standalone policy API.
 
 ## Policy and identity
 
@@ -58,8 +59,8 @@ integration source branches must be allowed. This does not prevent equivalent
 - uses one sanitized environment for probes and final Git;
 - rejects Git configuration/path injection and dynamic-loader variables;
 - rejects caller-selected askpass programs, configured credential helpers, and
-  `--exec-path`; later credential-broker integration must provide an approved
-  authentication path;
+  `--exec-path`; production GitHub HTTPS and SSH authentication use fixed
+  guest-installed wrappers;
 - never includes environment values, credentials, probe output, or complete
   argv in diagnostics;
 - replaces the guard process with Git on Unix, preserving standard streams,
@@ -72,15 +73,14 @@ sendbox-git-guard --policy /absolute/root-owned/policy.json \
   --git /absolute/trusted/git -- <git arguments>
 ```
 
-Deployment must place the policy, wrapper invocation, guard, and Git binary in
-root-owned non-writable locations. Command-line deployment arguments are not an
-authorization boundary; later broker integration must supply fixed trusted
-values.
+Standalone deployment must place the policy, wrapper invocation, guard, and Git
+binary in root-owned non-writable locations. Production guest deployment copies
+the verified binaries and signed policy into the root-owned runtime boundary
+and supplies fixed trusted values.
 
 ## Security boundary
 
 This component admits one Git invocation. It does not block direct execution of
 another Git binary, `git send-pack`, remote helpers, SSH receive-pack, alternate
 clients, or GitHub APIs. Local inspection and final Git execution are also not
-an atomic transaction. Server-side branch rules remain mandatory, and stronger
-claims require later exec-broker, credential, and egress integration.
+an atomic transaction. Server-side branch rules remain mandatory.
