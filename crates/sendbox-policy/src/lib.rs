@@ -286,6 +286,7 @@ pub struct McpHttpPolicy {
     pub allow_private_networks: bool,
     pub allow_redirects: bool,
     pub redirect_allowlist: Vec<String>,
+    pub max_redirects: u32,
     pub max_request_bytes: i64,
     pub max_response_bytes: i64,
     pub request_timeout_seconds: u64,
@@ -307,6 +308,7 @@ impl Default for McpHttpPolicy {
             allow_private_networks: false,
             allow_redirects: false,
             redirect_allowlist: Vec::new(),
+            max_redirects: 3,
             max_request_bytes: 1_048_576,
             max_response_bytes: 1_048_576,
             request_timeout_seconds: 30,
@@ -871,6 +873,7 @@ fn validate_http_policy(policy: &McpHttpPolicy, path: &str, diagnostics: &mut Ve
         }
     }
     for (field, value, maximum) in [
+        ("max_redirects", policy.max_redirects, 10),
         ("max_events", policy.max_events, MAX_HTTP_EVENTS),
         (
             "max_concurrent_requests",
@@ -899,6 +902,13 @@ fn validate_http_policy(policy: &McpHttpPolicy, path: &str, diagnostics: &mut Ve
             DiagnosticCode::InvalidValue,
             format!("{path}.redirect_allowlist"),
             "redirect targets require allow_redirects: true",
+        ));
+    }
+    if !policy.allow_redirects && policy.max_redirects != McpHttpPolicy::default().max_redirects {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            format!("{path}.max_redirects"),
+            "custom redirect limits require allow_redirects: true",
         ));
     }
     if policy.allow_redirects && policy.redirect_allowlist.is_empty() {

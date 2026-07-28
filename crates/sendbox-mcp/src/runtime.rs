@@ -1,16 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use sendbox_policy::{McpServerPolicy, ToolCallPolicy};
+use sendbox_policy::{
+    McpHttpPolicy, McpServerPolicy, ServerToolPolicy, ToolCallPolicy, ToolTransport,
+    normalize_mcp_http_endpoint,
+};
 use serde::{Deserialize, Serialize};
+use url::{Host, Url};
 
 use crate::config::{ApprovedCommand, ProjectConfigValidator};
-use crate::policy::{ResolvedServerPolicy, resolve_stdio_server};
+use crate::policy::{ResolvedServerPolicy, http_fingerprint, resolve_stdio_server};
 
 pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const NATIVE_POLICY_PATH: &str = "/run/sendbox-boundary/mcp-policy.json";
 pub const OBSERVATION_ROOT: &str = "/var/log/sendbox";
 pub const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/sendbox/boundary.log";
+pub const DEFAULT_HTTP_GATEWAY_PORT: u16 = 15_081;
+pub const HTTP_GATEWAY_ROUTE_PREFIX: &str = "/mcp/";
 const MAX_FRAME_BYTES: i64 = 16 * 1024 * 1024;
 const MAX_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;
 const MAX_ENVIRONMENT_BYTES: usize = 16 * 1024;
@@ -36,6 +42,59 @@ pub struct RuntimePolicyDocument {
     pub inherited_environment_keys: BTreeSet<String>,
     #[serde(default)]
     pub observation: Option<RuntimeObservationConfiguration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteServerRuntime {
+    pub id: String,
+    pub transport: ToolTransport,
+    pub fingerprint: String,
+    pub endpoint: HttpEndpoint,
+    pub gateway_url: String,
+    pub tools: ServerToolPolicy,
+    pub http: McpHttpPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpEndpoint {
+    pub normalized: String,
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+}
+
+impl HttpEndpoint {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let normalized = normalize_mcp_http_endpoint(value)?;
+        let parsed = Url::parse(&normalized)
+            .map_err(|error| format!("invalid MCP endpoint URL: {error}"))?;
+        let host = match parsed.host() {
+            Some(Host::Domain(domain)) => domain.to_owned(),
+            Some(Host::Ipv4(address)) => address.to_string(),
+            Some(Host::Ipv6(address)) => address.to_string(),
+            None => return Err("MCP endpoint URL must contain a host".to_owned()),
+        };
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| "MCP endpoint URL must have a known port".to_owned())?;
+        Ok(Self {
+            normalized,
+            scheme: parsed.scheme().to_owned(),
+            host,
+            port,
+            path: parsed.path().to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
 }
 
 impl RuntimePolicyDocument {
@@ -157,6 +216,53 @@ impl RuntimePolicyDocument {
     pub fn project_validator(&self) -> Result<ProjectConfigValidator, String> {
         ProjectConfigValidator::from_policy(&self.tool_policy)
     }
+
+    pub fn remote_servers(&self) -> Result<BTreeMap<String, RemoteServerRuntime>, String> {
+        self.tool_policy
+            .servers
+            .iter()
+            .filter_map(|(id, server)| {
+                let (transport, url, tools, http) = match server {
+                    McpServerPolicy::Stdio { .. } => return None,
+                    McpServerPolicy::StreamableHttp { url, tools, http } => {
+                        (ToolTransport::StreamableHttp, url, tools, http)
+                    }
+                    McpServerPolicy::StreamableHttp2025 { url, tools, http } => {
+                        (ToolTransport::StreamableHttp2025, url, tools, http)
+                    }
+                };
+                Some((id, transport, url, tools, http))
+            })
+            .map(|(id, transport, url, tools, http)| {
+                let endpoint = HttpEndpoint::parse(url)?;
+                Ok((
+                    id.clone(),
+                    RemoteServerRuntime {
+                        id: id.clone(),
+                        transport,
+                        fingerprint: http_fingerprint(transport, &endpoint.normalized),
+                        endpoint,
+                        gateway_url: gateway_url(id),
+                        tools: tools.clone(),
+                        http: http.clone(),
+                    },
+                ))
+            })
+            .collect()
+    }
+}
+
+#[must_use]
+pub fn gateway_route(server_id: &str) -> String {
+    format!("{HTTP_GATEWAY_ROUTE_PREFIX}{server_id}")
+}
+
+#[must_use]
+pub fn gateway_url(server_id: &str) -> String {
+    format!(
+        "http://127.0.0.1:{DEFAULT_HTTP_GATEWAY_PORT}{}",
+        gateway_route(server_id)
+    )
 }
 
 fn validate_absolute_normalized(path: &Path, name: &str) -> Result<(), String> {
@@ -239,5 +345,33 @@ mod tests {
         let mut policy = policy();
         policy.observation.as_mut().expect("observation").log_path = PathBuf::from("/tmp/mcp.log");
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn remote_servers_share_one_normalized_runtime_derivation() {
+        let mut policy = policy();
+        policy.tool_policy = ToolCallPolicy {
+            servers: BTreeMap::from([(
+                "remote-github".to_owned(),
+                McpServerPolicy::StreamableHttp {
+                    url: "https://MCP.Example.com/mcp".to_owned(),
+                    tools: ServerToolPolicy::default(),
+                    http: McpHttpPolicy::default(),
+                },
+            )]),
+            ..ToolCallPolicy::default()
+        };
+        let remote = policy.remote_servers().expect("remote runtime");
+        let server = remote.get("remote-github").expect("server");
+        assert_eq!(
+            server.endpoint.normalized,
+            "https://mcp.example.com:443/mcp"
+        );
+        assert_eq!(
+            server.gateway_url,
+            "http://127.0.0.1:15081/mcp/remote-github"
+        );
+        assert_eq!(server.endpoint.authority(), "mcp.example.com:443");
+        assert_eq!(server.transport, ToolTransport::StreamableHttp);
     }
 }

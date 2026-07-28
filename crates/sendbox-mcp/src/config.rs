@@ -4,7 +4,7 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use sendbox_policy::{McpServerPolicy, ToolCallPolicy};
+use sendbox_policy::{McpServerPolicy, ToolCallPolicy, ToolTransport};
 use serde_json::{Map, Value};
 
 use crate::error::ConfigError;
@@ -105,6 +105,7 @@ impl ApprovedCommand {
 pub struct ProjectConfigValidator {
     broker_prefixes: BTreeSet<Vec<String>>,
     stdio_servers: BTreeMap<ApprovedCommand, String>,
+    http_servers: BTreeMap<String, ToolTransport>,
 }
 
 impl ProjectConfigValidator {
@@ -123,21 +124,36 @@ impl ProjectConfigValidator {
         Self {
             broker_prefixes: broker_prefixes.into_iter().collect(),
             stdio_servers,
+            http_servers: BTreeMap::new(),
         }
     }
 
     pub fn from_policy(policy: &ToolCallPolicy) -> Result<Self, String> {
         let mut stdio_servers = BTreeMap::new();
+        let mut http_servers = BTreeMap::new();
         if policy.uses_hierarchical_servers() {
             for (id, server) in &policy.servers {
-                let McpServerPolicy::Stdio { command, .. } = server else {
-                    continue;
-                };
-                let command = ApprovedCommand::from_argv(command)?;
-                if let Some(existing) = stdio_servers.insert(command, id.clone()) {
-                    return Err(format!(
-                        "MCP stdio command is ambiguously mapped to '{existing}' and '{id}'"
-                    ));
+                match server {
+                    McpServerPolicy::Stdio { command, .. } => {
+                        let command = ApprovedCommand::from_argv(command)?;
+                        if let Some(existing) = stdio_servers.insert(command, id.clone()) {
+                            return Err(format!(
+                                "MCP stdio command is ambiguously mapped to '{existing}' and '{id}'"
+                            ));
+                        }
+                    }
+                    McpServerPolicy::StreamableHttp { .. } => {
+                        http_servers.insert(
+                            crate::runtime::gateway_url(id),
+                            ToolTransport::StreamableHttp,
+                        );
+                    }
+                    McpServerPolicy::StreamableHttp2025 { .. } => {
+                        http_servers.insert(
+                            crate::runtime::gateway_url(id),
+                            ToolTransport::StreamableHttp2025,
+                        );
+                    }
                 }
             }
         } else {
@@ -150,6 +166,7 @@ impl ProjectConfigValidator {
         Ok(Self {
             broker_prefixes: BTreeSet::from([vec![NATIVE_BROKER_PATH.to_owned()]]),
             stdio_servers,
+            http_servers,
         })
     }
 
@@ -227,17 +244,21 @@ impl ProjectConfigValidator {
             .or_else(|| server.get("transport"))
             .and_then(Value::as_str)
             .map(str::to_ascii_lowercase);
-        let remote = ["http", "https", "sse", "streamable-http"];
+        let remote = [
+            "http",
+            "https",
+            "sse",
+            "streamable-http",
+            "streamable_http",
+            "streamable-http-2025",
+            "streamable_http_2025",
+        ];
         if server.contains_key("url")
             || transport
                 .as_deref()
                 .is_some_and(|transport| remote.contains(&transport))
         {
-            return invalid_server(
-                path,
-                name,
-                "remote HTTP/SSE MCP is observation-only and cannot be authorized",
-            );
+            return self.validate_http_server(path, name, server, transport.as_deref());
         }
         if transport
             .as_deref()
@@ -300,6 +321,91 @@ impl ProjectConfigValidator {
                 path,
                 name,
                 "server executable and arguments do not map to an allowed server policy",
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_http_server(
+        &self,
+        path: &Path,
+        name: &str,
+        server: &Map<String, Value>,
+        transport: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        if [
+            "command",
+            "args",
+            "env",
+            "envFile",
+            "cwd",
+            "workingDirectory",
+            "headers",
+            "header",
+            "authorization",
+            "auth",
+            "token",
+            "cookies",
+        ]
+        .iter()
+        .any(|field| server.contains_key(*field))
+        {
+            return invalid_server(
+                path,
+                name,
+                "HTTP MCP definitions may only select an exact trusted local gateway URL and transport",
+            );
+        }
+        if ["policy", "policyId", "serverId", "sendboxPolicy"]
+            .iter()
+            .any(|field| server.contains_key(*field))
+        {
+            return invalid_server(
+                path,
+                name,
+                "project MCP definitions cannot select a SendBox server policy ID",
+            );
+        }
+        let url = server.get("url").and_then(Value::as_str).ok_or_else(|| {
+            ConfigError::InvalidServer {
+                path: path.to_path_buf(),
+                server: name.to_owned(),
+                message: "HTTP MCP server must contain a string url".to_owned(),
+            }
+        })?;
+        let Some(expected_transport) = self.http_servers.get(url) else {
+            return invalid_server(
+                path,
+                name,
+                "HTTP MCP URL does not exactly match a configured trusted gateway route",
+            );
+        };
+        let actual_transport = match transport {
+            Some("streamable-http" | "streamable_http" | "http") => ToolTransport::StreamableHttp,
+            Some("streamable-http-2025" | "streamable_http_2025") => {
+                ToolTransport::StreamableHttp2025
+            }
+            Some("sse" | "https") => {
+                return invalid_server(
+                    path,
+                    name,
+                    "legacy HTTP+SSE and direct HTTPS transports are not supported",
+                );
+            }
+            Some(_) => return invalid_server(path, name, "unsupported HTTP MCP transport"),
+            None => {
+                return invalid_server(
+                    path,
+                    name,
+                    "HTTP MCP definitions require an explicit transport type",
+                );
+            }
+        };
+        if &actual_transport != expected_transport {
+            return invalid_server(
+                path,
+                name,
+                "HTTP MCP transport does not match the configured gateway policy",
             );
         }
         Ok(())
@@ -495,5 +601,48 @@ mod tests {
             r#"{"servers":{"trusted-github":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/github-mcp","changed"]}}}"#,
         );
         assert!(validator.validate_project(temp.path()).is_err());
+    }
+
+    #[test]
+    fn remote_servers_require_exact_gateway_routes_and_transport_modes() {
+        let policy = ToolCallPolicy {
+            servers: BTreeMap::from([
+                (
+                    "modern".to_owned(),
+                    McpServerPolicy::StreamableHttp {
+                        url: "https://mcp.example.com/mcp".to_owned(),
+                        tools: ServerToolPolicy::default(),
+                        http: Default::default(),
+                    },
+                ),
+                (
+                    "compat".to_owned(),
+                    McpServerPolicy::StreamableHttp2025 {
+                        url: "https://legacy.example.com/mcp".to_owned(),
+                        tools: ServerToolPolicy::default(),
+                        http: Default::default(),
+                    },
+                ),
+            ]),
+            ..ToolCallPolicy::default()
+        };
+        let validator = ProjectConfigValidator::from_policy(&policy).unwrap();
+        let temp = TempDir::new().unwrap();
+        write_config(
+            &temp,
+            ".mcp.json",
+            r#"{"servers":{"alias":{"type":"streamable-http","url":"http://127.0.0.1:15081/mcp/modern"},"old":{"type":"streamable-http-2025","url":"http://127.0.0.1:15081/mcp/compat"}}}"#,
+        );
+        validator.validate_project(temp.path()).unwrap();
+
+        for invalid in [
+            r#"{"servers":{"x":{"type":"streamable-http","url":"https://mcp.example.com/mcp"}}}"#,
+            r#"{"servers":{"x":{"type":"streamable-http-2025","url":"http://127.0.0.1:15081/mcp/modern"}}}"#,
+            r#"{"servers":{"x":{"type":"sse","url":"http://127.0.0.1:15081/mcp/compat"}}}"#,
+            r#"{"servers":{"x":{"type":"streamable-http","url":"http://127.0.0.1:15081/mcp/modern","headers":{"Authorization":"secret"}}}}"#,
+        ] {
+            fs::write(temp.path().join(".mcp.json"), invalid).unwrap();
+            assert!(validator.validate_project(temp.path()).is_err());
+        }
     }
 }
