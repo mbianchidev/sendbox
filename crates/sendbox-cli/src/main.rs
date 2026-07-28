@@ -1058,7 +1058,7 @@ fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'sta
         .as_ref()
         .is_some_and(|value| value.mcp_inspection.enabled)
     {
-        return Some("experimental Kata run does not wire the native MCP subsystem");
+        return Some("production run does not yet wire the native MCP subsystem");
     }
 
     if configuration.github.forward_auth
@@ -1066,10 +1066,10 @@ fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'sta
         || configuration.github.allow_private_repository_access
         || configuration.github.ssh_key_path.is_some()
     {
-        return Some("experimental Kata run does not wire the credential broker");
+        return Some("production run does not yet wire the credential broker");
     }
     if configuration.github.branch_protection.enabled {
-        return Some("experimental Kata run does not wire the native Git branch guard");
+        return Some("production run does not yet wire the native Git branch guard");
     }
     let network = &configuration.policy.network;
     if network.default_action != sendbox_policy::Action::Allow
@@ -1082,7 +1082,7 @@ fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'sta
         || network.max_connections.is_some()
         || network.dns != sendbox_policy::DnsPolicy::default()
     {
-        return Some("experimental Kata run does not wire production egress enforcement");
+        return Some("production run does not yet wire production egress enforcement");
     }
     None
 }
@@ -1098,13 +1098,12 @@ fn host_error_exit_code(error: &HostError) -> u8 {
 }
 
 fn host_error_cancelled(error: &HostError) -> bool {
-    matches!(
-        error,
-        HostError::AgentRun(failure) if matches!(failure.primary, AgentError::Cancelled)
-    ) || matches!(
-        error,
-        HostError::Runtime(sendbox_runtime::RuntimeError::Cancelled)
-    )
+    match error {
+        HostError::AgentRun(failure) => matches!(failure.primary, AgentError::Cancelled),
+        HostError::Runtime(sendbox_runtime::RuntimeError::Cancelled) => true,
+        HostError::RuntimeSecurity { runtime, .. } => host_error_cancelled(runtime),
+        _ => false,
+    }
 }
 
 fn emit_run_error(json: bool, exit_code: u8, message: &str) {

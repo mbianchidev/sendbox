@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 use sendbox_policy::{Action, CommandPolicy};
@@ -108,15 +109,49 @@ struct CompiledRule {
 
 impl CompiledRule {
     fn matches(&self, argv: &[String]) -> bool {
+        if self.matches_with_program(argv, argv.first().map(String::as_str)) {
+            return true;
+        }
+        let program_basename = argv
+            .first()
+            .and_then(|program| Path::new(program).file_name())
+            .and_then(|basename| basename.to_str())
+            .filter(|basename| {
+                argv.first()
+                    .is_none_or(|program| basename != &program.as_str())
+            });
+        program_basename.is_some_and(|basename| self.matches_with_program(argv, Some(basename)))
+    }
+
+    fn matches_with_program(&self, argv: &[String], program: Option<&str>) -> bool {
         if let Some(exact) = &self.exact {
-            return exact == argv;
+            return exact.len() == argv.len()
+                && exact
+                    .iter()
+                    .zip(argv)
+                    .enumerate()
+                    .all(|(index, (expected, actual))| {
+                        expected
+                            == if index == 0 {
+                                program.unwrap_or(actual)
+                            } else {
+                                actual
+                            }
+                    });
         }
         self.tokens.len() == argv.len()
             && self
                 .tokens
                 .iter()
                 .zip(argv)
-                .all(|(pattern, argument)| pattern.matches(argument))
+                .enumerate()
+                .all(|(index, (pattern, argument))| {
+                    pattern.matches(if index == 0 {
+                        program.unwrap_or(argument)
+                    } else {
+                        argument
+                    })
+                })
     }
 
     const fn kind(&self) -> MatchKind {
@@ -328,6 +363,23 @@ mod tests {
         assert_eq!(
             policy
                 .evaluate(&["git".into(), "status".into(), "--short".into()])
+                .disposition,
+            AdmissionDisposition::Deny
+        );
+    }
+
+    #[test]
+    fn absolute_programs_match_documented_basename_rules() {
+        let policy = compile(Action::Deny, &["git *"], &["git push"]);
+        assert_eq!(
+            policy
+                .evaluate(&["/usr/bin/git".into(), "status".into()])
+                .disposition,
+            AdmissionDisposition::Allow
+        );
+        assert_eq!(
+            policy
+                .evaluate(&["/usr/bin/git".into(), "push".into()])
                 .disposition,
             AdmissionDisposition::Deny
         );

@@ -280,6 +280,12 @@ pub struct AuditSummary {
     pub head_hash: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditSnapshot {
+    pub records: Vec<AuditRecord>,
+    pub summary: AuditSummary,
+}
+
 impl AuditRecorder {
     pub fn new(session_id: SessionId) -> SessionSecurityResult<Self> {
         let log = AuditLog::new(session_id.to_string())
@@ -332,19 +338,26 @@ impl AuditRecorder {
     }
 
     pub fn summary(&self) -> SessionSecurityResult<AuditSummary> {
+        self.snapshot().map(|snapshot| snapshot.summary)
+    }
+
+    pub fn snapshot(&self) -> SessionSecurityResult<AuditSnapshot> {
         let log = self
             .inner
             .lock()
             .map_err(|_| operation("audit_lock", "audit mutex poisoned"))?;
         log.verify()
             .map_err(|error| operation("audit_verify", error))?;
-        Ok(AuditSummary {
-            event_count: log.records().len(),
-            merkle_root: log.merkle_root(),
-            head_hash: log
-                .records()
-                .last()
-                .map_or_else(String::new, |record| record.hash.clone()),
+        let records = log.records().to_vec();
+        Ok(AuditSnapshot {
+            summary: AuditSummary {
+                event_count: records.len(),
+                merkle_root: log.merkle_root(),
+                head_hash: records
+                    .last()
+                    .map_or_else(String::new, |record| record.hash.clone()),
+            },
+            records,
         })
     }
 }

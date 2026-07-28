@@ -29,6 +29,8 @@ pub struct EntryMetadata {
     pub allocated_bytes: u64,
     pub modified_unix_seconds: i64,
     pub modified_nanoseconds: i64,
+    pub changed_unix_seconds: i64,
+    pub changed_nanoseconds: i64,
     pub hardlink_count: u64,
 }
 
@@ -130,7 +132,7 @@ mod platform {
             let metadata = metadata_from_stat(&stat);
             self.validate_owner(&path, &metadata)?;
             if metadata.entry_type != EntryType::Regular {
-                return Err(SecurityError::UnsupportedFileType(path));
+                return Err(SecurityError::UnsupportedFileType(path.to_path_buf()));
             }
             if metadata.size > max_bytes {
                 return Err(SecurityError::SizeLimit {
@@ -264,7 +266,31 @@ mod platform {
 
         pub fn lock_exclusive(&self, path: impl AsRef<Path>) -> SecurityResult<ExclusiveLock> {
             let path = validated(path.as_ref())?;
-            let (parent, name) = self.open_parent(&path)?;
+            let fd = self.open_lock_file(&path)?;
+            rustix::fs::flock(&fd, rustix::fs::FlockOperation::LockExclusive)
+                .map_err(|error| io_error("lock file", path, error.into()))?;
+            Ok(ExclusiveLock {
+                _file: File::from(fd),
+            })
+        }
+
+        pub fn try_lock_exclusive(
+            &self,
+            path: impl AsRef<Path>,
+        ) -> SecurityResult<Option<ExclusiveLock>> {
+            let path = validated(path.as_ref())?;
+            let fd = self.open_lock_file(&path)?;
+            match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => Ok(Some(ExclusiveLock {
+                    _file: File::from(fd),
+                })),
+                Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(None),
+                Err(error) => Err(io_error("lock file", path, error.into())),
+            }
+        }
+
+        fn open_lock_file(&self, path: &Path) -> SecurityResult<OwnedFd> {
+            let (parent, name) = self.open_parent(path)?;
             let fd = openat(
                 &parent,
                 name,
@@ -275,21 +301,17 @@ mod platform {
                     | OFlags::NONBLOCK,
                 mode_from(PRIVATE_FILE_MODE),
             )
-            .map_err(|error| io_error("open lock file", &path, error.into()))?;
+            .map_err(|error| io_error("open lock file", path, error.into()))?;
             let stat =
-                fstat(&fd).map_err(|error| io_error("inspect lock file", &path, error.into()))?;
+                fstat(&fd).map_err(|error| io_error("inspect lock file", path, error.into()))?;
             let metadata = metadata_from_stat(&stat);
-            self.validate_owner(&path, &metadata)?;
+            self.validate_owner(path, &metadata)?;
             if metadata.entry_type != EntryType::Regular {
-                return Err(SecurityError::UnsupportedFileType(path));
+                return Err(SecurityError::UnsupportedFileType(path.to_path_buf()));
             }
             fchmod(&fd, mode_from(PRIVATE_FILE_MODE))
-                .map_err(|error| io_error("set lock file mode", &path, error.into()))?;
-            rustix::fs::flock(&fd, rustix::fs::FlockOperation::LockExclusive)
-                .map_err(|error| io_error("lock file", path, error.into()))?;
-            Ok(ExclusiveLock {
-                _file: File::from(fd),
-            })
+                .map_err(|error| io_error("set lock file mode", path, error.into()))?;
+            Ok(fd)
         }
 
         fn write_atomic_inner<F>(
@@ -492,6 +514,8 @@ mod platform {
                 .saturating_mul(512),
             modified_unix_seconds: stat.st_mtime,
             modified_nanoseconds: normalize_nanoseconds(stat.st_mtime_nsec),
+            changed_unix_seconds: stat.st_ctime,
+            changed_nanoseconds: normalize_nanoseconds(stat.st_ctime_nsec),
             hardlink_count: normalize_u64(stat.st_nlink),
         }
     }
@@ -626,6 +650,25 @@ mod platform {
                 root.read_bounded("private/nested/state", 4),
                 Err(SecurityError::SizeLimit { .. })
             ));
+        }
+
+        #[test]
+        fn nonblocking_lock_reports_contention() {
+            let temp = TempDir::new().expect("temp dir");
+            let root = SecureRoot::open(temp.path()).expect("open root");
+            let held = root.lock_exclusive("lease.lock").expect("hold lock");
+
+            assert!(
+                root.try_lock_exclusive("lease.lock")
+                    .expect("try contended lock")
+                    .is_none()
+            );
+            drop(held);
+            assert!(
+                root.try_lock_exclusive("lease.lock")
+                    .expect("try released lock")
+                    .is_some()
+            );
         }
 
         #[test]

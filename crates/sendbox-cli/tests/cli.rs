@@ -74,7 +74,7 @@ fn root_help_uses_the_final_command_name_and_only_implemented_surfaces() {
 }
 
 #[test]
-fn experimental_run_rejects_relative_guest_commands_deterministically() {
+fn production_run_rejects_relative_guest_commands_deterministically() {
     let temporary = tempdir().unwrap();
     let config = temporary.path().join("sandbox.yaml");
     let source = std::fs::read_to_string(workspace_root().join("config/example-sandbox.yaml"))
@@ -110,7 +110,7 @@ fn experimental_run_rejects_relative_guest_commands_deterministically() {
 }
 
 #[test]
-fn experimental_run_rejects_unwired_git_guard_before_launch() {
+fn production_run_rejects_unwired_git_guard_before_launch() {
     let temporary = tempdir().unwrap();
     let config = temporary.path().join("sandbox.yaml");
     let mut configuration =
@@ -142,7 +142,7 @@ fn experimental_run_rejects_unwired_git_guard_before_launch() {
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         result["message"],
-        "experimental Kata run does not wire the native Git branch guard"
+        "production run does not yet wire the native Git branch guard"
     );
 }
 

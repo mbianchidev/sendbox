@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod security;
+
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -25,6 +27,8 @@ use sendbox_boundary::{
 use sendbox_bundle::{Architecture as BundleArchitecture, VerifyOptions, verify_bundle};
 use sendbox_config::{RuntimeProvider as ConfiguredRuntime, SandboxConfiguration};
 use sendbox_core::{SessionId, VERSION};
+use sendbox_exec::{AdmissionDisposition, CompiledCommandPolicy};
+use sendbox_policy::{Action, DnsPolicy};
 use sendbox_runtime::{
     BootstrapMaterial, CancellationToken, CommandArgument, CommandSpec, ContainerId, CreateRequest,
     InitializeRequest, OutputStream, ProcessOptions, ProcessOutcome, Program, RuntimeError,
@@ -40,6 +44,7 @@ use sendbox_runtime_hyperlight::{
 use sendbox_runtime_kata::{KataProviderConfiguration, KataRuntimeProvider};
 use sendbox_secrets::{SecretName, SecretStore};
 use sendbox_security::{SecurityError, provenance::SigningKeyMaterial};
+use sendbox_session_security::SessionSecurityError;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -91,6 +96,22 @@ impl HostRunReport {
                 .unwrap_or_else(|| outcome.status.signal.map_or(5, |signal| 128 + signal)),
         }
     }
+
+    fn successful(&self) -> bool {
+        match self {
+            Self::Persistent(report) => {
+                matches!(report.terminal, GuestTerminal::Exited { code: 0 })
+            }
+            Self::OneShot(outcome) => outcome.status.success,
+        }
+    }
+
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Persistent(_) => "persistent",
+            Self::OneShot(_) => "one_shot",
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -103,6 +124,13 @@ pub enum HostError {
     Runtime(#[from] RuntimeError),
     #[error("security: {0}")]
     Security(#[from] SecurityError),
+    #[error("session security: {0}")]
+    SessionSecurity(#[from] SessionSecurityError),
+    #[error("runtime failed: {runtime}; session security also failed: {security}")]
+    RuntimeSecurity {
+        runtime: Box<HostError>,
+        security: SessionSecurityError,
+    },
     #[error("agent plan: {0}")]
     AgentPlan(#[from] sendbox_agent::AgentError),
     #[error("agent execution: {0}")]
@@ -123,6 +151,7 @@ pub enum HostError {
 pub struct PreparedHostRun {
     execution: HostExecution,
     secrets: Arc<HostSecretResolver>,
+    security: security::HostSecurityContext,
     signed_plan_path: PathBuf,
 }
 
@@ -131,14 +160,16 @@ enum HostExecution {
         provider: Arc<dyn RuntimeProvider>,
         plan: RunPlan,
     },
-    Hyperlight {
-        provider: Arc<HyperlightRuntime>,
-        verified_plan: VerifiedBoundaryPlan,
-        create_request: CreateRequest,
-        state_directory: PathBuf,
-        command: CommandSpec,
-        listen_ports: Vec<u16>,
-    },
+    Hyperlight(HyperlightExecution),
+}
+
+struct HyperlightExecution {
+    provider: Arc<HyperlightRuntime>,
+    verified_plan: VerifiedBoundaryPlan,
+    create_request: CreateRequest,
+    state_directory: PathBuf,
+    command: CommandSpec,
+    listen_ports: Vec<u16>,
 }
 
 impl PreparedHostRun {
@@ -153,42 +184,8 @@ impl PreparedHostRun {
         signals: Arc<dyn SignalSource>,
         cancellation: &CancellationToken,
     ) -> Result<HostRunReport, HostError> {
-        match self.execution {
-            HostExecution::Persistent { provider, plan } => {
-                let orchestrator = AgentOrchestrator::new(
-                    provider,
-                    self.secrets,
-                    Arc::new(ProtocolGuestConnector),
-                    output,
-                    signals,
-                );
-                orchestrator
-                    .run(&plan, cancellation)
-                    .await
-                    .map(HostRunReport::Persistent)
-                    .map_err(HostError::AgentRun)
-            }
-            HostExecution::Hyperlight {
-                provider,
-                verified_plan,
-                create_request,
-                state_directory,
-                command,
-                listen_ports,
-            } => execute_hyperlight(
-                provider,
-                verified_plan,
-                create_request,
-                state_directory,
-                command,
-                listen_ports,
-                self.secrets,
-                output,
-                cancellation,
-            )
-            .await
-            .map(HostRunReport::OneShot),
-        }
+        let runtime = execute_runtime(self.execution, self.secrets, output, signals, cancellation);
+        security::execute(self.security, runtime, cancellation).await
     }
 }
 
@@ -197,7 +194,11 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
         .configuration
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
+    if let Some(error) = unavailable_run_feature(&request.configuration) {
+        return Err(HostError::Invalid(error.to_owned()));
+    }
     let command = validate_command(&request.command)?;
+    validate_command_policy(&request.configuration.policy.commands, &request.command)?;
     let host = current_host()?;
     let runtime_request = effective_runtime_request(
         request.requested_runtime,
@@ -209,9 +210,16 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
     );
     let selection = select_runtime(runtime_request, host)?;
     let selected_runtime = selection.selected;
+    validate_runtime_features(selected_runtime, &request.configuration)?;
+    let workspace_source =
+        canonical_file_or_directory(&request.configuration.project_path, "project root")?;
+    ensure_private_directory(&request.state_root)?;
+    let state_root = canonical_file_or_directory(&request.state_root, "runtime state root")?;
     let session_id = random_session_id()?;
-    let state_directory = create_session_directory(&request.state_root, session_id)?;
-    let key = load_or_create_signing_key(&request.state_root)?;
+    let prospective_state_directory = state_root.join("sessions").join(session_id.to_string());
+    security::validate_state_workspace_disjoint(&workspace_source, &prospective_state_directory)?;
+    let state_directory = create_session_directory(&state_root, session_id)?;
+    let key = load_or_create_signing_key(&state_root)?;
     let signer_fingerprint = key
         .identity("SendBox local runtime", None, 0, None)
         .fingerprint;
@@ -231,11 +239,13 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
     .map_err(|error| HostError::Bundle(error.to_string()))?;
     let manifest_sha256 = hash_file(&bundle_root.join("manifest.json"))?;
     let bundle_id = format!("{}:{}", request.trust_root_id, bundle.release_sequence);
-    let configuration_sha256 = sha256_serialized(&request.configuration)?;
-    let policy_sha256 = sha256_serialized(&request.configuration.policy)?;
+    let configuration_bytes = serde_json::to_vec(&request.configuration)
+        .map_err(|error| HostError::Invalid(error.to_string()))?;
+    let policy_bytes = serde_json::to_vec(&request.configuration.policy)
+        .map_err(|error| HostError::Invalid(error.to_string()))?;
+    let configuration_sha256 = sha256_hex(&configuration_bytes);
+    let policy_sha256 = sha256_hex(&policy_bytes);
     let resources = runtime_resources(&request.configuration)?;
-    let workspace_source =
-        canonical_file_or_directory(&request.configuration.project_path, "project root")?;
     let workspace_destination = PathBuf::from("/workspace");
     let bootstrap_reference =
         SecretReference::new(format!("bootstrap-{session_id}")).map_err(HostError::AgentPlan)?;
@@ -307,6 +317,7 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
     };
     let signed_plan = SignedBoundaryPlan::sign(plan, &key, now_unix)?;
     let verified_plan = signed_plan.verify(&signer_fingerprint, now_unix)?;
+    let security_plan = verified_plan.clone();
     let signed_plan_path = state_directory.join("boundary-plan.json");
     atomic_write(
         &signed_plan_path,
@@ -321,7 +332,7 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
             let agent_request = AgentRequest {
                 boundary_plan: verified_plan,
                 session_id,
-                state_directory,
+                state_directory: state_directory.clone(),
                 image: request.image.ok_or_else(|| {
                     HostError::Invalid("persistent runtimes require --image".to_owned())
                 })?,
@@ -354,7 +365,7 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
                 hostname: format!("sendbox-{session_id}"),
                 resources,
                 mounts: vec![sendbox_runtime::RuntimeMount {
-                    source: workspace_source,
+                    source: workspace_source.clone(),
                     destination: workspace_destination,
                     writable: true,
                 }],
@@ -370,22 +381,61 @@ pub fn prepare(request: HostRunRequest) -> Result<PreparedHostRun, HostError> {
                 clear_environment: true,
                 ..CommandSpec::new(Program::Absolute(PathBuf::from(command.0)))
             };
-            HostExecution::Hyperlight {
+            HostExecution::Hyperlight(HyperlightExecution {
                 provider,
                 verified_plan,
                 create_request,
-                state_directory,
+                state_directory: state_directory.clone(),
                 command,
                 listen_ports: Vec::new(),
-            }
+            })
         }
     };
+    let security = security::HostSecurityContext::new(
+        security_plan,
+        configuration_bytes,
+        policy_bytes,
+        workspace_source,
+        state_directory,
+        key,
+    );
 
     Ok(PreparedHostRun {
         execution,
         secrets,
+        security,
         signed_plan_path,
     })
+}
+
+async fn execute_runtime(
+    execution: HostExecution,
+    secrets: Arc<HostSecretResolver>,
+    output: Arc<dyn OutputSink>,
+    signals: Arc<dyn SignalSource>,
+    cancellation: &CancellationToken,
+) -> Result<HostRunReport, HostError> {
+    match execution {
+        HostExecution::Persistent { provider, plan } => {
+            let orchestrator = AgentOrchestrator::new(
+                provider,
+                secrets,
+                Arc::new(ProtocolGuestConnector),
+                output,
+                signals,
+            );
+            orchestrator
+                .run(&plan, cancellation)
+                .await
+                .map(HostRunReport::Persistent)
+                .map_err(HostError::AgentRun)
+        }
+        HostExecution::Hyperlight(execution) => {
+            execute_hyperlight(execution, secrets, output, cancellation)
+                .await
+                .map(HostRunReport::OneShot)
+        }
+    }
 }
 
 struct RuntimeBuild {
@@ -598,16 +648,19 @@ fn build_runtime(
 }
 
 async fn execute_hyperlight(
-    provider: Arc<HyperlightRuntime>,
-    verified_plan: VerifiedBoundaryPlan,
-    create_request: CreateRequest,
-    state_directory: PathBuf,
-    command: CommandSpec,
-    listen_ports: Vec<u16>,
+    execution: HyperlightExecution,
     secrets: Arc<HostSecretResolver>,
     output: Arc<dyn OutputSink>,
     cancellation: &CancellationToken,
 ) -> Result<ProcessOutcome, HostError> {
+    let HyperlightExecution {
+        provider,
+        verified_plan,
+        create_request,
+        state_directory,
+        command,
+        listen_ports,
+    } = execution;
     verified_plan.reverify(unix_time()?)?;
     provider
         .preflight(
@@ -792,17 +845,11 @@ fn effective_runtime_request(
     requested: RequestedRuntime,
     configured: ConfiguredRuntime,
 ) -> ConfiguredRuntime {
-    let selected = match requested {
+    match requested {
         RequestedRuntime::Auto => configured,
         RequestedRuntime::Apple => ConfiguredRuntime::Apple,
         RequestedRuntime::Kata => ConfiguredRuntime::Kata,
         RequestedRuntime::Hyperlight => ConfiguredRuntime::Hyperlight,
-    };
-    match selected {
-        ConfiguredRuntime::Auto => ConfiguredRuntime::Auto,
-        ConfiguredRuntime::Apple => ConfiguredRuntime::Apple,
-        ConfiguredRuntime::Kata => ConfiguredRuntime::Kata,
-        ConfiguredRuntime::Hyperlight => ConfiguredRuntime::Hyperlight,
     }
 }
 
@@ -838,6 +885,52 @@ fn bundle_architecture(architecture: Architecture) -> BundleArchitecture {
     }
 }
 
+fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'static str> {
+    if configuration
+        .observability
+        .as_ref()
+        .is_some_and(|value| value.mcp_inspection.enabled)
+    {
+        return Some("production run does not yet wire the native MCP subsystem");
+    }
+    if configuration.github.forward_auth
+        || configuration.github.forward_copilot_auth
+        || configuration.github.allow_private_repository_access
+        || configuration.github.ssh_key_path.is_some()
+    {
+        return Some("production run does not yet wire the credential broker");
+    }
+    if configuration.github.branch_protection.enabled {
+        return Some("production run does not yet wire the native Git branch guard");
+    }
+    let network = &configuration.policy.network;
+    if network.default_action != Action::Allow
+        || !network.allowed_domains.is_empty()
+        || !network.blocked_domains.is_empty()
+        || !network.allowed_networks.is_empty()
+        || !network.blocked_networks.is_empty()
+        || !network.allowed_ports.is_empty()
+        || !network.allow_dns
+        || network.max_connections.is_some()
+        || network.dns != DnsPolicy::default()
+    {
+        return Some("production run does not yet wire production egress enforcement");
+    }
+    None
+}
+
+fn validate_runtime_features(
+    selected_runtime: ResolvedRuntime,
+    configuration: &SandboxConfiguration,
+) -> Result<(), HostError> {
+    if selected_runtime == ResolvedRuntime::Hyperlight && !configuration.secrets.is_empty() {
+        return Err(HostError::Invalid(
+            "Hyperlight does not support authenticated configured-secret delivery".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_command(command: &[String]) -> Result<(String, Vec<String>), HostError> {
     let Some(program) = command.first() else {
         return Err(HostError::Invalid("command is empty".to_owned()));
@@ -848,6 +941,25 @@ fn validate_command(command: &[String]) -> Result<(String, Vec<String>), HostErr
         ));
     }
     Ok((program.clone(), command[1..].to_vec()))
+}
+
+fn validate_command_policy(
+    policy: &sendbox_policy::CommandPolicy,
+    command: &[String],
+) -> Result<(), HostError> {
+    let compiled = CompiledCommandPolicy::compile(policy)
+        .map_err(|error| HostError::Invalid(format!("invalid command policy: {error}")))?;
+    let admission = compiled.evaluate(command);
+    if admission.disposition == AdmissionDisposition::Deny {
+        let source = admission.matched.source.map_or_else(
+            || "default action".to_owned(),
+            |rule| format!("rule `{rule}`"),
+        );
+        return Err(HostError::Invalid(format!(
+            "guest command is denied by command policy {source}"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_oci_digest(image: &str) -> Result<String, HostError> {
@@ -919,12 +1031,6 @@ fn hash_file(path: &Path) -> Result<String, HostError> {
         source,
     })?;
     Ok(sha256_hex(&bytes))
-}
-
-fn sha256_serialized<T: serde::Serialize>(value: &T) -> Result<String, HostError> {
-    serde_json::to_vec(value)
-        .map(|bytes| sha256_hex(&bytes))
-        .map_err(|error| HostError::Invalid(error.to_string()))
 }
 
 fn assert_provider_identity(
@@ -1196,4 +1302,140 @@ fn unix_time() -> Result<u64, HostError> {
 
 fn current_uid() -> u32 {
     rustix::process::getuid().as_raw()
+}
+
+#[cfg(test)]
+mod tests {
+    use sendbox_config::{PolicyPreset, RuntimeProvider as ConfigRuntimeProvider};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn supported_configuration(project_path: PathBuf) -> SandboxConfiguration {
+        let mut configuration = SandboxConfiguration::for_project(
+            project_path,
+            PolicyPreset::Permissive,
+            ConfigRuntimeProvider::Auto,
+        );
+        configuration.github.forward_auth = false;
+        configuration.github.forward_copilot_auth = false;
+        configuration.github.allow_private_repository_access = false;
+        configuration.github.branch_protection.enabled = false;
+        configuration.github.ssh_key_path = None;
+        if let Some(observability) = &mut configuration.observability {
+            observability.mcp_inspection.enabled = false;
+        }
+        assert_eq!(unavailable_run_feature(&configuration), None);
+        configuration
+    }
+
+    fn request(temp: &TempDir, configuration: SandboxConfiguration) -> HostRunRequest {
+        HostRunRequest {
+            requested_runtime: RequestedRuntime::Auto,
+            configuration,
+            image: None,
+            bundle_root: temp.path().join("missing-bundle"),
+            trust_root: temp.path().join("missing-trust-root"),
+            trust_root_id: "test-root".to_owned(),
+            minimum_release_sequence: 1,
+            command: vec!["/bin/true".to_owned()],
+            state_root: temp.path().join("state"),
+            readiness_timeout: Duration::from_secs(1),
+        }
+    }
+
+    fn assert_prepare_rejects(request: HostRunRequest, expected: &str) {
+        let error = match prepare(request) {
+            Ok(_) => panic!("unsupported feature must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, HostError::Invalid(message) if message == expected));
+    }
+
+    #[test]
+    fn direct_host_api_rejects_uncomposed_security_features() {
+        let temp = TempDir::new().expect("temp dir");
+
+        let mut mcp = supported_configuration(temp.path().to_path_buf());
+        mcp.observability
+            .as_mut()
+            .expect("observability")
+            .mcp_inspection
+            .enabled = true;
+        assert_prepare_rejects(
+            request(&temp, mcp),
+            "production run does not yet wire the native MCP subsystem",
+        );
+
+        let mut credentials = supported_configuration(temp.path().to_path_buf());
+        credentials.github.forward_auth = true;
+        assert_prepare_rejects(
+            request(&temp, credentials),
+            "production run does not yet wire the credential broker",
+        );
+
+        let mut git = supported_configuration(temp.path().to_path_buf());
+        git.github.branch_protection.enabled = true;
+        assert_prepare_rejects(
+            request(&temp, git),
+            "production run does not yet wire the native Git branch guard",
+        );
+
+        let mut egress = supported_configuration(temp.path().to_path_buf());
+        egress.policy.network.default_action = Action::Deny;
+        assert_prepare_rejects(
+            request(&temp, egress),
+            "production run does not yet wire production egress enforcement",
+        );
+    }
+
+    #[test]
+    fn hyperlight_rejects_configured_secrets() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.secrets.push("TOKEN".to_owned());
+        let error = validate_runtime_features(ResolvedRuntime::Hyperlight, &configuration)
+            .expect_err("Hyperlight secrets must fail closed");
+        assert!(matches!(
+            error,
+            HostError::Invalid(message)
+                if message
+                    == "Hyperlight does not support authenticated configured-secret delivery"
+        ));
+        validate_runtime_features(ResolvedRuntime::Kata, &configuration)
+            .expect("persistent runtime supports configured secrets");
+    }
+
+    #[test]
+    fn host_admits_entry_commands_through_shared_policy() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.policy.commands.default_action = Action::Allow;
+        configuration.policy.commands.denylist = vec!["true".to_owned()];
+
+        let error =
+            validate_command_policy(&configuration.policy.commands, &["/bin/true".to_owned()])
+                .expect_err("basename deny rule must reject absolute entry command");
+        assert!(matches!(
+            error,
+            HostError::Invalid(message)
+                if message == "guest command is denied by command policy rule `true`"
+        ));
+    }
+
+    #[test]
+    fn host_rejects_command_policy_grammar_errors() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.policy.commands.allowlist = vec!["tool\\".to_owned()];
+
+        let error =
+            validate_command_policy(&configuration.policy.commands, &["/bin/true".to_owned()])
+                .expect_err("malformed command policy must fail closed");
+        assert!(matches!(
+            error,
+            HostError::Invalid(message)
+                if message == "invalid command policy: allowlist[0] ends with an incomplete backslash escape"
+        ));
+    }
 }
