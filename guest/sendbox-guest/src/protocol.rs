@@ -243,7 +243,7 @@ where
         if let Err(error) = envelope.validate() {
             return send_rejection(host_writer, request.request_id, &error.to_string()).await;
         }
-        (envelope.launch, Some(envelope.terminal))
+        (envelope.launch, Some((envelope.terminal, envelope.term)))
     } else {
         let launch: LaunchRequestV2 = serde_json::from_slice(&request.payload)
             .map_err(|error| GuestError::Protocol(format!("decoding launch request: {error}")))?;
@@ -334,9 +334,16 @@ where
 }
 
 /// Queue depth for broker control frames (cancel, shutdown).
+/// Terminal type handed to an interactive workload.
+const TERM_ENVIRONMENT: &str = "TERM";
+
 const BROKER_CONTROL_DEPTH: usize = 4;
 /// Queue depth for pending terminal input frames.
-const BROKER_INPUT_DEPTH: usize = 32;
+const BROKER_INPUT_DEPTH: usize = 256;
+
+/// How long a terminal input frame may wait for the broker writer before it is
+/// dropped so the execution loop can keep draining broker output.
+const INPUT_OFFER_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[allow(clippy::too_many_arguments)]
 async fn run_execution_loop<S>(
@@ -474,17 +481,23 @@ async fn forward_terminal_event(
         }
         _ => return Err("unsupported terminal event kind".to_owned()),
     };
-    // Dropping under back pressure keeps cancellation responsive; blocking here
-    // would stop the loop from draining broker output.
-    if input_sender.try_send(frame).is_err() {
-        eprintln!("sendbox-guest: terminal input queue is full; dropping input");
+    // A bounded wait absorbs bursts such as a large paste. Blocking without a
+    // bound would stop this loop from draining broker output, which is the
+    // very thing the writer task is waiting on -- so saturation drops the frame
+    // loudly rather than deadlocking the session.
+    if let Err(error) = input_sender.send_timeout(frame, INPUT_OFFER_BOUND).await {
+        let dropped = match error {
+            tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => "queue is saturated",
+            tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => "broker writer stopped",
+        };
+        eprintln!("sendbox-guest: dropping terminal input: {dropped}");
     }
     Ok(())
 }
 
 fn build_execution_request(
     launch: &LaunchRequestV2,
-    terminal: Option<TerminalSizeV1>,
+    terminal: Option<(TerminalSizeV1, String)>,
     broker: &BrokerClientConfiguration,
     secret_decryptor: &GuestSecretDecryptor,
 ) -> Result<sendbox_exec::ExecutionRequest, GuestError> {
@@ -496,7 +509,17 @@ fn build_execution_request(
     let mut argv = Vec::with_capacity(launch.arguments.len() + 1);
     argv.push(launch.program.clone());
     argv.extend(launch.arguments.clone());
-    let environment = decrypt_environment(launch, secret_decryptor)?;
+    let mut environment = decrypt_environment(launch, secret_decryptor)?;
+    if let Some((_, term)) = terminal.as_ref() {
+        // The host's terminal type is authoritative for an interactive run: a
+        // stale configured TERM would make the workload render for the wrong
+        // terminal on the operator's screen.
+        environment.retain(|entry| entry.name != TERM_ENVIRONMENT);
+        environment.push(sendbox_exec::EnvironmentEntry {
+            name: TERM_ENVIRONMENT.to_owned(),
+            value: term.clone(),
+        });
+    }
     Ok(sendbox_exec::ExecutionRequest {
         session_id: broker.session_id,
         authentication: broker.authentication.clone(),
@@ -515,7 +538,7 @@ fn build_execution_request(
         environment,
         stdin: match terminal {
             None => sendbox_exec::StandardInput::Null,
-            Some(size) => sendbox_exec::StandardInput::Terminal {
+            Some((size, _)) => sendbox_exec::StandardInput::Terminal {
                 columns: size.columns,
                 rows: size.rows,
             },

@@ -14,8 +14,8 @@ use std::{
 
 use sendbox_agent::{
     AgentOrchestrator, AgentReport, AgentRequest, BoxFuture, EnvironmentIntent, GuestCommand,
-    GuestTerminal, OutputSink, ProtocolGuestConnector, RunFailure, RunPlan, SecretEnvelope,
-    SecretReference, SecretResolver, SignalSource,
+    GuestTerminal, GuestTerminalSize, OutputSink, ProtocolGuestConnector, RunFailure, RunPlan,
+    SecretEnvelope, SecretReference, SecretResolver, SignalSource, TerminalSource,
 };
 use sendbox_boundary::{
     Architecture, ArtifactIdentity, ArtifactKind, BOUNDARY_PLAN_FORMAT, BOUNDARY_PLAN_VERSION,
@@ -104,6 +104,8 @@ pub struct HostRunRequest {
     pub command: Vec<String>,
     pub state_root: PathBuf,
     pub readiness_timeout: Duration,
+    /// Requests a pseudoterminal for the workload with this initial geometry.
+    pub terminal: Option<GuestTerminalSize>,
 }
 
 #[derive(Debug)]
@@ -189,6 +191,7 @@ pub struct PreparedHostRun {
     secrets: Arc<HostSecretResolver>,
     security: security::HostSecurityContext,
     signed_plan_path: PathBuf,
+    terminal_source: Option<Arc<dyn TerminalSource>>,
 }
 
 struct EffectiveCredentialSet {
@@ -212,6 +215,7 @@ enum HostExecution {
     Persistent {
         provider: Arc<dyn RuntimeProvider>,
         plan: RunPlan,
+        terminal: Option<GuestTerminalSize>,
     },
     Hyperlight(HyperlightExecution),
 }
@@ -231,13 +235,31 @@ impl PreparedHostRun {
         &self.signed_plan_path
     }
 
+    /// Supplies the host keystroke/resize source for an interactive run.
+    ///
+    /// Ignored unless the request asked for a terminal; an interactive request
+    /// without a source fails at execution time rather than leaving the
+    /// workload unable to be typed into.
+    #[must_use]
+    pub fn with_terminal_source(mut self, source: Arc<dyn TerminalSource>) -> Self {
+        self.terminal_source = Some(source);
+        self
+    }
+
     pub async fn execute(
         self,
         output: Arc<dyn OutputSink>,
         signals: Arc<dyn SignalSource>,
         cancellation: &CancellationToken,
     ) -> Result<HostRunReport, HostError> {
-        let runtime = execute_runtime(self.execution, self.secrets, output, signals, cancellation);
+        let runtime = execute_runtime(
+            self.execution,
+            self.secrets,
+            output,
+            signals,
+            self.terminal_source,
+            cancellation,
+        );
         security::execute(self.security, runtime, cancellation).await
     }
 }
@@ -463,6 +485,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                 mounts: Vec::new(),
                 bootstrap_reference,
                 readiness_timeout: request.readiness_timeout,
+                interactive: request.terminal.is_some(),
             };
             let plan = RunPlan::compile(
                 &request.configuration,
@@ -470,10 +493,21 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                 &provider.capabilities(),
                 now_unix,
             )?;
-            HostExecution::Persistent { provider, plan }
+            HostExecution::Persistent {
+                provider,
+                plan,
+                terminal: request.terminal.clone(),
+            }
         }
         RuntimeInstance::Hyperlight(provider) => {
             assert_provider_identity(provider.as_ref(), selected_runtime)?;
+            if request.terminal.is_some() {
+                return Err(HostError::Invalid(
+                    "the hyperlight runtime cannot provide an interactive terminal; \
+                     use a persistent runtime such as apple or kata"
+                        .to_owned(),
+                ));
+            }
             let create_request = CreateRequest {
                 session_id,
                 container_id: container_id(&request.configuration.name, session_id)?,
@@ -522,6 +556,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         secrets,
         security,
         signed_plan_path,
+        terminal_source: None,
     })
 }
 
@@ -530,17 +565,30 @@ async fn execute_runtime(
     secrets: Arc<HostSecretResolver>,
     output: Arc<dyn OutputSink>,
     signals: Arc<dyn SignalSource>,
+    terminal_source: Option<Arc<dyn TerminalSource>>,
     cancellation: &CancellationToken,
 ) -> Result<HostRunReport, HostError> {
     match execution {
-        HostExecution::Persistent { provider, plan } => {
-            let orchestrator = AgentOrchestrator::new(
+        HostExecution::Persistent {
+            provider,
+            plan,
+            terminal,
+        } => {
+            let mut orchestrator = AgentOrchestrator::new(
                 provider,
                 secrets,
                 Arc::new(ProtocolGuestConnector),
                 output,
                 signals,
             );
+            if let Some(size) = terminal {
+                let source = terminal_source.ok_or_else(|| {
+                    HostError::Invalid(
+                        "interactive runs require a terminal input source".to_owned(),
+                    )
+                })?;
+                orchestrator = orchestrator.with_terminal(size, source);
+            }
             orchestrator
                 .run(&plan, cancellation)
                 .await

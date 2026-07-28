@@ -75,6 +75,11 @@ pub struct AgentReport {
     pub states: Vec<AgentState>,
 }
 
+enum WorkloadStep {
+    Event(Result<GuestEvent, AgentError>),
+    Terminal(Option<crate::HostTerminalCommand>),
+}
+
 pub struct AgentOrchestrator {
     runtime: Arc<dyn RuntimeProvider>,
     secrets: Arc<dyn SecretResolver>,
@@ -368,27 +373,45 @@ impl AgentOrchestrator {
                         }
                     }
                 }
-                command = self.terminal.next_command(), if terminal_open => {
-                    match command {
-                        Some(command) => {
+                // Guest output and host keystrokes are deliberately *not*
+                // biased against each other: a chatty workload must not starve
+                // typing, and a long paste must not starve the screen.
+                step = Self::next_workload_step(
+                    execution,
+                    self.terminal.as_ref(),
+                    terminal_open,
+                    cancellation,
+                ) => {
+                    match step {
+                        WorkloadStep::Event(event) => match event? {
+                            GuestEvent::Output { stream, bytes } => {
+                                self.output.write(stream, &bytes, cancellation).await?;
+                            }
+                            GuestEvent::Terminal(terminal) => return Ok(terminal),
+                        },
+                        WorkloadStep::Terminal(Some(command)) => {
                             let ended = matches!(command, crate::HostTerminalCommand::InputEof);
                             execution.send_terminal(command, cancellation).await?;
                             if ended {
                                 terminal_open = false;
                             }
                         }
-                        None => terminal_open = false,
-                    }
-                }
-                event = execution.next_event(cancellation) => {
-                    match event? {
-                        GuestEvent::Output { stream, bytes } => {
-                            self.output.write(stream, &bytes, cancellation).await?;
-                        }
-                        GuestEvent::Terminal(terminal) => return Ok(terminal),
+                        WorkloadStep::Terminal(None) => terminal_open = false,
                     }
                 }
             }
+        }
+    }
+
+    async fn next_workload_step(
+        execution: &mut Box<dyn GuestExecution>,
+        terminal: &dyn crate::TerminalSource,
+        terminal_open: bool,
+        cancellation: &CancellationToken,
+    ) -> WorkloadStep {
+        tokio::select! {
+            event = execution.next_event(cancellation) => WorkloadStep::Event(event),
+            command = terminal.next_command(), if terminal_open => WorkloadStep::Terminal(command),
         }
     }
 

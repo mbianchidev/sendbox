@@ -4,6 +4,7 @@ mod boundary;
 mod completions;
 mod mcp;
 mod secrets;
+mod terminal;
 
 use std::fs;
 use std::io::{self, Write};
@@ -86,6 +87,10 @@ struct RunArgs {
     minimum_release_sequence: u64,
     #[arg(long)]
     json: bool,
+    /// Run the workload on a pseudoterminal and forward this terminal's
+    /// keystrokes and window size to it.
+    #[arg(long, conflicts_with = "json")]
+    interactive: bool,
     #[arg(last = true, required = true, num_args = 1..)]
     command: Vec<String>,
 }
@@ -386,6 +391,22 @@ async fn run(arguments: RunArgs) -> ExitCode {
             return ExitCode::from(RUNTIME_EXIT);
         }
     };
+    let session = if arguments.interactive {
+        match terminal::TerminalSession::start() {
+            Ok(session) => Some(session),
+            Err(error) => {
+                emit_run_error(
+                    arguments.json,
+                    INVALID_CONFIGURATION_EXIT,
+                    &error.to_string(),
+                );
+                return ExitCode::from(INVALID_CONFIGURATION_EXIT);
+            }
+        }
+    } else {
+        None
+    };
+    let terminal_size = session.as_ref().map(|(_, size)| size.clone());
     let prepared = match prepare_host_run(HostRunRequest {
         requested_runtime: match arguments.runtime {
             RunRuntime::Auto => RequestedRuntime::Auto,
@@ -402,12 +423,16 @@ async fn run(arguments: RunArgs) -> ExitCode {
         command: arguments.command,
         state_root,
         readiness_timeout: Duration::from_secs(60),
+        terminal: terminal_size,
     })
     .await
     {
         Ok(prepared) => prepared,
         Err(error) => {
             let code = host_error_exit_code(&error);
+            if let Some((session, _)) = session {
+                session.finish();
+            }
             emit_run_error(arguments.json, code, &error.to_string());
             return ExitCode::from(code);
         }
@@ -415,13 +440,24 @@ async fn run(arguments: RunArgs) -> ExitCode {
     let output = Arc::new(CliOutput {
         json: arguments.json,
     });
-    let signals: Arc<dyn SignalSource> = if cfg!(unix) {
-        Arc::new(CtrlCSignals::new())
-    } else {
-        Arc::new(NoSignals)
-    };
     let cancellation = CancellationToken::new();
-    match prepared.execute(output, signals, &cancellation).await {
+    // Raw mode clears ISIG, so Ctrl-C reaches the workload's own terminal as a
+    // byte. Intercepting it on the host as well would kill the sandbox instead
+    // of the program the operator is looking at.
+    let signals: Arc<dyn SignalSource> = match (session.is_some(), cfg!(unix)) {
+        (true, _) => Arc::new(FatalSignals::new(cancellation.clone())),
+        (false, true) => Arc::new(CtrlCSignals::new()),
+        (false, false) => Arc::new(NoSignals),
+    };
+    let prepared = match session.as_ref() {
+        Some((session, _)) => prepared.with_terminal_source(session.source()),
+        None => prepared,
+    };
+    let result = prepared.execute(output, signals, &cancellation).await;
+    if let Some((session, _)) = session {
+        session.finish();
+    }
+    match result {
         Ok(report) => {
             let code = report.exit_code();
             if arguments.json {
@@ -1008,6 +1044,54 @@ impl OutputSink for CliOutput {
             };
             result.map_err(|error| sendbox_agent::AgentError::Output(error.to_string()))
         })
+    }
+}
+
+/// Signal policy for interactive runs.
+///
+/// Ctrl-C belongs to the workload because raw mode forwards it as a byte, but a
+/// terminal hang-up or an external `kill` must still unwind cleanly so the
+/// terminal is put back the way it was found.
+struct FatalSignals {
+    receiver: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<AgentSignal>>,
+}
+
+impl FatalSignals {
+    fn new(cancellation: CancellationToken) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        #[cfg(unix)]
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+                return;
+            };
+            let Ok(mut hangup) = signal(SignalKind::hangup()) else {
+                return;
+            };
+            let Ok(mut quit) = signal(SignalKind::quit()) else {
+                return;
+            };
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = hangup.recv() => {}
+                _ = quit.recv() => {}
+            }
+            cancellation.cancel();
+            let _ = sender.send(AgentSignal::Interrupt).await;
+        });
+        #[cfg(not(unix))]
+        {
+            let _ = (cancellation, sender);
+        }
+        Self {
+            receiver: tokio::sync::Mutex::new(receiver),
+        }
+    }
+}
+
+impl SignalSource for FatalSignals {
+    fn next_signal<'a>(&'a self) -> BoxFuture<'a, Option<AgentSignal>> {
+        Box::pin(async move { self.receiver.lock().await.recv().await })
     }
 }
 

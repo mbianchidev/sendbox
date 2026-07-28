@@ -54,6 +54,16 @@ fn runtime_capabilities() -> RuntimeCapabilities {
     ])
 }
 
+fn interactive_runtime_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities::from([
+        RuntimeCapability::Lifecycle,
+        RuntimeCapability::TransportProvisioning,
+        RuntimeCapability::BrokeredExec,
+        RuntimeCapability::InteractiveTerminal,
+        RuntimeCapability::PublishedUnixControlChannel,
+    ])
+}
+
 fn negotiated_agent_capabilities() -> CapabilitySet {
     sendbox_protocol::agent_host_capabilities()
         .intersection(&sendbox_protocol::agent_guest_capabilities())
@@ -101,6 +111,7 @@ fn request(resources: &TempResource, session_id: SessionId) -> AgentRequest {
         mounts,
         bootstrap_reference: SecretReference::new("bootstrap").expect("reference"),
         readiness_timeout: Duration::from_secs(1),
+        interactive: false,
     }
 }
 
@@ -226,6 +237,21 @@ fn plan(
     .expect("run plan")
 }
 
+fn interactive_plan(
+    resources: &TempResource,
+    capabilities: &RuntimeCapabilities,
+    session_id: SessionId,
+) -> Result<RunPlan, AgentError> {
+    let mut request = request(resources, session_id);
+    request.interactive = true;
+    RunPlan::compile(
+        &configuration(resources.path().to_path_buf()),
+        request,
+        capabilities,
+        plan_time(),
+    )
+}
+
 #[derive(Debug, Default)]
 struct FakeSecrets;
 
@@ -342,10 +368,14 @@ struct FakeGuestSession {
     events: VecDeque<Result<GuestEvent, AgentError>>,
 }
 
-#[derive(Default)]
+/// Records what the orchestrator forwarded and releases the workload once the
+/// expected number of commands has arrived, so assertions never race the
+/// orchestrator's deliberately unbiased input/output selection.
 struct TerminalLog {
     launch_terminal: Mutex<Option<Option<sendbox_agent::GuestTerminalSize>>>,
     commands: Mutex<Vec<String>>,
+    expected: usize,
+    drained: tokio::sync::watch::Sender<bool>,
 }
 
 impl TerminalLog {
@@ -359,13 +389,20 @@ impl TerminalLog {
                 format!("resize:{columns}x{rows}")
             }
         };
-        self.commands
+        let mut commands = self
+            .commands
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .push(rendered);
+            .unwrap_or_else(|poison| poison.into_inner());
+        commands.push(rendered);
+        if commands.len() >= self.expected {
+            let _ = self.drained.send(true);
+        }
     }
 }
 
+/// Replays a fixed command script, then parks forever. Parking rather than
+/// returning `None` keeps the orchestrator's terminal branch alive, which is
+/// what a real host terminal does.
 struct ScriptedTerminal {
     commands: Mutex<VecDeque<sendbox_agent::HostTerminalCommand>>,
 }
@@ -375,10 +412,15 @@ impl sendbox_agent::TerminalSource for ScriptedTerminal {
         &'a self,
     ) -> sendbox_agent::BoxFuture<'a, Option<sendbox_agent::HostTerminalCommand>> {
         Box::pin(async move {
-            self.commands
+            let next = self
+                .commands
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .pop_front()
+                .pop_front();
+            match next {
+                Some(command) => Some(command),
+                None => std::future::pending().await,
+            }
         })
     }
 }
@@ -399,6 +441,7 @@ impl GuestSession for FakeGuestSession {
                 events,
                 cancelled: false,
                 terminal: None,
+                exit_gate: None,
             }) as Box<dyn GuestExecution>)
         })
     }
@@ -415,6 +458,9 @@ struct FakeExecution {
     events: VecDeque<Result<GuestEvent, AgentError>>,
     cancelled: bool,
     terminal: Option<Arc<TerminalLog>>,
+    /// Holds the workload alive until the host terminal script is drained, so
+    /// interactive assertions do not race the orchestrator's unbiased select.
+    exit_gate: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl GuestExecution for FakeExecution {
@@ -423,9 +469,14 @@ impl GuestExecution for FakeExecution {
         _cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<GuestEvent, AgentError>> {
         Box::pin(async move {
-            self.events
-                .pop_front()
-                .unwrap_or_else(|| Err(AgentError::Guest("event stream ended".to_owned())))
+            if let Some(event) = self.events.pop_front() {
+                return event;
+            }
+            if let Some(gate) = self.exit_gate.as_mut() {
+                let _ = gate.wait_for(|drained| *drained).await;
+                return Ok(GuestEvent::Terminal(GuestTerminal::Exited { code: 0 }));
+            }
+            Err(AgentError::Guest("event stream ended".to_owned()))
         })
     }
 
@@ -461,6 +512,7 @@ impl GuestExecution for FakeExecution {
 struct InteractiveConnector {
     log: Arc<TerminalLog>,
     events: Mutex<Option<VecDeque<Result<GuestEvent, AgentError>>>>,
+    exit_gate: tokio::sync::watch::Receiver<bool>,
 }
 
 impl GuestConnector for InteractiveConnector {
@@ -474,6 +526,7 @@ impl GuestConnector for InteractiveConnector {
             Ok(Box::new(InteractiveSession {
                 capabilities: negotiated_agent_capabilities(),
                 log: Arc::clone(&self.log),
+                exit_gate: self.exit_gate.clone(),
                 events: self
                     .events
                     .lock()
@@ -489,6 +542,7 @@ struct InteractiveSession {
     capabilities: CapabilitySet,
     log: Arc<TerminalLog>,
     events: VecDeque<Result<GuestEvent, AgentError>>,
+    exit_gate: tokio::sync::watch::Receiver<bool>,
 }
 
 impl GuestSession for InteractiveSession {
@@ -508,11 +562,13 @@ impl GuestSession for InteractiveSession {
             .unwrap_or_else(|poison| poison.into_inner()) = Some(request.terminal.clone());
         let events = std::mem::take(&mut self.events);
         let log = Arc::clone(&self.log);
+        let exit_gate = self.exit_gate.clone();
         Box::pin(async move {
             Ok(Box::new(FakeExecution {
                 events,
                 cancelled: false,
                 terminal: Some(log),
+                exit_gate: Some(exit_gate),
             }) as Box<dyn GuestExecution>)
         })
     }
@@ -1124,6 +1180,7 @@ async fn cleanup_uses_the_provider_returned_container_id() {
 
 async fn interactive_run(
     commands: VecDeque<sendbox_agent::HostTerminalCommand>,
+    expected_commands: usize,
     events: VecDeque<Result<GuestEvent, AgentError>>,
 ) -> (
     Arc<TerminalLog>,
@@ -1131,15 +1188,24 @@ async fn interactive_run(
 ) {
     let resources = TempResource::new().expect("resources");
     resources.create_directory("state").expect("state");
-    let capabilities = runtime_capabilities();
+    let capabilities = interactive_runtime_capabilities();
     let runtime = Arc::new(FakeRuntime::new(capabilities.clone()).expect("runtime"));
     let (host, _guest) = tokio::io::duplex(4096);
     runtime.set_control_stream(Box::new(host));
-    let plan = plan(&resources, &capabilities, SessionId::from_bytes([9; 16]));
-    let log = Arc::new(TerminalLog::default());
+    let plan = interactive_plan(&resources, &capabilities, SessionId::from_bytes([9; 16]))
+        .expect("interactive run plan");
+    assert!(plan.interactive());
+    let (drained, exit_gate) = tokio::sync::watch::channel(false);
+    let log = Arc::new(TerminalLog {
+        launch_terminal: Mutex::new(None),
+        commands: Mutex::new(Vec::new()),
+        expected: expected_commands,
+        drained,
+    });
     let connector = Arc::new(InteractiveConnector {
         log: Arc::clone(&log),
         events: Mutex::new(Some(events)),
+        exit_gate,
     });
     let report = AgentOrchestrator::new(
         runtime,
@@ -1173,13 +1239,11 @@ async fn interactive_run_requests_a_terminal_and_forwards_input_before_output() 
                 rows: 30,
             },
         ]),
-        VecDeque::from([
-            Ok(GuestEvent::Output {
-                stream: OutputStream::Stdout,
-                bytes: b"ls\r\n".to_vec(),
-            }),
-            Ok(GuestEvent::Terminal(GuestTerminal::Exited { code: 0 })),
-        ]),
+        2,
+        VecDeque::from([Ok(GuestEvent::Output {
+            stream: OutputStream::Stdout,
+            bytes: b"ls\r\n".to_vec(),
+        })]),
     )
     .await;
 
@@ -1209,7 +1273,8 @@ async fn interactive_run_stops_forwarding_input_after_end_of_file() {
             sendbox_agent::HostTerminalCommand::InputEof,
             sendbox_agent::HostTerminalCommand::Input(b"ignored".to_vec()),
         ]),
-        VecDeque::from([Ok(GuestEvent::Terminal(GuestTerminal::Exited { code: 0 }))]),
+        1,
+        VecDeque::new(),
     )
     .await;
 
@@ -1234,4 +1299,39 @@ async fn headless_run_never_requests_a_terminal() {
     .await;
 
     report.expect("headless run succeeds");
+}
+
+#[test]
+fn interactive_plan_requires_the_runtime_terminal_capability() {
+    let resources = TempResource::new().expect("resources");
+    resources.create_directory("state").expect("state");
+    let error = interactive_plan(
+        &resources,
+        &runtime_capabilities(),
+        SessionId::from_bytes([11; 16]),
+    )
+    .expect_err("interactive plan is rejected");
+
+    match error {
+        AgentError::RuntimeCapabilities(message) => {
+            assert!(
+                message.contains("InteractiveTerminal"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn headless_plan_does_not_require_the_runtime_terminal_capability() {
+    let resources = TempResource::new().expect("resources");
+    resources.create_directory("state").expect("state");
+    let plan = plan(
+        &resources,
+        &runtime_capabilities(),
+        SessionId::from_bytes([12; 16]),
+    );
+
+    assert!(!plan.interactive());
 }

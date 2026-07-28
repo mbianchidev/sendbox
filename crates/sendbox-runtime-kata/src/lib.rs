@@ -418,6 +418,7 @@ impl RuntimeProvider for KataRuntimeProvider {
             RuntimeCapability::Health,
             RuntimeCapability::TransportProvisioning,
             RuntimeCapability::BrokeredExec,
+            RuntimeCapability::InteractiveTerminal,
             RuntimeCapability::RuntimeExecStdioControlChannel,
         ])
     }

@@ -18,6 +18,13 @@ pub enum RuntimeCapability {
     /// This capability is deliberately not represented in `sendbox-protocol`.
     TransportProvisioning,
     BrokeredExec,
+    /// Runtime-local ability to run a workload on a pseudoterminal and carry
+    /// keystrokes and resizes back to it over the control channel.
+    ///
+    /// This capability is deliberately not represented in `sendbox-protocol`:
+    /// interactive support is negotiated by operation name so that a guest
+    /// advertising it cannot break handshakes with an older host.
+    InteractiveTerminal,
     VsockControlChannel,
     PublishedUnixControlChannel,
     InheritedStdioControlChannel,
@@ -40,6 +47,7 @@ impl RuntimeCapability {
             Self::Health => Some(Capability::Health),
             Self::TransportProvisioning
             | Self::BrokeredExec
+            | Self::InteractiveTerminal
             | Self::VsockControlChannel
             | Self::PublishedUnixControlChannel
             | Self::InheritedStdioControlChannel
