@@ -210,13 +210,47 @@ pub enum EventKind {
     Audit = 3,
     Health = 4,
     Lifecycle = 5,
+    /// Terminal input bytes destined for the guest workload's pseudoterminal.
+    StandardInput = 6,
+    /// Signals that no further [`EventKind::StandardInput`] will be sent.
+    StandardInputEof = 7,
+    /// Carries an encoded `TerminalSizeV1` after a host terminal resize.
+    TerminalResize = 8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl EventKind {
+    /// Reports whether the kind may only travel from host to guest.
+    ///
+    /// These kinds are emitted exclusively after the guest accepts an
+    /// interactive launch, so a peer that predates interactive support can
+    /// never receive one.
+    #[must_use]
+    pub const fn is_terminal_input(self) -> bool {
+        matches!(
+            self,
+            Self::StandardInput | Self::StandardInputEof | Self::TerminalResize
+        )
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct Event {
     pub stream_id: u64,
     pub kind: EventKind,
     pub payload: Vec<u8>,
+}
+
+/// Redacts payload bytes so terminal input and secret-bearing output can never
+/// reach a debug log.
+impl std::fmt::Debug for Event {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Event")
+            .field("stream_id", &self.stream_id)
+            .field("kind", &self.kind)
+            .field("payload", &format_args!("<{} bytes>", self.payload.len()))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
