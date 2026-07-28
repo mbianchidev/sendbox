@@ -135,7 +135,7 @@ enum LedgerState {
 #[derive(Debug, Clone)]
 struct PullRequestPlan {
     changes: Vec<PathChange>,
-    patch_bytes: usize,
+    base_commit: String,
 }
 
 #[derive(Debug, Clone)]
@@ -627,7 +627,7 @@ fn preflight_pull_request(
         "--binary".to_owned(),
         "--no-ext-diff".to_owned(),
         "--no-textconv".to_owned(),
-        base_commit,
+        base_commit.clone(),
         "--".to_owned(),
     ];
     arguments.extend(paths.iter().map(|path| path.display().to_string()));
@@ -772,7 +772,7 @@ fn preflight_pull_request(
                 mode,
             })
             .collect(),
-        patch_bytes,
+        base_commit,
     })
 }
 
@@ -1515,6 +1515,22 @@ impl PreparedPullRequest {
             &["fetch", "--depth=1", "--", &remote, &refspec],
         )?;
         drop(authenticated_environment);
+        let fetched_base = parse_git_commit(
+            &run_git(
+                &git,
+                &repository,
+                &environment,
+                &["rev-parse", "FETCH_HEAD"],
+                128,
+            )?,
+            "fetched base commit",
+        )?;
+        if fetched_base != plan.base_commit {
+            return Err(HostError::SafeOutputs(format!(
+                "local base commit {} differs from the fetched remote base {}; fetch the configured base and retry",
+                plan.base_commit, fetched_base
+            )));
+        }
         let branch = format!(
             "safe-outputs/{}-{}",
             &context.policy.session_id.to_string()[..12],
@@ -1635,14 +1651,6 @@ impl PreparedPullRequest {
                 "isolated pull-request patch is empty or exceeds its configured limit".to_owned(),
             ));
         }
-        if patch.len() != plan.patch_bytes && plan.patch_bytes != 0 {
-            let maximum = context.configuration.create_pull_request.max_patch_bytes;
-            if patch.len() > maximum {
-                return Err(HostError::SafeOutputs(
-                    "pull-request patch changed after preflight".to_owned(),
-                ));
-            }
-        }
         let seconds = accepted_at_unix_ms / 1_000;
         environment.insert("GIT_AUTHOR_DATE".to_owned(), format!("@{seconds} +0000"));
         environment.insert("GIT_COMMITTER_DATE".to_owned(), format!("@{seconds} +0000"));
@@ -1666,21 +1674,10 @@ impl PreparedPullRequest {
                 &message,
             ],
         )?;
-        let commit_sha = String::from_utf8(run_git(
-            &git,
-            &repository,
-            &environment,
-            &["rev-parse", "HEAD"],
-            128,
-        )?)
-        .map_err(|_| HostError::SafeOutputs("Git commit ID is not UTF-8".to_owned()))?
-        .trim()
-        .to_owned();
-        if commit_sha.len() != 40 || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(HostError::SafeOutputs(
-                "Git returned an invalid commit ID".to_owned(),
-            ));
-        }
+        let commit_sha = parse_git_commit(
+            &run_git(&git, &repository, &environment, &["rev-parse", "HEAD"], 128)?,
+            "commit ID",
+        )?;
         Ok(Self {
             _temporary: temporary,
             git,
@@ -1738,7 +1735,21 @@ fn validate_branch_name(branch: &str) -> Result<(), HostError> {
             "base branch `{branch}` is not a safe Git ref"
         )));
     }
+
     Ok(())
+}
+
+fn parse_git_commit(bytes: &[u8], subject: &str) -> Result<String, HostError> {
+    let commit = String::from_utf8(bytes.to_vec())
+        .map_err(|_| HostError::SafeOutputs(format!("Git {subject} is not UTF-8")))?
+        .trim()
+        .to_owned();
+    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(HostError::SafeOutputs(format!(
+            "Git returned an invalid {subject}"
+        )));
+    }
+    Ok(commit)
 }
 
 fn write_askpass(path: &Path, token_environment: &str) -> Result<(), HostError> {
@@ -2231,7 +2242,7 @@ mod tests {
         assert_eq!(plan.changes.len(), 1);
         assert_eq!(plan.changes[0].path, PathBuf::from("src/lib.rs"));
         assert!(!plan.changes[0].deleted);
-        assert!(plan.patch_bytes > 0);
+        assert_eq!(plan.base_commit.len(), 40);
     }
 
     #[test]

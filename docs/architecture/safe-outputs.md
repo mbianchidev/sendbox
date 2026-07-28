@@ -173,7 +173,8 @@ Pull requests never mutate the user's index or current ref. The host:
   symlink, directory, conflict, file-count, and patch-size cases before any
   GitHub API write;
 - snapshots source hashes and rechecks them before copying;
-- fetches the configured base into a private temporary repository;
+- fetches the configured base into a private temporary repository and requires
+  it to match the commit used for local preflight;
 - disables system/global Git configuration, credential helpers, prompts,
   hooks, fsmonitor, external diff/text conversion, redirects, proxies, and
   commit signing;
