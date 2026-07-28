@@ -1,9 +1,10 @@
 # Session security lifecycle
 
 `sendbox-session-security` is the adapter-neutral coordination layer between
-`sendbox-security`, `sendbox-secrets`, and future host orchestration. It does not
-start a runtime, open a credential listener, expose CLI commands, or change guest
-controls.
+`sendbox-security`, `sendbox-secrets`, and host orchestration. It does not
+directly start a runtime or change guest controls; `sendbox-host` injects the
+runtime-independent adapters and executes the lifecycle around persistent Apple
+and Kata sessions.
 
 ## Lifecycle
 
@@ -85,9 +86,12 @@ report. Permission-broadening proposals also require a separate explicit
 acknowledgement. These APIs never write artifacts, migrate secrets, or weaken
 permissions automatically.
 
-## Integration status
+## Production integration
 
-The lifecycle, grant state machine, versioned persistence, legacy readers, and
-test fakes are implemented as Rust library surfaces. Host agent wiring, runtime
-adapter calls, CLI commands, MCP integration, credential network listeners, and
-guest platform enforcement are intentionally outside this change.
+`sendbox-host` validates that state and workspace roots are disjoint, then
+prepares this lifecycle before runtime execution. The production adapter
+persists supervisor checkpoints, signs audit publication, captures and verifies
+snapshots, restores eligible mutations on failure, and quarantines changed
+excluded cache/dependency entries. Runtime cleanup still runs when security
+finalization fails, and all primary, rollback, audit, publication, and cleanup
+failures remain visible.

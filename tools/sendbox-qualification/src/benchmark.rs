@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sendbox_config::SandboxConfiguration;
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_protocol::{
     BootstrapSecret, Capability, FrameLimits, GuestHandshake, HandshakeConfig, HostHandshake,
     Message, Request, Response, ResponseStatus, VersionRange, decode_message, encode_message,
@@ -187,6 +187,7 @@ async fn authenticated_round_trip() -> Result<Duration, String> {
             [Capability::Lifecycle].into(),
             FrameLimits::new(64 * 1024).map_err(|error| error.to_string())?,
             BootstrapSecret::new(SECRET).map_err(|error| error.to_string())?,
+            BoundaryPlanDigest::from_bytes([0x45; 32]),
         )
         .map_err(|error| error.to_string())
     };

@@ -1,16 +1,17 @@
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
+use sendbox_core::BoundaryPlanDigest;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::ProtocolError;
 use crate::types::MAC_BYTES;
 
-const TRANSCRIPT_DOMAIN: &[u8] = b"sendbox protocol transcript v1";
-const NEGOTIATION_DOMAIN: &[u8] = b"sendbox protocol negotiation v1";
-const READINESS_DOMAIN: &[u8] = b"sendbox protocol readiness v1";
-const FRAME_DOMAIN: &[u8] = b"sendbox protocol frame v1";
-const HKDF_SALT_DOMAIN: &[u8] = b"sendbox protocol hkdf salt v1";
+const TRANSCRIPT_DOMAIN: &[u8] = b"sendbox protocol transcript v2";
+const NEGOTIATION_DOMAIN: &[u8] = b"sendbox protocol negotiation v2";
+const READINESS_DOMAIN: &[u8] = b"sendbox protocol readiness v2";
+const FRAME_DOMAIN: &[u8] = b"sendbox protocol frame v2";
+const HKDF_SALT_DOMAIN: &[u8] = b"sendbox protocol hkdf salt v2";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -23,10 +24,20 @@ pub(crate) struct SessionKeys {
 impl SessionKeys {
     pub(crate) fn derive(
         bootstrap_secret: &[u8],
+        selected_version: u16,
+        boundary_plan_digest: BoundaryPlanDigest,
         hello_bytes: &[u8],
         negotiation_core: &[u8],
     ) -> Result<(Self, [u8; 32]), ProtocolError> {
-        let transcript_hash = transcript_hash(hello_bytes, negotiation_core);
+        if selected_version < crate::PROTOCOL_VERSION {
+            return Err(ProtocolError::VersionMismatch(selected_version));
+        }
+        let transcript_hash = transcript_hash(
+            selected_version,
+            boundary_plan_digest,
+            hello_bytes,
+            negotiation_core,
+        );
         let mut salt_hasher = Sha256::new();
         salt_hasher.update(HKDF_SALT_DOMAIN);
         salt_hasher.update(transcript_hash);
@@ -36,15 +47,15 @@ impl SessionKeys {
         let mut negotiation = Zeroizing::new([0_u8; MAC_BYTES]);
         let mut host_to_guest = Zeroizing::new([0_u8; MAC_BYTES]);
         let mut guest_to_host = Zeroizing::new([0_u8; MAC_BYTES]);
-        hkdf.expand(b"sendbox protocol negotiation key v1", negotiation.as_mut())
+        hkdf.expand(b"sendbox protocol negotiation key v2", negotiation.as_mut())
             .map_err(|error| ProtocolError::MalformedEncoding(error.to_string()))?;
         hkdf.expand(
-            b"sendbox protocol host-to-guest key v1",
+            b"sendbox protocol host-to-guest key v2",
             host_to_guest.as_mut(),
         )
         .map_err(|error| ProtocolError::MalformedEncoding(error.to_string()))?;
         hkdf.expand(
-            b"sendbox protocol guest-to-host key v1",
+            b"sendbox protocol guest-to-host key v2",
             guest_to_host.as_mut(),
         )
         .map_err(|error| ProtocolError::MalformedEncoding(error.to_string()))?;
@@ -139,9 +150,16 @@ pub(crate) fn verify_frame_mac(
     verify_mac_parts(key, &[FRAME_DOMAIN, unsigned_frame], proof)
 }
 
-fn transcript_hash(hello_bytes: &[u8], negotiation_core: &[u8]) -> [u8; 32] {
+fn transcript_hash(
+    selected_version: u16,
+    boundary_plan_digest: BoundaryPlanDigest,
+    hello_bytes: &[u8],
+    negotiation_core: &[u8],
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(TRANSCRIPT_DOMAIN);
+    hasher.update(selected_version.to_be_bytes());
+    hasher.update(boundary_plan_digest.as_bytes());
     hasher.update(hello_bytes);
     hasher.update(negotiation_core);
     hasher.finalize().into()
@@ -168,7 +186,7 @@ fn verify_mac_parts(key: &[u8], parts: &[&[u8]], proof: &[u8]) -> Result<(), Pro
 
 #[cfg(test)]
 mod tests {
-    use sendbox_core::SessionId;
+    use sendbox_core::{BoundaryPlanDigest, SessionId};
     use serde::Deserialize;
 
     use super::*;
@@ -196,7 +214,7 @@ mod tests {
     #[test]
     fn deterministic_session_vector_is_stable() {
         let vector: Vector = serde_json::from_str(include_str!(
-            "../../../test-fixtures/protocol/v1-authenticated-session.json"
+            "../../../test-fixtures/protocol/v2-authenticated-session.json"
         ))
         .expect("fixture");
         assert_eq!(vector.negotiated_capabilities, vec![1, 2, 9]);
@@ -206,7 +224,7 @@ mod tests {
         let bootstrap_secret = decode_hex(&vector.bootstrap_secret);
         let hello = Message::Hello(Hello {
             magic: PROTOCOL_MAGIC,
-            versions: VersionRange::new(1, 2),
+            versions: VersionRange::new(2, 2),
             session_id,
             role: PeerRole::HostClient,
             nonce: client_nonce,
@@ -223,7 +241,7 @@ mod tests {
         let hello_bytes = crate::encode_message(&hello).expect("hello encoding");
         let negotiation = Negotiation {
             magic: PROTOCOL_MAGIC,
-            versions: VersionRange::new(1, 2),
+            versions: VersionRange::new(2, 2),
             selected_version: 2,
             session_id,
             role: PeerRole::GuestServer,
@@ -244,9 +262,15 @@ mod tests {
         };
         let negotiation_core =
             encode_negotiation_core(&negotiation).expect("negotiation core encoding");
-        let (keys, transcript_hash) =
-            SessionKeys::derive(&bootstrap_secret, &hello_bytes, &negotiation_core)
-                .expect("derive keys");
+        let boundary_plan_digest = BoundaryPlanDigest::from_bytes([0x60; 32]);
+        let (keys, transcript_hash) = SessionKeys::derive(
+            &bootstrap_secret,
+            2,
+            boundary_plan_digest,
+            &hello_bytes,
+            &negotiation_core,
+        )
+        .expect("derive keys");
         let negotiation_mac = keys
             .negotiation_proof(&hello_bytes, &negotiation_core)
             .expect("negotiation proof");
@@ -311,8 +335,14 @@ mod tests {
 
     #[test]
     fn directional_keys_are_separated() {
-        let (keys, _) = SessionKeys::derive(b"0123456789abcdef0123456789abcdef", b"hello", b"core")
-            .expect("keys");
+        let (keys, _) = SessionKeys::derive(
+            b"0123456789abcdef0123456789abcdef",
+            2,
+            BoundaryPlanDigest::from_bytes([0x71; 32]),
+            b"hello",
+            b"core",
+        )
+        .expect("keys");
         assert_ne!(keys.host_to_guest.as_ref(), keys.guest_to_host.as_ref());
         assert_ne!(keys.negotiation.as_ref(), keys.host_to_guest.as_ref());
     }

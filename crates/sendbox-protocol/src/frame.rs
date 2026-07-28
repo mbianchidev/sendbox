@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn deterministic_authenticated_frame_vector_is_stable() {
         let vector: FrameVector = serde_json::from_str(include_str!(
-            "../../../test-fixtures/protocol/v1-authenticated-session.json"
+            "../../../test-fixtures/protocol/v2-authenticated-session.json"
         ))
         .expect("fixture");
         let metadata = FrameMetadata {

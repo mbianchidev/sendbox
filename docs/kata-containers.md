@@ -1,11 +1,11 @@
 # Kata Containers Runtime
 
-## Experimental Rust vertical slice
+## Authenticated runtime path
 
-The Rust CLI now exposes one deliberately thin command:
+The production CLI exposes the authenticated runtime command:
 
 ```bash
-sendbox-rs run \
+sendbox run \
   --config /absolute/path/.sendbox.yaml \
   --runtime kata \
   --image registry.example/workload@sha256:<digest> \
@@ -28,14 +28,13 @@ owned by a non-root uid/gid. The bundle must contain the signed static
 `bin/sendbox-guest` and `bin/sendbox-exec-launcher` artifacts produced by
 `packaging/guest/Dockerfile`.
 
-This command never invokes or falls back to Swift.
-
-The command also fails before image pull or VM launch when the configuration
-requests currently unwired integrations: secret injection, GitHub/Copilot/SSH
-credential forwarding, private-repository credentials, native Git branch
-protection, MCP inspection, or restrictive DNS/egress policy. Those production
-subsystems exist in Rust but are not silently enabled by this first Kata run
-slice.
+Before image pull or VM launch, the command resolves one immutable signed
+boundary plan. Configured secrets, repository-scoped GitHub/Copilot/SSH
+credentials, the native Git guard, authenticated MCP stdio inspection, and
+restrictive DNS/egress policy are composed into authenticated guest bootstrap.
+Restrictive egress binds the execution broker to the delegated
+`/sys/fs/cgroup/sendbox/<instance>/agent` hierarchy and starts Exec only after
+the guest DNS/SOCKS5 gateway is ready.
 
 SendBox can run sandboxes on Linux through [Kata Containers](https://katacontainers.io/), using `nerdctl` to create each workload with the Kata containerd shim. The agent runs in a dedicated hardware-virtualized guest rather than sharing the host kernel.
 
@@ -98,11 +97,10 @@ runtime:
     # configuration_path: /etc/kata-containers/configuration.toml
 ```
 
-The historical Swift command remains outside this slice. Use the explicit Rust
-command and all trust inputs shown above:
+Use the explicit runtime and all trust inputs shown above:
 
 ```bash
-sendbox-rs run --config .sendbox.yaml --runtime kata \
+sendbox run --config .sendbox.yaml --runtime kata \
   --image "$IMAGE_DIGEST" --bundle "$BUNDLE" --trust-root "$TRUST_ROOT" \
   -- /usr/bin/true
 ```
@@ -124,6 +122,9 @@ sendbox-rs run --config .sendbox.yaml --runtime kata \
 
 ## Runtime behavior
 
+- Kata and Apple encode the same typed inner guest-bootstrap document. Kata wraps
+  that document with its provider-specific trust-root injection envelope before
+  delivering both files to the VM.
 - CPU, memory, hostname, DNS, working directory, image, command, and bind mounts map to `nerdctl run`.
 - `disk_size_mb` is delegated to the configured containerd snapshotter because nerdctl does not expose a portable per-container writable-layer quota.
 - Single-line environment values are written to a mode `0600` temporary env file, passed with `--env-file`, and deleted immediately after container creation. Multi-line values are inherited by key through the nerdctl client environment, so secret values never appear in argv.

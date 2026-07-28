@@ -179,7 +179,7 @@ impl Default for McpInspectionConfiguration {
     fn default() -> Self {
         Self {
             enabled: false,
-            transports: vec![InspectionTransport::Stdio, InspectionTransport::Http],
+            transports: vec![InspectionTransport::Stdio],
             capture_payloads: true,
             max_payload_bytes: 16_384,
             log_path: PathBuf::from("/var/log/sendbox/mcp-trace.log"),

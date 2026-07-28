@@ -429,7 +429,13 @@ fn redacted_envelope(
         object.insert("method".into(), Value::String(method.into()));
     }
     if let Some(subject) = subject {
-        object.insert("name".into(), Value::String(subject.into()));
+        object.insert(
+            "params".into(),
+            Value::Object(serde_json::Map::from_iter([(
+                "name".into(),
+                Value::String(subject.into()),
+            )])),
+        );
     }
     object.insert(
         "kind".into(),

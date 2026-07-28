@@ -26,9 +26,10 @@
 //! cgroup id baked into the loaded nftables rules stays valid. A restarted
 //! broker is simply re-placed into the same existing cgroup.
 //!
-//! No controllers are enabled in the subtree, so processes can be placed
-//! directly into the leaf cgroups (the cgroup v2 "no internal processes" rule
-//! only constrains cgroups whose controllers are enabled).
+//! The optional execution-delegation mode enables `pids` and `memory`
+//! controllers through the agent cgroup. In that mode the agent cgroup is an
+//! internal node and workloads must live exclusively in descendant execution
+//! leaves.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -65,6 +66,13 @@ pub enum CgroupError {
         #[source]
         source: io::Error,
     },
+    #[error("required cgroup controller '{controller}' is not delegated at '{path}'")]
+    ControllerUnavailable {
+        controller: &'static str,
+        path: String,
+    },
+    #[error("cannot delegate controllers through populated cgroup '{0}'")]
+    PopulatedDelegationNode(String),
 }
 
 /// Parses the mount point of a `cgroup2` filesystem from `/proc/mounts`-style
@@ -243,6 +251,66 @@ impl CgroupHierarchy {
         self.broker_dir().join("cgroup.procs")
     }
 
+    /// Enables the execution broker's required controllers down the complete
+    /// root -> sendbox -> instance -> agent chain. Every non-root node must be
+    /// empty before controllers are enabled, as required by cgroup v2's no
+    /// internal processes rule.
+    pub fn delegate_execution_controllers(&self) -> Result<(), CgroupError> {
+        self.enable_controllers("")?;
+        self.enable_controllers(SENDBOX_CGROUP_PREFIX)?;
+        self.enable_controllers(&self.base_rel)?;
+        self.enable_controllers(&self.agent_rel)
+    }
+
+    fn enable_controllers(&self, rel: &str) -> Result<(), CgroupError> {
+        if !rel.is_empty() {
+            let procs = self.read_control(rel, "cgroup.procs")?;
+            if procs.split_ascii_whitespace().next().is_some() {
+                return Err(CgroupError::PopulatedDelegationNode(rel.to_owned()));
+            }
+        }
+        let available = self.read_control(rel, "cgroup.controllers")?;
+        for controller in ["pids", "memory"] {
+            if !available
+                .split_ascii_whitespace()
+                .any(|value| value == controller)
+            {
+                return Err(CgroupError::ControllerUnavailable {
+                    controller,
+                    path: rel.to_owned(),
+                });
+            }
+        }
+        let mut enable = "+pids +memory".to_owned();
+        if available
+            .split_ascii_whitespace()
+            .any(|value| value == "cpu")
+        {
+            enable.push_str(" +cpu");
+        }
+        enable.push('\n');
+        self.write_control(rel, "cgroup.subtree_control", enable.as_bytes())
+    }
+
+    fn read_control(&self, rel: &str, name: &str) -> Result<String, CgroupError> {
+        let path = control_path(rel, name);
+        self.root_dir
+            .read_to_string(&path)
+            .map_err(|source| self.io_error(&path, source))
+    }
+
+    fn write_control(&self, rel: &str, name: &str, bytes: &[u8]) -> Result<(), CgroupError> {
+        let path = control_path(rel, name);
+        let mut options = OpenOptions::new();
+        options.write(true).truncate(false);
+        let mut file = self
+            .root_dir
+            .open_with(&path, &options)
+            .map_err(|source| self.io_error(&path, source))?;
+        file.write_all(bytes)
+            .map_err(|source| self.io_error(&path, source))
+    }
+
     /// Moves `pid` into the agent cgroup via a descriptor-relative write.
     pub fn place_agent(&self, pid: u32) -> Result<(), CgroupError> {
         self.place(&self.agent_rel, pid)
@@ -319,6 +387,14 @@ fn is_valid_instance_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn control_path(rel: &str, name: &str) -> String {
+    if rel.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{rel}/{name}")
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +508,52 @@ tmpfs /run tmpfs rw 0 0
         hierarchy.place_broker(4243).unwrap();
         let broker = std::fs::read_to_string(hierarchy.broker_dir().join("cgroup.procs")).unwrap();
         assert_eq!(broker, "4243\n");
+    }
+
+    #[test]
+    fn execution_delegation_enables_every_parent_and_keeps_agent_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let hierarchy = CgroupHierarchy::create_under(root.path(), "inst01").unwrap();
+        for rel in ["", "sendbox", "sendbox/inst01", "sendbox/inst01/agent"] {
+            let dir = root.path().join(rel);
+            std::fs::write(dir.join("cgroup.controllers"), "cpu pids memory\n").unwrap();
+            std::fs::write(dir.join("cgroup.subtree_control"), "").unwrap();
+            if !rel.is_empty() {
+                std::fs::write(dir.join("cgroup.procs"), "").unwrap();
+            }
+        }
+        hierarchy
+            .delegate_execution_controllers()
+            .expect("delegate controllers");
+        for rel in ["", "sendbox", "sendbox/inst01", "sendbox/inst01/agent"] {
+            let control =
+                std::fs::read_to_string(root.path().join(rel).join("cgroup.subtree_control"))
+                    .unwrap();
+            assert_eq!(control, "+pids +memory +cpu\n");
+        }
+    }
+
+    #[test]
+    fn execution_delegation_refuses_a_populated_internal_node() {
+        let root = tempfile::tempdir().unwrap();
+        let hierarchy = CgroupHierarchy::create_under(root.path(), "inst01").unwrap();
+        for rel in ["", "sendbox", "sendbox/inst01", "sendbox/inst01/agent"] {
+            let dir = root.path().join(rel);
+            std::fs::write(dir.join("cgroup.controllers"), "pids memory\n").unwrap();
+            std::fs::write(dir.join("cgroup.subtree_control"), "").unwrap();
+            if !rel.is_empty() {
+                std::fs::write(dir.join("cgroup.procs"), "").unwrap();
+            }
+        }
+        std::fs::write(
+            root.path().join("sendbox/inst01/agent/cgroup.procs"),
+            "42\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            hierarchy.delegate_execution_controllers(),
+            Err(CgroupError::PopulatedDelegationNode(path)) if path == "sendbox/inst01/agent"
+        ));
     }
 
     #[test]

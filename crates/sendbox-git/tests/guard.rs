@@ -201,6 +201,8 @@ impl Fixture {
                     ..BranchPolicyConfiguration::default()
                 },
                 environment: EnvironmentPolicy::default(),
+                github_https_auth: false,
+                git_ssh_auth: false,
                 limits: GuardLimits::default(),
             },
             trusted_git(),
@@ -504,7 +506,7 @@ fn rejects_configured_credential_helpers() {
         fixture
             .service()
             .admit(&strings(&["push", "origin", "feature/topic"])),
-        "credential helpers require later credential-broker integration",
+        "configured credential helpers are incompatible with authenticated Git",
     );
 }
 

@@ -11,9 +11,12 @@ use crate::GuestError;
 use crate::audit::AuditLog;
 use crate::bootstrap::ImmutableBootstrapSource;
 use crate::broker;
+use crate::egress;
+use crate::git_guard;
 use crate::manifest::{VerifiedManifest, verify_manifest};
+use crate::mcp_broker;
 use crate::platform::PlatformControls;
-use crate::protocol::{handshake_config, serve_authenticated};
+use crate::protocol::{ProtocolServices, handshake_config, serve_authenticated};
 use crate::runtime::{ReadinessSnapshot, RuntimeIdentity, RuntimeSession};
 use crate::secure_fs::{leaf_name, open_directory_no_symlinks, validate_regular_metadata};
 use crate::service::{ServiceId, ServiceManager};
@@ -63,14 +66,67 @@ pub async fn run<P: PlatformControls>(
     runtime.write_state(StartupState::RuntimePrepared)?;
     transition(&state, &audit, StartupState::RuntimePrepared)?;
 
-    let broker_client = bootstrap
+    if let Some((policy, workload_uid, workload_gid)) =
+        bootstrap.execution_broker.as_ref().and_then(|broker| {
+            broker
+                .git_guard_policy
+                .as_ref()
+                .map(|policy| (policy, broker.workload_uid, broker.workload_gid))
+        })
+    {
+        git_guard::install(policy, &options.artifact_root, workload_uid, workload_gid)?;
+        audit.lock().expect("audit mutex").record(
+            "git_guard_installed",
+            policy.selected_repository.to_string(),
+            policy.selected_workspace.display().to_string(),
+        );
+    }
+    if let Some(policy) = bootstrap
+        .execution_broker
+        .as_ref()
+        .and_then(|broker| broker.mcp_policy.as_ref())
+    {
+        mcp_broker::install(policy, &options.artifact_root)?;
+        audit.lock().expect("audit mutex").record(
+            "mcp_broker_installed",
+            policy.workspace_root.display().to_string(),
+            policy.tool_policy.allowed_server_commands.len().to_string(),
+        );
+    }
+    let egress_configured = bootstrap.egress_policy.is_some();
+    if let Some(policy) = bootstrap.egress_policy.take() {
+        let instance_id = policy.instance_id.clone();
+        let service = egress::prepare(runtime.session_dir(), policy)?;
+        if bootstrap
+            .services
+            .iter()
+            .any(|existing| existing.id == service.id)
+        {
+            return Err(GuestError::Runtime(
+                "egress service was configured more than once".to_owned(),
+            ));
+        }
+        bootstrap.services.push(service);
+        if !bootstrap.required_services.contains(&ServiceId::Egress) {
+            bootstrap.required_services.push(ServiceId::Egress);
+        }
+        audit.lock().expect("audit mutex").record(
+            "egress_policy_prepared",
+            instance_id,
+            "authenticated cgroup and nftables enforcement",
+        );
+    }
+    let mut broker_client = bootstrap
         .execution_broker
         .take()
         .map(|configuration| {
             broker::prepare(bootstrap.session_id, runtime.session_dir(), configuration)
         })
         .transpose()?;
-    if let Some((_, service)) = &broker_client {
+    if let Some((_, service)) = &mut broker_client {
+        if egress_configured && !service.dependencies.contains(&ServiceId::Egress) {
+            service.dependencies.push(ServiceId::Egress);
+        }
         if bootstrap
             .services
             .iter()
@@ -167,16 +223,28 @@ pub async fn run<P: PlatformControls>(
     };
     let result = match stream {
         Ok(stream) => {
-            let config = handshake_config(bootstrap.session_id, bootstrap.bootstrap_secret)?;
+            let secret_decryptor = crate::protocol::GuestSecretDecryptor::new(
+                bootstrap.session_id,
+                bootstrap.bootstrap_secret.expose_for_key_derivation(),
+                bootstrap.boundary_plan_digest,
+            )?;
+            let config = handshake_config(
+                bootstrap.session_id,
+                bootstrap.bootstrap_secret,
+                bootstrap.boundary_plan_digest,
+            )?;
             tokio::select! {
                 protocol = serve_authenticated(
                     stream,
                     config,
-                    Arc::clone(&state),
-                    Arc::clone(&service_readiness),
-                    Arc::clone(&runtime),
-                    readiness,
-                    broker_client.as_ref().map(|(client, _)| client.clone()),
+                    ProtocolServices::new(
+                        Arc::clone(&state),
+                        Arc::clone(&service_readiness),
+                        Arc::clone(&runtime),
+                        readiness,
+                        broker_client.as_ref().map(|(client, _)| client.clone()),
+                        secret_decryptor,
+                    ),
                 ) => protocol,
                 failure = services.wait_for_mandatory_failure() => Err(failure),
             }

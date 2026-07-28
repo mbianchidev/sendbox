@@ -114,9 +114,11 @@ pub trait GuestConnector: Send + Sync {
 
 pub struct GuestConnectionConfiguration {
     pub session_id: sendbox_core::SessionId,
+    pub boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     pub capabilities: CapabilitySet,
     pub required_capabilities: CapabilitySet,
     pub bootstrap_secret: Vec<u8>,
+    pub policy_digest: [u8; 32],
 }
 
 impl fmt::Debug for GuestConnectionConfiguration {
@@ -124,9 +126,11 @@ impl fmt::Debug for GuestConnectionConfiguration {
         formatter
             .debug_struct("GuestConnectionConfiguration")
             .field("session_id", &self.session_id)
+            .field("boundary_plan_digest", &self.boundary_plan_digest)
             .field("capabilities", &self.capabilities)
             .field("required_capabilities", &self.required_capabilities)
             .field("bootstrap_secret", &"[REDACTED]")
+            .field("policy_digest", &self.policy_digest)
             .finish()
     }
 }

@@ -4,8 +4,9 @@ Status: **pre-1.0 production libraries**. `sendbox-secrets` owns host secret
 storage, explicit legacy migration, ephemeral session envelopes, and pure
 credential request transformation. `sendbox-credentials` owns the bounded local
 listener, certificate-verifying HTTPS forwarding, guarded GitHub repository
-authorization, and session-bound agent configuration. Runtime and CLI lifecycle
-wiring remain intentionally deferred.
+authorization, and session-bound agent configuration. Persistent Apple/Kata runs
+wire guarded GitHub, Copilot, and Git SSH credentials through authenticated
+secret envelopes. Generic explicit-base-URL broker rules remain library-only.
 
 ## Secret values and names
 
@@ -168,10 +169,17 @@ Copilot authentication is independently gated by
 listener and per-rule agent endpoints plus zeroizing GitHub/Copilot values for a
 specific session. It does not install environment variables or start a runtime.
 
-## Remaining integration
+Production `sendbox run` resolves the selected repository once, authorizes the
+GitHub token before retrieving it, and adds only derived credential names to the
+signed boundary plan. Values travel through protocol-v2 authenticated secret
+envelopes. The guest Git guard installs fixed askpass and SSH wrappers; caller
+askpass, credential helpers, `core.sshCommand`, and SSH configuration overrides
+remain rejected. SSH private keys use an owner-only runtime file only while the
+trusted SSH child runs and are removed afterward. Hyperlight rejects these
+features because it does not provide persistent secret delivery.
 
-- Bind the envelope key derivation to the final authenticated protocol key
-  export and host-to-guest message type.
-- Connect the session-bound broker and guarded GitHub outputs to the final
-  security lifecycle after runtime/agent integration lands.
-- Run signed Keychain ACL qualification before the Rust CLI replaces Swift.
+## Remaining qualification
+
+- Connect generic explicit-base-URL credential rules to compatible agents.
+- Run the ignored Keychain ACL qualification whenever the production signing
+  identity or Keychain service identity changes.

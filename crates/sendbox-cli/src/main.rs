@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod boundary;
 mod completions;
+mod mcp;
+mod secrets;
 
 use std::fs;
 use std::io::{self, Write};
@@ -11,20 +14,18 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use completions::CompletionShell;
-use sendbox_agent::{
-    AgentError, AgentOrchestrator, AgentRequest, AgentSignal, BoxFuture, EnvironmentIntent,
-    GuestCommand, GuestTerminal, NoSignals, OutputSink, ProtocolGuestConnector, RunPlan,
-    SecretEnvelope, SecretReference, SecretResolver, SignalSource,
-};
+use sendbox_agent::{AgentError, AgentSignal, BoxFuture, NoSignals, OutputSink, SignalSource};
 use sendbox_config::{
     ConfigurationError, MigrationReport, PolicyPreset, RuntimeProvider, SandboxConfiguration,
 };
-use sendbox_core::{CONFIG_SCHEMA_VERSION, Diagnostic, DiagnosticCode, SessionId, VERSION};
+use sendbox_core::{CONFIG_SCHEMA_VERSION, Diagnostic, DiagnosticCode, VERSION};
+use sendbox_host::{
+    HostError, HostRunReport, HostRunRequest, RequestedRuntime, prepare as prepare_host_run,
+};
 use sendbox_project::{
     Analyzer, DevContainerOverrides, ProjectError, ScanLimits, write_devcontainer,
 };
-use sendbox_runtime::{CancellationToken, OutputStream, RuntimeProvider as RuntimeProviderTrait};
-use sendbox_runtime_kata::{KataProviderConfiguration, KataRuntimeProvider};
+use sendbox_runtime::{CancellationToken, OutputStream};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -48,27 +49,33 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Analyze(AnalyzeArgs),
+    Boundary(boundary::BoundaryArgs),
     Completions(CompletionsArgs),
     Devcontainer(Box<DevContainerArgs>),
     Init(InitArgs),
+    Mcp(mcp::McpArgs),
     Policy(PolicyArgs),
-    /// Run one exact argv workload through the experimental Rust Kata runtime.
+    /// Run one exact argv workload through an authenticated runtime boundary.
     Run(RunArgs),
+    Secrets(secrets::SecretsArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum RunRuntime {
+    Auto,
+    Apple,
     Kata,
+    Hyperlight,
 }
 
 #[derive(Debug, Args)]
 struct RunArgs {
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
-    #[arg(long, value_enum, default_value_t = RunRuntime::Kata)]
+    #[arg(long, value_enum, default_value_t = RunRuntime::Auto)]
     runtime: RunRuntime,
     #[arg(long, value_name = "IMAGE@sha256:DIGEST")]
-    image: String,
+    image: Option<String>,
     #[arg(long, value_name = "PATH")]
     bundle: PathBuf,
     #[arg(long, value_name = "PATH")]
@@ -87,6 +94,12 @@ struct RunArgs {
 struct AnalyzeArgs {
     #[command(flatten)]
     scan: ScanArgs,
+    #[arg(
+        long,
+        value_name = "PROJECT_ROOT",
+        help = "Write PROJECT_ROOT/.devcontainer/devcontainer.json"
+    )]
+    output: Option<PathBuf>,
     #[arg(long, help = "Emit the complete deterministic JSON analysis")]
     json: bool,
 }
@@ -318,16 +331,19 @@ struct CompletionInstallResult<'a> {
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Analyze(arguments) => analyze(arguments),
+        Command::Boundary(arguments) => boundary::execute(arguments),
         Command::Completions(arguments) => completions(arguments),
         Command::Devcontainer(arguments) => match arguments.command {
             DevContainerCommand::Generate(arguments) => generate_devcontainer(arguments),
         },
         Command::Init(arguments) => init(arguments),
+        Command::Mcp(arguments) => mcp::execute(arguments),
         Command::Policy(policy) => match policy.command {
             PolicyCommand::Show(arguments) => show_policy(arguments),
             PolicyCommand::Validate(arguments) => validate(arguments),
         },
         Command::Run(arguments) => run(arguments).await,
+        Command::Secrets(arguments) => secrets::execute(arguments),
     }
 }
 
@@ -351,114 +367,51 @@ async fn run(arguments: RunArgs) -> ExitCode {
         );
         return ExitCode::from(INVALID_CONFIGURATION_EXIT);
     }
-    let Some(program) = arguments.command.first() else {
+    if arguments
+        .command
+        .first()
+        .is_none_or(|program| !Path::new(program).is_absolute())
+    {
         emit_run_error(
             arguments.json,
             INVALID_CONFIGURATION_EXIT,
-            "command is empty",
-        );
-        return ExitCode::from(INVALID_CONFIGURATION_EXIT);
-    };
-    if !Path::new(program).is_absolute() {
-        emit_run_error(
-            arguments.json,
-            INVALID_CONFIGURATION_EXIT,
-            "experimental Kata command must use an absolute guest executable path",
+            "guest command must use an absolute executable path",
         );
         return ExitCode::from(INVALID_CONFIGURATION_EXIT);
     }
-    if let Some(error) = unavailable_run_feature(&configuration) {
-        emit_run_error(arguments.json, INVALID_CONFIGURATION_EXIT, error);
-        return ExitCode::from(INVALID_CONFIGURATION_EXIT);
-    }
-    let kata = configuration
-        .runtime
-        .as_ref()
-        .map(|runtime| runtime.kata.clone())
-        .unwrap_or_default();
-    let (workload_uid, workload_gid) = match project_identity(&configuration.project_path) {
-        Ok(identity) => identity,
-        Err(error) => {
-            emit_run_error(arguments.json, INVALID_CONFIGURATION_EXIT, &error);
-            return ExitCode::from(INVALID_CONFIGURATION_EXIT);
-        }
-    };
-    let provider = match KataRuntimeProvider::new(KataProviderConfiguration {
-        executable: kata.executable,
-        runtime_handler: kata.runtime_handler,
-        namespace: kata.namespace,
-        address: kata.address,
-        snapshotter: kata.snapshotter,
-        configuration_path: kata.configuration_path,
-        bundle_root: arguments.bundle,
-        trust_root_file: arguments.trust_root,
-        trust_root_id: arguments.trust_root_id,
-        minimum_release_sequence: arguments.minimum_release_sequence,
-        command_policy: configuration.policy.commands.clone(),
-        workload_uid,
-        workload_gid,
-    }) {
-        Ok(provider) => Arc::new(provider),
-        Err(error) => {
-            emit_run_error(arguments.json, RUNTIME_EXIT, &error.to_string());
-            return ExitCode::from(RUNTIME_EXIT);
-        }
-    };
-    let session_id = match random_session_id() {
-        Ok(session_id) => session_id,
-        Err(error) => {
-            emit_run_error(arguments.json, RUNTIME_EXIT, &error);
-            return ExitCode::from(RUNTIME_EXIT);
-        }
-    };
-    let bootstrap_reference =
-        SecretReference::new(format!("bootstrap-{session_id}")).expect("generated reference");
-    let state_directory = match runtime_state_directory() {
+    let state_root = match runtime_state_directory() {
         Ok(path) => path,
         Err(error) => {
             emit_run_error(arguments.json, RUNTIME_EXIT, &error);
             return ExitCode::from(RUNTIME_EXIT);
         }
     };
-    let request = AgentRequest {
-        session_id,
-        state_directory,
-        image: arguments.image,
-        guest_workspace: PathBuf::from("/workspace"),
-        command: GuestCommand {
-            program: program.clone(),
-            arguments: arguments.command[1..].to_vec(),
-            working_directory: "/workspace".to_owned(),
+    let prepared = match prepare_host_run(HostRunRequest {
+        requested_runtime: match arguments.runtime {
+            RunRuntime::Auto => RequestedRuntime::Auto,
+            RunRuntime::Apple => RequestedRuntime::Apple,
+            RunRuntime::Kata => RequestedRuntime::Kata,
+            RunRuntime::Hyperlight => RequestedRuntime::Hyperlight,
         },
-        environment: Vec::<EnvironmentIntent>::new(),
-        mounts: Vec::new(),
-        bootstrap_reference: bootstrap_reference.clone(),
+        configuration,
+        image: arguments.image,
+        bundle_root: arguments.bundle,
+        trust_root: arguments.trust_root,
+        trust_root_id: arguments.trust_root_id,
+        minimum_release_sequence: arguments.minimum_release_sequence,
+        command: arguments.command,
+        state_root,
         readiness_timeout: Duration::from_secs(60),
-    };
-    let plan = match RunPlan::compile(&configuration, request, &provider.capabilities()) {
-        Ok(plan) => plan,
+    })
+    .await
+    {
+        Ok(prepared) => prepared,
         Err(error) => {
-            emit_run_error(
-                arguments.json,
-                INVALID_CONFIGURATION_EXIT,
-                &error.to_string(),
-            );
-            return ExitCode::from(INVALID_CONFIGURATION_EXIT);
+            let code = host_error_exit_code(&error);
+            emit_run_error(arguments.json, code, &error.to_string());
+            return ExitCode::from(code);
         }
     };
-    let mut secret = [0_u8; 32];
-    if let Err(error) = getrandom::fill(&mut secret) {
-        emit_run_error(
-            arguments.json,
-            RUNTIME_EXIT,
-            &format!("generate bootstrap secret: {error}"),
-        );
-        return ExitCode::from(RUNTIME_EXIT);
-    }
-    let secrets = Arc::new(EphemeralSecrets {
-        reference: bootstrap_reference,
-        secret,
-    });
     let output = Arc::new(CliOutput {
         json: arguments.json,
     });
@@ -467,40 +420,30 @@ async fn run(arguments: RunArgs) -> ExitCode {
     } else {
         Arc::new(NoSignals)
     };
-    let orchestrator = AgentOrchestrator::new(
-        provider as Arc<dyn RuntimeProviderTrait>,
-        secrets,
-        Arc::new(ProtocolGuestConnector),
-        output,
-        signals,
-    );
     let cancellation = CancellationToken::new();
-    match orchestrator.run(&plan, &cancellation).await {
+    match prepared.execute(output, signals, &cancellation).await {
         Ok(report) => {
-            let code = match report.terminal {
-                GuestTerminal::Exited { code } => code,
-                GuestTerminal::Signaled { signal } => 128_i32.saturating_add(signal),
-                GuestTerminal::Cancelled => 130,
-                GuestTerminal::Failed { .. } => i32::from(RUNTIME_EXIT),
-            };
+            let code = report.exit_code();
             if arguments.json {
                 print_json(&serde_json::json!({
                     "event": "result",
                     "ok": code == 0,
                     "exit_code": code,
-                    "terminal": report.terminal,
+                    "execution": match report {
+                        HostRunReport::Persistent(_) => "persistent_guest",
+                        HostRunReport::OneShot(_) => "authenticated_one_shot",
+                    },
                 }));
             }
             exit_code(code)
         }
-        Err(error) if matches!(error.primary, AgentError::Cancelled) => {
+        Err(error) if host_error_cancelled(&error) => {
             if arguments.json {
                 print_json(&serde_json::json!({
                     "event": "result",
                     "ok": false,
                     "exit_code": 130,
                     "terminal": "cancelled",
-                    "cleanup_failures": error.cleanup.len(),
                 }));
             } else {
                 eprintln!("sendbox run: cancelled");
@@ -606,6 +549,12 @@ fn analyze(arguments: AnalyzeArgs) -> ExitCode {
     let project = arguments.scan.project.display().to_string();
     match analyzer(&arguments.scan).analyze(&arguments.scan.project) {
         Ok(analysis) => {
+            if let Some(output) = arguments.output.as_deref()
+                && let Err(error) =
+                    write_devcontainer(output, None, &analysis, &DevContainerOverrides::default())
+            {
+                return emit_project_error(arguments.json, OUTPUT_EXIT, &project, &error);
+            }
             if arguments.json {
                 print_json(&analysis);
             } else {
@@ -1020,32 +969,6 @@ fn parse_string_entry(value: &str) -> std::result::Result<(String, String), Stri
     Ok((key.to_owned(), value.to_owned()))
 }
 
-struct EphemeralSecrets {
-    reference: SecretReference,
-    secret: [u8; 32],
-}
-
-impl SecretResolver for EphemeralSecrets {
-    fn resolve<'a>(
-        &'a self,
-        reference: &'a SecretReference,
-        cancellation: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<SecretEnvelope, sendbox_agent::AgentError>> {
-        Box::pin(async move {
-            if cancellation.is_cancelled() {
-                return Err(sendbox_agent::AgentError::Cancelled);
-            }
-            if reference != &self.reference {
-                return Err(sendbox_agent::AgentError::Secret {
-                    reference: reference.as_str().to_owned(),
-                    message: "unknown ephemeral secret".to_owned(),
-                });
-            }
-            Ok(SecretEnvelope::new(reference.clone(), self.secret))
-        })
-    }
-}
-
 struct CliOutput {
     json: bool,
 }
@@ -1112,16 +1035,10 @@ impl SignalSource for CtrlCSignals {
     }
 }
 
-fn random_session_id() -> Result<SessionId, String> {
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
-    Ok(SessionId::from_bytes(bytes))
-}
-
 fn runtime_state_directory() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or_else(|| "HOME is not set for the Kata state directory".to_owned())?;
+        .ok_or_else(|| "HOME is not set for the runtime state directory".to_owned())?;
     let path = home.join(".sendbox").join("run");
     fs::create_dir_all(&path).map_err(|error| format!("create {}: {error}", path.display()))?;
     #[cfg(unix)]
@@ -1133,63 +1050,25 @@ fn runtime_state_directory() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn project_identity(path: &Path) -> Result<(u32, u32), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = path
-            .metadata()
-            .map_err(|error| format!("inspect project path {}: {error}", path.display()))?;
-        if metadata.uid() == 0 || metadata.gid() == 0 {
-            return Err(
-                "experimental Kata workloads require a non-root project owner uid and gid"
-                    .to_owned(),
-            );
-        }
-        Ok((metadata.uid(), metadata.gid()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Err("experimental Kata workloads require a Unix host".to_owned())
+fn host_error_exit_code(error: &HostError) -> u8 {
+    match error {
+        HostError::Invalid(_)
+        | HostError::Boundary(_)
+        | HostError::Credentials(_)
+        | HostError::GitGuard(_)
+        | HostError::AgentPlan(_)
+        | HostError::Bundle(_) => INVALID_CONFIGURATION_EXIT,
+        _ => RUNTIME_EXIT,
     }
 }
 
-fn unavailable_run_feature(configuration: &SandboxConfiguration) -> Option<&'static str> {
-    if !configuration.secrets.is_empty() {
-        return Some("experimental Kata run does not provide secret injection");
+fn host_error_cancelled(error: &HostError) -> bool {
+    match error {
+        HostError::AgentRun(failure) => matches!(failure.primary, AgentError::Cancelled),
+        HostError::Runtime(sendbox_runtime::RuntimeError::Cancelled) => true,
+        HostError::RuntimeSecurity { runtime, .. } => host_error_cancelled(runtime),
+        _ => false,
     }
-    if configuration
-        .observability
-        .as_ref()
-        .is_some_and(|value| value.mcp_inspection.enabled)
-    {
-        return Some("experimental Kata run does not wire the native MCP subsystem");
-    }
-    if configuration.github.forward_auth
-        || configuration.github.forward_copilot_auth
-        || configuration.github.allow_private_repository_access
-        || configuration.github.ssh_key_path.is_some()
-    {
-        return Some("experimental Kata run does not wire the credential broker");
-    }
-    if configuration.github.branch_protection.enabled {
-        return Some("experimental Kata run does not wire the native Git branch guard");
-    }
-    let network = &configuration.policy.network;
-    if network.default_action != sendbox_policy::Action::Allow
-        || !network.allowed_domains.is_empty()
-        || !network.blocked_domains.is_empty()
-        || !network.allowed_networks.is_empty()
-        || !network.blocked_networks.is_empty()
-        || !network.allowed_ports.is_empty()
-        || !network.allow_dns
-        || network.max_connections.is_some()
-        || network.dns != sendbox_policy::DnsPolicy::default()
-    {
-        return Some("experimental Kata run does not wire production egress enforcement");
-    }
-    None
 }
 
 fn emit_run_error(json: bool, exit_code: u8, message: &str) {

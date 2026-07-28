@@ -1,7 +1,8 @@
 # Production egress enforcement architecture (`sendbox-egress`)
 
-Status: **production foundation**. This document describes the architecture of
-the `sendbox-egress` crate, which promotes the proven
+Status: **production runtime integration**. This document describes the
+`sendbox-egress` crate and its authenticated host/guest composition, which
+promotes the proven
 `spikes/egress-enforcement` mechanism into a production workspace crate. The
 spike is left intact for reference; nothing here depends on it.
 
@@ -46,6 +47,7 @@ permits, and do so with a mechanism that:
 | `gateway` | Colocates both brokers so they share one `AuthorizationCache`, engine, guard, and audit sink. |
 | `audit` | Typed, deterministic, serializable audit events and sinks. |
 | `dialer` | The `Dialer` abstraction and `SO_MARK`-aware socket helpers. |
+| `runtime` | Session-derived authenticated runtime policy, stable instance/table/mark identity, execution-cgroup parent, and exact proxy environment. |
 
 The core performs no privileged operations and is exercised by the unit tests in
 each module plus the portable `tests/gateway_integration.rs` suite.
@@ -54,7 +56,7 @@ each module plus the portable `tests/gateway_integration.rs` suite.
 
 | Module | Responsibility |
 |---|---|
-| `linux::cgroup` | Supervisor-owned stable cgroup v2 hierarchy (`sendbox/<instance>/{agent,broker}`); creates, places pids, and tears down. |
+| `linux::cgroup` | Supervisor-owned stable cgroup v2 hierarchy (`sendbox/<instance>/{agent,broker}`), with optional `pids`/`memory`/`cpu` delegation through the agent ancestor for descendant execution leaves. |
 | `linux::mark` | `SO_MARK` socket helpers (via `socket2`) and the `MarkDialer`. |
 | `linux::nft` | Deterministic nftables rendering keyed on `socket cgroupv2` + `meta mark`; atomic apply/validate/cleanup/verify via `nft -f -` (stdin, no shell, no temp files). |
 | `linux::preflight` | cgroup v2, `nft socket cgroupv2` support, `CAP_NET_ADMIN`, and `SO_MARK` probes. |
@@ -69,14 +71,24 @@ could originate broker-class traffic. The production layer instead keys on
 - The supervisor owns a stable hierarchy `sendbox/<instance>/agent` and
   `sendbox/<instance>/broker` under the cgroup v2 root. The `level` in each
   nftables rule equals the number of path components.
-- The **agent cgroup** may only originate traffic to the loopback DNS and
-  CONNECT broker ports.
+- The **agent cgroup ancestor**, including every nested execution leaf beneath
+  it, may only originate traffic to the loopback DNS and CONNECT broker ports.
 - The **broker cgroup** may originate external traffic **only when the socket
   also carries the fixed `SO_MARK`** (`meta mark`), and never to cloud-metadata
   addresses.
 
 `meta cgroup` (cgroup v1 `net_cls`) is deliberately never emitted; a test
 asserts its absence.
+
+Production execution uses:
+
+```text
+/sys/fs/cgroup/sendbox/<instance>/agent/<session>/<command>
+```
+
+The nftables identity remains the level-3 `agent` ancestor, so every execution
+descendant inherits the same network boundary. The agent ancestor is an internal
+cgroup: direct process placement is rejected once controllers are delegated.
 
 Because SO_MARK must be set on *every* broker-originated external socket, both
 the CONNECT broker's dials (`MarkDialer`) and the DNS forwarding resolver's
@@ -151,7 +163,9 @@ availability (util-linux).
 
 1. **Preflight** — cgroup v2 mounted, `nft socket cgroupv2` supported,
    `CAP_NET_ADMIN` held, `SO_MARK` settable. Any gap is a hard error.
-2. **Create the stable cgroup hierarchy.**
+2. **Create the stable cgroup hierarchy** and, for production execution,
+   delegate required controllers through
+   `root -> sendbox -> instance -> agent`.
 3. **Validate** the rendered ruleset with `nft --check -f -` against the real
    cgroup paths (the definitive `socket cgroupv2` support/resolution check).
 4. **Apply** the ruleset atomically with `nft -f -`.
@@ -166,6 +180,33 @@ an apply failure — and leaves that instance's cgroups untouched, so a transien
 re-arm failure cannot strip live enforcement. Holding the guard is the
 precondition for placing and starting the agent. Dropping the guard tears
 everything down.
+
+## Authenticated production composition
+
+The host derives a schema-v1 `RuntimePolicyDocument` from the authenticated
+session ID and the configured `NetworkPolicy`. Apple and Kata bind that exact
+document into guest bootstrap together with the matching execution broker
+cgroup parent. The guest rejects session or cgroup drift before starting any
+service.
+
+The guest supervisor makes Egress a mandatory service and makes Exec depend on
+it. The egress supervisor:
+
+1. validates and consumes its root-owned configuration;
+2. recovers the original resolver from root-owned state under `/run/sendbox`;
+3. starts a separate gateway child that binds DNS and SOCKS5 listeners but does
+   not serve yet;
+4. arms delegated cgroups and nftables, then places the gateway in the broker
+   cgroup;
+5. authorizes the gateway to serve, installs loopback resolver configuration,
+   and only then publishes readiness.
+
+Workloads receive exact upper- and lower-case `ALL_PROXY`/`NO_PROXY` variables.
+The authenticated MCP broker receives the same fixed proxy environment, so MCP
+servers remain descendants of execution leaves and cannot bypass enforcement.
+Shutdown runs in reverse dependency order: Exec is fully stopped before Egress
+restores resolver state and attempts cgroup-then-nftables teardown. All service
+shutdown failures are aggregated rather than abandoning later cleanup.
 
 ## Atomic apply / update / rollback and fail-closed teardown
 
@@ -230,8 +271,10 @@ success-shaped default for an invalid value:
   `tests/gateway_integration.rs`. Both run on macOS and Linux.
 - The privileged live proof is `tests/live_netns.rs`, gated by
   `target_os = "linux"`, `SENDBOX_EGRESS_LIVE=1`, and a full `Preflight` (plus
-  `setpriv`). It proves cgroup identity isolation, the mark requirement,
-  sibling/identity-spoof denial, direct-egress bypass denial, non-vacuous
+  `setpriv`). It proves cgroup identity isolation, the mark requirement, a
+  nested execution leaf that can reach the loopback broker but cannot connect
+  directly externally, sibling/identity-spoof denial, direct-egress bypass
+  denial, non-vacuous
   IPv6/UDP denial with reachable positive controls, an **unprivileged agent**
   (dropped via `setpriv` with all capabilities cleared and `no_new_privs`, whose
   raw-socket creation is denied), **marked upstream DNS with a UDP-truncation →

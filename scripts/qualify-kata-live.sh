@@ -21,7 +21,7 @@ test -c /dev/kvm
 "$nerdctl_bin" --namespace "$namespace" info >/dev/null
 
 set +e
-./target/release/sendbox-rs run \
+./target/release/sendbox run \
   --config "$SENDBOX_KATA_CONFIG" \
   --runtime kata \
   --image "$SENDBOX_KATA_IMAGE" \

@@ -7,20 +7,28 @@ on:
       - "tools/sendbox-qualification/**"
       - "Tests/qualification/**"
       - "docs/qualification.md"
-      - "Sources/**"
-      - "copilot-bridge/src/**"
       - "crates/**"
+      - "guest/**"
+      - "packaging/release/**"
+      - "Makefile"
+      - "setup.sh"
+      - "scripts/qualify-setup-release.sh"
       - ".github/workflows/qualification.yaml"
+      - ".github/workflows/release.yaml"
   pull_request:
     branches: [main]
     paths:
       - "tools/sendbox-qualification/**"
       - "Tests/qualification/**"
       - "docs/qualification.md"
-      - "Sources/**"
-      - "copilot-bridge/src/**"
       - "crates/**"
+      - "guest/**"
+      - "packaging/release/**"
+      - "Makefile"
+      - "setup.sh"
+      - "scripts/qualify-setup-release.sh"
       - ".github/workflows/qualification.yaml"
+      - ".github/workflows/release.yaml"
 
 concurrency:
   group: qualification-${{ github.ref }}
@@ -32,15 +40,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libelf-dev \
+            libseccomp-dev \
+            libzstd-dev \
+            make \
+            pkg-config \
+            zlib1g-dev
 
       - name: Check formatting
         run: cargo fmt --manifest-path tools/sendbox-qualification/Cargo.toml --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --manifest-path tools/sendbox-qualification/Cargo.toml --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --manifest-path tools/sendbox-qualification/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --manifest-path tools/sendbox-qualification/Cargo.toml --all-features
+        run: cargo test --locked --manifest-path tools/sendbox-qualification/Cargo.toml --all-features
 
       - name: Validate inventory, conformance, and benchmark specification
         run: cargo run --locked --manifest-path tools/sendbox-qualification/Cargo.toml -- validate
@@ -51,7 +75,7 @@ jobs:
       - name: Run stable benchmark smoke
         run: |
           cargo run --locked --manifest-path tools/sendbox-qualification/Cargo.toml -- \
-            benchmark --profile smoke --rust-binary target/release/sendbox-rs \
+            benchmark --profile smoke --rust-binary target/release/sendbox \
             > qualification-smoke.json
           jq -e '
             .schema_version == 1 and

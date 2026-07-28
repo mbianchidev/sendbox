@@ -24,23 +24,10 @@ use sendbox_exec::{ExecutionUser, SessionAuthentication};
 use sendbox_policy::CommandPolicy;
 use serde::{Deserialize, Serialize};
 
+pub use sendbox_bootstrap::ExecutionBrokerBootstrap;
+
 use crate::GuestError;
 use crate::service::{HealthCheck, RestartPolicy, ServiceId, ServiceSpec};
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionBrokerBootstrap {
-    pub authentication: [u8; 32],
-    pub runtime_parent: PathBuf,
-    pub socket_path: PathBuf,
-    pub launcher_path: PathBuf,
-    pub cgroup_parent: PathBuf,
-    pub workspace_root: PathBuf,
-    pub system_root: PathBuf,
-    pub workload_uid: u32,
-    pub workload_gid: u32,
-    pub command_policy: CommandPolicy,
-}
 
 #[derive(Clone)]
 pub struct BrokerClientConfiguration {

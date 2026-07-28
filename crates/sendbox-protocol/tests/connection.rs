@@ -1,4 +1,4 @@
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_protocol::{
     BootstrapSecret, Cancellation, Capability, CapabilitySet, CloseCode, Event, EventKind,
     FrameLimits, GracefulClose, GuestHandshake, HandshakeConfig, HostHandshake, Message, Request,
@@ -21,6 +21,7 @@ fn config(session_id: SessionId) -> HandshakeConfig {
         [Capability::Lifecycle, Capability::Health].into(),
         FrameLimits::new(64 * 1024).expect("limits"),
         BootstrapSecret::new(SECRET).expect("secret"),
+        BoundaryPlanDigest::from_bytes([0x31; 32]),
     )
     .expect("config")
 }

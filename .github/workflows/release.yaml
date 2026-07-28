@@ -12,160 +12,361 @@ permissions:
   packages: write
 
 jobs:
-  build-package:
-    name: Build & Package
-    runs-on: macos-15
+  guest-bundles:
+    name: Signed guest bundle (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            platform: amd64
+          - arch: aarch64
+            platform: arm64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Select latest Xcode
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          version: v0.33.0
+          driver-opts: image=moby/buildkit:buildx-stable-1@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Load release signing key
+        env:
+          SIGNING_KEY_BASE64: ${{ secrets.SENDBOX_RELEASE_SIGNING_KEY_BASE64 }}
         run: |
-          XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
-          if [ -n "$XCODE_PATH" ]; then
-            echo "Using $XCODE_PATH"
-            sudo xcode-select -s "${XCODE_PATH}/Contents/Developer"
-          fi
+          test -n "$SIGNING_KEY_BASE64"
+          printf '%s' "$SIGNING_KEY_BASE64" \
+            | base64 --decode >"$RUNNER_TEMP/sendbox-release.key"
+          test "$(wc -c <"$RUNNER_TEMP/sendbox-release.key")" -eq 32
+          chmod 0400 "$RUNNER_TEMP/sendbox-release.key"
 
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Run tests
-        run: swift test
-
-      - name: Build release binary
-        run: swift build -c release
-
-      - name: Verify binary
+      - name: Build signed reproducible guest bundle
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
-          .build/release/sendbox --help
-          .build/release/sendbox --version
+          version="${VERSION#v}"
+          package_version="$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "sendbox-cli") | .version'
+          )"
+          test "$version" = "$package_version"
+          docker buildx build \
+            --no-cache \
+            --platform "linux/${{ matrix.platform }}" \
+            --target artifact \
+            --build-arg "RELEASE_SEQUENCE=${GITHUB_RUN_NUMBER}" \
+            --build-arg "MINIMUM_ACCEPTED_SEQUENCE=1" \
+            --build-arg "HOST_VERSION=${version}" \
+            --build-arg "GUEST_VERSION=${version}" \
+            --build-arg "TRUST_ROOT_ID=external-release-root" \
+            --secret "id=release_signing_key,src=$RUNNER_TEMP/sendbox-release.key" \
+            --output "type=local,dest=dist/raw" \
+            -f packaging/guest/Dockerfile \
+            .
 
-      # ── Standalone tarball ──────────────────────────────────
-      - name: Create tarball
+          mkdir -p "dist/payload/bundle"
+          tar -xf dist/raw/sendbox-guest-rootfs.tar -C "dist/payload/bundle"
+          cp dist/raw/release-public.key dist/payload/
+          test -x dist/payload/bundle/bin/sendbox-guest
+          test -x dist/payload/bundle/bin/sendbox-exec-launcher
+          test -f dist/payload/bundle/manifest.json
+          test -f dist/payload/bundle/manifest.sig
+          sudo chown -R 0:0 dist/payload
+          sudo chmod -R go-w dist/payload
+          test "$(stat -c '%a' dist/payload/bundle/bin/sendbox-guest)" = 555
+          test "$(stat -c '%a' dist/payload/bundle/bin/sendbox-exec-launcher)" = 555
+          test "$(stat -c '%a' dist/payload/bundle/manifest.json)" = 444
+          test "$(stat -c '%a' dist/payload/release-public.key)" = 444
+          test -r dist/payload/bundle/manifest.json
+          test -r dist/payload/release-public.key
+          cargo run --locked -p sendbox-bundle -- verify \
+            --root dist/payload/bundle \
+            --public-key dist/payload/release-public.key \
+            --architecture "${{ matrix.arch }}" \
+            --trust-root-id external-release-root \
+            --host-version "$version" \
+            --guest-version "$version" \
+            --minimum-release-sequence 1
+
+          staging="sendbox-guest-${version}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$staging"
+          cp -R dist/payload/bundle "dist/$staging/"
+          cp dist/payload/release-public.key "dist/$staging/"
+          cp \
+            dist/raw/inventory.json \
+            dist/raw/sbom.spdx.json \
+            dist/raw/verification-report.json \
+            "dist/$staging/"
+          tar \
+            --sort=name \
+            --mtime="@0" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -czf "dist/${staging}.tar.gz" \
+            -C dist "$staging"
+          sha256sum "dist/${staging}.tar.gz" \
+            >"dist/${staging}.tar.gz.sha256"
+
+      - name: Remove release signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sendbox-release.key"
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: release-guest-${{ matrix.arch }}
+          path: |
+            dist/sendbox-guest-*.tar.gz
+            dist/sendbox-guest-*.tar.gz.sha256
+          if-no-files-found: error
+
+  macos:
+    name: macOS arm64 packages
+    needs: guest-bundles
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-guest-aarch64
+          path: guest-archive
+
+      - name: Extract signed guest payload
         run: |
-          STAGING="sendbox-${{ steps.version.outputs.version }}-macos-arm64"
-          mkdir -p "$STAGING"
-          cp .build/release/sendbox "$STAGING/"
-          cp README.md LICENSE ROADMAP.md "$STAGING/"
-          cp -r config "$STAGING/"
-          cp setup.sh "$STAGING/"
+          mkdir guest-payload
+          tar -xzf guest-archive/sendbox-guest-*-linux-aarch64.tar.gz \
+            -C guest-payload \
+            --strip-components 1
+          test -x guest-payload/bundle/bin/sendbox-guest
 
-          tar czf "${STAGING}.tar.gz" "$STAGING"
-          shasum -a 256 "${STAGING}.tar.gz" > "${STAGING}.tar.gz.sha256"
-
-      # ── macOS .pkg installer ────────────────────────────────
-      - name: Build .pkg installer
+      - name: Test and build Rust CLI
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          PKG_ROOT="$(mktemp -d)"
-          SCRIPTS_DIR="$(mktemp -d)"
+          cargo test --locked -p sendbox-cli
+          cargo build --locked --release -p sendbox-cli
+          ./target/release/sendbox --version
+          ./target/release/sendbox --help >/dev/null
 
-          # Layout: /usr/local/bin/sendbox
-          mkdir -p "${PKG_ROOT}/usr/local/bin"
-          cp .build/release/sendbox "${PKG_ROOT}/usr/local/bin/"
+      - name: Create macOS tarball
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          version="${VERSION#v}"
+          staging="sendbox-${version}-macos-arm64"
+          mkdir -p "$staging/guest/aarch64"
+          cp target/release/sendbox "$staging/"
+          cp README.md LICENSE ROADMAP.md setup.sh "$staging/"
+          cp -R config "$staging/"
+          cp -R guest-payload/bundle "$staging/guest/aarch64/"
+          cp guest-payload/release-public.key "$staging/guest/aarch64/"
+          COPYFILE_DISABLE=1 tar \
+            --uid 0 \
+            --gid 0 \
+            --uname root \
+            --gname wheel \
+            -czf "${staging}.tar.gz" \
+            "$staging"
+          shasum -a 256 "${staging}.tar.gz" >"${staging}.tar.gz.sha256"
 
-          # Layout: /usr/local/share/sendbox/config
-          mkdir -p "${PKG_ROOT}/usr/local/share/sendbox"
-          cp -r config "${PKG_ROOT}/usr/local/share/sendbox/"
-          cp setup.sh "${PKG_ROOT}/usr/local/share/sendbox/"
+      - name: Build unsigned macOS pkg
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          version="${VERSION#v}"
+          pkg_root="$(mktemp -d)"
+          scripts_dir="$(mktemp -d)"
+          mkdir -p "$pkg_root/usr/local/bin"
+          mkdir -p "$pkg_root/usr/local/share/sendbox/guest/aarch64"
+          install -m 0755 target/release/sendbox "$pkg_root/usr/local/bin/sendbox"
+          cp README.md LICENSE ROADMAP.md setup.sh "$pkg_root/usr/local/share/sendbox/"
+          cp -R config "$pkg_root/usr/local/share/sendbox/"
+          cp -R guest-payload/bundle \
+            "$pkg_root/usr/local/share/sendbox/guest/aarch64/"
+          cp guest-payload/release-public.key \
+            "$pkg_root/usr/local/share/sendbox/guest/aarch64/"
 
-          # Post-install script — remove quarantine so unsigned binary runs
-          cat > "${SCRIPTS_DIR}/postinstall" << 'POSTINSTALL'
-          #!/bin/bash
+          cat >"$scripts_dir/postinstall" <<'POSTINSTALL'
+          #!/bin/sh
+          set -eu
           xattr -dr com.apple.quarantine /usr/local/bin/sendbox 2>/dev/null || true
           echo "SendBox installed to /usr/local/bin/sendbox"
-          echo "Run 'sendbox --help' to get started."
           POSTINSTALL
-          chmod +x "${SCRIPTS_DIR}/postinstall"
+          chmod 0755 "$scripts_dir/postinstall"
 
-          # Build the flat package (unsigned)
           pkgbuild \
-            --root "${PKG_ROOT}" \
-            --scripts "${SCRIPTS_DIR}" \
-            --identifier "dev.sendbox.cli" \
-            --version "${VERSION}" \
-            --install-location "/" \
-            "sendbox-${VERSION}-macos-arm64.pkg"
+            --root "$pkg_root" \
+            --scripts "$scripts_dir" \
+            --identifier dev.sendbox.cli \
+            --version "$version" \
+            --install-location / \
+            "sendbox-${version}-macos-arm64.pkg"
+          shasum -a 256 "sendbox-${version}-macos-arm64.pkg" \
+            >"sendbox-${version}-macos-arm64.pkg.sha256"
 
-          shasum -a 256 "sendbox-${VERSION}-macos-arm64.pkg" > "sendbox-${VERSION}-macos-arm64.pkg.sha256"
-
-      # ── macOS .dmg ──────────────────────────────────────────
-      - name: Build .dmg image
+      - name: Build unsigned macOS dmg
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          DMG_STAGING="$(mktemp -d)"
-          DMG_NAME="sendbox-${VERSION}-macos-arm64"
-
-          # Copy binary and support files
-          mkdir -p "${DMG_STAGING}/SendBox"
-          cp .build/release/sendbox "${DMG_STAGING}/SendBox/"
-          cp README.md LICENSE "${DMG_STAGING}/SendBox/"
-          cp -r config "${DMG_STAGING}/SendBox/"
-          cp setup.sh "${DMG_STAGING}/SendBox/"
-
-          # Create install script inside DMG
-          cat > "${DMG_STAGING}/SendBox/install.sh" << 'INSTALL'
-          #!/bin/bash
-          set -euo pipefail
-          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-          echo "Installing SendBox to /usr/local/bin..."
-          cp "${SCRIPT_DIR}/sendbox" /usr/local/bin/sendbox
-          chmod +x /usr/local/bin/sendbox
-          xattr -dr com.apple.quarantine /usr/local/bin/sendbox 2>/dev/null || true
-          mkdir -p /usr/local/share/sendbox
-          cp -r "${SCRIPT_DIR}/config" /usr/local/share/sendbox/
-          echo "✔ SendBox installed. Run 'sendbox --help' to get started."
-          INSTALL
-          chmod +x "${DMG_STAGING}/SendBox/install.sh"
-
-          # Create the DMG
+          version="${VERSION#v}"
+          staging="$(mktemp -d)/SendBox"
+          mkdir -p "$staging/guest/aarch64"
+          cp target/release/sendbox "$staging/"
+          cp README.md LICENSE setup.sh "$staging/"
+          cp -R config "$staging/"
+          cp -R guest-payload/bundle "$staging/guest/aarch64/"
+          cp guest-payload/release-public.key "$staging/guest/aarch64/"
+          cp packaging/release/install-macos.sh "$staging/install.sh"
+          chmod 0755 "$staging/install.sh"
           hdiutil create \
-            -volname "SendBox ${VERSION}" \
-            -srcfolder "${DMG_STAGING}/SendBox" \
-            -ov -format UDZO \
-            "${DMG_NAME}.dmg"
+            -volname "SendBox ${version}" \
+            -srcfolder "$staging" \
+            -ov \
+            -format UDZO \
+            "sendbox-${version}-macos-arm64.dmg"
+          shasum -a 256 "sendbox-${version}-macos-arm64.dmg" \
+            >"sendbox-${version}-macos-arm64.dmg.sha256"
 
-          shasum -a 256 "${DMG_NAME}.dmg" > "${DMG_NAME}.dmg.sha256"
-
-      # ── Upload artifacts ────────────────────────────────────
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: sendbox-${{ steps.version.outputs.version }}-macos-arm64
+          name: release-host-macos-arm64
           path: |
             sendbox-*.tar.gz
+            sendbox-*.tar.gz.sha256
             sendbox-*.pkg
+            sendbox-*.pkg.sha256
             sendbox-*.dmg
-            sendbox-*.sha256
+            sendbox-*.dmg.sha256
+          if-no-files-found: error
 
-  release:
-    name: Create GitHub Release
-    needs: build-package
-    runs-on: ubuntu-latest
+  linux:
+    name: Linux ${{ matrix.arch }} archive
+    needs: guest-bundles
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Download artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: sendbox-${{ steps.version.outputs.version }}-macos-arm64
-          path: dist/
+          name: release-guest-${{ matrix.arch }}
+          path: guest-archive
 
-      # ── Attestations (SLSA3 provenance) ─────────────────────
-      - name: Attest build provenance
+      - name: Extract signed guest payload
+        run: |
+          mkdir guest-payload
+          tar -xzf \
+            "guest-archive/sendbox-guest-"*"-linux-${{ matrix.arch }}.tar.gz" \
+            -C guest-payload \
+            --strip-components 1
+          test -x guest-payload/bundle/bin/sendbox-guest
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libelf-dev \
+            libseccomp-dev \
+            libzstd-dev \
+            make \
+            pkg-config \
+            zlib1g-dev
+
+      - name: Test and build Rust CLI
+        run: |
+          cargo test --locked -p sendbox-cli
+          cargo build --locked --release -p sendbox-cli
+          ./target/release/sendbox --version
+          ./target/release/sendbox --help >/dev/null
+          ldd ./target/release/sendbox
+
+      - name: Create Linux tarball
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          version="${VERSION#v}"
+          staging="sendbox-${version}-linux-${{ matrix.arch }}"
+          mkdir -p "$staging/guest/${{ matrix.arch }}"
+          cp target/release/sendbox "$staging/"
+          cp README.md LICENSE ROADMAP.md setup.sh "$staging/"
+          cp -R config "$staging/"
+          cp -R guest-payload/bundle "$staging/guest/${{ matrix.arch }}/"
+          cp guest-payload/release-public.key \
+            "$staging/guest/${{ matrix.arch }}/"
+          tar \
+            --sort=name \
+            --mtime="@0" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -czf "${staging}.tar.gz" \
+            "$staging"
+          sha256sum "${staging}.tar.gz" >"${staging}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: release-host-linux-${{ matrix.arch }}
+          path: |
+            sendbox-*.tar.gz
+            sendbox-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [guest-bundles, macos, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release asset set
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          version="${VERSION#v}"
+          for artifact in \
+            "sendbox-${version}-macos-arm64.tar.gz" \
+            "sendbox-${version}-macos-arm64.pkg" \
+            "sendbox-${version}-macos-arm64.dmg" \
+            "sendbox-${version}-linux-x86_64.tar.gz" \
+            "sendbox-${version}-linux-aarch64.tar.gz" \
+            "sendbox-guest-${version}-linux-x86_64.tar.gz" \
+            "sendbox-guest-${version}-linux-aarch64.tar.gz"; do
+            test -f "dist/$artifact"
+            test -f "dist/$artifact.sha256"
+          done
+
+      - name: Attest release provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: |
-            dist/sendbox-*.tar.gz
-            dist/sendbox-*.pkg
-            dist/sendbox-*.dmg
+            dist/*.tar.gz
+            dist/*.pkg
+            dist/*.dmg
 
-      # ── Publish to GHCR ────────────────────────────────────
       - name: Login to GHCR
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
         with:
@@ -173,73 +374,62 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup ORAS
-        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1.2.4
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1.2.4
+        with:
+          version: 1.3.3
 
-      - name: Push artifacts to GHCR
+      - name: Publish OCI release artifact
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          REPO="ghcr.io/${{ github.repository_owner }}/sendbox"
+          version="${VERSION#v}"
+          arguments=()
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              *.tar.gz) media_type="application/gzip" ;;
+              *.sha256) media_type="text/plain" ;;
+              *) media_type="application/octet-stream" ;;
+            esac
+            arguments+=("$file:$media_type")
+          done < <(find dist -maxdepth 1 -type f -print0 | sort -z)
+          test "${#arguments[@]}" -gt 0
+          repository="ghcr.io/${{ github.repository_owner }}/sendbox"
+          oras push \
+            "$repository:$version" \
+            --artifact-type application/vnd.sendbox.release.v1 \
+            "${arguments[@]}"
+          oras tag "$repository:$version" latest
 
-          oras push "${REPO}:${VERSION}" \
-            --artifact-type application/vnd.sendbox.cli.v1 \
-            "dist/sendbox-${VERSION}-macos-arm64.tar.gz:application/gzip" \
-            "dist/sendbox-${VERSION}-macos-arm64.pkg:application/octet-stream" \
-            "dist/sendbox-${VERSION}-macos-arm64.dmg:application/octet-stream"
-
-          oras tag "${REPO}:${VERSION}" latest
-
-      # ── Create GitHub Release ───────────────────────────────
-      - name: Create release
+      - name: Create GitHub release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
-          name: "SendBox ${{ steps.version.outputs.version }}"
+          name: SendBox ${{ github.ref_name }}
           generate_release_notes: true
           body: |
             ## Install
 
-            ### Option 1 — Package installer (.pkg)
-            Download `sendbox-${{ steps.version.outputs.version }}-macos-arm64.pkg` and double-click to install.
+            Host archives are published for macOS arm64, Linux x86_64, and
+            Linux aarch64. Each host archive includes the matching signed guest
+            bundle and release public key. macOS also has unsigned `.pkg` and
+            `.dmg` installers.
 
-            ### Option 2 — DMG
-            Download `sendbox-${{ steps.version.outputs.version }}-macos-arm64.dmg`, open it, and run the included `install.sh`.
+            Verify the artifact provenance before trusting its embedded guest
+            public key:
 
-            ### Option 3 — Tarball
             ```bash
-            tar xzf sendbox-${{ steps.version.outputs.version }}-macos-arm64.tar.gz
-            sudo cp sendbox-${{ steps.version.outputs.version }}-macos-arm64/sendbox /usr/local/bin/
+            gh attestation verify <artifact> -R ${{ github.repository }}
             ```
 
-            ### Option 4 — GHCR (OCI artifact)
-            ```bash
-            oras pull ghcr.io/${{ github.repository_owner }}/sendbox:${{ steps.version.outputs.version }}
-            ```
+            Then verify its adjacent SHA-256 file and install `sendbox`.
+            Linux hosts require the runtime packages documented in the README,
+            including libseccomp, Kata/containerd/nerdctl, and KVM support.
 
-            ### Verify attestations
-            ```bash
-            gh attestation verify sendbox-${{ steps.version.outputs.version }}-macos-arm64.tar.gz -o ${{ github.repository_owner }}
-            ```
+            The macOS `.pkg` and `.dmg` are not Apple-signed or notarized.
+            Gatekeeper approval is required; prefer per-artifact approval or
+            removal of the downloaded file's quarantine attribute. Do not
+            disable Gatekeeper globally.
 
-            ### Running unsigned binaries on macOS
-            These releases are **unsigned**. macOS Gatekeeper may block execution. To allow it:
-            ```bash
-            # Remove quarantine attribute (recommended)
-            xattr -dr com.apple.quarantine /usr/local/bin/sendbox
-
-            # Or, if you get "not allowed to execute", also run:
-            sudo spctl --master-disable   # disables Gatekeeper (re-enable with --master-enable)
-            ```
-
-            See the [README](https://github.com/mbianchidev/sendbox#running-unsigned-releases) for more details.
-
-            ### Verify checksums
-            ```bash
-            shasum -a 256 -c sendbox-${{ steps.version.outputs.version }}-macos-arm64.tar.gz.sha256
-            ```
-          files: |
-            dist/sendbox-*.tar.gz
-            dist/sendbox-*.tar.gz.sha256
-            dist/sendbox-*.pkg
-            dist/sendbox-*.pkg.sha256
-            dist/sendbox-*.dmg
-            dist/sendbox-*.dmg.sha256
+            Standalone signed guest bundles are also attached for operators
+            that manage host and guest artifacts separately.
+          files: dist/*
+          fail_on_unmatched_files: true

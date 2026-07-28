@@ -7,10 +7,11 @@ product dependencies.
 
 ## Inventory gate
 
-`inventory.v1.json` is the countable migration scope. It covers all current
-Swift, Rust, and bridge source modules, CLI commands, configuration sections/keys/defaults,
-runtime operations and capabilities, security modules, persisted formats,
-setup/completion/release surfaces, and top-level documented claims.
+`inventory.v1.json` is the countable rewrite scope. It covers current Rust
+source modules, historical implementation decisions, CLI commands,
+configuration sections and defaults, runtime operations and capabilities,
+security modules, persisted formats, setup/completion/release surfaces, and
+top-level documented claims.
 
 Every entry has a stable ID, one of `preserve`, `redesign`, `defer`, or
 `remove`, repository evidence in `path#symbol-or-claim` form, a target Rust
@@ -18,11 +19,21 @@ crate and phase, and a conformance status. Redesigns also require a
 compatibility note. Validation fails on duplicate IDs, missing evidence,
 unknown fields, missing fixtures, or an unresolved disposition.
 
-The phase 9 security records now include library-level evidence for the
-adapter-neutral session lifecycle, audit anchoring, snapshot rollback, secret
-envelopes, provenance verification, permission grants, and bounded migration
-reports. These entries do not claim host agent, runtime, CLI, MCP, credential
-listener, or guest enforcement integration.
+The production records include adapter-neutral session lifecycle, audit
+anchoring, snapshot rollback, secret envelopes, provenance verification,
+permission grants, and bounded migration reports. `sendbox-host` composes those
+records with verified runtime plans and authenticated Apple/Kata guest services.
+All inventory and conformance entries are implemented or explicitly
+not-applicable.
+
+Deleted implementation paths are represented through
+`Tests/qualification/historical/swift-to-rust.v1.json`, which binds each
+historical evidence path to the exact pre-cutover commit and Git blob object.
+Validation resolves the commit and every blob from repository history, rejects
+paths still present in the current tree, and requires a full-history checkout.
+The text after the second `#` is a stable semantic claim label rather than a
+source-code selector. Implemented entries must also resolve to live repository
+evidence directly or through their implemented target source module.
 
 For a PR, changed behavior must update the corresponding inventory and fixture.
 Cutover requires every preserved entry to have a passing implementation test
@@ -31,9 +42,8 @@ and every redesign to have its compatibility note satisfied.
 ## Conformance gate
 
 `conformance.v1.json` indexes intended-behavior fixtures. Intended behavior is
-the oracle. Current Swift output is explicitly labeled `swift_observation_only`
-and is used only for a feature already marked `preserve`; untested Swift
-behavior is never copied automatically.
+the only oracle; the production qualification tool no longer executes or
+compares a legacy implementation.
 
 Fixtures specify CLI channels and exits, config defaults and errors, policy
 decisions, protocol contracts, runtime capabilities, persisted formats,
@@ -41,31 +51,22 @@ setup/release behavior, and known-defect negative cases. Existing config and
 protocol fixtures remain the executable implementation tests where available;
 qualification fixtures define the cross-implementation contract.
 
-The native Git guard implements the protected-branch policy slice with typed
-Rust decisions and real-Git integration tests. Its evidence covers
-repository/workspace identity, aliases, options, remote rewrites, refspecs,
-timeouts, output limits, environment/config injection, trusted binary paths, and
-native exit preservation. The broader `policy.decisions` fixture remains
-specified until every command, network, MCP, and repository decision slice has
-a pure Rust implementation.
+`scripts/qualify-setup-release.sh` is the executable `setup.release` gate. The
+macOS and Linux CI matrix runs real setup configuration/build flows, a staged
+Make install, host tar assembly, checksum verification, and archive inspection;
+the macOS leg additionally builds and inspects the unsigned pkg and dmg.
 
-`mcp.contracts` records the native framing, JSON-RPC, policy, exact-command,
-project-validation, legacy-trace, versioned-observation, redaction, backpressure,
-and cancellation contracts. It deliberately excludes guest/runtime integration
-and remote HTTP authorization.
+`policy.decisions` is implemented across the native command broker, egress
+engine, MCP broker, repository-scope authorization, and Git guard. The Git
+evidence covers repository/workspace identity, aliases, options, remote
+rewrites, refspecs, timeouts, output limits, environment/config injection,
+trusted binary paths, and native exit preservation.
 
-The comparison runner invokes binaries directly, never through a shell. It
-normalizes declared paths and JSON fields, enforces a timeout and combined
-output cap, and emits deterministic JSON. Missing binaries, timeouts, and
-output-limit violations are explicit outcomes rather than passes:
-
-```bash
-cargo run --manifest-path tools/sendbox-qualification/Cargo.toml -- \
-  compare \
-  --fixture cli.policy-validate-common \
-  --swift-binary .build/release/sendbox \
-  --rust-binary target/release/sendbox-rs
-```
+`mcp.contracts` records native framing, JSON-RPC, policy, exact-command,
+project-validation, authenticated guest delivery, legacy-trace,
+versioned-observation, redaction, backpressure, and cancellation contracts.
+Remote HTTP/SSE authorization remains intentionally unsupported and fails
+closed.
 
 ## Benchmark gate
 
@@ -90,16 +91,16 @@ Qualification enforcement is reserved for declared reference hosts:
 cargo run --manifest-path tools/sendbox-qualification/Cargo.toml -- validate
 
 cargo run --manifest-path tools/sendbox-qualification/Cargo.toml -- \
-  benchmark --profile smoke --rust-binary target/release/sendbox-rs
+  benchmark --profile smoke --rust-binary target/release/sendbox
 
 cargo run --manifest-path tools/sendbox-qualification/Cargo.toml -- \
   benchmark --profile qualification --enforce-thresholds \
-  --rust-binary target/release/sendbox-rs
+  --rust-binary target/release/sendbox
 ```
 
 The portable harness never starts Apple container services, containerd, Kata,
-Hyperlight, guest services, or BPF programs. The experimental Rust Kata slice
-adds a separate, non-skipping self-hosted gate:
+Hyperlight, guest services, or BPF programs. Production Kata has a separate,
+non-skipping self-hosted gate:
 
 ```bash
 SENDBOX_KATA_LIVE=1 \

@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::{self, File},
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -8,13 +9,13 @@ use std::{
 use crate::GuardError;
 
 #[derive(Debug, Clone)]
-pub struct TrustedGitBinary {
+pub struct TrustedExecutable {
     path: PathBuf,
     identity: FileIdentity,
-    _descriptor: Arc<File>,
+    descriptor: Arc<File>,
 }
 
-impl TrustedGitBinary {
+impl TrustedExecutable {
     pub fn verify(path: impl AsRef<Path>) -> Result<Self, GuardError> {
         let path = path.as_ref();
         if !path.is_absolute() {
@@ -38,16 +39,10 @@ impl TrustedGitBinary {
                 .metadata()
                 .map_err(|error| invalid(path, error))?,
         );
-        let current = env::current_exe().map_err(|error| invalid(path, error))?;
-        if let Ok(current_metadata) = fs::metadata(current)
-            && identity == FileIdentity::from_metadata(&current_metadata)
-        {
-            return Err(invalid(path, "guard recursion is not allowed"));
-        }
         Ok(Self {
             path: path.to_owned(),
             identity,
-            _descriptor: Arc::new(descriptor),
+            descriptor: Arc::new(descriptor),
         })
     }
 
@@ -66,9 +61,73 @@ impl TrustedGitBinary {
         Ok(())
     }
 
+    pub fn copy_to(&self, destination: &Path, mode: u32) -> Result<(), GuardError> {
+        self.verify_unchanged()?;
+        let mut source = self.descriptor.try_clone().map_err(GuardError::Process)?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(GuardError::Process)?;
+        let mut destination_file = Self::destination_file(destination, mode)?;
+        std::io::copy(&mut source, &mut destination_file).map_err(GuardError::Process)?;
+        destination_file.flush().map_err(GuardError::Process)?;
+        destination_file.sync_all().map_err(GuardError::Process)
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(unix)]
+    fn destination_file(path: &Path, mode: u32) -> Result<File, GuardError> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(mode)
+            .open(path)
+            .map_err(GuardError::Process)
+    }
+
+    #[cfg(not(unix))]
+    fn destination_file(path: &Path, _mode: u32) -> Result<File, GuardError> {
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(GuardError::Process)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TrustedGitBinary {
+    executable: TrustedExecutable,
+}
+
+impl TrustedGitBinary {
+    pub fn verify(path: impl AsRef<Path>) -> Result<Self, GuardError> {
+        let executable = TrustedExecutable::verify(path)?;
+        let current = env::current_exe().map_err(|error| invalid(executable.path(), error))?;
+        if let Ok(current_metadata) = fs::metadata(current)
+            && executable.identity == FileIdentity::from_metadata(&current_metadata)
+        {
+            return Err(invalid(executable.path(), "guard recursion is not allowed"));
+        }
+        Ok(Self { executable })
+    }
+
+    pub fn verify_unchanged(&self) -> Result<(), GuardError> {
+        self.executable.verify_unchanged()
+    }
+
+    pub fn copy_to(&self, destination: &Path, mode: u32) -> Result<(), GuardError> {
+        self.executable.copy_to(destination, mode)
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.executable.path()
     }
 }
 

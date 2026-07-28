@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use sendbox_core::SessionId;
 
 pub const PROTOCOL_MAGIC: [u8; 8] = *b"SENDBOX\0";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const NONCE_BYTES: usize = 32;
 pub const MAC_BYTES: usize = 32;
 

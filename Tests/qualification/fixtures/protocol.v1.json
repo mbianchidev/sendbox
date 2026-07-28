@@ -5,6 +5,7 @@
     "canonical CBOR only",
     "bounded frames before allocation",
     "HMAC authenticated post-handshake frames",
+    "XChaCha20-Poly1305 secret envelopes bound to session, guest role, name, sequence, expiry, and policy digest",
     "session and direction binding",
     "strict sequence numbers",
     "explicit cancellation and graceful close",
@@ -12,4 +13,3 @@
   ],
   "sample": "test-fixtures/protocol/v1-authenticated-session.json"
 }
-

@@ -37,6 +37,7 @@ pub mod forwarding_resolver;
 pub mod gateway;
 pub mod policy;
 pub mod resolver;
+pub mod runtime;
 pub mod socks5;
 
 #[cfg(target_os = "linux")]

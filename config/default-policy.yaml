@@ -193,11 +193,11 @@ commands:
 # then dropped to the invoking host UID, every process inherits seccomp rules,
 # and configured stdio MCP servers must be prefixed with:
 #
-#   /run/sendbox-boundary/mcp-proxy -- <server> [args...]
+#   /run/sendbox-boundary/mcp-broker -- <server> [args...]
 #
-# Direct launches matching the configured MCP server patterns are terminated by
-# the eBPF bypass detector. HTTP/SSE MCP is intentionally unsupported here:
-# application-layer policy cannot be enforced safely through generic TLS probes.
+# The authenticated guest broker validates JSON-RPC and exact argv, clears the
+# server environment, and applies the configured tool policy. HTTP/SSE MCP is
+# intentionally unsupported because TLS plaintext is unavailable at this boundary.
 boundaries:
   enabled: true
   tool_calls:
@@ -215,9 +215,8 @@ boundaries:
       - mcp-remote
       - server-mcp
       - mcp.server
-    # Exact commands the root-owned MCP policy daemon may launch. Executables
-    # must be absolute paths, and a later argument must match one of the server
-    # patterns above. Package runners/shells such as npx, npm, yarn, pnpm, uvx,
+    # Exact commands the authenticated MCP broker may launch. Executables must be
+    # absolute paths. Package runners/shells such as npx, npm, yarn, pnpm, uvx,
     # sh, and bash are rejected; use the final interpreter/native command.
     # An empty list disables all MCP servers.
     allowed_server_commands: []

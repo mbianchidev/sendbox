@@ -11,7 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use sendbox_bootstrap::{
+    BootstrapDocumentConfiguration, ExecutionBrokerConfiguration, REQUIRED_RUNTIME_CONTROLS,
+    encode_bootstrap_document,
+};
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
+use sendbox_egress::runtime::{
+    DEFAULT_CGROUP_ROOT, RuntimePolicyDocument as EgressRuntimePolicyDocument,
+};
+use sendbox_git::GuardPolicyDocument;
+use sendbox_mcp::runtime::RuntimePolicyDocument;
 use sendbox_policy::CommandPolicy;
 use sendbox_runtime::{
     BootstrapDelivery, BoxFuture, CancellationToken, CleanupReport, CommandArgument, CommandSpec,
@@ -53,6 +62,9 @@ pub struct KataProviderConfiguration {
     pub trust_root_id: String,
     pub minimum_release_sequence: u64,
     pub command_policy: CommandPolicy,
+    pub git_guard_policy: Option<GuardPolicyDocument>,
+    pub mcp_policy: Option<RuntimePolicyDocument>,
+    pub egress_policy: Option<EgressRuntimePolicyDocument>,
     pub workload_uid: u32,
     pub workload_gid: u32,
 }
@@ -586,6 +598,7 @@ impl RuntimeProvider for KataRuntimeProvider {
                     to: LifecycleState::Running,
                 });
             }
+            request.validate_create_binding(&container.request)?;
             let trust_root =
                 Zeroizing::new(fs::read(&self.configuration.trust_root_file).map_err(
                     |source| RuntimeError::Provider(format!("read trust root: {source}")),
@@ -972,49 +985,49 @@ fn bootstrap_payload(
     secret: &[u8],
     trust_root: &[u8],
 ) -> Result<Vec<u8>, RuntimeError> {
-    let mut nonce = [0_u8; 32];
-    let mut authentication = [0_u8; 32];
-    getrandom::fill(&mut nonce)
-        .map_err(|error| RuntimeError::Provider(format!("generate bootstrap nonce: {error}")))?;
-    getrandom::fill(&mut authentication).map_err(|error| {
-        RuntimeError::Provider(format!("generate broker authentication: {error}"))
-    })?;
     let workspace = create
         .mounts
         .iter()
         .find(|mount| mount.destination == Path::new("/workspace"))
         .ok_or_else(|| RuntimeError::Provider("Kata run requires a /workspace mount".to_owned()))?;
-    let bootstrap = serde_json::json!({
-        "schema_version": 1,
-        "session_id": channel.session_id,
-        "bootstrap_nonce": nonce,
-        "bootstrap_secret": secret,
-        "host_version": env!("CARGO_PKG_VERSION"),
-        "trust_root_id": configuration.trust_root_id,
-        "manifest_path": "manifest.json",
-        "minimum_release_sequence": configuration.minimum_release_sequence,
-        "required_controls": ["privilege_drop", "capabilities", "seccomp"],
-        "required_services": [],
-        "services": [],
-        "execution_broker": {
-            "authentication": authentication,
-            "runtime_parent": GUEST_BROKER_RUNTIME,
-            "socket_path": format!("{GUEST_BROKER_RUNTIME}/{}/s", channel.session_id),
-            "launcher_path": format!("{GUEST_BUNDLE_ROOT}/{BUNDLE_LAUNCHER}"),
-            "cgroup_parent": GUEST_CGROUP_PARENT,
-            "workspace_root": workspace.destination,
-            "system_root": "/",
-            "workload_uid": configuration.workload_uid,
-            "workload_gid": configuration.workload_gid,
-            "command_policy": configuration.command_policy,
-        }
-    });
-    let bootstrap = Zeroizing::new(
-        serde_json::to_vec(&bootstrap)
-            .map_err(|error| RuntimeError::Provider(format!("encode bootstrap: {error}")))?,
+    let cgroup_parent = configuration.egress_policy.as_ref().map_or_else(
+        || PathBuf::from(GUEST_CGROUP_PARENT),
+        |policy| policy.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT)),
     );
+    let bootstrap = encode_bootstrap_document(
+        BootstrapDocumentConfiguration {
+            session_id: channel.session_id,
+            boundary_plan_digest: channel.boundary_plan_digest,
+            host_version: env!("CARGO_PKG_VERSION").to_owned(),
+            trust_root_id: configuration.trust_root_id.clone(),
+            manifest_path: PathBuf::from("manifest.json"),
+            minimum_release_sequence: configuration.minimum_release_sequence,
+            required_controls: REQUIRED_RUNTIME_CONTROLS.to_vec(),
+            required_services: Vec::new(),
+            services: Vec::new(),
+            execution_broker: Some(ExecutionBrokerConfiguration {
+                runtime_parent: PathBuf::from(GUEST_BROKER_RUNTIME),
+                socket_path: PathBuf::from(format!(
+                    "{GUEST_BROKER_RUNTIME}/{}/s",
+                    channel.session_id
+                )),
+                launcher_path: PathBuf::from(format!("{GUEST_BUNDLE_ROOT}/{BUNDLE_LAUNCHER}")),
+                cgroup_parent,
+                workspace_root: workspace.destination.clone(),
+                system_root: PathBuf::from("/"),
+                workload_uid: configuration.workload_uid,
+                workload_gid: configuration.workload_gid,
+                command_policy: configuration.command_policy.clone(),
+                git_guard_policy: configuration.git_guard_policy.clone(),
+                mcp_policy: configuration.mcp_policy.clone(),
+            }),
+            egress_policy: configuration.egress_policy.clone(),
+        },
+        secret,
+    )
+    .map_err(|error| RuntimeError::Provider(format!("encode bootstrap: {error}")))?;
     serde_json::to_vec(&BootstrapEnvelope {
-        bootstrap: &bootstrap,
+        bootstrap: bootstrap.as_ref(),
         trust_root,
     })
     .map_err(|error| RuntimeError::Provider(format!("encode bootstrap injection: {error}")))
@@ -1334,10 +1347,13 @@ fn spawn_stderr_capture(stderr: ChildStderr) -> JoinHandle<Vec<u8>> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use sendbox_bootstrap::decode_bootstrap_document;
+    use sendbox_core::{BoundaryPlanDigest, SessionId};
     use sendbox_policy::Action;
     use sendbox_runtime::{
-        CreateRequest, InitializeRequest, RuntimeEnvironment, RuntimeLabel, RuntimeMount,
-        RuntimeProvider, RuntimeResources, StartRequest, StopRequest,
+        BootstrapDelivery, BootstrapMaterial, ChannelLifetime, ChannelOwnership, CreateRequest,
+        InitializeRequest, RuntimeEnvironment, RuntimeLabel, RuntimeMount, RuntimeProvider,
+        RuntimeResources, StartRequest, StopRequest,
     };
     use tempfile::tempdir;
 
@@ -1365,6 +1381,9 @@ mod tests {
                 denylist: Vec::new(),
                 log_blocked: true,
             },
+            git_guard_policy: None,
+            mcp_policy: None,
+            egress_policy: None,
             workload_uid: 65_534,
             workload_gid: 65_534,
         }
@@ -1372,7 +1391,9 @@ mod tests {
 
     fn request(workspace: &Path) -> CreateRequest {
         CreateRequest {
+            session_id: SessionId::from_bytes([5; 16]),
             container_id: ContainerId::new("kata-test").expect("container"),
+            boundary_plan_digest: BoundaryPlanDigest::from_bytes([0x85; 32]),
             image: "registry.example/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             hostname: "kata-test".to_owned(),
             resources: RuntimeResources {
@@ -1396,6 +1417,75 @@ mod tests {
                 value: "exact value".to_owned(),
             }],
         }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DecodedBootstrapEnvelope {
+        bootstrap: Vec<u8>,
+        trust_root: Vec<u8>,
+    }
+
+    #[test]
+    fn kata_wraps_the_shared_guest_bootstrap_document() {
+        let temporary = tempdir().expect("temporary");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let mut configuration = configuration(
+            &temporary.path().join("nerdctl"),
+            &temporary.path().join("bundle"),
+            &temporary.path().join("trust.key"),
+        );
+        let create = request(&workspace);
+        let egress = EgressRuntimePolicyDocument::for_session(
+            create.session_id,
+            sendbox_policy::NetworkPolicy {
+                default_action: Action::Deny,
+                allowed_domains: vec!["example.com".to_owned()],
+                blocked_domains: Vec::new(),
+                allow_dns: true,
+                max_connections: None,
+                allowed_networks: Vec::new(),
+                blocked_networks: Vec::new(),
+                allowed_ports: Vec::new(),
+                dns: sendbox_policy::DnsPolicy::default(),
+            },
+        );
+        configuration.egress_policy = Some(egress.clone());
+        let channel = ControlChannelRequest {
+            session_id: create.session_id,
+            container_id: create.container_id.clone(),
+            boundary_plan_digest: create.boundary_plan_digest,
+            endpoint_kind: ControlEndpointKind::RuntimeExecStdio,
+            ownership: ChannelOwnership::RuntimeLifecycle,
+            lifetime: ChannelLifetime::UntilRuntimeCleanup,
+            readiness_timeout: Duration::from_secs(30),
+            bootstrap_delivery: BootstrapDelivery::RuntimeInjection {
+                target: GUEST_BOOTSTRAP.to_owned(),
+            },
+            bootstrap_material: BootstrapMaterial::new(vec![9; 32]).expect("bootstrap secret"),
+        };
+
+        let payload = bootstrap_payload(&configuration, &channel, &create, &[9; 32], &[7; 32])
+            .expect("Kata bootstrap envelope");
+        let envelope: DecodedBootstrapEnvelope =
+            serde_json::from_slice(&payload).expect("bootstrap envelope JSON");
+        assert_eq!(envelope.trust_root, vec![7; 32]);
+        let decoded =
+            decode_bootstrap_document(&envelope.bootstrap).expect("shared guest bootstrap schema");
+        assert_eq!(decoded.session_id, channel.session_id);
+        assert_eq!(decoded.boundary_plan_digest, channel.boundary_plan_digest);
+        assert_eq!(
+            decoded.bootstrap_secret.expose_for_key_derivation(),
+            &[9; 32]
+        );
+        assert_eq!(decoded.required_controls, REQUIRED_RUNTIME_CONTROLS);
+        assert_eq!(decoded.egress_policy, Some(egress.clone()));
+        let broker = decoded.execution_broker.expect("execution broker");
+        assert_eq!(broker.workspace_root, Path::new("/workspace"));
+        assert_eq!(
+            broker.cgroup_parent,
+            egress.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT))
+        );
     }
 
     #[tokio::test]

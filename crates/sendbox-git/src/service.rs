@@ -14,6 +14,10 @@ use crate::{
 };
 
 const MAX_ALIAS_DEPTH: usize = 8;
+pub const GITHUB_TOKEN_ENVIRONMENT: &str = "GITHUB_TOKEN";
+pub const GIT_ASKPASS_PATH: &str = "/run/sendbox-branch-protection/sendbox-git-askpass";
+pub const GIT_SSH_PATH: &str = "/run/sendbox-branch-protection/sendbox-git-ssh";
+pub const SSH_KEY_ENVIRONMENT: &str = "SENDBOX_GIT_SSH_KEY";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -52,6 +56,10 @@ pub struct GuardPolicyDocument {
     #[serde(default)]
     pub environment: EnvironmentPolicy,
     #[serde(default)]
+    pub github_https_auth: bool,
+    #[serde(default)]
+    pub git_ssh_auth: bool,
+    #[serde(default)]
     pub limits: GuardLimits,
 }
 
@@ -77,6 +85,26 @@ impl GuardPolicyDocument {
         }
         BranchPolicy::compile(&self.branch_protection)?;
         self.environment.validate()?;
+        if self.github_https_auth
+            && !self
+                .environment
+                .inherited_keys
+                .contains(GITHUB_TOKEN_ENVIRONMENT)
+        {
+            return Err(GuardError::InvalidPolicy(
+                "GitHub HTTPS auth requires the authenticated token environment".to_owned(),
+            ));
+        }
+        if self.git_ssh_auth
+            && !self
+                .environment
+                .inherited_keys
+                .contains(SSH_KEY_ENVIRONMENT)
+        {
+            return Err(GuardError::InvalidPolicy(
+                "Git SSH auth requires the authenticated key environment".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -113,7 +141,18 @@ impl<R: GitProcessRunner> GuardService<R> {
         policy.validate()?;
         let branches = BranchPolicy::compile(&policy.branch_protection)?;
         let workspace = WorkspaceIdentity::capture(&policy.selected_workspace)?;
-        let environment = policy.environment.sanitize(environment)?;
+        let mut environment = policy.environment.sanitize(environment)?;
+        if policy.github_https_auth {
+            require_non_empty_environment(&environment, GITHUB_TOKEN_ENVIRONMENT)?;
+            environment.insert("GIT_ASKPASS".to_owned(), GIT_ASKPASS_PATH.to_owned());
+            environment.insert("GIT_ASKPASS_REQUIRE".to_owned(), "force".to_owned());
+            environment.insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
+        }
+        if policy.git_ssh_auth {
+            require_non_empty_environment(&environment, SSH_KEY_ENVIRONMENT)?;
+            environment.insert("GIT_SSH_COMMAND".to_owned(), GIT_SSH_PATH.to_owned());
+            environment.insert("GIT_SSH_VARIANT".to_owned(), "ssh".to_owned());
+        }
         let service = Self {
             policy,
             branches,
@@ -130,16 +169,30 @@ impl<R: GitProcessRunner> GuardService<R> {
                 reason: "binary did not identify itself as Git".to_owned(),
             });
         }
+
         Ok(service)
     }
 
     pub fn admit(&self, arguments: &[String]) -> Result<Admission, GuardError> {
+        let invocation = self.resolve_aliases(parse_invocation(arguments)?)?;
+        if self.policy.github_https_auth || self.policy.git_ssh_auth {
+            if invocation
+                .global_arguments
+                .iter()
+                .any(|argument| argument == "--config-env" || argument.starts_with("--config-env="))
+            {
+                return Err(GuardError::InvalidInvocation(
+                    "--config-env is unsupported for authenticated Git".to_owned(),
+                ));
+            }
+            self.validate_global_configuration(&invocation.global_arguments, Operation::Push)?;
+            self.reject_external_configuration(&invocation.global_arguments, Operation::Push)?;
+        }
         if !self.branches.enabled() {
             return Ok(Admission::PassThrough {
                 reason: "branch protection disabled",
             });
         }
-        let invocation = self.resolve_aliases(parse_invocation(arguments)?)?;
         let operation = match invocation.command.as_deref() {
             Some("push") => Operation::Push,
             Some("pull") => Operation::Pull,
@@ -568,7 +621,17 @@ impl<R: GitProcessRunner> GuardService<R> {
         if !helpers.is_empty() {
             return Err(GuardError::denied(
                 operation,
-                "configured credential helpers require later credential-broker integration",
+                "configured credential helpers are incompatible with authenticated Git",
+            ));
+        }
+        if self.policy.git_ssh_auth
+            && self
+                .config_value(globals, "core.sshCommand")?
+                .is_some_and(|value| !value.is_empty())
+        {
+            return Err(GuardError::denied(
+                operation,
+                "configured core.sshCommand is incompatible with authenticated Git",
             ));
         }
         Ok(())
@@ -698,6 +761,19 @@ fn normalize_push_source(source: &str) -> Result<String, GuardError> {
         ));
     }
     Ok(source.to_owned())
+}
+
+fn require_non_empty_environment(
+    environment: &BTreeMap<String, String>,
+    name: &str,
+) -> Result<(), GuardError> {
+    if environment.get(name).is_some_and(|value| !value.is_empty()) {
+        Ok(())
+    } else {
+        Err(GuardError::InvalidInvocation(format!(
+            "authenticated Git environment `{name}` is unavailable"
+        )))
+    }
 }
 
 #[cfg(test)]

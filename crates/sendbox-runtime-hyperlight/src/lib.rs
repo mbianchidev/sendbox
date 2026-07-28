@@ -113,6 +113,8 @@ pub struct HyperlightConfiguration {
 }
 
 pub struct AuthenticatedLaunchRequest {
+    pub session_id: sendbox_core::SessionId,
+    pub boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     pub command: CommandSpec,
     pub bootstrap_material: BootstrapMaterial,
     pub listen_ports: Vec<u16>,
@@ -148,6 +150,8 @@ impl std::fmt::Debug for AuthenticatedLaunchRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AuthenticatedLaunchRequest")
+            .field("session_id", &self.session_id)
+            .field("boundary_plan_digest", &self.boundary_plan_digest)
             .field("command", &"[REDACTED]")
             .field("bootstrap_material", &self.bootstrap_material)
             .field("listen_ports", &self.listen_ports)
@@ -267,6 +271,7 @@ impl Drop for ActiveInvocationGuard {
 struct Container {
     lifecycle: LifecycleStateMachine,
     operation: Mutex<()>,
+    request: sendbox_runtime::CreateRequest,
     artifacts: VerifiedArtifacts,
     directory: PathBuf,
     directory_handle: Arc<Dir>,
@@ -346,6 +351,14 @@ impl HyperlightRuntime {
         let guard = {
             let _operation = container.operation.lock().await;
             require_running(&container)?;
+            if request.session_id != container.request.session_id
+                || request.boundary_plan_digest != container.request.boundary_plan_digest
+            {
+                return Err(RuntimeError::Provider(
+                    "Hyperlight authenticated launch session or boundary plan does not match container creation"
+                        .to_owned(),
+                ));
+            }
             validate_ports(&request.listen_ports)?;
             self.register_invocation(Arc::clone(&container))?
         };
@@ -865,6 +878,7 @@ impl RuntimeProvider for HyperlightRuntime {
             let container = Arc::new(Container {
                 lifecycle: LifecycleStateMachine::new(LifecycleState::Created),
                 operation: Mutex::new(()),
+                request: request.clone(),
                 artifacts,
                 directory,
                 directory_handle: Arc::new(directory_handle),

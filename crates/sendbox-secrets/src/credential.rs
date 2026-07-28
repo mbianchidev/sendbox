@@ -18,6 +18,8 @@ pub const GUARDED_GITHUB_CREDENTIALS: &[&str] = &[
     "GITHUB_PAT",
     "GITHUB_OAUTH_TOKEN",
     "GITHUB_APP_PRIVATE_KEY",
+    "GITHUB_COPILOT_TOKEN",
+    "COPILOT_GITHUB_TOKEN",
     "GIT_ASKPASS",
     "GIT_ASKPASS_REQUIRE",
     "SSH_ASKPASS",
@@ -25,6 +27,7 @@ pub const GUARDED_GITHUB_CREDENTIALS: &[&str] = &[
     "GIT_SSH",
     "GIT_SSH_COMMAND",
     "SSH_AUTH_SOCK",
+    "SENDBOX_GIT_SSH_KEY",
 ];
 
 #[must_use]

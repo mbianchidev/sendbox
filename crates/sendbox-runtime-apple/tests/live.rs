@@ -5,14 +5,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_protocol::{
     BootstrapSecret, Capability, FrameLimits, HandshakeConfig, HostHandshake, Message, VersionRange,
 };
 use sendbox_runtime::{
     BootstrapDelivery, BootstrapMaterial, CancellationToken, ChannelLifetime, ChannelOwnership,
     ContainerId, ControlChannelRequest, ControlEndpointKind, CreateRequest, InitializeRequest,
-    PreflightRequest, RuntimeProvider, StartRequest, StopRequest,
+    PreflightRequest, RuntimeMount, RuntimeProvider, StartRequest, StopRequest,
 };
 use sendbox_runtime_apple::{AppleRuntime, AppleRuntimeConfiguration};
 
@@ -27,17 +27,17 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
     let public_key = required_path("SENDBOX_APPLE_CONTAINER_PUBLIC_KEY");
     let trust_root_id = required("SENDBOX_APPLE_CONTAINER_TRUST_ROOT_ID");
     let image = required("SENDBOX_APPLE_CONTAINER_LIVE_IMAGE");
+    let minimum_release_sequence = required("SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE")
+        .parse()
+        .expect("minimum release sequence must be an integer");
     let mut configuration = AppleRuntimeConfiguration::new(
         bundle,
         public_key,
         trust_root_id.clone(),
         env!("CARGO_PKG_VERSION"),
         env!("CARGO_PKG_VERSION"),
+        minimum_release_sequence,
     );
-    configuration.minimum_release_sequence =
-        required("SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE")
-            .parse()
-            .expect("minimum release sequence must be an integer");
     if let Ok(executable) = std::env::var("SENDBOX_APPLE_CONTAINER_EXECUTABLE") {
         configuration.executable = Some(PathBuf::from(executable));
     }
@@ -75,23 +75,8 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
     let mut session_bytes = nonce.to_le_bytes();
     session_bytes[..4].copy_from_slice(&std::process::id().to_le_bytes());
     let session_id = SessionId::from_bytes(session_bytes);
+    let boundary_plan_digest = BoundaryPlanDigest::from_bytes([0x84; 32]);
     let secret = [0x6d_u8; 32];
-    let bootstrap = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
-        "session_id": session_id,
-        "bootstrap_nonce": vec![0x37_u8; 32],
-        "bootstrap_secret": secret,
-        "host_version": env!("CARGO_PKG_VERSION"),
-        "trust_root_id": trust_root_id,
-        "manifest_path": "manifest.json",
-        "minimum_release_sequence": required("SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE")
-            .parse::<u64>()
-            .expect("minimum release sequence"),
-        "required_controls": [],
-        "required_services": [],
-        "services": []
-    }))
-    .expect("bootstrap");
 
     let mut created = false;
     let mut channel = None;
@@ -99,14 +84,20 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
         runtime
             .create(
                 CreateRequest {
+                    session_id,
                     container_id: container_id.clone(),
+                    boundary_plan_digest,
                     image,
                     hostname: container_id.as_str().to_owned(),
                     resources: sendbox_runtime::RuntimeResources {
                         cpus: 2,
                         memory_bytes: 512 * 1024 * 1024,
                     },
-                    mounts: Vec::new(),
+                    mounts: vec![RuntimeMount {
+                        source: temporary.path().to_path_buf(),
+                        destination: PathBuf::from("/workspace"),
+                        writable: true,
+                    }],
                     environment: Vec::new(),
                     working_directory: "/workspace".into(),
                     dns_servers: Vec::new(),
@@ -124,6 +115,7 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
                 ControlChannelRequest {
                     session_id,
                     container_id: container_id.clone(),
+                    boundary_plan_digest,
                     endpoint_kind: ControlEndpointKind::InheritedStdio,
                     ownership: ChannelOwnership::RuntimeLifecycle,
                     lifetime: ChannelLifetime::UntilRuntimeCleanup,
@@ -131,7 +123,7 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
                     bootstrap_delivery: BootstrapDelivery::RuntimeInjection {
                         target: "/run/sendbox-bootstrap/bootstrap.json".to_owned(),
                     },
-                    bootstrap_material: BootstrapMaterial::new(bootstrap)?,
+                    bootstrap_material: BootstrapMaterial::new(secret.to_vec())?,
                 },
                 &cancellation,
             )
@@ -157,6 +149,7 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
             [Capability::Lifecycle, Capability::Health].into(),
             FrameLimits::default(),
             BootstrapSecret::new(secret).expect("secret"),
+            boundary_plan_digest,
         )
         .expect("handshake config");
         let mut handshake = HostHandshake::new(config);

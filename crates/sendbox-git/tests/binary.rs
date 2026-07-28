@@ -28,6 +28,8 @@ fn policy(workspace: &Path) -> GuardPolicyDocument {
         selected_workspace: workspace.to_owned(),
         branch_protection: BranchPolicyConfiguration::default(),
         environment: EnvironmentPolicy::default(),
+        github_https_auth: false,
+        git_ssh_auth: false,
         limits: GuardLimits::default(),
     }
 }

@@ -1,8 +1,8 @@
 use std::path::{Component, Path, PathBuf};
 
 use sendbox_runtime::{
-    CommandArgument, CommandSpec, ContainerId, EnvironmentVariable, ExecRequest, Program,
-    RuntimeError, RuntimeSignal,
+    CommandArgument, CommandSpec, ContainerId, CreateRequest, EnvironmentVariable, ExecRequest,
+    Program, RuntimeError, RuntimeSignal,
 };
 
 const GUEST_ARTIFACT_ROOT: &str = "/opt/sendbox";
@@ -46,11 +46,19 @@ pub struct AppleResourceConfiguration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppleLabel {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppleLaunchConfiguration {
     pub environment: Vec<AppleEnvironmentVariable>,
     pub mounts: Vec<AppleMount>,
     pub network: AppleNetworkConfiguration,
     pub resources: AppleResourceConfiguration,
+    pub working_directory: Option<PathBuf>,
+    pub labels: Vec<AppleLabel>,
     pub kernel: Option<PathBuf>,
     pub pull_policy: ImagePullPolicy,
     pub read_only_root: bool,
@@ -63,6 +71,8 @@ impl Default for AppleLaunchConfiguration {
             mounts: Vec::new(),
             network: AppleNetworkConfiguration::default(),
             resources: AppleResourceConfiguration::default(),
+            working_directory: None,
+            labels: Vec::new(),
             kernel: None,
             pull_policy: ImagePullPolicy::Missing,
             read_only_root: false,
@@ -105,6 +115,12 @@ impl AppleLaunchConfiguration {
         if self.resources.memory_mib == Some(0) {
             return Err(invalid("memory allocation must be greater than zero"));
         }
+        if let Some(working_directory) = &self.working_directory {
+            validate_guest_path(working_directory, "working directory")?;
+        }
+        for label in &self.labels {
+            validate_label(label)?;
+        }
         if let Some(kernel) = &self.kernel {
             validate_mapping_path(kernel, "kernel")?;
             if !kernel.is_file() {
@@ -117,6 +133,84 @@ impl AppleLaunchConfiguration {
             ));
         }
         Ok(())
+    }
+
+    pub fn merge_create_request(&self, request: &CreateRequest) -> Result<Self, RuntimeError> {
+        const MIB: u64 = 1024 * 1024;
+
+        let mut merged = self.clone();
+        let cpus = u16::try_from(request.resources.cpus)
+            .map_err(|_| invalid("Apple CPU allocation exceeds the supported range"))?;
+        if !request.resources.memory_bytes.is_multiple_of(MIB) {
+            return Err(invalid("Apple memory allocation must use whole mebibytes"));
+        }
+        merged.resources.cpus = Some(cpus);
+        merged.resources.memory_mib = Some(request.resources.memory_bytes / MIB);
+        merged.working_directory = Some(request.working_directory.clone());
+
+        let mut environment = merged
+            .environment
+            .into_iter()
+            .map(|variable| (variable.key.clone(), variable))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        environment.extend(request.environment.iter().map(|variable| {
+            (
+                variable.name.clone(),
+                AppleEnvironmentVariable {
+                    key: variable.name.clone(),
+                    value: variable.value.clone(),
+                    sensitive: variable.sensitive,
+                },
+            )
+        }));
+        merged.environment = environment.into_values().collect();
+
+        let mut mounts = merged
+            .mounts
+            .into_iter()
+            .map(|mount| (mount.target.clone(), mount))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        mounts.extend(request.mounts.iter().map(|mount| {
+            (
+                mount.destination.clone(),
+                AppleMount {
+                    source: mount.source.clone(),
+                    target: mount.destination.clone(),
+                    read_only: !mount.writable,
+                },
+            )
+        }));
+        merged.mounts = mounts.into_values().collect();
+
+        merged
+            .network
+            .dns_servers
+            .extend(request.dns_servers.iter().cloned());
+        merged.network.dns_servers.sort();
+        merged.network.dns_servers.dedup();
+        if merged.network.no_dns && !merged.network.dns_servers.is_empty() {
+            return Err(invalid(
+                "Apple no-DNS mode cannot be combined with configured DNS servers",
+            ));
+        }
+
+        let mut labels = merged
+            .labels
+            .into_iter()
+            .map(|label| (label.key.clone(), label))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        labels.extend(request.labels.iter().map(|label| {
+            (
+                label.name.clone(),
+                AppleLabel {
+                    key: label.name.clone(),
+                    value: label.value.clone(),
+                },
+            )
+        }));
+        merged.labels = labels.into_values().collect();
+        merged.validate()?;
+        Ok(merged)
     }
 }
 
@@ -202,6 +296,10 @@ impl AppleContainerCommands {
         append_mounts(&mut arguments, &launch.mounts)?;
         append_network(&mut arguments, &launch.network)?;
         append_resources(&mut arguments, &launch.resources)?;
+        if let Some(working_directory) = &launch.working_directory {
+            arguments.extend([plain("--workdir"), plain(display_path(working_directory))]);
+        }
+        append_labels(&mut arguments, &launch.labels)?;
         if let Some(kernel) = &launch.kernel {
             arguments.extend([plain("--kernel"), plain(display_path(kernel))]);
         }
@@ -466,6 +564,22 @@ fn append_resources(
     Ok(())
 }
 
+fn append_labels(
+    arguments: &mut Vec<CommandArgument>,
+    labels: &[AppleLabel],
+) -> Result<(), RuntimeError> {
+    let mut labels = labels.to_vec();
+    labels.sort_by(|left, right| left.key.cmp(&right.key).then(left.value.cmp(&right.value)));
+    for label in labels {
+        validate_label(&label)?;
+        arguments.extend([
+            plain("--label"),
+            plain(format!("{}={}", label.key, label.value)),
+        ]);
+    }
+    Ok(())
+}
+
 fn validate_image(image: &str) -> Result<(), RuntimeError> {
     if image.is_empty()
         || image.starts_with('-')
@@ -484,6 +598,19 @@ fn validate_environment_key(key: &str) -> Result<(), RuntimeError> {
         || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     {
         return Err(invalid("environment key is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_label(label: &AppleLabel) -> Result<(), RuntimeError> {
+    if label.key.is_empty()
+        || label.key.contains('=')
+        || label.key.as_bytes().contains(&0)
+        || label.value.as_bytes().contains(&0)
+    {
+        return Err(invalid(
+            "label keys must be non-empty and exclude equals signs and NUL; values must exclude NUL",
+        ));
     }
     Ok(())
 }
@@ -609,6 +736,11 @@ mod tests {
                 memory_mib: Some(2048),
                 ulimits: vec!["nofile=1024:2048".to_owned()],
             },
+            working_directory: Some("/workspace".into()),
+            labels: vec![AppleLabel {
+                key: "com.sendbox.test".to_owned(),
+                value: "true".to_owned(),
+            }],
             ..AppleLaunchConfiguration::default()
         };
         let command = commands
@@ -652,6 +784,10 @@ mod tests {
                 "2048M",
                 "--ulimit",
                 "nofile=1024:2048",
+                "--workdir",
+                "/workspace",
+                "--label",
+                "com.sendbox.test=true",
                 "ghcr.io/example/sendbox:latest",
                 "container-init",
             ]

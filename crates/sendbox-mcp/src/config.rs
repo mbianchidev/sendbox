@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use sendbox_policy::ToolCallPolicy;
@@ -23,6 +25,7 @@ const FORBIDDEN_EXECUTABLES: [&str; 13] = [
 ];
 const MAX_COMMAND_PARTS: usize = 16;
 const MAX_COMMAND_PART_BYTES: usize = 4095;
+const MAX_PROJECT_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ApprovedCommand {
@@ -135,7 +138,7 @@ impl ProjectConfigValidator {
         let project = project.as_ref();
         for relative in PROJECT_CONFIG_PATHS {
             let path = project.join(relative);
-            if path.is_file() {
+            if path.symlink_metadata().is_ok() {
                 self.validate_file(&path)?;
             }
         }
@@ -144,10 +147,32 @@ impl ProjectConfigValidator {
 
     pub fn validate_file(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         let path = path.as_ref();
-        let bytes = fs::read(path).map_err(|source| ConfigError::Io {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| ConfigError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let metadata = file.metadata().map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
         })?;
+        if !metadata.is_file() || metadata.len() > MAX_PROJECT_CONFIG_BYTES {
+            return Err(ConfigError::InvalidJson {
+                path: path.to_path_buf(),
+                message: format!(
+                    "configuration must be a regular file no larger than {MAX_PROJECT_CONFIG_BYTES} bytes"
+                ),
+            });
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        file.read_to_end(&mut bytes)
+            .map_err(|source| ConfigError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
         let root: Value =
             serde_json::from_slice(&bytes).map_err(|error| ConfigError::InvalidJson {
                 path: path.to_path_buf(),
@@ -333,6 +358,8 @@ fn invalid_server<T>(path: &Path, server: &str, message: &str) -> Result<T, Conf
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -388,5 +415,20 @@ mod tests {
             write_config(&temp, ".mcp.json", case);
             assert!(validator().validate_project(temp.path()).is_err());
         }
+    }
+
+    #[test]
+    fn rejects_symlinked_project_configuration() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("outside.json");
+        fs::write(
+            &target,
+            r#"{"servers":{"fs":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/node","/opt/mcp-server-filesystem.js"]}}}"#,
+        )
+        .unwrap();
+        symlink(&target, temp.path().join(".mcp.json")).unwrap();
+        assert!(validator().validate_project(temp.path()).is_err());
     }
 }

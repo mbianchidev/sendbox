@@ -4,7 +4,7 @@
 official Apple `container` CLI and service. It invokes the executable directly
 with exact argv, clears the inherited environment, supplies only `PATH`,
 `LANG`, `LC_ALL`, and explicitly marked secret variables, and never invokes a
-shell or Swift bridge.
+shell or language bridge.
 
 ## Requirements
 
@@ -19,6 +19,11 @@ shell or Swift bridge.
 - an explicit Linux arm64 image and any configured kernel, mounts, network,
   DNS, CPU, memory, and ulimit values
 
+`setup.sh` installs only the qualified 0.10.0 signed package and verifies its
+pinned SHA-256 digest plus package signature before invoking the installer.
+Already-installed later versions fail preflight rather than being accepted
+optimistically.
+
 Preflight is non-mutating. It queries version, complete command help, and
 `container system status --format json`. It never runs `container system
 start`, `stop`, or registration commands.
@@ -32,14 +37,21 @@ period, and deletes only the owned container. Workload exec is rejected;
 `container exec` is reserved for bootstrap/control operations because workload
 commands must pass through the authenticated guest broker.
 
+Provider-neutral create requests are applied at container creation: dynamic
+environment, mounts, DNS servers, CPU, memory, working directory, and labels
+override or extend adapter defaults. Memory must be expressed in whole MiB, and
+conflicting no-DNS/DNS settings fail before the CLI is invoked.
+
 Apple 0.10.0 advertises `--publish-socket`, but the available development host
 reported an unregistered service, so no live VM evidence established its
 replacement, ownership, cancellation, or bidirectional semantics. The
 production adapter therefore **does not advertise published Unix sockets**.
 It uses another official CLI surface:
 
-1. `container exec --interactive` injects the bounded bootstrap bytes into a
-   root-created, mode `0400` guest file.
+1. The provider combines the per-session secret with the signed trust metadata,
+   hardening requirements, and broker policy in the shared typed guest-bootstrap
+   schema, then `container exec --interactive` installs it as a root-created,
+   mode `0400` guest file.
 2. A detached bootstrap/control exec starts the verified guest supervisor.
 3. A second interactive exec runs the signed `stdio-bridge`, which connects to
    the session-unique guest Unix socket and relays raw stdin/stdout.
@@ -85,10 +97,14 @@ identities and always attempts channel cleanup, stop, and targeted delete.
 - The adapter does not start/register/stop the Apple service.
 - `--publish-socket`, Rosetta, virtualization passthrough, SSH forwarding, TTY
   mode, and arbitrary workload exec are not advertised.
-- Runtime `Network` capability means Apple network/DNS configuration only. It
-  does not claim domain egress enforcement; that requires the signed guest
-  egress controls and must fail policy validation when those controls are not
-  present.
+- Apple CLI 0.10.0 has no hostname option. Container identity remains the
+  session-unique container name rather than claiming a separately configured
+  kernel hostname.
+- Runtime `Network` capability covers Apple network/DNS provisioning.
+  Restrictive policy is a separate signed guest admission: the provider binds
+  the authenticated egress policy and delegated execution cgroup parent into
+  bootstrap, and Exec cannot start until the guest DNS/SOCKS5 gateway reports
+  readiness.
 - Bundle and trust-root mounts depend on official CLI bind-mount semantics and
   are fail-closed by guest-side mode, owner, digest, version, and rollback
   checks.

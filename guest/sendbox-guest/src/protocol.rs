@@ -1,10 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use sendbox_protocol::{
-    AGENT_LAUNCH_OPERATION, BootstrapSecret, Capability, CloseCode, Event, EventKind, FrameLimits,
-    GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV1, LaunchRequestV1, Message,
+    AGENT_LAUNCH_OPERATION, BootstrapSecret, CloseCode, Event, EventKind, FrameLimits,
+    GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, LaunchRequestV2, Message,
     OPERATION_SCHEMA_VERSION, ProtocolErrorCode, ProtocolErrorMessage, Request, Response,
-    ResponseStatus, TerminalResultV1, TerminalStateV1, VersionRange,
+    ResponseStatus, TerminalResultV2, TerminalStateV1, VersionRange, agent_guest_capabilities,
+    agent_guest_required_capabilities,
+};
+use sendbox_secrets::{
+    EnvelopeBinding, EnvelopeCipher, RecipientRole, ReplayGuard, SecretName, SessionKeyMaterial,
 };
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
@@ -20,38 +24,86 @@ use crate::state::{StartupState, StartupStateMachine};
 pub fn handshake_config(
     session_id: sendbox_core::SessionId,
     bootstrap_secret: BootstrapSecret,
+    boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
 ) -> Result<HandshakeConfig, GuestError> {
     HandshakeConfig::new(
         session_id,
         VersionRange::default(),
-        [
-            Capability::Lifecycle,
-            Capability::Exec,
-            Capability::Audit,
-            Capability::Health,
-        ]
-        .into(),
-        [Capability::Lifecycle, Capability::Health].into(),
+        agent_guest_capabilities(),
+        agent_guest_required_capabilities(),
         FrameLimits::default(),
         bootstrap_secret,
+        boundary_plan_digest,
     )
     .map_err(GuestError::from)
 }
 
-pub async fn serve_authenticated<S>(
-    stream: S,
-    config: HandshakeConfig,
+pub(crate) struct GuestSecretDecryptor {
+    session_id: sendbox_core::SessionId,
+    boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
+    cipher: EnvelopeCipher,
+    replay_guard: ReplayGuard,
+}
+
+impl GuestSecretDecryptor {
+    pub(crate) fn new(
+        session_id: sendbox_core::SessionId,
+        material: &[u8],
+        boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
+    ) -> Result<Self, GuestError> {
+        let material = SessionKeyMaterial::new(material.to_vec())
+            .map_err(|error| GuestError::Protocol(format!("prepare secret key: {error}")))?;
+        let cipher = EnvelopeCipher::new(&material, session_id).map_err(|error| {
+            GuestError::Protocol(format!("derive secret envelope key: {error}"))
+        })?;
+        Ok(Self {
+            session_id,
+            boundary_plan_digest,
+            cipher,
+            replay_guard: ReplayGuard::default(),
+        })
+    }
+}
+
+pub(crate) struct ProtocolServices {
     state: Arc<Mutex<StartupStateMachine>>,
     service_readiness: Arc<ReadinessGate>,
     runtime: Arc<RuntimeSession>,
     readiness: ReadinessSnapshot,
     broker: Option<BrokerClientConfiguration>,
+    secret_decryptor: GuestSecretDecryptor,
+}
+
+impl ProtocolServices {
+    pub(crate) fn new(
+        state: Arc<Mutex<StartupStateMachine>>,
+        service_readiness: Arc<ReadinessGate>,
+        runtime: Arc<RuntimeSession>,
+        readiness: ReadinessSnapshot,
+        broker: Option<BrokerClientConfiguration>,
+        secret_decryptor: GuestSecretDecryptor,
+    ) -> Self {
+        Self {
+            state,
+            service_readiness,
+            runtime,
+            readiness,
+            broker,
+            secret_decryptor,
+        }
+    }
+}
+
+pub(crate) async fn serve_authenticated<S>(
+    stream: S,
+    config: HandshakeConfig,
+    services: ProtocolServices,
 ) -> Result<(), GuestError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if state.lock().expect("state mutex").state() != StartupState::Ready
-        || !service_readiness.verified_live()
+    if services.state.lock().expect("state mutex").state() != StartupState::Ready
+        || !services.service_readiness.verified_live()
     {
         return Err(GuestError::Protocol(
             "authenticated readiness requested before local readiness".to_owned(),
@@ -61,12 +113,12 @@ where
     let mut handshake = GuestHandshake::new(config);
     let connection = handshake.establish(stream).await?;
     let (mut reader, mut writer) = connection.into_parts();
-    if !service_readiness.verified_live() {
+    if !services.service_readiness.verified_live() {
         return Err(GuestError::Protocol(
             "mandatory service failed during authenticated handshake".to_owned(),
         ));
     }
-    let readiness_payload = serde_json::to_vec(&readiness)
+    let readiness_payload = serde_json::to_vec(&services.readiness)
         .map_err(|error| GuestError::Protocol(format!("encoding readiness: {error}")))?;
     writer
         .send(&Message::Event(Event {
@@ -79,19 +131,11 @@ where
     loop {
         match reader.receive().await? {
             Message::Request(request) if request.operation == AGENT_LAUNCH_OPERATION => {
-                launch(
-                    request,
-                    &mut reader,
-                    &mut writer,
-                    &state,
-                    &service_readiness,
-                    &runtime,
-                    broker.as_ref(),
-                )
-                .await?;
+                launch(request, &mut reader, &mut writer, &services).await?;
             }
             Message::Request(request) => {
-                let response = handle_request(request, &service_readiness, &readiness)?;
+                let response =
+                    handle_request(request, &services.service_readiness, &services.readiness)?;
                 writer.send(&Message::Response(response)).await?;
             }
             Message::GracefulClose(close) => {
@@ -131,7 +175,7 @@ fn handle_request(
     let (status, payload) = match request.operation.as_str() {
         "health" if service_readiness.verified_live() => (
             ResponseStatus::Ok,
-            serde_json::to_vec(&HealthResponseV1 {
+            serde_json::to_vec(&HealthResponseV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 ready: true,
                 broker_live: true,
@@ -141,7 +185,7 @@ fn handle_request(
         ),
         "health" => (
             ResponseStatus::Rejected,
-            serde_json::to_vec(&HealthResponseV1 {
+            serde_json::to_vec(&HealthResponseV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 ready: false,
                 broker_live: false,
@@ -165,15 +209,12 @@ async fn launch<S>(
     request: Request,
     host_reader: &mut sendbox_protocol::FramedReader<ReadHalf<S>>,
     host_writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
-    state: &Arc<Mutex<StartupStateMachine>>,
-    service_readiness: &ReadinessGate,
-    runtime: &RuntimeSession,
-    broker: Option<&BrokerClientConfiguration>,
+    services: &ProtocolServices,
 ) -> Result<(), GuestError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if !service_readiness.verified_live() {
+    if !services.service_readiness.verified_live() {
         return send_rejection(
             host_writer,
             request.request_id,
@@ -181,7 +222,7 @@ where
         )
         .await;
     }
-    let Some(broker) = broker else {
+    let Some(broker) = services.broker.as_ref() else {
         return send_rejection(
             host_writer,
             request.request_id,
@@ -189,7 +230,7 @@ where
         )
         .await;
     };
-    let launch: LaunchRequestV1 = serde_json::from_slice(&request.payload)
+    let launch: LaunchRequestV2 = serde_json::from_slice(&request.payload)
         .map_err(|error| GuestError::Protocol(format!("decoding launch request: {error}")))?;
     if launch.schema_version != OPERATION_SCHEMA_VERSION {
         return send_rejection(
@@ -199,10 +240,18 @@ where
         )
         .await;
     }
+    if launch.boundary_plan_digest != services.secret_decryptor.boundary_plan_digest {
+        return send_rejection(
+            host_writer,
+            request.request_id,
+            "boundary-plan-digest-mismatch",
+        )
+        .await;
+    }
     let launch_permitted = {
-        let mut machine = state.lock().expect("state mutex");
+        let mut machine = services.state.lock().expect("state mutex");
         if machine.permit_agent_launch().is_ok() {
-            runtime.write_state(machine.state())?;
+            services.runtime.write_state(machine.state())?;
             true
         } else {
             false
@@ -212,7 +261,7 @@ where
         return send_rejection(host_writer, request.request_id, "readiness-not-available").await;
     }
 
-    let execution = build_execution_request(&launch, broker)?;
+    let execution = build_execution_request(&launch, broker, &services.secret_decryptor)?;
     let stream = UnixStream::connect(&broker.socket_path)
         .await
         .map_err(|error| GuestError::io("connecting execution broker", error))?;
@@ -288,8 +337,9 @@ where
 }
 
 fn build_execution_request(
-    launch: &LaunchRequestV1,
+    launch: &LaunchRequestV2,
     broker: &BrokerClientConfiguration,
+    secret_decryptor: &GuestSecretDecryptor,
 ) -> Result<sendbox_exec::ExecutionRequest, GuestError> {
     let (executable_root, executable) = descriptor_path(&launch.program)?;
     let (cwd_root, cwd) = descriptor_path(&launch.working_directory)?;
@@ -299,6 +349,7 @@ fn build_execution_request(
     let mut argv = Vec::with_capacity(launch.arguments.len() + 1);
     argv.push(launch.program.clone());
     argv.extend(launch.arguments.clone());
+    let environment = decrypt_environment(launch, secret_decryptor)?;
     Ok(sendbox_exec::ExecutionRequest {
         session_id: broker.session_id,
         authentication: broker.authentication.clone(),
@@ -314,14 +365,7 @@ fn build_execution_request(
             root: cwd_root,
             relative: cwd,
         },
-        environment: launch
-            .environment
-            .iter()
-            .map(|entry| sendbox_exec::EnvironmentEntry {
-                name: entry.name.clone(),
-                value: entry.value.clone(),
-            })
-            .collect(),
+        environment,
         stdin: sendbox_exec::StandardInput::Null,
         timeout,
         containment: sendbox_exec::ContainmentProfile {
@@ -329,6 +373,80 @@ fn build_execution_request(
             ..sendbox_exec::ContainmentProfile::default()
         },
     })
+}
+
+fn decrypt_environment(
+    launch: &LaunchRequestV2,
+    secret_decryptor: &GuestSecretDecryptor,
+) -> Result<Vec<sendbox_exec::EnvironmentEntry>, GuestError> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut environment = Vec::with_capacity(launch.environment.len() + launch.secrets.len());
+    for entry in &launch.environment {
+        if !names.insert(entry.name.as_str()) {
+            return Err(GuestError::Protocol(format!(
+                "duplicate environment name {}",
+                entry.name
+            )));
+        }
+        environment.push(sendbox_exec::EnvironmentEntry {
+            name: entry.name.clone(),
+            value: entry.value.clone(),
+        });
+    }
+    let now = unix_time_ms()?;
+    for secret in &launch.secrets {
+        if secret.boundary_plan_digest != secret_decryptor.boundary_plan_digest {
+            return Err(GuestError::Protocol(format!(
+                "secret {} carries a different boundary plan digest",
+                secret.reference
+            )));
+        }
+        if !names.insert(secret.reference.as_str()) {
+            return Err(GuestError::Protocol(format!(
+                "duplicate environment or secret name {}",
+                secret.reference
+            )));
+        }
+        let binding = EnvelopeBinding {
+            session_id: secret_decryptor.session_id,
+            recipient: RecipientRole::Guest,
+            secret_name: SecretName::new(secret.reference.clone())
+                .map_err(|error| GuestError::Protocol(format!("invalid secret name: {error}")))?,
+            sequence: secret.sequence,
+            expires_at_unix_ms: secret.expires_at_unix_ms,
+            policy_digest: secret.policy_digest,
+            boundary_plan_digest: secret_decryptor.boundary_plan_digest,
+        };
+        let value = secret_decryptor
+            .cipher
+            .open(
+                &secret.envelope,
+                &binding,
+                &secret_decryptor.replay_guard,
+                now,
+            )
+            .map_err(|error| GuestError::Protocol(format!("open secret envelope: {error}")))?;
+        let value = String::from_utf8(value.expose_secret().to_vec()).map_err(|_| {
+            GuestError::Protocol(format!(
+                "secret {} is not valid UTF-8 for environment injection",
+                secret.reference
+            ))
+        })?;
+        environment.push(sendbox_exec::EnvironmentEntry {
+            name: secret.reference.clone(),
+            value,
+        });
+    }
+    Ok(environment)
+}
+
+fn unix_time_ms() -> Result<u64, GuestError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| GuestError::Protocol(format!("read system time: {error}")))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| GuestError::Protocol("system time is out of range".to_owned()))
 }
 
 fn descriptor_path(
@@ -361,7 +479,7 @@ fn descriptor_path(
     ))
 }
 
-fn terminal_result(result: sendbox_exec::ExecutionResult) -> TerminalResultV1 {
+fn terminal_result(result: sendbox_exec::ExecutionResult) -> TerminalResultV2 {
     use sendbox_exec::TerminalState;
     let terminal = match result.terminal {
         TerminalState::Exited(status) => TerminalStateV1::Exited {
@@ -379,7 +497,7 @@ fn terminal_result(result: sendbox_exec::ExecutionResult) -> TerminalResultV1 {
         TerminalState::BrokerShutdown => TerminalStateV1::BrokerShutdown,
         TerminalState::SupervisorDied => TerminalStateV1::SupervisorDied,
     };
-    TerminalResultV1 {
+    TerminalResultV2 {
         schema_version: OPERATION_SCHEMA_VERSION,
         terminal,
         cleanup_complete: result.cleanup.is_complete(),
@@ -398,7 +516,7 @@ where
         .send(&Message::Response(Response {
             request_id,
             status: ResponseStatus::Rejected,
-            payload: serde_json::to_vec(&TerminalResultV1 {
+            payload: serde_json::to_vec(&TerminalResultV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 terminal: TerminalStateV1::Rejected {
                     reason: reason.to_owned(),
@@ -462,7 +580,7 @@ where
 #[cfg(test)]
 mod tests {
     use rustix::process::{getgid, getuid};
-    use sendbox_core::SessionId;
+    use sendbox_core::{BoundaryPlanDigest, SessionId};
     use sendbox_protocol::{HostHandshake, Message, Request};
     use tempfile::tempdir;
 
@@ -489,20 +607,29 @@ mod tests {
             handshake_config(
                 SessionId::from_bytes([3; 16]),
                 BootstrapSecret::new([9; 32]).expect("secret"),
+                BoundaryPlanDigest::from_bytes([0x91; 32]),
             )
             .expect("config"),
-            Arc::new(Mutex::new(StartupStateMachine::default())),
-            ReadinessGate::test_ready(),
-            runtime,
-            ReadinessSnapshot {
-                session_id: SessionId::from_bytes([3; 16]),
-                state: StartupState::Ready,
-                release_sequence: 1,
-                controls: Vec::new(),
-                services: Vec::new(),
-                audit_events: Vec::new(),
-            },
-            None,
+            ProtocolServices::new(
+                Arc::new(Mutex::new(StartupStateMachine::default())),
+                ReadinessGate::test_ready(),
+                runtime,
+                ReadinessSnapshot {
+                    session_id: SessionId::from_bytes([3; 16]),
+                    state: StartupState::Ready,
+                    release_sequence: 1,
+                    controls: Vec::new(),
+                    services: Vec::new(),
+                    audit_events: Vec::new(),
+                },
+                None,
+                GuestSecretDecryptor::new(
+                    SessionId::from_bytes([3; 16]),
+                    &[9; 32],
+                    BoundaryPlanDigest::from_bytes([0x91; 32]),
+                )
+                .expect("secret decryptor"),
+            ),
         )
         .await;
         assert!(matches!(result, Err(GuestError::Protocol(_))));
@@ -512,6 +639,7 @@ mod tests {
     async fn authenticated_launch_requires_a_configured_broker() {
         let temporary = tempdir().expect("temporary directory");
         let session_id = SessionId::from_bytes([4; 16]);
+        let boundary_plan_digest = BoundaryPlanDigest::from_bytes([0x92; 32]);
         let runtime = Arc::new(
             RuntimeSession::prepare(
                 &temporary.path().join("run"),
@@ -547,17 +675,33 @@ mod tests {
         let (host_stream, guest_stream) = tokio::io::duplex(16 * 1024);
         let guest = tokio::spawn(serve_authenticated(
             guest_stream,
-            handshake_config(session_id, BootstrapSecret::new([8; 32]).expect("secret"))
-                .expect("guest config"),
-            Arc::clone(&state),
-            ReadinessGate::test_ready(),
-            runtime,
-            readiness,
-            None,
+            handshake_config(
+                session_id,
+                BootstrapSecret::new([8; 32]).expect("secret"),
+                boundary_plan_digest,
+            )
+            .expect("guest config"),
+            ProtocolServices::new(
+                Arc::clone(&state),
+                ReadinessGate::test_ready(),
+                runtime,
+                readiness,
+                None,
+                GuestSecretDecryptor::new(session_id, &[8; 32], boundary_plan_digest)
+                    .expect("secret decryptor"),
+            ),
         ));
         let mut host_handshake = HostHandshake::new(
-            handshake_config(session_id, BootstrapSecret::new([8; 32]).expect("secret"))
-                .expect("host config"),
+            HandshakeConfig::new(
+                session_id,
+                VersionRange::default(),
+                sendbox_protocol::agent_host_capabilities(),
+                sendbox_protocol::agent_host_required_capabilities(),
+                FrameLimits::default(),
+                BootstrapSecret::new([8; 32]).expect("secret"),
+                boundary_plan_digest,
+            )
+            .expect("host config"),
         );
         let connection = host_handshake
             .establish(host_stream)

@@ -1,12 +1,19 @@
 use sendbox_protocol::{
-    AGENT_LAUNCH_OPERATION, BootstrapSecret, CapabilitySet, CloseCode, EnvironmentEntryV1,
-    EventKind, FrameLimits, GracefulClose, HandshakeConfig, HostHandshake, LaunchRequestV1,
-    Message, OPERATION_SCHEMA_VERSION, Request, ResponseStatus, TerminalResultV1, TerminalStateV1,
-    VersionRange,
+    AGENT_LAUNCH_OPERATION, BootstrapSecret, CapabilitySet, CloseCode, EnvironmentEntryV2,
+    EventKind, FrameLimits, GracefulClose, HandshakeConfig, HostHandshake, LaunchRequestV2,
+    Message, OPERATION_SCHEMA_VERSION, Request, ResponseStatus, SecretEnvelopeV2, TerminalResultV2,
+    TerminalStateV1, VersionRange,
 };
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
+use sendbox_secrets::{
+    EnvelopeBinding, EnvelopeCipher, RecipientRole, SecretName, SecretValue, SessionKeyMaterial,
+};
 
-use std::{future::Future, time::Duration};
+use std::{
+    collections::BTreeSet,
+    future::Future,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     AgentError, BoxFuture, GuestConnectionConfiguration, GuestConnector, GuestEvent,
@@ -30,6 +37,12 @@ impl GuestConnector for ProtocolGuestConnector {
             if cancellation.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
+            let material = SessionKeyMaterial::new(configuration.bootstrap_secret.clone())
+                .map_err(|error| AgentError::Guest(format!("prepare secret key: {error}")))?;
+            let secret_cipher =
+                EnvelopeCipher::new(&material, configuration.session_id).map_err(|error| {
+                    AgentError::Guest(format!("derive secret envelope key: {error}"))
+                })?;
             let handshake = HandshakeConfig::new(
                 configuration.session_id,
                 VersionRange::default(),
@@ -37,6 +50,7 @@ impl GuestConnector for ProtocolGuestConnector {
                 configuration.required_capabilities,
                 FrameLimits::default(),
                 BootstrapSecret::new(configuration.bootstrap_secret)?,
+                configuration.boundary_plan_digest,
             )?;
             let mut host = HostHandshake::new(handshake);
             let connection = host.establish(stream).await?;
@@ -59,6 +73,11 @@ impl GuestConnector for ProtocolGuestConnector {
                 negotiated,
                 reader: Some(reader),
                 writer: Some(writer),
+                session_id: configuration.session_id,
+                policy_digest: configuration.policy_digest,
+                boundary_plan_digest: configuration.boundary_plan_digest,
+                secret_cipher,
+                next_secret_sequence: 1,
             }) as Box<dyn GuestSession>)
         })
     }
@@ -68,6 +87,11 @@ pub struct ProtocolGuestSession {
     negotiated: CapabilitySet,
     reader: Option<sendbox_protocol::FramedReader<tokio::io::ReadHalf<Box<dyn ControlStream>>>>,
     writer: Option<sendbox_protocol::FramedWriter<tokio::io::WriteHalf<Box<dyn ControlStream>>>>,
+    session_id: sendbox_core::SessionId,
+    policy_digest: [u8; 32],
+    boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
+    secret_cipher: EnvelopeCipher,
+    next_secret_sequence: u64,
 }
 
 impl GuestSession for ProtocolGuestSession {
@@ -84,19 +108,30 @@ impl GuestSession for ProtocolGuestSession {
             if cancellation.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            let payload = serde_json::to_vec(&LaunchRequestV1 {
+            let secrets = seal_secrets(
+                request.environment,
+                request.secrets,
+                self.session_id,
+                self.policy_digest,
+                self.boundary_plan_digest,
+                &mut self.secret_cipher,
+                &mut self.next_secret_sequence,
+            )?;
+            let payload = serde_json::to_vec(&LaunchRequestV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
+                boundary_plan_digest: self.boundary_plan_digest,
                 program: request.command.program.clone(),
                 arguments: request.command.arguments.clone(),
                 working_directory: request.command.working_directory.clone(),
                 environment: request
                     .environment
                     .iter()
-                    .map(|entry| EnvironmentEntryV1 {
+                    .map(|entry| EnvironmentEntryV2 {
                         name: entry.name.clone(),
                         value: entry.value.clone(),
                     })
                     .collect(),
+                secrets,
                 timeout_ms: 300_000,
             })
             .map_err(|error| AgentError::Guest(format!("encode launch request: {error}")))?;
@@ -151,6 +186,73 @@ impl GuestSession for ProtocolGuestSession {
     }
 }
 
+fn seal_secrets(
+    environment: &[crate::EnvironmentIntent],
+    secrets: Vec<crate::GuestSecretEnvelope<'_>>,
+    session_id: sendbox_core::SessionId,
+    policy_digest: [u8; 32],
+    boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
+    cipher: &mut EnvelopeCipher,
+    next_sequence: &mut u64,
+) -> Result<Vec<SecretEnvelopeV2>, AgentError> {
+    let mut names = environment
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect::<BTreeSet<_>>();
+    let now = unix_time_ms()?;
+    let expires_at_unix_ms = now
+        .checked_add(5 * 60 * 1_000)
+        .ok_or_else(|| AgentError::Guest("secret envelope expiry overflowed".to_owned()))?;
+    secrets
+        .into_iter()
+        .map(|secret| {
+            if !names.insert(secret.reference.to_owned()) {
+                return Err(AgentError::Guest(format!(
+                    "duplicate environment or secret name {}",
+                    secret.reference
+                )));
+            }
+            let name = SecretName::new(secret.reference.to_owned())
+                .map_err(|error| AgentError::Guest(format!("invalid secret name: {error}")))?;
+            let value = SecretValue::new(secret.envelope.to_vec())
+                .map_err(|error| AgentError::Guest(format!("invalid secret value: {error}")))?;
+            let sequence = *next_sequence;
+            *next_sequence = (*next_sequence).checked_add(1).ok_or_else(|| {
+                AgentError::Guest("secret envelope sequence overflowed".to_owned())
+            })?;
+            let binding = EnvelopeBinding {
+                session_id,
+                recipient: RecipientRole::Guest,
+                secret_name: name,
+                sequence,
+                expires_at_unix_ms,
+                policy_digest,
+                boundary_plan_digest,
+            };
+            let envelope = cipher
+                .seal(&binding, &value)
+                .map_err(|error| AgentError::Guest(format!("seal secret envelope: {error}")))?;
+            Ok(SecretEnvelopeV2 {
+                reference: secret.reference.to_owned(),
+                sequence,
+                expires_at_unix_ms,
+                policy_digest,
+                boundary_plan_digest,
+                envelope,
+            })
+        })
+        .collect()
+}
+
+fn unix_time_ms() -> Result<u64, AgentError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| AgentError::Guest(format!("read system time: {error}")))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| AgentError::Guest("system time is out of range".to_owned()))
+}
+
 pub struct ProtocolGuestExecution {
     reader: sendbox_protocol::FramedReader<tokio::io::ReadHalf<Box<dyn ControlStream>>>,
     writer: sendbox_protocol::FramedWriter<tokio::io::WriteHalf<Box<dyn ControlStream>>>,
@@ -190,7 +292,7 @@ impl GuestExecution for ProtocolGuestExecution {
                 Message::Response(response) if response.request_id == REQUEST_ID => {
                     self.terminal = true;
                     if response.status == ResponseStatus::Ok {
-                        let terminal: TerminalResultV1 = serde_json::from_slice(&response.payload)
+                        let terminal: TerminalResultV2 = serde_json::from_slice(&response.payload)
                             .map_err(|error| {
                                 AgentError::Guest(format!("decode terminal response: {error}"))
                             })?;
@@ -281,7 +383,7 @@ fn validate_operational_readiness(payload: &[u8]) -> Result<(), AgentError> {
     }
 }
 
-fn map_terminal(result: TerminalResultV1) -> GuestTerminal {
+fn map_terminal(result: TerminalResultV2) -> GuestTerminal {
     match result.terminal {
         TerminalStateV1::Exited {
             exit_code: Some(code),
@@ -324,7 +426,7 @@ mod tests {
     #[test]
     fn broker_signal_terminal_is_preserved() {
         assert_eq!(
-            map_terminal(TerminalResultV1 {
+            map_terminal(TerminalResultV2 {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 terminal: TerminalStateV1::Exited {
                     exit_code: None,

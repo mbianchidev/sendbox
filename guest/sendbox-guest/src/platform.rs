@@ -1,26 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub use sendbox_bootstrap::ControlKind;
+
 use crate::GuestError;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlKind {
-    PrivilegeDrop,
-    Capabilities,
-    Seccomp,
-}
-
-impl ControlKind {
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::PrivilegeDrop => "privilege_drop",
-            Self::Capabilities => "capabilities",
-            Self::Seccomp => "seccomp",
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlStatus {

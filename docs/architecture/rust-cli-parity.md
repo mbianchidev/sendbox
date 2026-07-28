@@ -1,11 +1,10 @@
-# Rust CLI parity boundary
+# Rust CLI
 
-The migration binary remains named `sendbox-rs`, but its clap command name,
-help, JSON contracts, and generated completions use the final `sendbox` surface.
-This keeps Rust and Swift binaries installable side by side without freezing an
-experimental name into scripts or completion files.
+Cargo emits the production binary as `sendbox`. Its clap command name, help,
+JSON contracts, generated completions, install paths, and release artifacts use
+the same name.
 
-## Implemented without runtime dependencies
+## Implemented command groups
 
 | Surface | Rust behavior |
 |---|---|
@@ -15,6 +14,10 @@ experimental name into scripts or completion files.
 | `completions print` | Generates bash, zsh, or fish output directly from the clap command tree. |
 | `completions install` | Detects `SHELL` or accepts `--shell`, falls back to zsh when detection is unavailable, writes to stable per-shell paths with atomic replacement, mode `0644`, and directory mode `0755`. It never launches a shell or respawns the CLI. |
 | `analyze` / `devcontainer generate` | Retains the existing native project-analysis subset. |
+| `secrets` | Adds, lists, and removes versioned secrets through Keychain on macOS or the descriptor-safe protected file store on Linux without printing values. |
+| `mcp parse` / `mcp report` | Parses native or legacy observations with optional redaction and deterministic JSON. It does not generate executable inspection scripts. |
+| `boundary inspect` | Emits the structured native boundary declaration without scripts or secret values. |
+| `run` | Resolves and verifies a signed immutable boundary plan, selects Apple/Kata/Hyperlight without fallback, and dispatches either an authenticated persistent guest session or the explicit authenticated Hyperlight one-shot path. |
 
 Exit `2` is reserved for invalid input/configuration, `3` for project analysis
 failures, and `4` for output failures or no-overwrite refusals. Text failures go
@@ -39,10 +42,11 @@ traversal requires read and search permission on existing destination
 directories. Completion setup applies `0755` only to directories it creates and
 preserves stricter modes on directories that already exist.
 
-## Deferred command groups
+## Runtime contract
 
-The Rust CLI intentionally does not expose `run`, secrets commands, MCP
-commands, or boundary commands in this phase. Those require concrete runtime,
-credential-storage, MCP authorization, or security-listener integration and
-remain on Swift until their dependencies and qualification fixtures are ready.
-Release installers also continue to package the Swift binary.
+`run` requires an absolute guest command plus a verified bundle and trust root.
+Persistent Apple and Kata execution waits for authenticated guest readiness and
+the required capability set before resolving workload secrets or launching the
+command. Hyperlight is explicit-only and rejects every feature its one-shot
+boundary cannot enforce. Text errors use stderr; `--json` emits one error or
+result object to stdout.

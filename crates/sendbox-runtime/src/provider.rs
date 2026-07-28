@@ -1,5 +1,7 @@
 use std::{future::Future, path::PathBuf, pin::Pin, time::Duration};
 
+use sendbox_core::BoundaryPlanDigest;
+
 use crate::{
     CancellationToken, CommandSpec, ContainerId, ControlChannelRequest, LifecycleState,
     OutputSubscription, ProcessOutcome, ProvisionedControlChannel, RuntimeCapabilities,
@@ -33,7 +35,9 @@ impl PreflightReport {
 
 #[derive(Debug, Clone)]
 pub struct CreateRequest {
+    pub session_id: sendbox_core::SessionId,
     pub container_id: ContainerId,
+    pub boundary_plan_digest: BoundaryPlanDigest,
     pub image: String,
     pub hostname: String,
     pub resources: RuntimeResources,

@@ -1,8 +1,7 @@
-# Security Records Migration
+# Security records migration
 
-The Rust security formats are new foundations, not evidence that lifecycle
-integration is complete. Existing Swift state remains readable through explicit
-versioned compatibility APIs.
+The production security lifecycle writes the native versioned formats. Existing
+pre-rewrite state remains readable through explicit, bounded compatibility APIs.
 
 | Data | Legacy support | Rust format | Migration behavior |
 |---|---|---|---|
@@ -20,6 +19,7 @@ cryptographic semantics even where the replacement format is stronger. Unsupport
 versions, malformed paths, invalid ownership, corruption, and policy failures return
 explicit errors; they do not trigger automatic repair or fallback.
 
-Before lifecycle integration, follow-up work must define external audit-head
-publication, user-facing migration commands, archived Swift snapshot content
-conversion, signing-key storage, and CLI/runtime call sites.
+The runtime publishes signed audit heads, exposes explicit migration commands,
+validates archived snapshot metadata without trusting legacy tar extraction, and
+uses the secure host secret store for signing material. Compatibility readers do
+not create an automatic downgrade or fallback path.

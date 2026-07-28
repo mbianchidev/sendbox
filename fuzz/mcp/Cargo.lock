@@ -269,7 +269,9 @@ name = "sendbox-mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "libc",
  "sendbox-config",
+ "sendbox-core",
  "sendbox-policy",
  "serde",
  "serde_json",

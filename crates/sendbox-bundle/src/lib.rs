@@ -20,6 +20,8 @@ use zeroize::Zeroizing;
 
 const MAX_KEY_BYTES: usize = 129;
 const RELEASE_METADATA_DOMAIN: &str = "dev.sendbox.guest.release-metadata.v1";
+const READ_ONLY_MODE: u32 = 0o444;
+const EXECUTABLE_MODE: u32 = 0o555;
 
 #[derive(Debug, Error)]
 pub enum BundleError {
@@ -230,7 +232,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         options.output,
         Path::new("bin/sendbox-guest"),
         InventoryKind::GuestBinary,
-        0o500,
+        EXECUTABLE_MODE,
         options.uid,
         options.gid,
     )?);
@@ -239,7 +241,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         options.output,
         Path::new("bin/sendbox-exec-launcher"),
         InventoryKind::ServiceBinary,
-        0o500,
+        EXECUTABLE_MODE,
         options.uid,
         options.gid,
     )?);
@@ -248,7 +250,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         options.output,
         Path::new("lib/sendbox/observe.bpf.o"),
         InventoryKind::BpfObject,
-        0o400,
+        READ_ONLY_MODE,
         options.uid,
         options.gid,
     )?);
@@ -278,7 +280,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         options.output,
         Path::new("share/sendbox/bundle-metadata.json"),
         &metadata,
-        0o400,
+        READ_ONLY_MODE,
         options.uid,
         options.gid,
     )?);
@@ -301,7 +303,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         options.output,
         Path::new("share/sendbox/verification-report.json"),
         &verification,
-        0o400,
+        READ_ONLY_MODE,
         options.uid,
         options.gid,
     )?);
@@ -311,7 +313,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         options.output,
         Path::new("share/sendbox/sbom.spdx.json"),
         &sbom,
-        0o400,
+        READ_ONLY_MODE,
         options.uid,
         options.gid,
     )?);
@@ -328,7 +330,7 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         options.output,
         Path::new("share/sendbox/inventory.json"),
         &primary_inventory,
-        0o400,
+        READ_ONLY_MODE,
         options.uid,
         options.gid,
     )?);
@@ -365,9 +367,9 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         signature: signature_hex.clone(),
     };
     let manifest_path = options.output.join("manifest.json");
-    write_json(&manifest_path, &envelope, 0o400)?;
+    write_json(&manifest_path, &envelope, READ_ONLY_MODE)?;
     let signature_path = options.output.join("manifest.sig");
-    write_bytes(&signature_path, signature_hex.as_bytes(), 0o400)?;
+    write_bytes(&signature_path, signature_hex.as_bytes(), READ_ONLY_MODE)?;
     let release_payload = serde_json::to_string(&primary_inventory)?;
     let release_signature = signing_key.sign(release_payload.as_bytes());
     let release_signature_hex = encode_hex(&release_signature.to_bytes());
@@ -376,11 +378,11 @@ pub fn stage_bundle(options: &StageOptions<'_>) -> Result<StageReport, BundleErr
         signature: release_signature_hex.clone(),
     };
     let release_metadata_path = options.output.join("release-metadata.json");
-    write_json(&release_metadata_path, &release_envelope, 0o400)?;
+    write_json(&release_metadata_path, &release_envelope, READ_ONLY_MODE)?;
     write_bytes(
         &options.output.join("release-metadata.sig"),
         release_signature_hex.as_bytes(),
-        0o400,
+        READ_ONLY_MODE,
     )?;
 
     Ok(StageReport {
@@ -436,7 +438,7 @@ pub fn verify_bundle_artifacts(options: &VerifyOptions<'_>) -> Result<VerifiedBu
 
 pub fn write_public_key(signing_key: &Path, output: &Path) -> Result<(), BundleError> {
     let verifying_key = read_signing_key(signing_key)?.verifying_key();
-    write_bytes(output, &verifying_key.to_bytes(), 0o400)
+    write_bytes(output, &verifying_key.to_bytes(), READ_ONLY_MODE)
 }
 
 fn validate_stage_options(options: &StageOptions<'_>) -> Result<(), BundleError> {
@@ -929,6 +931,22 @@ mod tests {
         let root = stage(&fixture);
         let report = verify(&fixture, &root).expect("verify");
         assert_eq!(report.artifact_count, 3);
+        assert_eq!(
+            fs::metadata(root.join("bin/sendbox-guest"))
+                .expect("guest metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        assert_eq!(
+            fs::metadata(root.join("share/sendbox/sbom.spdx.json"))
+                .expect("SBOM metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
         assert!(root.join("share/sendbox/inventory.json").is_file());
         assert!(root.join("share/sendbox/sbom.spdx.json").is_file());
         assert!(
@@ -946,7 +964,7 @@ mod tests {
         let guest = root.join("bin/sendbox-guest");
         fs::remove_file(&guest).expect("remove guest");
         fs::write(&guest, b"tamper").expect("tamper");
-        fs::set_permissions(&guest, fs::Permissions::from_mode(0o500)).expect("restore mode");
+        fs::set_permissions(&guest, fs::Permissions::from_mode(0o555)).expect("restore mode");
         assert!(verify(&fixture, &root).is_err());
 
         let fixture = new_fixture();
@@ -954,7 +972,7 @@ mod tests {
         let sbom = root.join("share/sendbox/sbom.spdx.json");
         fs::set_permissions(&sbom, fs::Permissions::from_mode(0o600)).expect("writable sbom");
         fs::write(&sbom, b"tampered sbom").expect("tamper sbom");
-        fs::set_permissions(&sbom, fs::Permissions::from_mode(0o400)).expect("restore mode");
+        fs::set_permissions(&sbom, fs::Permissions::from_mode(0o444)).expect("restore mode");
         assert!(verify(&fixture, &root).is_err());
 
         let fixture = new_fixture();

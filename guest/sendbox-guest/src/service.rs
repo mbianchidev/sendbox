@@ -13,7 +13,8 @@ use std::time::Duration;
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 #[cfg(target_os = "macos")]
 use rustix::process::{WaitId, WaitIdOptions, waitid};
-use serde::{Deserialize, Serialize};
+pub use sendbox_bootstrap::{HealthCheck, RestartPolicy, ServiceId, ServiceSpec};
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
@@ -23,106 +24,11 @@ use crate::GuestError;
 use crate::audit::AuditLog;
 use crate::manifest::VerifiedManifest;
 
-const DEFAULT_LOG_BYTES: usize = 64 * 1024;
 type ValidatedServices = (
     BTreeMap<ServiceId, ServiceSpec>,
     Vec<ServiceId>,
     BTreeMap<ServiceId, OwnedFd>,
 );
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceId {
-    Exec,
-    Mcp,
-    Dns,
-    Egress,
-    Audit,
-    Bpf,
-}
-
-impl ServiceId {
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Exec => "exec",
-            Self::Mcp => "mcp",
-            Self::Dns => "dns",
-            Self::Egress => "egress",
-            Self::Audit => "audit",
-            Self::Bpf => "bpf",
-        }
-    }
-}
-
-impl std::fmt::Display for ServiceId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RestartPolicy {
-    #[serde(default)]
-    pub max_restarts: u32,
-    #[serde(default = "default_backoff_ms")]
-    pub backoff_ms: u64,
-}
-
-impl Default for RestartPolicy {
-    fn default() -> Self {
-        Self {
-            max_restarts: 0,
-            backoff_ms: default_backoff_ms(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HealthCheck {
-    ProcessAlive {
-        #[serde(default = "default_health_delay_ms")]
-        delay_ms: u64,
-    },
-    UnixSocket {
-        path: PathBuf,
-        #[serde(default = "default_health_timeout_ms")]
-        timeout_ms: u64,
-    },
-}
-
-impl Default for HealthCheck {
-    fn default() -> Self {
-        Self::ProcessAlive {
-            delay_ms: default_health_delay_ms(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServiceSpec {
-    pub id: ServiceId,
-    #[serde(default)]
-    pub dependencies: Vec<ServiceId>,
-    pub executable: PathBuf,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default = "default_true")]
-    pub mandatory: bool,
-    #[serde(default)]
-    pub restart: RestartPolicy,
-    #[serde(default)]
-    pub health: HealthCheck,
-    #[serde(default = "default_grace_ms")]
-    pub graceful_shutdown_ms: u64,
-    #[serde(default = "default_kill_ms")]
-    pub forced_shutdown_ms: u64,
-    #[serde(default = "default_log_bytes")]
-    pub max_log_bytes: usize,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServiceHealth {
@@ -397,13 +303,26 @@ impl ServiceManager {
 
     pub async fn shutdown(&mut self) -> Result<(), GuestError> {
         self.readiness.revoke();
+        let mut failures = Vec::new();
         for id in self.order.iter().rev() {
             if let Some(mut service) = self.running.remove(id) {
-                terminate_service(&mut service).await?;
-                self.record("service_stopped", *id, "process group reaped");
+                match terminate_service(&mut service).await {
+                    Ok(()) => self.record("service_stopped", *id, "process group reaped"),
+                    Err(error) => {
+                        self.record("service_stop_failed", *id, error.to_string());
+                        failures.push(format!("{id}: {error}"));
+                    }
+                }
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GuestError::Runtime(format!(
+                "service shutdown failures: {}",
+                failures.join("; ")
+            )))
+        }
     }
 
     async fn recheck_dependents(&mut self, dependency: ServiceId) -> Result<(), GuestError> {
@@ -638,30 +557,56 @@ async fn check_health(service: &mut RunningService) -> Result<(), GuestError> {
 
 async fn terminate_service(service: &mut RunningService) -> Result<(), GuestError> {
     signal_group(service.process_group, Signal::TERM)?;
-    if timeout(
+    match timeout(
         Duration::from_millis(service.spec.graceful_shutdown_ms),
         service.child.wait(),
     )
     .await
-    .is_err()
     {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Err(GuestError::Service {
+                service: service.spec.id.to_string(),
+                detail: format!("reaping process after SIGTERM: {error}"),
+            });
+        }
+        Err(_) => {
+            signal_group(service.process_group, Signal::KILL)?;
+            timeout(
+                Duration::from_millis(service.spec.forced_shutdown_ms),
+                service.child.wait(),
+            )
+            .await
+            .map_err(|_| GuestError::Service {
+                service: service.spec.id.to_string(),
+                detail: "process group did not terminate after SIGKILL".to_owned(),
+            })?
+            .map_err(|error| GuestError::Service {
+                service: service.spec.id.to_string(),
+                detail: format!("reaping process after SIGKILL: {error}"),
+            })?;
+        }
+    }
+    if test_kill_process_group(service.process_group).is_ok() {
         signal_group(service.process_group, Signal::KILL)?;
         timeout(
             Duration::from_millis(service.spec.forced_shutdown_ms),
-            service.child.wait(),
+            wait_for_process_group_exit(service.process_group),
         )
         .await
         .map_err(|_| GuestError::Service {
             service: service.spec.id.to_string(),
-            detail: "process group did not terminate after SIGKILL".to_owned(),
-        })?
-        .map_err(|error| GuestError::Service {
-            service: service.spec.id.to_string(),
-            detail: format!("reaping process: {error}"),
+            detail: "service descendants remained live after SIGKILL".to_owned(),
         })?;
     }
     abort_log_tasks(service);
     Ok(())
+}
+
+async fn wait_for_process_group_exit(group: Pid) {
+    while test_kill_process_group(group).is_ok() {
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn signal_group(group: Pid, signal: Signal) -> Result<(), GuestError> {
@@ -692,34 +637,6 @@ async fn drain_log(mut reader: impl AsyncRead + Unpin, output: Arc<Mutex<Bounded
                 .push(&buffer[..read]),
         }
     }
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-const fn default_backoff_ms() -> u64 {
-    25
-}
-
-const fn default_health_delay_ms() -> u64 {
-    50
-}
-
-const fn default_health_timeout_ms() -> u64 {
-    1_000
-}
-
-const fn default_grace_ms() -> u64 {
-    500
-}
-
-const fn default_kill_ms() -> u64 {
-    500
-}
-
-const fn default_log_bytes() -> usize {
-    DEFAULT_LOG_BYTES
 }
 
 #[cfg(test)]

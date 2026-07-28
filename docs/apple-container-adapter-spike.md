@@ -1,9 +1,9 @@
-# Apple `container` CLI adapter spike
+# Historical Apple `container` CLI adapter spike
 
-This Phase 1 spike evaluates whether SendBox can replace its first-party Swift
-Apple runtime adapter with a Rust adapter over Apple's official `container`
-CLI/service. It is isolated under `spikes/apple-container-adapter/` and is not a
-production runtime.
+This Phase 1 spike evaluated Apple's official `container` CLI/service before the
+production Rust adapter was accepted. The isolated probe remains under
+`spikes/apple-container-adapter/` as historical qualification evidence; current
+runtime behavior is documented in [Apple runtime adapter](apple-runtime.md).
 
 ## Tested environment
 
@@ -86,7 +86,7 @@ The test uses a unique container name and temporary host socket. It always
 attempts targeted stop, signal fallback, delete, and socket removal; it never
 uses `--all`, prune, or image deletion.
 
-## ADR consequence
+## Historical ADR consequence
 
 The 0.10.0 CLI surface is **provisionally viable but not qualified**. It exposes
 every required lifecycle option and a promising Unix-socket transport, so the
@@ -94,8 +94,8 @@ spike does not yet justify a direct Rust Virtualization.framework adapter.
 However, the stopped service prevents proof of lifecycle semantics, stream
 ordering, cancellation, cleanup, and the authenticated control channel.
 
-ADR-003 must therefore retain the current Swift path, or a temporary narrow
-Swift IPC bridge during migration, until the opt-in live qualification passes.
-Only then can the CLI adapter be accepted as viable. If live qualification shows
-that `--publish-socket` or lifecycle streaming cannot satisfy ADR-002, proceed
-to the direct Rust Virtualization.framework option.
+This result originally identified the live-qualification requirement. The
+adapter was subsequently implemented with a stateful fake-CLI conformance suite
+and an explicit opt-in prepared-host gate; unavailable live infrastructure is
+never reported as a successful run. The direct Virtualization.framework option
+remains unnecessary while the pinned CLI contract continues to satisfy ADR-002.

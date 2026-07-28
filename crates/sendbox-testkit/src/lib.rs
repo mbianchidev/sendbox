@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use sendbox_core::BoundaryPlanDigest;
 use sendbox_runtime::{
     BoxFuture, CancellationToken, CleanupReport, Clock, CommandArgument, CommandSpec, ContainerId,
     ControlChannelRequest, ControlEndpointKind, ControlStream, CreateRequest, ExecPurpose,
@@ -666,7 +667,9 @@ pub fn fake_conformance_scenario(
     Ok(RuntimeConformanceScenario {
         initialize: InitializeRequest { state_directory },
         create: CreateRequest {
+            session_id: sendbox_core::SessionId::from_bytes([0x86; 16]),
             container_id: ContainerId::new("conformance-container")?,
+            boundary_plan_digest: BoundaryPlanDigest::from_bytes([0x86; 32]),
             image: "fake:image".to_owned(),
             hostname: "conformance-container".to_owned(),
             resources: sendbox_runtime::RuntimeResources {

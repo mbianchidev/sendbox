@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 use std::{
@@ -49,6 +49,10 @@ enum Commands {
     BootstrapInstall(BootstrapInstallArgs),
     #[command(hide = true)]
     ExecBroker(ExecBrokerArgs),
+    #[command(hide = true)]
+    EgressSupervisor(EgressProcessArgs),
+    #[command(hide = true)]
+    EgressGateway(EgressProcessArgs),
     #[command(hide = true)]
     Tunnel(TunnelArgs),
     #[command(hide = true)]
@@ -116,6 +120,12 @@ struct ExecBrokerArgs {
 }
 
 #[derive(Debug, Args)]
+struct EgressProcessArgs {
+    #[arg(long)]
+    config: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct TunnelArgs {
     #[arg(long)]
     socket: PathBuf,
@@ -140,6 +150,50 @@ enum FixtureMode {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    let invocation = invocation_name();
+    if invocation.as_deref() == Some("mcp-broker") {
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        return match sendbox_guest::mcp_broker::execute_current(&arguments).await {
+            Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
+            Err(error) => {
+                eprintln!("[sendbox-mcp-broker] {error}");
+                ExitCode::from(sendbox_guest::mcp_broker::denied_exit_code())
+            }
+        };
+    }
+    if invocation.as_deref() == Some("git") {
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        return match sendbox_guest::git_guard::execute_current(&arguments) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("[sendbox-git-guard] {error}");
+                ExitCode::from(sendbox_guest::git_guard::denied_exit_code())
+            }
+        };
+    }
+    if invocation.as_deref() == Some("sendbox-git-askpass") {
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        return match sendbox_guest::git_guard::askpass_response(&arguments) {
+            Ok(response) => {
+                println!("{response}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("[sendbox-git-askpass] {error}");
+                ExitCode::from(sendbox_guest::git_guard::denied_exit_code())
+            }
+        };
+    }
+    if invocation.as_deref() == Some("sendbox-git-ssh") {
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        return match sendbox_guest::git_guard::execute_ssh(&arguments) {
+            Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
+            Err(error) => {
+                eprintln!("[sendbox-git-ssh] {error}");
+                ExitCode::from(sendbox_guest::git_guard::denied_exit_code())
+            }
+        };
+    }
     match execute(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -147,6 +201,15 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn invocation_name() -> Option<String> {
+    std::env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|name| Path::new(name).file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
 }
 
 async fn execute(cli: Cli) -> Result<(), GuestError> {
@@ -177,6 +240,10 @@ async fn execute(cli: Cli) -> Result<(), GuestError> {
         Commands::StdioBridge(args) => stdio_bridge(args).await,
         Commands::BootstrapInstall(args) => bootstrap_install(args).await,
         Commands::ExecBroker(args) => sendbox_guest::broker::run(args.config).await,
+        Commands::EgressSupervisor(args) => {
+            sendbox_guest::egress::run_supervisor(args.config).await
+        }
+        Commands::EgressGateway(args) => sendbox_guest::egress::run_gateway(args.config).await,
         Commands::Tunnel(args) => tunnel(args).await,
         Commands::InjectBootstrap(args) => inject_bootstrap(args).await,
     };

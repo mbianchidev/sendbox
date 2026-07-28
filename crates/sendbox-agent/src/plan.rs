@@ -4,13 +4,18 @@ use std::{
     time::Duration,
 };
 
+use sendbox_boundary::{
+    MountDeclaration, ResolvedRuntime, VerifiedBoundaryPlan, WorkloadIdentity, sha256_hex,
+};
 use sendbox_config::SandboxConfiguration;
-use sendbox_core::SessionId;
-use sendbox_protocol::{Capability, CapabilitySet};
+use sendbox_core::{BoundaryPlanDigest, SessionId};
+use sendbox_protocol::{CapabilitySet, agent_host_required_capabilities};
 use sendbox_runtime::{
     ContainerId, ControlEndpointKind, RuntimeCapabilities, RuntimeCapability, RuntimeResources,
 };
+use sendbox_secrets::SecretName;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::AgentError;
 
@@ -21,11 +26,9 @@ pub struct SecretReference(String);
 impl SecretReference {
     pub fn new(value: impl Into<String>) -> Result<Self, AgentError> {
         let value = value.into();
-        if value.is_empty() || value.len() > 128 || value.as_bytes().contains(&0) {
-            return Err(AgentError::InvalidPlan(
-                "secret references must contain 1..=128 non-NUL bytes".to_owned(),
-            ));
-        }
+        SecretName::new(value.clone()).map_err(|error| {
+            AgentError::InvalidPlan(format!("invalid secret reference: {error}"))
+        })?;
         Ok(Self(value))
     }
 
@@ -53,6 +56,7 @@ pub struct MountIntent {
 pub struct EnvironmentIntent {
     pub name: String,
     pub value: String,
+    pub sensitive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +68,7 @@ pub struct GuestCommand {
 
 #[derive(Debug, Clone)]
 pub struct AgentRequest {
+    pub boundary_plan: VerifiedBoundaryPlan,
     pub session_id: SessionId,
     pub state_directory: PathBuf,
     pub image: String,
@@ -77,6 +82,8 @@ pub struct AgentRequest {
 
 #[derive(Debug, Clone)]
 pub struct RunPlan {
+    verified_boundary_plan: VerifiedBoundaryPlan,
+    resolved_runtime: ResolvedRuntime,
     session_id: SessionId,
     container_id: ContainerId,
     state_directory: PathBuf,
@@ -92,6 +99,7 @@ pub struct RunPlan {
     resources: RuntimeResources,
     required_runtime_capabilities: RuntimeCapabilities,
     required_guest_capabilities: CapabilitySet,
+    policy_digest: [u8; 32],
 }
 
 impl RunPlan {
@@ -99,11 +107,26 @@ impl RunPlan {
         configuration: &SandboxConfiguration,
         request: AgentRequest,
         available: &RuntimeCapabilities,
+        now_unix: u64,
     ) -> Result<Self, AgentError> {
         configuration
             .validate()
             .map_err(|error| AgentError::Configuration(error.to_string()))?;
+        request
+            .boundary_plan
+            .reverify(now_unix)
+            .map_err(|error| AgentError::InvalidPlan(error.to_string()))?;
         validate_request(configuration, &request)?;
+        validate_boundary_equivalence(configuration, &request)?;
+        let boundary = request.boundary_plan.plan().clone();
+        let image = match &boundary.workload {
+            WorkloadIdentity::OciImage { reference, .. } => reference.clone(),
+            WorkloadIdentity::GuestBundle { .. } => {
+                return Err(AgentError::InvalidPlan(
+                    "persistent guest sessions require an OCI image workload".to_owned(),
+                ));
+            }
+        };
         let endpoint_kind = select_endpoint(available)?;
         let transport_capability = endpoint_capability(endpoint_kind);
         let required_runtime_capabilities = RuntimeCapabilities::new([
@@ -118,55 +141,78 @@ impl RunPlan {
                 &missing,
             )));
         }
-        let secret_references = configuration
+        let secret_references = boundary
             .secrets
             .iter()
             .map(|reference| SecretReference::new(reference.clone()))
             .collect::<Result<Vec<_>, _>>()?;
+        let policy_digest = Sha256::digest(
+            serde_json::to_vec(&configuration.policy)
+                .map_err(|error| AgentError::InvalidPlan(error.to_string()))?,
+        )
+        .into();
         let container_id = ContainerId::new(format!(
             "{}-{}",
             sanitize_identifier(&configuration.name),
-            request.session_id
+            boundary.session_id
         ))
-        .or_else(|_| ContainerId::new(format!("sendbox-{}", request.session_id)))
+        .or_else(|_| ContainerId::new(format!("sendbox-{}", boundary.session_id)))
         .map_err(AgentError::Runtime)?;
         Ok(Self {
-            session_id: request.session_id,
+            verified_boundary_plan: request.boundary_plan,
+            resolved_runtime: boundary.selection.selected,
+            session_id: boundary.session_id,
             container_id,
             state_directory: request.state_directory,
-            image: request.image,
+            image,
             workspace: WorkspaceIntent {
-                host_path: configuration.project_path.clone(),
-                guest_path: request.guest_workspace,
-                writable: true,
+                host_path: boundary.workspace.source,
+                guest_path: boundary.workspace.destination,
+                writable: boundary.workspace.writable,
             },
-            mounts: request.mounts,
+            mounts: boundary
+                .mounts
+                .into_iter()
+                .map(|mount| MountIntent {
+                    source: mount.source,
+                    destination: mount.destination,
+                    writable: mount.writable,
+                })
+                .collect(),
             environment: request.environment,
-            command: request.command,
+            command: GuestCommand {
+                program: boundary.command.program,
+                arguments: boundary.command.arguments,
+                working_directory: boundary.command.working_directory,
+            },
             secret_references,
             bootstrap_reference: request.bootstrap_reference,
             endpoint_kind,
             readiness_timeout: request.readiness_timeout,
             resources: RuntimeResources {
-                cpus: u32::try_from(configuration.resources.cpus).map_err(|_| {
-                    AgentError::InvalidPlan("resource CPU count is out of range".to_owned())
-                })?,
-                memory_bytes: u64::try_from(configuration.resources.memory_mb)
-                    .map_err(|_| {
-                        AgentError::InvalidPlan("resource memory is out of range".to_owned())
-                    })?
-                    .checked_mul(1024 * 1024)
-                    .ok_or_else(|| {
-                        AgentError::InvalidPlan("resource memory is out of range".to_owned())
-                    })?,
+                cpus: boundary.resources.cpus,
+                memory_bytes: boundary.resources.memory_bytes,
             },
             required_runtime_capabilities,
-            required_guest_capabilities: CapabilitySet::from([
-                Capability::Exec,
-                Capability::StreamedIo,
-                Capability::Health,
-            ]),
+            required_guest_capabilities: agent_host_required_capabilities(),
+            policy_digest,
         })
+    }
+
+    #[must_use]
+    pub const fn boundary_plan_digest(&self) -> BoundaryPlanDigest {
+        self.verified_boundary_plan.digest()
+    }
+
+    pub fn reverify_boundary(&self, now_unix: u64) -> Result<(), AgentError> {
+        self.verified_boundary_plan
+            .reverify(now_unix)
+            .map_err(|error| AgentError::InvalidPlan(error.to_string()))
+    }
+
+    #[must_use]
+    pub const fn resolved_runtime(&self) -> ResolvedRuntime {
+        self.resolved_runtime
     }
 
     #[must_use]
@@ -240,6 +286,11 @@ impl RunPlan {
     }
 
     #[must_use]
+    pub const fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
+    }
+
+    #[must_use]
     pub const fn required_guest_capabilities(&self) -> &CapabilitySet {
         &self.required_guest_capabilities
     }
@@ -263,6 +314,12 @@ fn validate_request(
     }
     let mut names = BTreeSet::new();
     for entry in &request.environment {
+        if entry.sensitive {
+            return Err(AgentError::InvalidPlan(format!(
+                "sensitive environment entry `{}` must use a secret reference",
+                entry.name
+            )));
+        }
         if entry.name.is_empty()
             || entry.name.contains('=')
             || entry.name.as_bytes().contains(&0)
@@ -290,6 +347,124 @@ fn validate_request(
         ));
     }
     Ok(())
+}
+
+fn validate_boundary_equivalence(
+    configuration: &SandboxConfiguration,
+    request: &AgentRequest,
+) -> Result<(), AgentError> {
+    let boundary = request.boundary_plan.plan();
+    require_equal("session ID", &boundary.session_id, &request.session_id)?;
+    require_equal(
+        "configuration digest",
+        &boundary.configuration_sha256,
+        &sha256_hex(
+            &serde_json::to_vec(configuration)
+                .map_err(|error| AgentError::InvalidPlan(error.to_string()))?,
+        ),
+    )?;
+    require_equal(
+        "policy digest",
+        &boundary.policy_sha256,
+        &sha256_hex(
+            &serde_json::to_vec(&configuration.policy)
+                .map_err(|error| AgentError::InvalidPlan(error.to_string()))?,
+        ),
+    )?;
+    let WorkloadIdentity::OciImage { reference, .. } = &boundary.workload else {
+        return boundary_mismatch("persistent OCI workload");
+    };
+    require_equal("image reference", reference, &request.image)?;
+    require_equal(
+        "workspace source",
+        &boundary.workspace.source,
+        &configuration.project_path,
+    )?;
+    require_equal(
+        "workspace destination",
+        &boundary.workspace.destination,
+        &request.guest_workspace,
+    )?;
+    require_equal(
+        "workspace writable flag",
+        &boundary.workspace.writable,
+        &true,
+    )?;
+    require_equal(
+        "command program",
+        &boundary.command.program,
+        &request.command.program,
+    )?;
+    require_equal(
+        "command arguments",
+        &boundary.command.arguments,
+        &request.command.arguments,
+    )?;
+    require_equal(
+        "command working directory",
+        &boundary.command.working_directory,
+        &request.command.working_directory,
+    )?;
+
+    let supplied_mounts = request
+        .mounts
+        .iter()
+        .map(|mount| MountDeclaration {
+            source: mount.source.clone(),
+            destination: mount.destination.clone(),
+            writable: mount.writable,
+        })
+        .collect::<Vec<_>>();
+    require_equal("mounts", &boundary.mounts, &supplied_mounts)?;
+
+    if boundary.environment.len() != request.environment.len() {
+        return boundary_mismatch("environment");
+    }
+    for (declared, supplied) in boundary.environment.iter().zip(&request.environment) {
+        require_equal("environment name", &declared.name, &supplied.name)?;
+        require_equal(
+            "environment value digest",
+            &declared.value_sha256,
+            &sha256_hex(supplied.value.as_bytes()),
+        )?;
+        require_equal(
+            "environment sensitivity",
+            &declared.sensitive,
+            &supplied.sensitive,
+        )?;
+    }
+
+    require_equal("secret names", &boundary.secrets, &configuration.secrets)?;
+    let cpus = u32::try_from(configuration.resources.cpus)
+        .map_err(|_| AgentError::InvalidPlan("resource CPU count is out of range".to_owned()))?;
+    let memory_bytes = u64::try_from(configuration.resources.memory_mb)
+        .map_err(|_| AgentError::InvalidPlan("resource memory is out of range".to_owned()))?
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| AgentError::InvalidPlan("resource memory is out of range".to_owned()))?;
+    require_equal("resource CPUs", &boundary.resources.cpus, &cpus)?;
+    require_equal(
+        "resource memory",
+        &boundary.resources.memory_bytes,
+        &memory_bytes,
+    )?;
+    Ok(())
+}
+
+fn require_equal<T>(field: &str, declared: &T, supplied: &T) -> Result<(), AgentError>
+where
+    T: PartialEq + ?Sized,
+{
+    if declared == supplied {
+        Ok(())
+    } else {
+        boundary_mismatch(field)
+    }
+}
+
+fn boundary_mismatch<T>(field: &str) -> Result<T, AgentError> {
+    Err(AgentError::InvalidPlan(format!(
+        "signed boundary plan does not match supplied {field}"
+    )))
 }
 
 fn select_endpoint(available: &RuntimeCapabilities) -> Result<ControlEndpointKind, AgentError> {

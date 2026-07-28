@@ -8,8 +8,8 @@ pub mod migration;
 pub mod supervisor;
 
 pub use lifecycle::{
-    AuditRecorder, AuditSummary, ProvenanceDocument, SecuritySession, SessionSecurityError,
-    SessionSecurityResult, TrustStoreProvenanceVerifier,
+    AuditRecorder, AuditSnapshot, AuditSummary, ProvenanceDocument, SecuritySession,
+    SessionSecurityError, SessionSecurityResult, TrustStoreProvenanceVerifier,
 };
 pub use migration::{
     MigrationAuthorization, MigrationError, MigrationLimits, MigrationProposal, MigrationReport,

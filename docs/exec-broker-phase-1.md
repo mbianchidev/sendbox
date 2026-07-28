@@ -1,8 +1,9 @@
-# Phase 1 execution broker proof
+# Historical Phase 1 execution broker proof
 
-This isolated Rust spike evaluates ADR-001's primary semantic command-enforcement
-model. It is not integrated with the production guest, runtimes, Swift CLI, MCP,
-network controls, or VM startup.
+This document records the isolated proof that established ADR-001's semantic
+command-enforcement model. The resulting design is now integrated into the
+production guest and Apple/Kata runtime composition; see
+[Execution broker](architecture/execution-broker.md).
 
 ## Proven contract
 

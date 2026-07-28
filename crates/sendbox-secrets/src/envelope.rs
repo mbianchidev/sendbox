@@ -7,18 +7,18 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use getrandom::fill;
 use hkdf::Hkdf;
 use minicbor::{Decoder, Encoder};
-use sendbox_core::SessionId;
+use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::{MAX_SECRET_VALUE_BYTES, SecretName, SecretValue};
 
-const ENVELOPE_MAGIC: &[u8] = b"\xffSBXENVELOPE\x01";
-const ENVELOPE_VERSION: u8 = 1;
-const ENVELOPE_DOMAIN: &[u8] = b"sendbox session secret envelope v1";
-const ENVELOPE_SALT_DOMAIN: &[u8] = b"sendbox session secret envelope hkdf salt v1";
-const ENVELOPE_KEY_DOMAIN: &[u8] = b"sendbox session secret envelope key v1";
+const ENVELOPE_MAGIC: &[u8] = b"\xffSBXENVELOPE\x02";
+const ENVELOPE_VERSION: u8 = 2;
+const ENVELOPE_DOMAIN: &[u8] = b"sendbox session secret envelope v2";
+const ENVELOPE_SALT_DOMAIN: &[u8] = b"sendbox session secret envelope hkdf salt v2";
+const ENVELOPE_KEY_DOMAIN: &[u8] = b"sendbox session secret envelope key v2";
 const NONCE_BYTES: usize = 24;
 const POLICY_DIGEST_BYTES: usize = 32;
 const MAX_ENVELOPE_BYTES: usize = MAX_SECRET_VALUE_BYTES + 2048;
@@ -57,6 +57,7 @@ pub struct EnvelopeBinding {
     pub sequence: u64,
     pub expires_at_unix_ms: u64,
     pub policy_digest: [u8; POLICY_DIGEST_BYTES],
+    pub boundary_plan_digest: BoundaryPlanDigest,
 }
 
 pub struct SessionKeyMaterial(Zeroizing<Vec<u8>>);
@@ -298,7 +299,7 @@ fn encode_aad(binding: &EnvelopeBinding) -> Result<Zeroizing<Vec<u8>>, EnvelopeE
     let mut aad = Zeroizing::new(Vec::with_capacity(256));
     let mut encoder = Encoder::new(&mut *aad);
     encoder
-        .array(7)
+        .array(8)
         .and_then(|encoder| encoder.bytes(ENVELOPE_DOMAIN))
         .and_then(|encoder| encoder.bytes(binding.session_id.as_bytes()))
         .and_then(|encoder| encoder.u8(binding.recipient.code()))
@@ -306,6 +307,7 @@ fn encode_aad(binding: &EnvelopeBinding) -> Result<Zeroizing<Vec<u8>>, EnvelopeE
         .and_then(|encoder| encoder.u64(binding.sequence))
         .and_then(|encoder| encoder.u64(binding.expires_at_unix_ms))
         .and_then(|encoder| encoder.bytes(&binding.policy_digest))
+        .and_then(|encoder| encoder.bytes(binding.boundary_plan_digest.as_bytes()))
         .map_err(|error| EnvelopeError::Malformed(error.to_string()))?;
     Ok(aad)
 }
@@ -315,7 +317,7 @@ fn encode_envelope(envelope: &DecodedEnvelope) -> Result<Vec<u8>, EnvelopeError>
     encoded.extend_from_slice(ENVELOPE_MAGIC);
     let mut encoder = Encoder::new(&mut encoded);
     encoder
-        .array(9)
+        .array(10)
         .and_then(|encoder| encoder.u8(ENVELOPE_VERSION))
         .and_then(|encoder| encoder.bytes(envelope.binding.session_id.as_bytes()))
         .and_then(|encoder| encoder.u8(envelope.binding.recipient.code()))
@@ -323,6 +325,7 @@ fn encode_envelope(envelope: &DecodedEnvelope) -> Result<Vec<u8>, EnvelopeError>
         .and_then(|encoder| encoder.u64(envelope.binding.sequence))
         .and_then(|encoder| encoder.u64(envelope.binding.expires_at_unix_ms))
         .and_then(|encoder| encoder.bytes(&envelope.binding.policy_digest))
+        .and_then(|encoder| encoder.bytes(envelope.binding.boundary_plan_digest.as_bytes()))
         .and_then(|encoder| encoder.bytes(&envelope.nonce))
         .and_then(|encoder| encoder.bytes(&envelope.ciphertext))
         .map_err(|error| EnvelopeError::Malformed(error.to_string()))?;
@@ -347,7 +350,7 @@ fn decode_envelope(encoded: &[u8]) -> Result<DecodedEnvelope, EnvelopeError> {
     if decoder
         .array()
         .map_err(malformed)?
-        .is_some_and(|length| length != 9)
+        .is_some_and(|length| length != 10)
     {
         return Err(EnvelopeError::Malformed(
             "invalid envelope field count".to_owned(),
@@ -367,6 +370,10 @@ fn decode_envelope(encoded: &[u8]) -> Result<DecodedEnvelope, EnvelopeError> {
     let expires_at_unix_ms = decoder.u64().map_err(malformed)?;
     let policy_digest =
         copy_array::<POLICY_DIGEST_BYTES>(decoder.bytes().map_err(malformed)?, "policy digest")?;
+    let boundary_plan_digest = BoundaryPlanDigest::from_bytes(copy_array::<POLICY_DIGEST_BYTES>(
+        decoder.bytes().map_err(malformed)?,
+        "boundary plan digest",
+    )?);
     let nonce = copy_array::<NONCE_BYTES>(decoder.bytes().map_err(malformed)?, "nonce")?;
     let ciphertext = decoder.bytes().map_err(malformed)?.to_vec();
     if ciphertext.len() < 16 || ciphertext.len() > MAX_SECRET_VALUE_BYTES + 16 {
@@ -387,6 +394,7 @@ fn decode_envelope(encoded: &[u8]) -> Result<DecodedEnvelope, EnvelopeError> {
             sequence,
             expires_at_unix_ms,
             policy_digest,
+            boundary_plan_digest,
         },
         nonce,
         ciphertext,
@@ -415,6 +423,7 @@ mod tests {
             sequence: 7,
             expires_at_unix_ms: 10_000,
             policy_digest: [0x22; 32],
+            boundary_plan_digest: BoundaryPlanDigest::from_bytes([0x23; 32]),
         }
     }
 
@@ -433,7 +442,7 @@ mod tests {
             encoded_hex: String,
         }
         let vector: Vector = serde_json::from_str(include_str!(
-            "../../../test-fixtures/secrets/session-envelope-v1.json"
+            "../../../test-fixtures/secrets/session-envelope-v2.json"
         ))
         .expect("fixture");
         let mut cipher = cipher();
@@ -480,6 +489,12 @@ mod tests {
         ));
         wrong = expected.clone();
         wrong.policy_digest[0] ^= 1;
+        assert!(matches!(
+            cipher.open(&encoded, &wrong, &ReplayGuard::default(), 9_999),
+            Err(EnvelopeError::BindingMismatch)
+        ));
+        wrong = expected.clone();
+        wrong.boundary_plan_digest = BoundaryPlanDigest::from_bytes([0x24; 32]);
         assert!(matches!(
             cipher.open(&encoded, &wrong, &ReplayGuard::default(), 9_999),
             Err(EnvelopeError::BindingMismatch)

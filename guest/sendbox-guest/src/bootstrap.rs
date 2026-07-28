@@ -1,101 +1,23 @@
 use std::ffi::OsString;
-use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags, fstat, openat, renameat};
+use sendbox_bootstrap::decode_bootstrap_document;
+pub use sendbox_bootstrap::{
+    BOOTSTRAP_SCHEMA_VERSION, BootstrapDocument as BootstrapMaterial, MAX_BOOTSTRAP_BYTES,
+};
 use sendbox_core::SessionId;
-use sendbox_protocol::BootstrapSecret;
-use serde::de::{SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use crate::GuestError;
-use crate::broker::ExecutionBrokerBootstrap;
 use crate::manifest::encode_hex;
-use crate::platform::ControlKind;
 use crate::secure_fs::{
     leaf_name, open_directory_no_symlinks, read_bounded, unlink_relative, validate_regular_metadata,
 };
-use crate::service::{ServiceId, ServiceSpec};
-
-pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 1;
-pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
-
-pub struct BootstrapMaterial {
-    pub session_id: SessionId,
-    pub bootstrap_nonce: [u8; 32],
-    pub bootstrap_secret: BootstrapSecret,
-    pub host_version: String,
-    pub trust_root_id: String,
-    pub manifest_path: PathBuf,
-    pub minimum_release_sequence: u64,
-    pub required_controls: Vec<ControlKind>,
-    pub required_services: Vec<ServiceId>,
-    pub services: Vec<ServiceSpec>,
-    pub execution_broker: Option<ExecutionBrokerBootstrap>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BootstrapWire {
-    schema_version: u32,
-    session_id: SessionId,
-    bootstrap_nonce: [u8; 32],
-    bootstrap_secret: SecretBytes,
-    host_version: String,
-    trust_root_id: String,
-    manifest_path: PathBuf,
-    minimum_release_sequence: u64,
-    #[serde(default)]
-    required_controls: Vec<ControlKind>,
-    #[serde(default)]
-    required_services: Vec<ServiceId>,
-    #[serde(default)]
-    services: Vec<ServiceSpec>,
-    #[serde(default)]
-    execution_broker: Option<ExecutionBrokerBootstrap>,
-}
-
-struct SecretBytes(Zeroizing<[u8; 32]>);
-
-impl<'de> Deserialize<'de> for SecretBytes {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct SecretVisitor;
-
-        impl<'de> Visitor<'de> for SecretVisitor {
-            type Value = SecretBytes;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("exactly 32 bootstrap-secret bytes")
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut bytes = Zeroizing::new([0_u8; 32]);
-                for index in 0..32 {
-                    bytes[index] = sequence
-                        .next_element()?
-                        .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
-                }
-                if sequence.next_element::<u8>()?.is_some() {
-                    return Err(serde::de::Error::invalid_length(33, &self));
-                }
-                Ok(SecretBytes(bytes))
-            }
-        }
-
-        deserializer.deserialize_seq(SecretVisitor)
-    }
-}
 
 pub struct ImmutableBootstrapSource {
     path: PathBuf,
@@ -157,10 +79,9 @@ impl ImmutableBootstrapSource {
 
         let mut file = File::from(descriptor);
         let mut bytes = read_bounded(&mut file, MAX_BOOTSTRAP_BYTES)?;
-        let wire: BootstrapWire = serde_json::from_slice(&bytes)
-            .map_err(|error| GuestError::Bootstrap(error.to_string()))?;
+        let material = decode_bootstrap_document(&bytes);
         bytes.zeroize();
-        let material = validate_wire(wire)?;
+        let material = material.map_err(|error| GuestError::Bootstrap(error.to_string()))?;
         register_replay(
             replay_root,
             &replay_key(material.session_id, &material.bootstrap_nonce),
@@ -198,46 +119,9 @@ impl Drop for ConsumedBootstrap {
     }
 }
 
-fn validate_wire(wire: BootstrapWire) -> Result<BootstrapMaterial, GuestError> {
-    if wire.schema_version != BOOTSTRAP_SCHEMA_VERSION {
-        return Err(GuestError::Bootstrap(format!(
-            "unsupported schema version {}",
-            wire.schema_version
-        )));
-    }
-    if wire.bootstrap_nonce.iter().all(|byte| *byte == 0) {
-        return Err(GuestError::Bootstrap(
-            "bootstrap nonce must not be all zero".to_owned(),
-        ));
-    }
-    if wire.host_version.is_empty()
-        || wire.host_version.len() > 128
-        || wire.trust_root_id.is_empty()
-        || wire.trust_root_id.len() > 128
-    {
-        return Err(GuestError::Bootstrap(
-            "host version and trust-root ID must be 1-128 bytes".to_owned(),
-        ));
-    }
-    let secret = BootstrapSecret::new(wire.bootstrap_secret.0.as_ref().to_vec())?;
-    Ok(BootstrapMaterial {
-        session_id: wire.session_id,
-        bootstrap_nonce: wire.bootstrap_nonce,
-        bootstrap_secret: secret,
-        host_version: wire.host_version,
-        trust_root_id: wire.trust_root_id,
-        manifest_path: wire.manifest_path,
-        minimum_release_sequence: wire.minimum_release_sequence,
-        required_controls: wire.required_controls,
-        required_services: wire.required_services,
-        services: wire.services,
-        execution_broker: wire.execution_broker,
-    })
-}
-
 pub fn replay_key(session_id: SessionId, nonce: &[u8; 32]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"sendbox guest bootstrap replay v1");
+    hasher.update(b"sendbox guest bootstrap replay v2");
     hasher.update(session_id.as_bytes());
     hasher.update(nonce);
     encode_hex(&hasher.finalize())
@@ -293,32 +177,32 @@ mod tests {
     use super::*;
     use crate::secure_fs::secure_tempdir;
     use rustix::process::{getgid, getuid};
-    use serde_json::json;
+    use sendbox_bootstrap::{BootstrapDocumentConfiguration, encode_bootstrap_document};
+    use sendbox_core::BoundaryPlanDigest;
 
     fn identity() -> (u32, u32) {
         (getuid().as_raw(), getgid().as_raw())
     }
 
     fn write_bootstrap(path: &Path, secret: [u8; 32]) {
-        fs::write(
-            path,
-            serde_json::to_vec(&json!({
-                "schema_version": BOOTSTRAP_SCHEMA_VERSION,
-                "session_id": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-                "bootstrap_nonce": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-                    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
-                "bootstrap_secret": secret,
-                "host_version": "0.1.0",
-                "trust_root_id": "root-v1",
-                "manifest_path": "manifest.json",
-                "minimum_release_sequence": 1,
-                "required_controls": [],
-                "required_services": [],
-                "services": []
-            }))
-            .expect("bootstrap JSON"),
+        let encoded = encode_bootstrap_document(
+            BootstrapDocumentConfiguration {
+                session_id: SessionId::from_bytes([1; 16]),
+                boundary_plan_digest: BoundaryPlanDigest::from_bytes([2; 32]),
+                host_version: "0.1.0".to_owned(),
+                trust_root_id: "root-v1".to_owned(),
+                manifest_path: PathBuf::from("manifest.json"),
+                minimum_release_sequence: 1,
+                required_controls: Vec::new(),
+                required_services: Vec::new(),
+                services: Vec::new(),
+                execution_broker: None,
+                egress_policy: None,
+            },
+            &secret,
         )
-        .expect("write bootstrap");
+        .expect("bootstrap JSON");
+        fs::write(path, &encoded[..]).expect("write bootstrap");
         fs::set_permissions(path, fs::Permissions::from_mode(0o400)).expect("bootstrap mode");
     }
 
