@@ -6,9 +6,11 @@
 
 use std::io::{self, Read};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
-use sendbox_agent::{BoxFuture, GuestTerminalSize, HostTerminalCommand, TerminalSource};
+use sendbox_agent::{
+    AgentError, BoxFuture, GuestTerminalSize, HostTerminalCommand, TerminalSource,
+};
 
 /// Bound on queued host keystrokes. Deeper than a human types and deep enough
 /// for a paste; beyond that the operator is better served by back pressure on
@@ -16,7 +18,7 @@ use sendbox_agent::{BoxFuture, GuestTerminalSize, HostTerminalCommand, TerminalS
 const INPUT_QUEUE_DEPTH: usize = 256;
 
 /// Largest keystroke batch read from the host terminal in one go.
-const INPUT_CHUNK: usize = 4096;
+const INPUT_CHUNK: usize = sendbox_core::TERMINAL_INPUT_CHUNK_BYTES;
 
 /// How long the reader thread waits before retrying a full input queue. Short
 /// enough that shutdown is prompt, long enough not to spin a core.
@@ -61,9 +63,9 @@ impl std::error::Error for TerminalError {}
 #[cfg(unix)]
 mod imp {
     use super::{
-        Arc, AtomicBool, BoxFuture, DEFAULT_TERM, GuestTerminalSize, HostTerminalCommand,
-        INPUT_CHUNK, INPUT_QUEUE_DEPTH, MAX_TERM_LENGTH, OFFER_RETRY, Ordering, Read,
-        TerminalError, TerminalSource, io,
+        AgentError, Arc, AtomicBool, AtomicU16, BoxFuture, DEFAULT_TERM, GuestTerminalSize,
+        HostTerminalCommand, INPUT_CHUNK, INPUT_QUEUE_DEPTH, MAX_TERM_LENGTH, OFFER_RETRY,
+        Ordering, Read, TerminalError, TerminalSource, io,
     };
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
@@ -121,7 +123,9 @@ mod imp {
     }
 
     /// Confirms the process owns the terminal and reports its current size.
-    pub fn require_controlling_terminal() -> Result<GuestTerminalSize, TerminalError> {
+    pub fn require_controlling_terminal(
+        separate_stderr: bool,
+    ) -> Result<GuestTerminalSize, TerminalError> {
         if !rustix::termios::isatty(stdin_fd()) {
             return Err(TerminalError::NotATerminal("stdin"));
         }
@@ -140,6 +144,7 @@ mod imp {
             columns: size.0,
             rows: size.1,
             term: host_term()?,
+            separate_stderr,
         })
     }
 
@@ -178,11 +183,16 @@ mod imp {
     /// Host keystroke and resize stream handed to the agent orchestrator.
     pub struct CliTerminal {
         commands: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<HostTerminalCommand>>,
+        credits: Arc<InputCreditGate>,
     }
 
     impl TerminalSource for CliTerminal {
         fn next_command<'a>(&'a self) -> BoxFuture<'a, Option<HostTerminalCommand>> {
             Box::pin(async move { self.commands.lock().await.recv().await })
+        }
+
+        fn grant_input_credit(&self, credits: u16) -> Result<(), AgentError> {
+            self.credits.grant(credits)
         }
     }
 
@@ -195,7 +205,7 @@ mod imp {
     }
 
     impl TerminalSession {
-        pub fn start() -> Result<(Self, GuestTerminalSize), TerminalError> {
+        pub fn start(separate_stderr: bool) -> Result<(Self, GuestTerminalSize), TerminalError> {
             // Register for resizes before sampling the size, so a resize racing
             // startup is reported rather than lost.
             let mut winch =
@@ -203,10 +213,10 @@ mod imp {
                     .map_err(|error| {
                         TerminalError::Query(format!("watch terminal resizes: {error}"))
                     })?;
-            let size = require_controlling_terminal()?;
+            let size = require_controlling_terminal(separate_stderr)?;
             let guard = Arc::new(RawModeGuard::enter()?);
             let (sender, receiver) = tokio::sync::mpsc::channel(INPUT_QUEUE_DEPTH);
-            let reader = StdinPump::start(sender.clone())?;
+            let (reader, credits) = StdinPump::start(sender.clone())?;
             let resizes = tokio::spawn(async move {
                 while winch.recv().await.is_some() {
                     match window_size() {
@@ -232,6 +242,7 @@ mod imp {
                     guard,
                     source: Arc::new(CliTerminal {
                         commands: tokio::sync::Mutex::new(receiver),
+                        credits,
                     }),
                     reader: Some(reader),
                     resizes,
@@ -272,28 +283,110 @@ mod imp {
     /// `poll` waits on the terminal and on a self-pipe so shutting down never
     /// depends on the operator pressing another key.
     struct StdinPump {
-        wake: OwnedFd,
+        credits: Arc<InputCreditGate>,
         stopping: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    struct InputCreditGate {
+        available: AtomicU16,
+        wake: OwnedFd,
+    }
+
+    impl InputCreditGate {
+        fn grant(&self, credits: u16) -> Result<(), AgentError> {
+            if credits == 0 {
+                return Err(AgentError::TerminalInput(
+                    "terminal input credit must be non-zero".to_owned(),
+                ));
+            }
+            let mut current = self.available.load(Ordering::Acquire);
+            loop {
+                let next = current
+                    .checked_add(credits)
+                    .filter(|next| *next <= sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS)
+                    .ok_or_else(|| {
+                        AgentError::TerminalInput(
+                            "terminal input credit exceeds the negotiated window".to_owned(),
+                        )
+                    })?;
+                match self.available.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        if current == 0 {
+                            self.notify().map_err(|error| {
+                                AgentError::TerminalInput(format!(
+                                    "wake terminal input reader: {error}"
+                                ))
+                            })?;
+                        }
+                        return Ok(());
+                    }
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
+        fn available(&self) -> u16 {
+            self.available.load(Ordering::Acquire)
+        }
+
+        fn consume(&self) -> bool {
+            let mut current = self.available.load(Ordering::Acquire);
+            loop {
+                if current == 0 {
+                    return false;
+                }
+                match self.available.compare_exchange_weak(
+                    current,
+                    current - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
+        fn notify(&self) -> io::Result<()> {
+            rustix::io::write(&self.wake, b"\0")
+                .map(|_| ())
+                .map_err(io::Error::from)
+        }
     }
 
     impl StdinPump {
         fn start(
             sender: tokio::sync::mpsc::Sender<HostTerminalCommand>,
-        ) -> Result<Self, TerminalError> {
+        ) -> Result<(Self, Arc<InputCreditGate>), TerminalError> {
             let (wake_reader, wake_writer) = rustix::pipe::pipe()
                 .map_err(|error| TerminalError::Query(format!("create wake pipe: {error}")))?;
+            let credits = Arc::new(InputCreditGate {
+                available: AtomicU16::new(0),
+                wake: wake_writer,
+            });
             let stopping = Arc::new(AtomicBool::new(false));
             let thread_stopping = Arc::clone(&stopping);
+            let thread_credits = Arc::clone(&credits);
             let handle = std::thread::Builder::new()
                 .name("sendbox-stdin".to_owned())
-                .spawn(move || pump_stdin(&wake_reader, &sender, &thread_stopping))
+                .spawn(move || {
+                    pump_stdin(&wake_reader, &sender, &thread_stopping, &thread_credits);
+                })
                 .map_err(|error| TerminalError::Query(format!("start stdin reader: {error}")))?;
-            Ok(Self {
-                wake: wake_writer,
-                stopping,
-                handle: Some(handle),
-            })
+            Ok((
+                Self {
+                    credits: Arc::clone(&credits),
+                    stopping,
+                    handle: Some(handle),
+                },
+                credits,
+            ))
         }
 
         fn stop(mut self) {
@@ -305,7 +398,7 @@ mod imp {
         /// queue, and nothing drains that queue once the run is tearing down.
         fn shutdown(&mut self) {
             self.stopping.store(true, Ordering::Release);
-            let _ = rustix::io::write(&self.wake, b"\0");
+            let _ = self.credits.notify();
             if let Some(handle) = self.handle.take()
                 && handle.join().is_err()
             {
@@ -347,16 +440,24 @@ mod imp {
         wake: &OwnedFd,
         sender: &tokio::sync::mpsc::Sender<HostTerminalCommand>,
         stopping: &AtomicBool,
+        credits: &InputCreditGate,
     ) {
         let stdin = io::stdin();
         let input = stdin_fd();
         let wake = wake.as_fd();
         let mut buffer = [0_u8; INPUT_CHUNK];
         loop {
-            let mut fds = [
-                rustix::event::PollFd::new(&input, rustix::event::PollFlags::IN),
-                rustix::event::PollFd::new(&wake, rustix::event::PollFlags::IN),
-            ];
+            let has_credit = credits.available() > 0;
+            let mut fds = vec![rustix::event::PollFd::new(
+                &wake,
+                rustix::event::PollFlags::IN,
+            )];
+            if has_credit {
+                fds.push(rustix::event::PollFd::new(
+                    &input,
+                    rustix::event::PollFlags::IN,
+                ));
+            }
             match rustix::event::poll(&mut fds, None) {
                 Ok(_) => {}
                 Err(rustix::io::Errno::INTR) => continue,
@@ -365,10 +466,15 @@ mod imp {
                     return;
                 }
             }
-            if !fds[1].revents().is_empty() {
-                return;
+            if !fds[0].revents().is_empty() {
+                let mut notification = [0_u8; 8];
+                let _ = rustix::io::read(wake, &mut notification);
+                if stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                continue;
             }
-            if fds[0].revents().is_empty() {
+            if !has_credit || fds[1].revents().is_empty() {
                 continue;
             }
             match stdin.lock().read(&mut buffer) {
@@ -377,6 +483,12 @@ mod imp {
                     return;
                 }
                 Ok(read) => {
+                    if !credits.consume() {
+                        eprintln!(
+                            "sendbox run: terminal input became readable without launcher credit"
+                        );
+                        return;
+                    }
                     if !offer(
                         sender,
                         stopping,
@@ -396,7 +508,7 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{AtomicBool, HostTerminalCommand, Ordering, offer};
+        use super::{AtomicBool, AtomicU16, HostTerminalCommand, InputCreditGate, Ordering, offer};
         use std::sync::Arc;
 
         #[test]
@@ -425,6 +537,27 @@ mod imp {
                 "offer should report that the reader must stop"
             );
         }
+
+        #[test]
+        fn input_credit_gate_starts_closed_and_enforces_the_window() {
+            let (_reader, writer) = rustix::pipe::pipe().expect("wake pipe");
+            let gate = InputCreditGate {
+                available: AtomicU16::new(0),
+                wake: writer,
+            };
+            assert_eq!(gate.available(), 0);
+            gate.grant(sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS)
+                .expect("initial credit");
+            assert_eq!(
+                gate.available(),
+                sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS
+            );
+            assert!(gate.grant(1).is_err(), "overgrant must fail");
+            for _ in 0..sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS {
+                assert!(gate.consume());
+            }
+            assert!(!gate.consume(), "zero-credit input must be refused");
+        }
     }
 }
 
@@ -435,7 +568,7 @@ mod imp {
     pub struct TerminalSession;
 
     impl TerminalSession {
-        pub fn start() -> Result<(Self, GuestTerminalSize), TerminalError> {
+        pub fn start(_separate_stderr: bool) -> Result<(Self, GuestTerminalSize), TerminalError> {
             Err(TerminalError::NotATerminal("this platform"))
         }
 

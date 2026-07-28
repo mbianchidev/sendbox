@@ -22,10 +22,13 @@ use crate::runtime::{AuthenticatedUnixListener, RuntimeError};
 pub const MAX_SERVICE_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Queue depth for pending terminal commands.
-const INPUT_CHANNEL_DEPTH: usize = 32;
+const INPUT_CHANNEL_DEPTH: usize =
+    sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + INPUT_CONTROL_RESERVE;
+const INPUT_CONTROL_RESERVE: usize = 8;
 /// Hard bound on queuing one terminal command, so the control reader keeps
 /// observing cancellation even while the workload ignores its terminal.
 const INPUT_OFFER_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+const REQUIRED_INPUT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Client-to-broker control frames.
 ///
@@ -164,6 +167,7 @@ impl<B: ExecutionBackend + 'static> BrokerService<B> {
             request.correlation_id.clone(),
             Arc::clone(&done),
             input_sender,
+            request.stdin.uses_flow_control(),
         );
         let mut sink = ServiceEventSink {
             stream: &mut stream,
@@ -205,6 +209,7 @@ fn spawn_client_control_reader(
     correlation_id: CorrelationId,
     done: Arc<AtomicBool>,
     input: Option<InputSender>,
+    flow_controlled: bool,
 ) {
     thread::spawn(move || {
         while !done.load(Ordering::Acquire) {
@@ -241,12 +246,32 @@ fn spawn_client_control_reader(
                 cancellation.disconnect();
                 return;
             };
-            match sender.offer(command, INPUT_OFFER_BOUND) {
+            let required = matches!(command, TerminalCommand::InputEof);
+            let offered = if flow_controlled {
+                sender.try_offer(command)
+            } else {
+                sender.offer(
+                    command,
+                    if required {
+                        REQUIRED_INPUT_BOUND
+                    } else {
+                        INPUT_OFFER_BOUND
+                    },
+                )
+            };
+            match offered {
                 Ok(()) => {}
-                Err(InputOfferError::Saturated) => {
+                Err(InputOfferError::Saturated) if !flow_controlled && !required => {
                     eprintln!(
                         "sendbox-broker: workload stopped reading its terminal; dropping input"
                     );
+                }
+                Err(InputOfferError::Saturated) => {
+                    eprintln!(
+                        "sendbox-broker: required terminal input could not be queued without blocking control"
+                    );
+                    cancellation.disconnect();
+                    return;
                 }
                 Err(InputOfferError::Disconnected) => return,
             }

@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 use sendbox_protocol::{
     AGENT_LAUNCH_OPERATION, BootstrapSecret, CloseCode, Event, EventKind, FrameLimits,
     GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, INTERACTIVE_LAUNCH_OPERATION,
-    InteractiveLaunchRequestV1, LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION,
-    ProtocolErrorCode, ProtocolErrorMessage, Request, Response, ResponseStatus, TerminalResultV2,
-    TerminalSizeV1, TerminalStateV1, VersionRange, agent_guest_capabilities,
-    agent_guest_required_capabilities,
+    INTERACTIVE_LAUNCH_OPERATION_V2, InteractiveLaunchRequestV1, InteractiveLaunchRequestV2,
+    LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, ProtocolErrorCode, ProtocolErrorMessage,
+    Request, Response, ResponseStatus, TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1,
+    TerminalStateV1, VersionRange, agent_guest_capabilities, agent_guest_required_capabilities,
 };
 use sendbox_secrets::{
     EnvelopeBinding, EnvelopeCipher, RecipientRole, ReplayGuard, SecretName, SessionKeyMaterial,
@@ -132,10 +132,34 @@ where
     loop {
         match reader.receive().await? {
             Message::Request(request) if request.operation == AGENT_LAUNCH_OPERATION => {
-                launch(request, &mut reader, &mut writer, &services, false).await?;
+                launch(
+                    request,
+                    &mut reader,
+                    &mut writer,
+                    &services,
+                    LaunchMode::Headless,
+                )
+                .await?;
             }
             Message::Request(request) if request.operation == INTERACTIVE_LAUNCH_OPERATION => {
-                launch(request, &mut reader, &mut writer, &services, true).await?;
+                launch(
+                    request,
+                    &mut reader,
+                    &mut writer,
+                    &services,
+                    LaunchMode::InteractiveV1,
+                )
+                .await?;
+            }
+            Message::Request(request) if request.operation == INTERACTIVE_LAUNCH_OPERATION_V2 => {
+                launch(
+                    request,
+                    &mut reader,
+                    &mut writer,
+                    &services,
+                    LaunchMode::InteractiveV2,
+                )
+                .await?;
             }
             Message::Request(request) => {
                 let response =
@@ -209,12 +233,29 @@ fn handle_request(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchMode {
+    Headless,
+    InteractiveV1,
+    InteractiveV2,
+}
+
+impl LaunchMode {
+    const fn is_interactive(self) -> bool {
+        !matches!(self, Self::Headless)
+    }
+
+    const fn uses_flow_control(self) -> bool {
+        matches!(self, Self::InteractiveV2)
+    }
+}
+
 async fn launch<S>(
     request: Request,
     host_reader: &mut sendbox_protocol::FramedReader<ReadHalf<S>>,
     host_writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
     services: &ProtocolServices,
-    interactive: bool,
+    mode: LaunchMode,
 ) -> Result<(), GuestError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -235,19 +276,47 @@ where
         )
         .await;
     };
-    let (launch, terminal) = if interactive {
-        let envelope: InteractiveLaunchRequestV1 = serde_json::from_slice(&request.payload)
-            .map_err(|error| {
-                GuestError::Protocol(format!("decoding interactive launch request: {error}"))
-            })?;
-        if let Err(error) = envelope.validate() {
-            return send_rejection(host_writer, request.request_id, &error.to_string()).await;
+    let (launch, terminal) = match mode {
+        LaunchMode::Headless => {
+            let launch: LaunchRequestV2 =
+                serde_json::from_slice(&request.payload).map_err(|error| {
+                    GuestError::Protocol(format!("decoding launch request: {error}"))
+                })?;
+            (launch, None)
         }
-        (envelope.launch, Some((envelope.terminal, envelope.term)))
-    } else {
-        let launch: LaunchRequestV2 = serde_json::from_slice(&request.payload)
-            .map_err(|error| GuestError::Protocol(format!("decoding launch request: {error}")))?;
-        (launch, None)
+        LaunchMode::InteractiveV1 => {
+            let envelope: InteractiveLaunchRequestV1 = serde_json::from_slice(&request.payload)
+                .map_err(|error| {
+                    GuestError::Protocol(format!("decoding interactive launch request: {error}"))
+                })?;
+            if let Err(error) = envelope.validate() {
+                return send_rejection(host_writer, request.request_id, &error.to_string()).await;
+            }
+            (
+                envelope.launch,
+                Some((envelope.terminal, envelope.term, false, false)),
+            )
+        }
+        LaunchMode::InteractiveV2 => {
+            let envelope: InteractiveLaunchRequestV2 = serde_json::from_slice(&request.payload)
+                .map_err(|error| {
+                    GuestError::Protocol(format!(
+                        "decoding flow-controlled interactive launch request: {error}"
+                    ))
+                })?;
+            if let Err(error) = envelope.validate() {
+                return send_rejection(host_writer, request.request_id, &error.to_string()).await;
+            }
+            (
+                envelope.launch,
+                Some((
+                    envelope.terminal,
+                    envelope.term,
+                    envelope.separate_stderr,
+                    true,
+                )),
+            )
+        }
     };
     if launch.schema_version != OPERATION_SCHEMA_VERSION {
         return send_rejection(
@@ -323,7 +392,7 @@ where
         host_writer,
         &control_sender,
         &input_sender,
-        interactive,
+        mode,
         &mut input_ended,
     )
     .await;
@@ -339,11 +408,13 @@ const TERM_ENVIRONMENT: &str = "TERM";
 
 const BROKER_CONTROL_DEPTH: usize = 4;
 /// Queue depth for pending terminal input frames.
-const BROKER_INPUT_DEPTH: usize = 256;
+const BROKER_INPUT_DEPTH: usize =
+    sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + BROKER_CONTROL_DEPTH;
 
 /// How long a terminal input frame may wait for the broker writer before it is
 /// dropped so the execution loop can keep draining broker output.
 const INPUT_OFFER_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+const REQUIRED_INPUT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[allow(clippy::too_many_arguments)]
 async fn run_execution_loop<S>(
@@ -354,7 +425,7 @@ async fn run_execution_loop<S>(
     host_writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
     control_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
     input_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
-    interactive: bool,
+    mode: LaunchMode,
     input_ended: &mut bool,
 ) -> Result<(), GuestError>
 where
@@ -381,6 +452,29 @@ where
                             stream_id: request.request_id,
                             kind,
                             payload: data,
+                        })).await?;
+                    }
+                    sendbox_exec::ExecutionEvent::TerminalInputCredit { credits, .. } => {
+                        if !mode.uses_flow_control() {
+                            return Err(GuestError::Protocol(
+                                "execution broker emitted terminal input credit for a V1 launch"
+                                    .to_owned(),
+                            ));
+                        }
+                        let credit = TerminalInputCreditV1::new(credits).map_err(|error| {
+                            GuestError::Protocol(format!(
+                                "execution broker emitted invalid terminal input credit: {error}"
+                            ))
+                        })?;
+                        let payload = serde_json::to_vec(&credit).map_err(|error| {
+                            GuestError::Protocol(format!(
+                                "encoding terminal input credit: {error}"
+                            ))
+                        })?;
+                        host_writer.send(&Message::Event(Event {
+                            stream_id: request.request_id,
+                            kind: EventKind::TerminalInputCredit,
+                            payload,
                         })).await?;
                     }
                     sendbox_exec::ExecutionEvent::Terminal { result, .. } => {
@@ -415,7 +509,7 @@ where
                             request,
                             execution,
                             input_sender,
-                            interactive,
+                            mode,
                             input_ended,
                         ).await {
                             host_writer.send(&Message::ProtocolError(ProtocolErrorMessage {
@@ -447,10 +541,10 @@ async fn forward_terminal_event(
     request: &Request,
     execution: &sendbox_exec::ExecutionRequest,
     input_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
-    interactive: bool,
+    mode: LaunchMode,
     input_ended: &mut bool,
 ) -> Result<(), String> {
-    if !interactive {
+    if !mode.is_interactive() {
         return Err("terminal input is only accepted for an interactive launch".to_owned());
     }
     if event.stream_id != request.request_id {
@@ -460,44 +554,85 @@ async fn forward_terminal_event(
         return Err("terminal input was already ended".to_owned());
     }
     let correlation_id = execution.correlation_id.clone();
-    let frame = match event.kind {
-        EventKind::StandardInput => sendbox_exec::service::ClientFrame::Input {
-            correlation_id,
-            data: event.payload.clone(),
-        },
-        EventKind::StandardInputEof => {
-            *input_ended = true;
-            sendbox_exec::service::ClientFrame::InputEof { correlation_id }
+    let (frame, ends_input) = match event.kind {
+        EventKind::StandardInput => {
+            if event.payload.is_empty()
+                || event.payload.len() > sendbox_core::TERMINAL_INPUT_CHUNK_BYTES
+            {
+                return Err(format!(
+                    "terminal input chunk must contain 1..={} bytes",
+                    sendbox_core::TERMINAL_INPUT_CHUNK_BYTES
+                ));
+            }
+            (
+                sendbox_exec::service::ClientFrame::Input {
+                    correlation_id,
+                    data: event.payload.clone(),
+                },
+                false,
+            )
         }
+        EventKind::StandardInputEof => (
+            sendbox_exec::service::ClientFrame::InputEof { correlation_id },
+            true,
+        ),
         EventKind::TerminalResize => {
             let size: TerminalSizeV1 = serde_json::from_slice(&event.payload)
                 .map_err(|error| format!("decoding terminal resize: {error}"))?;
             size.validate().map_err(|error| error.to_string())?;
-            sendbox_exec::service::ClientFrame::Resize {
-                correlation_id,
-                columns: size.columns,
-                rows: size.rows,
-            }
+            (
+                sendbox_exec::service::ClientFrame::Resize {
+                    correlation_id,
+                    columns: size.columns,
+                    rows: size.rows,
+                },
+                false,
+            )
         }
         _ => return Err("unsupported terminal event kind".to_owned()),
     };
-    // A bounded wait absorbs bursts such as a large paste. Blocking without a
-    // bound would stop this loop from draining broker output, which is the
-    // very thing the writer task is waiting on -- so saturation drops the frame
-    // loudly rather than deadlocking the session.
-    if let Err(error) = input_sender.send_timeout(frame, INPUT_OFFER_BOUND).await {
+    if mode.uses_flow_control() {
+        match input_sender.try_send(frame) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                return Err(
+                    "terminal input credit invariant failed: broker writer queue is full"
+                        .to_owned(),
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err("broker writer stopped".to_owned());
+            }
+        }
+    } else if ends_input {
+        input_sender
+            .send_timeout(frame, REQUIRED_INPUT_BOUND)
+            .await
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => format!(
+                    "broker writer did not accept terminal end of file within {}ms",
+                    REQUIRED_INPUT_BOUND.as_millis()
+                ),
+                tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => {
+                    "broker writer stopped".to_owned()
+                }
+            })?;
+    } else if let Err(error) = input_sender.send_timeout(frame, INPUT_OFFER_BOUND).await {
         let dropped = match error {
             tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => "queue is saturated",
             tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => "broker writer stopped",
         };
         eprintln!("sendbox-guest: dropping terminal input: {dropped}");
     }
+    if ends_input {
+        *input_ended = true;
+    }
     Ok(())
 }
 
 fn build_execution_request(
     launch: &LaunchRequestV2,
-    terminal: Option<(TerminalSizeV1, String)>,
+    terminal: Option<(TerminalSizeV1, String, bool, bool)>,
     broker: &BrokerClientConfiguration,
     secret_decryptor: &GuestSecretDecryptor,
 ) -> Result<sendbox_exec::ExecutionRequest, GuestError> {
@@ -510,7 +645,7 @@ fn build_execution_request(
     argv.push(launch.program.clone());
     argv.extend(launch.arguments.clone());
     let mut environment = decrypt_environment(launch, secret_decryptor)?;
-    if let Some((_, term)) = terminal.as_ref() {
+    if let Some((_, term, _, _)) = terminal.as_ref() {
         // The host's terminal type is authoritative for an interactive run: a
         // stale configured TERM would make the workload render for the wrong
         // terminal on the operator's screen.
@@ -538,10 +673,14 @@ fn build_execution_request(
         environment,
         stdin: match terminal {
             None => sendbox_exec::StandardInput::Null,
-            Some((size, _)) => sendbox_exec::StandardInput::Terminal {
-                columns: size.columns,
-                rows: size.rows,
-            },
+            Some((size, _, separate_stderr, flow_controlled)) => {
+                sendbox_exec::StandardInput::Terminal {
+                    columns: size.columns,
+                    rows: size.rows,
+                    separate_stderr,
+                    flow_controlled,
+                }
+            }
         },
         timeout,
         containment: sendbox_exec::ContainmentProfile {

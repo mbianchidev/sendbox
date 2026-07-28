@@ -33,17 +33,21 @@ use super::{capabilities, raw, rlimits, seccomp};
 
 const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 const OUTPUT_CHANNEL_DEPTH: usize = 16;
-const INPUT_CHANNEL_DEPTH: usize = 32;
+const INPUT_CONTROL_RESERVE: usize = 8;
+const INPUT_CHANNEL_DEPTH: usize =
+    sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + INPUT_CONTROL_RESERVE;
 /// Hard bound on queuing one terminal command, so the control reader keeps
 /// observing cancellation even while the workload ignores its terminal.
 const INPUT_OFFER_BOUND: Duration = Duration::from_millis(250);
+const REQUIRED_INPUT_BOUND: Duration = Duration::from_secs(5);
 /// How long one pass waits for a non-draining workload to accept more input
 /// before letting the writer thread look at cancellation again.
 const INPUT_WRITE_SLICE: Duration = Duration::from_millis(10);
 /// Largest terminal backlog held for a workload that is not reading it.
-const MAX_PENDING_INPUT: usize = 256 * 1024;
+const MAX_PENDING_INPUT: usize =
+    sendbox_core::TERMINAL_INPUT_CHUNK_BYTES * sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize;
 /// Largest terminal chunk forwarded in one control frame.
-pub const MAX_TERMINAL_INPUT_BYTES: usize = 4 * 1024;
+pub const MAX_TERMINAL_INPUT_BYTES: usize = sendbox_core::TERMINAL_INPUT_CHUNK_BYTES;
 pub const MAX_LAUNCHER_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Trusted one-shot input sent by the broker to the dedicated launcher
@@ -428,7 +432,7 @@ fn run(
     };
     let mut terminal_input: Option<Arc<ChannelInput>> = None;
     if let (Some(device), Some(user)) = (terminal_device.as_ref(), request.containment.run_as)
-        && let Err(error) = device.transfer_secondary_to(user)
+        && let Err(error) = device.transfer_secondaries_to(user)
     {
         return launch_error(error, leaf.remove_unlaunched());
     }
@@ -459,12 +463,16 @@ fn run(
         Ok(environment) => environment,
         Err(error) => return launch_error(error, leaf.remove_unlaunched()),
     };
-    let pty_secondary = match terminal_device
+    let terminal_stdio = match terminal_device
         .as_ref()
-        .map(super::pty::PseudoTerminal::secondary_raw_fd)
+        .map(super::pty::TerminalDevices::secondary_raw_fds)
         .transpose()
     {
-        Ok(fd) => fd,
+        Ok(Some((controlling_secondary, stderr_secondary))) => Some(raw::TerminalStdio {
+            controlling_secondary,
+            stderr_secondary,
+        }),
+        Ok(None) => None,
         Err(error) => return launch_error(error, leaf.remove_unlaunched()),
     };
     let process = match raw::clone3_exec(
@@ -474,7 +482,7 @@ fn run(
         &argv,
         &environment,
         request.containment.run_as,
-        pty_secondary,
+        terminal_stdio,
     ) {
         Ok(process) => process,
         Err(error) => return launch_error(error, leaf.remove_unlaunched()),
@@ -482,7 +490,7 @@ fn run(
     // Dropping the launcher's secondary is what lets the primary report EOF
     // once the workload exits; holding it would hang the output pump forever.
     if let Some(device) = terminal_device.as_mut() {
-        device.release_secondary();
+        device.release_secondaries();
     }
     let raw::SpawnedProcess {
         pidfd,
@@ -503,6 +511,7 @@ fn run(
             cancellation.clone(),
             request.correlation_id.clone(),
             input_sender,
+            request.stdin.uses_flow_control(),
         );
     }
 
@@ -532,14 +541,14 @@ fn run(
     let writer_done = Arc::new(AtomicBool::new(false));
     let mut terminal_writer = None;
     if let Some(device) = terminal_device {
-        let writer = match TerminalWriter::new(device) {
+        let writer = match TerminalWriter::new(device, request.stdin.uses_flow_control()) {
             Ok(writer) => writer,
             Err(error) => {
                 let (cleanup, _) = leaf.cleanup(pidfd.as_raw_fd(), cleanup_bound);
                 return launch_error(error, cleanup);
             }
         };
-        let primary = match writer.device.primary().try_clone() {
+        let primary = match writer.devices.controlling_primary().try_clone() {
             Ok(primary) => primary,
             Err(error) => {
                 let (cleanup, _) = leaf.cleanup(pidfd.as_raw_fd(), cleanup_bound);
@@ -549,15 +558,39 @@ fn run(
                 );
             }
         };
-        readers.push(spawn_terminal_reader(primary, sender));
+        readers.push(spawn_terminal_reader(
+            primary,
+            StreamKind::Stdout,
+            sender.clone(),
+        ));
+        if let Some(stderr) = writer.devices.stderr_primary() {
+            let primary = match stderr.try_clone() {
+                Ok(primary) => primary,
+                Err(error) => {
+                    let (cleanup, _) = leaf.cleanup(pidfd.as_raw_fd(), cleanup_bound);
+                    return launch_error(
+                        PlatformError::io("duplicate stderr pseudoterminal primary", error),
+                        cleanup,
+                    );
+                }
+            };
+            readers.push(spawn_terminal_reader(
+                primary,
+                StreamKind::Stderr,
+                sender.clone(),
+            ));
+        }
         if let Some(queue) = terminal_input {
             terminal_writer = Some(spawn_terminal_writer(
                 writer,
                 queue,
                 cancellation.clone(),
                 Arc::clone(&writer_done),
+                sender.clone(),
+                request.stdin.uses_flow_control(),
             ));
         }
+        drop(sender);
     } else {
         if let Some(stdout) = stdout {
             readers.push(spawn_reader(stdout, StreamKind::Stdout, sender.clone()));
@@ -589,12 +622,22 @@ fn run(
             }
         }
         if let Some(next) = receive_output(&receiver) {
-            sequence = sequence.saturating_add(1);
-            let event = ExecutionEvent::Output {
-                correlation_id: request.correlation_id.clone(),
-                stream: next.stream,
-                sequence,
-                data: next.data,
+            let event = match next {
+                LauncherEvent::Output(next) => {
+                    sequence = sequence.saturating_add(1);
+                    ExecutionEvent::Output {
+                        correlation_id: request.correlation_id.clone(),
+                        stream: next.stream,
+                        sequence,
+                        data: next.data,
+                    }
+                }
+                LauncherEvent::TerminalInputCredit(credits) => {
+                    ExecutionEvent::TerminalInputCredit {
+                        correlation_id: request.correlation_id.clone(),
+                        credits,
+                    }
+                }
             };
             if let Err(error) = sink.emit(event) {
                 break terminal_from_sink_error(error);
@@ -658,10 +701,13 @@ fn admit_terminal_request(request: &ExecutionRequest) -> Result<(), PlatformErro
 
 fn open_terminal_device(
     request: &ExecutionRequest,
-) -> Result<Option<super::pty::PseudoTerminal>, PlatformError> {
+) -> Result<Option<super::pty::TerminalDevices>, PlatformError> {
     match request.stdin.terminal_size() {
         None => Ok(None),
-        Some((columns, rows)) => super::pty::PseudoTerminal::open(columns, rows).map(Some),
+        Some((columns, rows)) => {
+            super::pty::TerminalDevices::open(columns, rows, request.stdin.separates_stderr())
+                .map(Some)
+        }
     }
 }
 
@@ -671,10 +717,16 @@ struct OutputChunk {
     data: Vec<u8>,
 }
 
+#[derive(Debug)]
+enum LauncherEvent {
+    Output(OutputChunk),
+    TerminalInputCredit(u16),
+}
+
 fn spawn_reader(
     descriptor: OwnedFd,
     stream: StreamKind,
-    sender: SyncSender<OutputChunk>,
+    sender: SyncSender<LauncherEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut file = File::from(descriptor);
@@ -684,10 +736,10 @@ fn spawn_reader(
                 Ok(0) => break,
                 Ok(length) => {
                     if sender
-                        .send(OutputChunk {
+                        .send(LauncherEvent::Output(OutputChunk {
                             stream,
                             data: buffer[..length].to_vec(),
-                        })
+                        }))
                         .is_err()
                     {
                         break;
@@ -709,7 +761,8 @@ fn spawn_reader(
 /// the following read still reports the EIO that ends the stream.
 fn spawn_terminal_reader(
     descriptor: OwnedFd,
-    sender: SyncSender<OutputChunk>,
+    stream: StreamKind,
+    sender: SyncSender<LauncherEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut file = File::from(descriptor);
@@ -719,10 +772,10 @@ fn spawn_terminal_reader(
                 Ok(0) => break,
                 Ok(length) => {
                     if sender
-                        .send(OutputChunk {
-                            stream: StreamKind::Stdout,
+                        .send(LauncherEvent::Output(OutputChunk {
+                            stream,
                             data: buffer[..length].to_vec(),
-                        })
+                        }))
                         .is_err()
                     {
                         break;
@@ -755,12 +808,12 @@ fn wait_readable(primary: &File) -> bool {
     }
 }
 
-fn receive_output(receiver: &Receiver<OutputChunk>) -> Option<OutputChunk> {
+fn receive_output(receiver: &Receiver<LauncherEvent>) -> Option<LauncherEvent> {
     receiver.recv_timeout(Duration::from_millis(10)).ok()
 }
 
 fn drain_after_cleanup(
-    receiver: &Receiver<OutputChunk>,
+    receiver: &Receiver<LauncherEvent>,
     sink: &mut dyn EventSink,
     request: &ExecutionRequest,
     sequence: &mut u64,
@@ -776,7 +829,7 @@ fn drain_after_cleanup(
     let deadline = Instant::now() + bound;
     loop {
         match receiver.recv_timeout(Duration::from_millis(10)) {
-            Ok(output) => {
+            Ok(LauncherEvent::Output(output)) => {
                 *sequence = sequence.saturating_add(1);
                 if let Err(error) = sink.emit(ExecutionEvent::Output {
                     correlation_id: request.correlation_id.clone(),
@@ -788,6 +841,7 @@ fn drain_after_cleanup(
                     return;
                 }
             }
+            Ok(LauncherEvent::TerminalInputCredit(_)) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
             Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
                 if matches!(terminal, TerminalState::Exited(_)) {
@@ -1008,6 +1062,7 @@ fn spawn_launcher_control_monitor(
     cancellation: CancellationFlag,
     correlation_id: crate::api::CorrelationId,
     terminal: Option<InputSender>,
+    flow_controlled: bool,
 ) {
     thread::spawn(move || {
         loop {
@@ -1053,6 +1108,7 @@ fn spawn_launcher_control_monitor(
                         terminal.as_ref(),
                         TerminalCommand::Input(data),
                         &cancellation,
+                        flow_controlled,
                     ) {
                         return;
                     }
@@ -1060,8 +1116,12 @@ fn spawn_launcher_control_monitor(
                 LauncherControl::InputEof {
                     correlation_id: requested,
                 } if requested == correlation_id => {
-                    if !offer_terminal(terminal.as_ref(), TerminalCommand::InputEof, &cancellation)
-                    {
+                    if !offer_terminal(
+                        terminal.as_ref(),
+                        TerminalCommand::InputEof,
+                        &cancellation,
+                        flow_controlled,
+                    ) {
                         return;
                     }
                 }
@@ -1074,6 +1134,7 @@ fn spawn_launcher_control_monitor(
                         terminal.as_ref(),
                         TerminalCommand::Resize { columns, rows },
                         &cancellation,
+                        flow_controlled,
                     ) {
                         return;
                     }
@@ -1098,6 +1159,7 @@ fn offer_terminal(
     terminal: Option<&InputSender>,
     command: TerminalCommand,
     cancellation: &CancellationFlag,
+    flow_controlled: bool,
 ) -> bool {
     let Some(sender) = terminal else {
         // Terminal traffic for a headless launch is a supervisor protocol bug.
@@ -1105,14 +1167,34 @@ fn offer_terminal(
         cancellation.supervisor_died();
         return false;
     };
-    match sender.offer(command, INPUT_OFFER_BOUND) {
+    let required = matches!(command, TerminalCommand::InputEof);
+    let offered = if flow_controlled {
+        sender.try_offer(command)
+    } else {
+        sender.offer(
+            command,
+            if required {
+                REQUIRED_INPUT_BOUND
+            } else {
+                INPUT_OFFER_BOUND
+            },
+        )
+    };
+    match offered {
         Ok(()) => true,
-        Err(InputOfferError::Saturated) => {
+        Err(InputOfferError::Saturated) if !flow_controlled && !required => {
             eprintln!(
                 "sendbox-launcher: workload stopped reading its terminal for {}ms; dropping input",
                 INPUT_OFFER_BOUND.as_millis()
             );
             true
+        }
+        Err(InputOfferError::Saturated) => {
+            eprintln!(
+                "sendbox-launcher: required terminal input could not be queued without blocking control"
+            );
+            cancellation.supervisor_died();
+            false
         }
         Err(InputOfferError::Disconnected) => false,
     }
@@ -1124,66 +1206,118 @@ fn spawn_terminal_writer(
     input: Arc<ChannelInput>,
     cancellation: CancellationFlag,
     done: Arc<AtomicBool>,
+    events: SyncSender<LauncherEvent>,
+    flow_controlled: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut device = device;
+        if flow_controlled
+            && events
+                .send(LauncherEvent::TerminalInputCredit(
+                    sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS,
+                ))
+                .is_err()
+        {
+            return;
+        }
         while !done.load(Ordering::Acquire) {
             if !matches!(cancellation.cause(), CancellationCause::None) {
                 return;
             }
-            if let Err(error) = device.pump() {
-                eprintln!("sendbox-launcher: terminal input failed: {error}");
-                return;
+            match device.pump() {
+                Ok(credits) => {
+                    if !send_terminal_input_credit(&events, credits, flow_controlled) {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("sendbox-launcher: terminal input failed: {error}");
+                    return;
+                }
             }
             let Some(command) = input.poll(Duration::from_millis(10)) else {
                 continue;
             };
-            if let Err(error) = device.apply(command) {
-                eprintln!("sendbox-launcher: terminal input failed: {error}");
-                return;
+            match device.apply(command) {
+                Ok(credits) => {
+                    if !send_terminal_input_credit(&events, credits, flow_controlled) {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("sendbox-launcher: terminal input failed: {error}");
+                    return;
+                }
             }
         }
     })
 }
 
+fn send_terminal_input_credit(
+    events: &SyncSender<LauncherEvent>,
+    credits: u16,
+    flow_controlled: bool,
+) -> bool {
+    !flow_controlled
+        || credits == 0
+        || events
+            .send(LauncherEvent::TerminalInputCredit(credits))
+            .is_ok()
+}
+
 /// Applies terminal commands to the pseudoterminal primary.
 struct TerminalWriter {
-    device: super::pty::PseudoTerminal,
+    devices: super::pty::TerminalDevices,
     primary: File,
     end_of_file: u8,
     end_of_file_sent: bool,
-    pending: VecDeque<u8>,
+    flow_controlled: bool,
+    pending_bytes: usize,
+    pending: VecDeque<PendingTerminalInput>,
+}
+
+struct PendingTerminalInput {
+    data: Vec<u8>,
+    offset: usize,
+    returns_credit: bool,
 }
 
 impl TerminalWriter {
-    fn new(device: super::pty::PseudoTerminal) -> Result<Self, PlatformError> {
-        let end_of_file = device.end_of_file_byte()?;
-        let primary = device
-            .primary()
+    fn new(
+        devices: super::pty::TerminalDevices,
+        flow_controlled: bool,
+    ) -> Result<Self, PlatformError> {
+        let end_of_file = devices.end_of_file_byte()?;
+        let primary = devices
+            .controlling_primary()
             .try_clone()
             .map(File::from)
             .map_err(|error| PlatformError::io("duplicate pseudoterminal primary", error))?;
         Ok(Self {
-            device,
+            devices,
             primary,
             end_of_file,
             end_of_file_sent: false,
+            flow_controlled,
+            pending_bytes: 0,
             pending: VecDeque::new(),
         })
     }
 
-    fn apply(&mut self, command: TerminalCommand) -> io::Result<()> {
+    fn apply(&mut self, command: TerminalCommand) -> io::Result<u16> {
         match command {
             TerminalCommand::Input(data) => {
                 if self.end_of_file_sent {
-                    return Ok(());
+                    return Ok(0);
                 }
-                self.queue(&data);
+                if !self.queue(data)? {
+                    return Ok(0);
+                }
                 self.pump()
             }
             TerminalCommand::InputEof => {
                 if self.end_of_file_sent {
-                    return Ok(());
+                    return Ok(0);
                 }
                 self.end_of_file_sent = true;
                 // Never close the primary here: that would raise SIGHUP and
@@ -1191,43 +1325,84 @@ impl TerminalWriter {
                 // ignores the backlog bound because a workload waiting for end
                 // of input is by definition still reading, so it will arrive as
                 // soon as the backlog ahead of it drains.
-                self.pending.push_back(self.end_of_file);
+                self.pending_bytes = self.pending_bytes.saturating_add(1);
+                self.pending.push_back(PendingTerminalInput {
+                    data: vec![self.end_of_file],
+                    offset: 0,
+                    returns_credit: false,
+                });
                 self.pump()
             }
             // Resizing is an ioctl, so it overtakes a backlog the workload has
             // not read yet. `SIGWINCH` is out of band anyway.
-            TerminalCommand::Resize { columns, rows } => self
-                .device
-                .resize(columns, rows)
-                .map_err(|error| io::Error::other(error.to_string())),
+            TerminalCommand::Resize { columns, rows } => {
+                self.devices
+                    .resize(columns, rows)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                Ok(0)
+            }
         }
     }
 
-    /// Queues input behind whatever the workload has not read yet. A chunk that
-    /// does not fit is dropped whole: truncating one would cut an escape
-    /// sequence in half, and an agent that loses the tail of a bracketed paste
-    /// stays in paste mode and swallows everything typed afterwards.
-    fn queue(&mut self, data: &[u8]) {
-        if self.pending.len() + data.len() > MAX_PENDING_INPUT {
+    fn queue(&mut self, data: Vec<u8>) -> io::Result<bool> {
+        if data.is_empty() || data.len() > MAX_TERMINAL_INPUT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("terminal input chunk must contain 1..={MAX_TERMINAL_INPUT_BYTES} bytes"),
+            ));
+        }
+        let window_full =
+            self.pending.len() >= usize::from(sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS);
+        let bytes_full = self.pending_bytes.saturating_add(data.len()) > MAX_PENDING_INPUT;
+        if window_full || bytes_full {
+            if self.flow_controlled {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "terminal input credit invariant failed: launcher backlog is full",
+                ));
+            }
             eprintln!(
                 "sendbox-launcher: workload is not reading its terminal; dropping {} bytes of input",
                 data.len()
             );
-            return;
+            return Ok(false);
         }
-        self.pending.extend(data);
+        self.pending_bytes += data.len();
+        self.pending.push_back(PendingTerminalInput {
+            data,
+            offset: 0,
+            returns_credit: true,
+        });
+        Ok(true)
     }
 
     /// Writes as much of the backlog as the workload is willing to accept right
     /// now. Never parks for longer than one slice, so cancellation and resizes
     /// keep flowing while a workload ignores its terminal.
-    fn pump(&mut self) -> io::Result<()> {
-        while !self.pending.is_empty() {
-            let chunk = self.pending.as_slices().0;
+    fn pump(&mut self) -> io::Result<u16> {
+        let mut credits = 0_u16;
+        while let Some(front) = self.pending.front() {
+            let chunk = &front.data[front.offset..];
             match self.primary.write(chunk) {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
                 Ok(written) => {
-                    self.pending.drain(..written);
+                    self.pending_bytes = self.pending_bytes.saturating_sub(written);
+                    let complete = {
+                        let front = self.pending.front_mut().expect("pending input exists");
+                        front.offset += written;
+                        front.offset == front.data.len()
+                    };
+                    if complete {
+                        let completed = self.pending.pop_front().expect("pending input exists");
+                        if completed.returns_credit {
+                            credits = credits.checked_add(1).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "terminal input credit counter overflowed",
+                                )
+                            })?;
+                        }
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 // The primary is non-blocking, so a workload that stops
@@ -1237,13 +1412,14 @@ impl TerminalWriter {
                 // can be bounded and where later commands can overtake it.
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     if !Self::writable(&self.primary, INPUT_WRITE_SLICE)? {
-                        return Ok(());
+                        return Ok(credits);
                     }
                 }
                 Err(error) => return Err(error),
             }
         }
-        self.primary.flush()
+        self.primary.flush()?;
+        Ok(credits)
     }
 
     fn writable(primary: &File, slice: Duration) -> io::Result<bool> {
@@ -1381,6 +1557,7 @@ fn event_correlation(event: &ExecutionEvent) -> &crate::api::CorrelationId {
     match event {
         ExecutionEvent::Started { correlation_id, .. }
         | ExecutionEvent::Output { correlation_id, .. }
+        | ExecutionEvent::TerminalInputCredit { correlation_id, .. }
         | ExecutionEvent::Terminal { correlation_id, .. } => correlation_id,
     }
 }
@@ -1465,10 +1642,10 @@ mod tests {
 
     #[test]
     fn terminal_input_never_stalls_on_a_workload_that_does_not_read_it() {
-        let device = super::super::pty::PseudoTerminal::open(80, 24).expect("allocate pty");
+        let device = super::super::pty::TerminalDevices::open(80, 24, false).expect("allocate pty");
         // Raw mode is what makes the line discipline throttle instead of
         // silently discarding, which is the shape a full-screen agent has.
-        let secondary = device.secondary().expect("secondary");
+        let secondary = device.controlling_secondary().expect("secondary");
         let mut attributes = rustix::termios::tcgetattr(secondary).expect("read attributes");
         attributes.make_raw();
         rustix::termios::tcsetattr(
@@ -1478,12 +1655,17 @@ mod tests {
         )
         .expect("set raw");
 
-        let mut writer = TerminalWriter::new(device).expect("terminal writer");
-        let chunks = (MAX_PENDING_INPUT / MAX_TERMINAL_INPUT_BYTES) * 2;
+        let mut writer = TerminalWriter::new(device, true).expect("terminal writer");
+        let mut credits = sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS;
+        let chunks = usize::from(sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS) * 2;
         let mut slowest = Duration::ZERO;
         for _ in 0..chunks {
+            if credits == 0 {
+                break;
+            }
+            credits -= 1;
             let started = Instant::now();
-            writer
+            credits += writer
                 .apply(TerminalCommand::Input(vec![b'x'; MAX_TERMINAL_INPUT_BYTES]))
                 .expect("a workload that stops reading is not a broken session");
             slowest = slowest.max(started.elapsed());
@@ -1498,14 +1680,19 @@ mod tests {
 
         assert!(writer.end_of_file_sent);
         assert_eq!(
-            *writer.pending.back().expect("a queued backlog"),
-            writer.end_of_file,
+            writer.pending.back().expect("a queued backlog").data,
+            vec![writer.end_of_file],
             "end of file must stay behind the input it follows"
         );
         assert!(
-            writer.pending.len() <= MAX_PENDING_INPUT + 1,
-            "the backlog bound was not enforced: {}",
-            writer.pending.len()
+            writer.pending_bytes <= MAX_PENDING_INPUT + 1,
+            "the byte backlog bound was not enforced: {}",
+            writer.pending_bytes
+        );
+        assert!(
+            writer.pending.len() <= usize::from(sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS) + 1,
+            "the chunk backlog bound was not enforced: {}",
+            writer.pending.len(),
         );
         // A blocking primary parks here for as long as the workload declines to
         // read, which is the whole point of this bound.

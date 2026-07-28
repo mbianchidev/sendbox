@@ -25,7 +25,7 @@ use sendbox_exec::{
     AdmissionDisposition, Broker, CancellationFlag, ContainmentProfile, CorrelationId,
     DescriptorPath, EnvironmentEntry, ExecutionBackend, ExecutionDecision, ExecutionEvent,
     ExecutionRequest, ExecutionTimeout, KernelPrimitive, LaunchFailure, NullInput, RelativePath,
-    RequestLimits, RootId, SemanticScope, SinkError, TerminalState,
+    RequestLimits, RootId, SemanticScope, SinkError, StreamKind, TerminalState,
 };
 use sendbox_policy::{Action, CommandPolicy};
 
@@ -1040,6 +1040,12 @@ const TERMINAL_ECHO: &str = "import os, sys, termios, fcntl, struct\n\
      sys.stdout.write('done\\n')\n\
      sys.stdout.flush()\n";
 
+const TERMINAL_STREAM_PROBE: &str = "import os, sys\n\
+     sys.stdout.write('stdout-marker\\n')\n\
+     sys.stdout.flush()\n\
+     sys.stderr.write('stderr-marker tty=%s\\n' % os.isatty(2))\n\
+     sys.stderr.flush()\n";
+
 fn interactive_case<'a>(
     correlation: &'a str,
     executable: &'a str,
@@ -1056,7 +1062,18 @@ fn interactive_case<'a>(
         stdin: sendbox_exec::StandardInput::Terminal {
             columns: INTERACTIVE_COLUMNS,
             rows: INTERACTIVE_ROWS,
+            separate_stderr: false,
+            flow_controlled: false,
         },
+    }
+}
+
+fn terminal_input(separate_stderr: bool, flow_controlled: bool) -> sendbox_exec::StandardInput {
+    sendbox_exec::StandardInput::Terminal {
+        columns: INTERACTIVE_COLUMNS,
+        rows: INTERACTIVE_ROWS,
+        separate_stderr,
+        flow_controlled,
     }
 }
 
@@ -1089,6 +1106,132 @@ fn interactive_launch_gives_the_workload_a_controlling_terminal() {
     assert!(
         rendered.contains("ctty True"),
         "workload did not own the terminal's foreground process group: {rendered}"
+    );
+}
+
+#[test]
+fn interactive_launch_merges_stderr_by_default() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    let invocation = launcher_invocation(
+        &session,
+        parent,
+        interactive_case(
+            "live-pty-merged-stderr",
+            &executable,
+            &python,
+            TERMINAL_STREAM_PROBE,
+        ),
+    );
+    let backend = launcher_backend(&invocation);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut sink = |event| {
+        if let ExecutionEvent::Output { stream, data, .. } = event {
+            match stream {
+                StreamKind::Stdout => stdout.extend(data),
+                StreamKind::Stderr => stderr.extend(data),
+            }
+        }
+        Ok(())
+    };
+    let result = backend.execute(
+        &invocation.request,
+        &invocation.decision,
+        &mut sink,
+        &NullInput,
+        &CancellationFlag::default(),
+    );
+
+    assert_clean_exit(&result.terminal);
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(stdout.contains("stdout-marker"), "stdout missing: {stdout}");
+    assert!(
+        stdout.contains("stderr-marker tty=True"),
+        "stderr was not merged into the controlling terminal: {stdout}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "default interactive launch emitted a separate stderr stream: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
+fn interactive_launch_can_separate_stderr_on_a_resized_tty() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    let script = "import fcntl, os, struct, sys, termios\n\
+         sys.stdout.write('ready\\n')\n\
+         sys.stdout.flush()\n\
+         sys.stdin.readline()\n\
+         rows, columns = struct.unpack('hh', fcntl.ioctl(2, termios.TIOCGWINSZ, b'\\0' * 4))\n\
+         sys.stderr.write('stderr-tty %s size %d %d\\n' % (os.isatty(2), columns, rows))\n\
+         sys.stderr.flush()\n";
+    let mut case = interactive_case("live-pty-split-stderr", &executable, &python, script);
+    case.stdin = terminal_input(true, false);
+    let invocation = launcher_invocation(&session, parent, case);
+    let (sender, input) = sendbox_exec::ChannelInput::bounded(4);
+    let feeder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        sender
+            .offer(
+                sendbox_exec::TerminalCommand::Resize {
+                    columns: 100,
+                    rows: 30,
+                },
+                Duration::from_secs(5),
+            )
+            .expect("queue resize");
+        sender
+            .offer(
+                sendbox_exec::TerminalCommand::Input(b"probe\n".to_vec()),
+                Duration::from_secs(5),
+            )
+            .expect("queue probe");
+    });
+    let backend = launcher_backend(&invocation);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut sink = |event| {
+        if let ExecutionEvent::Output { stream, data, .. } = event {
+            match stream {
+                StreamKind::Stdout => stdout.extend(data),
+                StreamKind::Stderr => stderr.extend(data),
+            }
+        }
+        Ok(())
+    };
+    let result = backend.execute(
+        &invocation.request,
+        &invocation.decision,
+        &mut sink,
+        &input,
+        &CancellationFlag::default(),
+    );
+    feeder.join().expect("input feeder");
+
+    assert_clean_exit(&result.terminal);
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(stdout.contains("ready"), "stdout missing: {stdout}");
+    assert!(
+        !stdout.contains("stderr-tty"),
+        "stderr leaked into stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("stderr-tty True size 100 30"),
+        "separate stderr was not a resized tty: {stderr}"
     );
 }
 
@@ -1307,6 +1450,192 @@ fn interactive_launch_survives_simultaneous_input_and_heavy_output() {
         "workload output was truncated: {bytes} bytes"
     );
     assert!(drained, "workload never reported a clean drain");
+}
+
+#[test]
+fn flow_controlled_terminal_delivers_a_paste_larger_than_the_launcher_window() {
+    const EXTRA_CHUNKS: usize = 16;
+    let paste_chunks = usize::from(sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS) + EXTRA_CHUNKS;
+    let paste_bytes = paste_chunks * sendbox_core::TERMINAL_INPUT_CHUNK_BYTES;
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    let script = format!(
+        "import os, sys, time, tty\n\
+         TARGET = {paste_bytes}\n\
+         tty.setraw(0)\n\
+         os.write(1, b'ready\\n')\n\
+         time.sleep(1.0)\n\
+         data = bytearray()\n\
+         while len(data) < TARGET:\n\
+         \x20   chunk = os.read(0, min(65536, TARGET - len(data)))\n\
+         \x20   if not chunk:\n\
+         \x20       break\n\
+         \x20   data.extend(chunk)\n\
+         expected = bytes((index % 251 for index in range(TARGET)))\n\
+         valid = data == expected\n\
+         os.write(1, ('verified %d %s\\n' % (len(data), valid)).encode())\n\
+         sys.exit(0 if valid else 3)\n"
+    );
+    let mut case = interactive_case("live-pty-credits", &executable, &python, &script);
+    case.stdin = terminal_input(false, true);
+    let invocation = launcher_invocation(&session, parent, case);
+    let (sender, input) = sendbox_exec::ChannelInput::bounded(
+        usize::from(sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS) + 4,
+    );
+    let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+    let (credit_sender, credit_receiver) = std::sync::mpsc::channel::<u16>();
+    let feeder = std::thread::spawn(move || {
+        ready_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("workload readiness");
+        let payload = (0..paste_bytes)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut offset = 0;
+        let mut credits = 0_u16;
+        while offset < payload.len() {
+            while credits == 0 {
+                credits = credit_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("terminal input credit");
+            }
+            let end = (offset + sendbox_core::TERMINAL_INPUT_CHUNK_BYTES).min(payload.len());
+            sender
+                .try_offer(sendbox_exec::TerminalCommand::Input(
+                    payload[offset..end].to_vec(),
+                ))
+                .expect("credited terminal input must fit");
+            offset = end;
+            credits -= 1;
+        }
+    });
+    let backend = launcher_backend(&invocation);
+    let mut output = Vec::new();
+    let mut ready_sent = false;
+    let mut sink = |event| {
+        match event {
+            ExecutionEvent::Output { data, .. } => {
+                output.extend(data);
+                if !ready_sent && output.windows(b"ready".len()).any(|part| part == b"ready") {
+                    ready_sent = true;
+                    let _ = ready_sender.send(());
+                }
+            }
+            ExecutionEvent::TerminalInputCredit { credits, .. } => {
+                let _ = credit_sender.send(credits);
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    let result = backend.execute(
+        &invocation.request,
+        &invocation.decision,
+        &mut sink,
+        &input,
+        &CancellationFlag::default(),
+    );
+    feeder.join().expect("input feeder");
+
+    assert_clean_exit(&result.terminal);
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(
+        rendered.contains(&format!("verified {paste_bytes} True")),
+        "credited paste was truncated or reordered: {rendered}"
+    );
+}
+
+#[test]
+fn flow_controlled_terminal_cancellation_stays_prompt_when_input_is_blocked() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    let script = "import os, time, tty\n\
+         tty.setraw(0)\n\
+         os.write(1, b'ready\\n')\n\
+         time.sleep(30)\n";
+    let mut case = interactive_case("live-pty-cancel-credit", &executable, &python, script);
+    case.stdin = terminal_input(false, true);
+    let invocation = launcher_invocation(&session, parent, case);
+    let (sender, input) = sendbox_exec::ChannelInput::bounded(
+        usize::from(sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS) + 4,
+    );
+    let cancellation = CancellationFlag::default();
+    let feeder_cancellation = cancellation.clone();
+    let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+    let (credit_sender, credit_receiver) = std::sync::mpsc::channel::<u16>();
+    let feeder = std::thread::spawn(move || {
+        ready_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("workload readiness");
+        let credits = credit_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("initial terminal input credit");
+        assert_eq!(
+            credits,
+            sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS,
+            "launcher did not grant the negotiated initial window"
+        );
+        for _ in 0..credits {
+            sender
+                .try_offer(sendbox_exec::TerminalCommand::Input(vec![
+                    b'x';
+                    sendbox_core::TERMINAL_INPUT_CHUNK_BYTES
+                ]))
+                .expect("credited terminal input must fit");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        feeder_cancellation.cancel();
+    });
+    let backend = launcher_backend(&invocation);
+    let mut output = Vec::new();
+    let mut ready_sent = false;
+    let mut sink = |event| {
+        match event {
+            ExecutionEvent::Output { data, .. } => {
+                output.extend(data);
+                if !ready_sent && output.windows(b"ready".len()).any(|part| part == b"ready") {
+                    ready_sent = true;
+                    let _ = ready_sender.send(());
+                }
+            }
+            ExecutionEvent::TerminalInputCredit { credits, .. } => {
+                let _ = credit_sender.send(credits);
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    let started = std::time::Instant::now();
+    let result = backend.execute(
+        &invocation.request,
+        &invocation.decision,
+        &mut sink,
+        &input,
+        &cancellation,
+    );
+    let elapsed = started.elapsed();
+    feeder.join().expect("input feeder");
+
+    assert_eq!(result.terminal, TerminalState::Cancelled);
+    assert!(
+        result.cleanup.is_complete(),
+        "cancellation cleanup failed: {:?}",
+        result.cleanup.failures
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "blocked terminal input delayed cancellation for {elapsed:?}"
+    );
 }
 
 #[test]

@@ -305,6 +305,16 @@ impl ChannelInput {
 }
 
 impl InputSender {
+    /// Queues a command without blocking a control reader.
+    pub fn try_offer(&self, command: TerminalCommand) -> Result<(), InputOfferError> {
+        use std::sync::mpsc::TrySendError;
+        match self.sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(InputOfferError::Saturated),
+            Err(TrySendError::Disconnected(_)) => Err(InputOfferError::Disconnected),
+        }
+    }
+
     /// Queues a command, giving up after `bound` rather than blocking.
     pub fn offer(
         &self,

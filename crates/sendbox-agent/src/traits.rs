@@ -84,6 +84,7 @@ pub struct GuestTerminalSize {
     pub columns: u16,
     pub rows: u16,
     pub term: String,
+    pub separate_stderr: bool,
 }
 
 impl fmt::Debug for GuestLaunchRequest<'_> {
@@ -111,6 +112,9 @@ pub enum GuestEvent {
     Output {
         stream: OutputStream,
         bytes: Vec<u8>,
+    },
+    TerminalInputCredit {
+        credits: u16,
     },
     Terminal(GuestTerminal),
 }
@@ -223,6 +227,10 @@ impl fmt::Debug for HostTerminalCommand {
 /// Source of host terminal commands for an interactive run.
 pub trait TerminalSource: Send + Sync {
     fn next_command<'a>(&'a self) -> BoxFuture<'a, Option<HostTerminalCommand>>;
+
+    fn grant_input_credit(&self, _credits: u16) -> Result<(), AgentError> {
+        Ok(())
+    }
 }
 
 /// Terminal source for headless runs, which never produce commands.
