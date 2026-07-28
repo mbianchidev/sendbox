@@ -35,9 +35,10 @@ provider with a narrower capability set.
   versioned hash-chained records with Merkle summaries and externally verifiable
   heads.
 - **Native MCP Boundary** — Apple and Kata guests install a root-owned stdio
-  broker with bounded framing, strict JSON-RPC validation, deny-first tool
-  policy, exact server commands, a cleared environment, and versioned
-  observation records. See [docs/mcp-inspection.md](docs/mcp-inspection.md).
+  broker and trusted Streamable HTTP gateway with bounded framing, strict
+  JSON-RPC validation, exact server identities, independent deny-first tool
+  policies, filtered discovery, and one mandatory redacted audit path. See
+  [docs/mcp-inspection.md](docs/mcp-inspection.md).
 - **Boundary Enforcement** — The host signs one immutable runtime plan before
   provider dispatch. The authenticated guest starts mandatory security services
   before workload execution and rejects session, policy, feature, or cgroup
@@ -334,6 +335,19 @@ policy:
             default_action: deny
             allowlist: [search_code, get_file_contents]
             denylist: ["create_*", "update_*", "delete_*"]
+        remote-docs:
+          transport: streamable_http
+          url: https://mcp.example.com/mcp
+          tools:
+            default_action: deny
+            allowlist: [search_docs, get_document]
+            denylist: ["create_*", "update_*", "delete_*"]
+          http:
+            allow_redirects: false
+            max_response_bytes: 1048576
+            request_timeout_seconds: 30
+            authorization:
+              bearer_secret: REMOTE_MCP_TOKEN
     syscalls:
       additional_denylist:
         - io_uring_setup
@@ -389,12 +403,17 @@ The native Rust admission engine is connected to persistent Apple and Kata `send
 sessions through authenticated guest bootstrap. It does not replace hosting-provider rulesets
 or protect alternate clients and direct GitHub API calls.
 
-Local stdio MCP configuration is validated before launch and must use
-`/run/sendbox-boundary/mcp-broker -- <exact-approved-command>`. The broker derives a stable server
-policy from exact argv, filters `tools/list`, and enforces that server's deny-first tool rules again
-at `tools/call`. Apple and Kata guests install the root-owned broker, signed policy, and mandatory
-append-only audit log before the agent starts; server children receive a cleared, signed environment
-and fixed workspace. HTTP/SSE inspection and Hyperlight MCP composition fail closed.
+Local stdio MCP configuration must use
+`/run/sendbox-boundary/mcp-broker -- <exact-approved-command>`. Remote project
+definitions must use the deterministic
+`http://127.0.0.1:15081/mcp/<server-id>` route and the configured
+`streamable-http` or `streamable-http-2025` type; direct upstream URLs and
+project-supplied credentials are rejected. Stdio and HTTP share exact server
+resolution, deny-first tool policy, `tools/list` filtering, call-time checks,
+and a root-owned audit log. The gateway verifies TLS, revalidates DNS and
+redirect addresses, pins exact destinations, and keeps bearer credentials out
+of the agent environment. Legacy 2024 HTTP+SSE and Hyperlight MCP composition
+fail closed.
 
 ### Copilot credentials
 
@@ -434,7 +453,7 @@ and never print a credential value.
 | `policy.commands` | object | Command allowlist/denylist policy |
 | `policy.network` | object | Outbound network policy |
 | `policy.boundaries.enabled` | bool | Install fail-closed MCP and syscall boundaries |
-| `policy.boundaries.tool_calls` | object | Framed stdio MCP tool allow/deny rules |
+| `policy.boundaries.tool_calls` | object | Exact stdio/HTTP MCP servers with independent tool and transport policy |
 | `policy.boundaries.syscalls.additional_denylist` | list | Extra syscall names blocked by seccomp |
 | `secrets` | list | Secret names injected at runtime |
 | `devcontainer.auto_generate` | bool | Generate a devcontainer spec |
@@ -504,8 +523,9 @@ SendBox follows a **deny-by-default** security posture:
 1. **Filesystem** — Only explicitly configured host paths are mounted into the guest. State and workspace roots cannot overlap.
 2. **Commands** — Deny rules win over allow rules for the brokered top-level argv. Descendants are constrained by the guest execution boundary, not recursively reinterpreted as shell text.
 3. **Network** — Persistent workloads can reach only the loopback DNS and SOCKS5 brokers. Kernel rules deny direct external agent traffic and unmarked broker traffic.
-4. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when repository scope matches policy. Secret values use authenticated envelopes and temporary owner-only guest files where a child process requires a file.5. **Isolation** — Apple and Kata provide persistent Linux VMs; Hyperlight provides explicit Linux/KVM one-shot isolation. Missing host or runtime capabilities are errors, never silent fallbacks.
-6. **Boundaries** — Signed guest services must become ready before execution. Local stdio MCP calls must traverse the installed broker; HTTP/SSE, direct project-server configuration, and unsupported transports fail closed.
+4. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when repository scope matches policy. Gateway credential names form a separate signed partition and their values never enter the agent environment.
+5. **Isolation** — Apple and Kata provide persistent Linux VMs; Hyperlight provides explicit Linux/KVM one-shot isolation. Missing host or runtime capabilities are errors, never silent fallbacks.
+6. **Boundaries** — Signed guest services must become ready before execution. Stdio MCP calls traverse the installed broker; remote MCP calls traverse the loopback gateway. Direct upstream access, unknown routes, unsupported transports, and authorization fallback fail closed.
 7. **Branches** — Trusted Git wrappers restrict selected-repository push and pull operations. Alternate clients and direct hosting-provider APIs remain outside this local guard, so server-side rules stay required.
 
 ## CLI Reference

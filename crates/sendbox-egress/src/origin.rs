@@ -8,6 +8,9 @@ use thiserror::Error;
 use crate::address::canonicalize;
 use crate::domain;
 
+const MAX_OBSERVED_NAMES_PER_ORIGIN: usize = 64;
+const MAX_OBSERVED_ADDRESSES_PER_ORIGIN: usize = 256;
+
 #[derive(Debug, Error)]
 pub enum OriginReservationError {
     #[error("invalid reserved MCP origin host '{0}'")]
@@ -16,6 +19,8 @@ pub enum OriginReservationError {
     InvalidPort,
     #[error("reserved MCP origin state is unavailable")]
     Poisoned,
+    #[error("reserved MCP origin state exceeded its configured bound")]
+    CapacityExceeded,
 }
 
 #[derive(Debug, Default)]
@@ -24,16 +29,39 @@ struct ReservationState {
     addresses: BTreeSet<(IpAddr, u16)>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OriginReservations {
     remote_mcp_active: bool,
+    max_names: usize,
+    max_addresses: usize,
     state: RwLock<ReservationState>,
+}
+
+impl Default for OriginReservations {
+    fn default() -> Self {
+        Self {
+            remote_mcp_active: false,
+            max_names: 0,
+            max_addresses: 0,
+            state: RwLock::new(ReservationState::default()),
+        }
+    }
 }
 
 impl OriginReservations {
     pub fn new(origins: &[McpHttpOrigin]) -> Result<Self, OriginReservationError> {
+        let max_names = origins
+            .len()
+            .checked_mul(MAX_OBSERVED_NAMES_PER_ORIGIN + 1)
+            .ok_or(OriginReservationError::CapacityExceeded)?;
+        let max_addresses = origins
+            .len()
+            .checked_mul(MAX_OBSERVED_ADDRESSES_PER_ORIGIN)
+            .ok_or(OriginReservationError::CapacityExceeded)?;
         let reservations = Self {
             remote_mcp_active: !origins.is_empty(),
+            max_names,
+            max_addresses,
             state: RwLock::new(ReservationState::default()),
         };
         for origin in origins {
@@ -54,21 +82,39 @@ impl OriginReservations {
         aliases: &[String],
         addresses: &[IpAddr],
     ) -> Result<(), OriginReservationError> {
-        self.reserve_configured(host, port)?;
+        if port == 0 {
+            return Err(OriginReservationError::InvalidPort);
+        }
+        let mut names = aliases
+            .iter()
+            .map(|alias| normalize_host(alias).map(|alias| (alias, port)))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        names.insert((normalize_host(host)?, port));
+        let addresses = addresses
+            .iter()
+            .copied()
+            .map(canonicalize)
+            .map(|address| (address, port))
+            .collect::<BTreeSet<_>>();
         let mut state = self
             .state
             .write()
             .map_err(|_| OriginReservationError::Poisoned)?;
-        for alias in aliases {
-            state.names.insert((normalize_host(alias)?, port));
+        let new_names = names
+            .iter()
+            .filter(|name| !state.names.contains(*name))
+            .count();
+        let new_addresses = addresses
+            .iter()
+            .filter(|address| !state.addresses.contains(*address))
+            .count();
+        if state.names.len().saturating_add(new_names) > self.max_names
+            || state.addresses.len().saturating_add(new_addresses) > self.max_addresses
+        {
+            return Err(OriginReservationError::CapacityExceeded);
         }
-        state.addresses.extend(
-            addresses
-                .iter()
-                .copied()
-                .map(canonicalize)
-                .map(|address| (address, port)),
-        );
+        state.names.extend(names);
+        state.addresses.extend(addresses);
         Ok(())
     }
 
@@ -101,11 +147,14 @@ impl OriginReservations {
             return Err(OriginReservationError::InvalidPort);
         }
         let host = normalize_host(host)?;
-        self.state
+        let mut state = self
+            .state
             .write()
-            .map_err(|_| OriginReservationError::Poisoned)?
-            .names
-            .insert((host, port));
+            .map_err(|_| OriginReservationError::Poisoned)?;
+        if !state.names.contains(&(host.clone(), port)) && state.names.len() >= self.max_names {
+            return Err(OriginReservationError::CapacityExceeded);
+        }
+        state.names.insert((host, port));
         Ok(())
     }
 }
@@ -155,6 +204,27 @@ mod tests {
         assert!(
             !reservations
                 .denies_hostname("edge.example.net", 8443)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn observed_origin_state_is_bounded_and_updated_atomically() {
+        let reservations = OriginReservations::new(&[McpHttpOrigin {
+            host: "api.example.com".to_owned(),
+            port: 443,
+        }])
+        .unwrap();
+        let aliases = (0..=MAX_OBSERVED_NAMES_PER_ORIGIN)
+            .map(|index| format!("edge-{index}.example.net"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            reservations.reserve_resolution("api.example.com", 443, &aliases, &[]),
+            Err(OriginReservationError::CapacityExceeded)
+        ));
+        assert!(
+            !reservations
+                .denies_hostname("edge-0.example.net", 443)
                 .unwrap()
         );
     }

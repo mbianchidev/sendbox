@@ -502,6 +502,12 @@ mod tests {
         assert!(text.contains(
             "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip daddr 127.0.0.1 udp dport 15053 accept"
         ));
+        assert!(text.contains(
+            "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip daddr 127.0.0.1 tcp dport 15081 accept"
+        ));
+        assert!(text.contains(
+            "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip6 daddr ::1 tcp dport 15081 accept"
+        ));
         // The agent identity never gets a blanket accept.
         assert!(!text.contains("\"sendbox/inst01/agent\" meta mark"));
         assert!(!text.contains("\"sendbox/inst01/agent\" accept"));
@@ -600,6 +606,13 @@ mod tests {
         let mut zero = config();
         zero.broker_mark = 0;
         assert!(matches!(zero.validate(), Err(NftError::ZeroMark)));
+
+        let mut duplicate_port = config();
+        duplicate_port.mcp_gateway_port = Some(duplicate_port.connect_broker_tcp_port);
+        assert!(matches!(
+            duplicate_port.validate(),
+            Err(NftError::InvalidBrokerPorts)
+        ));
 
         let mut iface = config();
         iface.fixture_iface = Some("bad iface".to_owned());

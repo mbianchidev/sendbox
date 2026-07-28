@@ -157,6 +157,34 @@ policy:
               - "create_*"
               - "update_*"
               - "delete_*"
+        remote-docs:
+          # Project MCP files must use:
+          #   type: streamable-http
+          #   url: http://127.0.0.1:15081/mcp/remote-docs
+          transport: streamable_http
+          url: https://mcp.example.com/mcp
+          tools:
+            default_action: deny
+            allowlist:
+              - search_docs
+              - get_document
+            denylist:
+              - "create_*"
+              - "update_*"
+              - "delete_*"
+          http:
+            allow_redirects: false
+            max_request_bytes: 1048576
+            max_response_bytes: 1048576
+            request_timeout_seconds: 30
+            connect_timeout_seconds: 10
+            idle_timeout_seconds: 30
+            max_events: 1024
+            max_concurrent_requests: 32
+            authorization:
+              # Stored in the SendBox vault, delivered only to the trusted
+              # gateway, and intentionally absent from top-level secrets.
+              bearer_secret: REMOTE_MCP_TOKEN
 
     syscalls:
       # These extend the built-in ContainerHardening seccomp denylist.

@@ -1,128 +1,224 @@
-# MCP brokering and inspection
+# MCP boundary and inspection
 
-`sendbox-mcp` is the native Rust library for local stdio MCP authorization,
-project configuration validation, and observation processing. Production
-`sendbox run` validates configuration on the host, binds the policy digest into
-the signed boundary plan, and installs the broker in authenticated Apple and Kata
-guests.
+SendBox provides one fail-closed MCP authorization model for exact stdio
+servers and trusted Streamable HTTP upstreams. Optional inspection records are
+an observation by-product; they are not an authorization mechanism.
 
-## Authorization boundary
+## Configure server and tool policy
 
-Authorization applies only to local stdio MCP servers launched through the
-broker:
-
-- Newline and `Content-Length` frames are bounded before body allocation.
-- JSON-RPC 2.0 requests, notifications, responses, errors, and IDs are validated
-  before forwarding. Batch messages are rejected.
-- The exact server argv selects one stable policy ID. Project aliases and
-  caller-supplied IDs never select policy.
-- Each server has independent deny-first `*`/`?` tool rules. Denylist matches
-  win, then allowlist matches, then the server default.
-- Correlated `tools/list` responses are filtered before forwarding. Every
-  `tools/call` is checked again even if the tool was previously listed.
-- Denied requests receive error `-32001` in the request's framing mode. Denied
-  notifications are dropped.
-- Missing `params.name`, malformed JSON-RPC, oversized frames, child death,
-  output saturation, and broker cancellation fail closed.
-- The injected process launcher receives one exact approved absolute executable
-  and argv vector. Shells, package runners, project-defined environment
-  overrides, and project-defined working directories are rejected.
-- The Tokio launcher clears its inherited environment before applying the
-  administrator-supplied minimal environment.
-- Every decision is written first to the root-created JSON-lines boundary audit
-  log. Audit failure denies the operation and terminates the broker.
-
-Remote HTTP/SSE MCP is not an authorization or inspection surface. Enabling HTTP
-inspection fails closed because the native runtime cannot observe TLS plaintext.
-
-## Project configuration
-
-The validator checks every existing Swift-recognized path:
-
-- `.mcp.json`
-- `.vscode/mcp.json`
-- `.github/copilot/mcp.json`
-- `.cursor/mcp.json`
-- `.claude/mcp.json`
-
-It accepts `mcpServers` or `servers` at the root or below `mcp`. A local server
-must use `/run/sendbox-boundary/mcp-broker`, `--`, and an exact command from one
-`policy.boundaries.tool_calls.servers` stdio entry. The project-local name may
-be any alias; exact argv uniquely determines the trusted policy. Remote
-transports, unproxied commands, wrapper arguments, policy-ID fields, shells,
-package runners, `env`, and `cwd` are rejected.
+`policy.boundaries.tool_calls.servers` maps stable policy IDs to exact transport
+identities and independent tool policies:
 
 ```yaml
-boundaries:
-  tool_calls:
-    max_frame_bytes: 1048576
-    servers:
-      github:
-        transport: stdio
-        command: ["/usr/local/bin/github-mcp-server", "stdio"]
-        tools:
-          default_action: deny
-          allowlist: [search_code, get_file_contents]
-          denylist: ["create_*", "update_*", "delete_*"]
-      filesystem:
-        transport: stdio
-        command: ["/usr/local/bin/node", "/opt/mcp/filesystem.js", "/workspace"]
-        tools:
-          default_action: deny
-          allowlist: [read_file, list_directory]
-          denylist: ["write_*", "move_*", "delete_*"]
+policy:
+  boundaries:
+    enabled: true
+    tool_calls:
+      max_frame_bytes: 1048576
+      servers:
+        filesystem:
+          transport: stdio
+          command:
+            - /usr/local/bin/node
+            - /usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js
+            - /workspaces/my-project
+          tools:
+            default_action: deny
+            allowlist: [read_file, list_directory]
+            denylist: ["write_*", "delete_*"]
+
+        remote-docs:
+          transport: streamable_http
+          url: https://mcp.example.com/mcp
+          tools:
+            default_action: deny
+            allowlist: [search_docs, get_document]
+            denylist: ["create_*", "update_*", "delete_*"]
+          http:
+            allow_redirects: false
+            max_request_bytes: 1048576
+            max_response_bytes: 1048576
+            request_timeout_seconds: 30
+            connect_timeout_seconds: 10
+            idle_timeout_seconds: 30
+            max_events: 1024
+            max_concurrent_requests: 32
+            authorization:
+              bearer_secret: REMOTE_MCP_TOKEN
 ```
 
-Server IDs must match `[a-z][a-z0-9_-]{0,63}`. Commands must be absolute,
-non-shell vectors of at most 16 printable parts. Duplicate IDs, duplicate exact
-commands, empty allow-by-default policies, and mixed legacy/hierarchical fields
-are configuration errors.
+Server IDs are stable policy identities, not caller-provided authorization
+claims. Exact stdio argv or an exact deterministic gateway route selects the
+policy. Unknown servers, ambiguous identities, changed commands or endpoints,
+invalid transport metadata, and audit failures deny.
 
-## Legacy configuration migration
+Tool deny rules win, then allow rules, then `default_action`. Use
+`default_action: deny` to require explicit tool admission. SendBox filters every
+`tools/list` page and checks `tools/call` again, so discovery is never an
+authorization grant.
 
-The former global `allowlist`, `denylist`, `default_action`, and
-`allowed_server_commands` fields remain an explicit compatibility mode. Each
-legacy exact command receives a deterministic `legacy-<fingerprint>` audit ID.
-Legacy and hierarchical fields cannot be mixed. Migrate by moving every command
-under a stable `servers.<id>` entry and copying the global tool rules into that
-server's `tools` block, then narrow permissions independently.
+All policy and configuration structs reject unknown YAML fields. Stdio and HTTP
+server entries are tagged by `transport` and cannot mix transport-specific
+fields.
 
-`sendbox boundary inspect --config <path> [--json]` reports the mode, stable
-server IDs, non-reversible command fingerprints, transports, and effective tool
-rules without printing command arguments.
+## Bind project MCP definitions
 
-## Observation formats
+SendBox validates `.mcp.json`, `.vscode/mcp.json`,
+`.github/copilot/mcp.json`, `.cursor/mcp.json`, and `.claude/mcp.json`.
+Project aliases do not affect policy selection and project files cannot select a
+SendBox policy ID.
 
-The parser retains compatibility with legacy Swift trace lines:
+Stdio definitions must invoke the installed broker followed by one exact
+approved command:
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "type": "stdio",
+      "command": "/run/sendbox-boundary/mcp-broker",
+      "args": [
+        "--",
+        "/usr/local/bin/node",
+        "/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js",
+        "/workspaces/my-project"
+      ]
+    }
+  }
+}
+```
+
+Remote definitions must select the exact loopback route derived from the server
+ID:
+
+```json
+{
+  "mcpServers": {
+    "docs": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:15081/mcp/remote-docs"
+    }
+  }
+}
+```
+
+Direct upstream URLs, custom headers or credentials, URL drift, query strings,
+fragments, user information, env/cwd overrides, wrapper chains, unknown routes,
+and unsupported transports are rejected.
+
+## HTTP transport modes
+
+- `streamable_http` implements modern Streamable HTTP with POST-only,
+  request-scoped JSON or SSE responses. Session IDs, GET streams, DELETE, and
+  reconnect event IDs are rejected.
+- `streamable_http_2025` is an explicit compatibility mode for issued session
+  IDs, GET/SSE, DELETE, and validated `Last-Event-ID` reconnects. Sessions and
+  observed event IDs are bound to one server and gateway instance.
+- Legacy 2024 HTTP+SSE and WebSocket upgrades are unsupported and fail closed.
+
+For either supported HTTP mode, the root-owned gateway:
+
+- accepts only the canonical `/mcp/<server-id>` loopback route;
+- validates JSON-RPC, status, content type, protocol metadata, response IDs,
+  sizes, concurrency, timeouts, and SSE event limits;
+- verifies TLS chains, validity, hostname, and SNI with system roots plus any
+  configured PEM roots;
+- resolves each connection independently, classifies every address, and dials
+  the exact validated address with the egress mark;
+- disables redirects by default and permits only exact configured redirect
+  targets when enabled;
+- strips hop-by-hop, cookie, and unapproved headers;
+- has no direct-upstream fallback.
+
+Plaintext HTTP is limited to loopback endpoints with
+`allow_plaintext_local: true`. Restricted literal addresses require
+`allow_private_networks: true`; metadata addresses remain denied.
+
+Remote MCP forces authenticated egress enforcement. Agent processes can reach
+only the loopback gateway route, configured upstream names are reserved from the
+normal CONNECT broker, and direct-IP CONNECT is disabled while remote MCP is
+active. TLS uprobes remain observation-only and never authorize traffic.
+
+## Gateway credentials
+
+`http.authorization.bearer_secret` names a value in the SendBox vault. Store it
+with the normal secret CLI:
+
+```bash
+sendbox secrets add REMOTE_MCP_TOKEN
+```
+
+Gateway credential names are signed separately from top-level `secrets` and
+must not overlap them. Values are resolved by the host, delivered only through
+authenticated root-owned bootstrap material, zeroized, and injected only into
+the configured upstream request. They never enter the workload environment or
+project MCP file.
+
+## Inspect the resolved boundary
+
+Inspect policy without launching a sandbox:
+
+```bash
+sendbox boundary inspect --config .sendbox.yaml
+sendbox boundary inspect --config .sendbox.yaml --json
+```
+
+The output identifies hierarchical versus legacy mode and reports each server's
+ID, transport, fingerprint, exact command or normalized endpoint, deterministic
+local gateway route, effective tool rules, HTTP limits, TLS settings, redirect
+policy, and credential reference names. Secret values are never shown.
+
+## Mandatory audit and optional observation
+
+Stdio and HTTP authorization share a mandatory append-only JSONL audit path:
 
 ```text
-SENDBOX_MCP<TAB>ts<TAB>pid<TAB>comm<TAB>transport<TAB>direction<TAB>payload
+/var/log/sendbox/mcp-audit.jsonl
 ```
 
-The native versioned format is:
+Records include stable server identity, transport and fingerprint, normalized
+endpoint where applicable, method/tool, outcome, rule/reason, status, byte
+counts, timing, and hashed session identity. They exclude commands, tool
+arguments, payloads, environment values, and credentials. The trusted service
+writes a record before an action takes effect; write failure is terminal.
 
-```text
-SENDBOX_MCP_EVENT<TAB>{"schema_version":1,...}
+Optional stdio observation can be enabled separately:
+
+```yaml
+observability:
+  mcp_inspection:
+    enabled: true
+    transports: [stdio]
+    capture_payloads: false
+    max_payload_bytes: 16384
+    log_path: /var/log/sendbox/mcp-trace.log
 ```
 
-The guest broker emits the native format for wrapper-mediated stdio traffic. The
-log is created by the root supervisor and is writable only by the configured
-workload group. When payload capture is disabled, arguments and error messages
-are removed before the event is written.
+Inspection requires `policy.boundaries.enabled: true`. Paths outside
+`/var/log/sendbox`, duplicate transports, and unsupported transports are
+rejected. Payload text is omitted unless capture is explicitly enabled and is
+then truncated to the configured bound.
 
-Authorization decisions use the separate boundary audit log configured by
-`policy.boundaries.log_path`. Records include the server policy ID, command
-fingerprint, transport, method, tool, outcome, matching rule, and denial reason.
-They never include command arguments or tool arguments.
+```bash
+sendbox mcp parse /var/log/sendbox/mcp-trace.log
+sendbox mcp report /var/log/sendbox/mcp-trace.log --json
+```
 
-Both formats support request/response correlation by process and JSON-RPC ID,
-method/category classification, payload redaction, deterministic summaries, and
-deterministic reports.
+Apple and Kata support MCP composition. Hyperlight rejects it.
 
-## Runtime limits
+## Deprecated flat policy
 
-Only traffic that traverses the installed stdio broker is authorized and
-observed. Project configuration that launches a server directly, sets its own
-environment or working directory, uses a shell/package runner, or selects a
-remote transport is rejected. Separately available binaries and alternate
-clients remain outside this wrapper boundary.
+The old flat stdio fields remain as an explicit compatibility mode:
+
+```yaml
+tool_calls:
+  allowed_server_commands:
+    - [/usr/local/bin/github-mcp-server, stdio]
+  default_action: deny
+  allowlist: [search_code]
+  denylist: ["delete_*"]
+```
+
+Flat fields cannot be mixed with `servers`. SendBox synthesizes deterministic
+legacy IDs from command fingerprints and exposes the compatibility mode in
+boundary inspection. New configurations should use hierarchical `servers`.

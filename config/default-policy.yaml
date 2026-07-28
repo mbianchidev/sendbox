@@ -195,10 +195,12 @@ commands:
 #
 #   /run/sendbox-boundary/mcp-broker -- <server> [args...]
 #
-# The authenticated guest broker derives the server policy from exact argv,
-# validates JSON-RPC, filters tools/list, clears the server environment, and
-# applies that server's independent tool policy. HTTP/SSE remains unsupported
-# until the trusted HTTP gateway is configured.
+# The authenticated guest derives stdio policy from exact argv and remote policy
+# from an exact deterministic loopback gateway URL. Both paths validate JSON-RPC,
+# filter tools/list, and apply the selected server's independent tool policy.
+# Modern streamable_http is supported through the trusted gateway. Stateful
+# 2025 behavior requires explicit streamable_http_2025; legacy 2024 HTTP+SSE is
+# unsupported.
 boundaries:
   enabled: true
   tool_calls:

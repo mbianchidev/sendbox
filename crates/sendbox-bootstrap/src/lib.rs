@@ -764,7 +764,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use sendbox_mcp::runtime::RUNTIME_POLICY_SCHEMA_VERSION;
-    use sendbox_policy::{Action, ToolCallPolicy, ToolTransport};
+    use sendbox_policy::{
+        Action, McpHttpPolicy, McpServerPolicy, ServerToolPolicy, ToolCallPolicy, ToolTransport,
+    };
 
     use super::*;
 
@@ -824,6 +826,24 @@ mod tests {
             fixed_environment: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
             inherited_environment_keys: BTreeSet::from(["TOKEN".to_owned()]),
             observation: None,
+        }
+    }
+
+    fn remote_mcp_policy() -> RuntimePolicyDocument {
+        RuntimePolicyDocument {
+            tool_policy: ToolCallPolicy {
+                servers: BTreeMap::from([(
+                    "remote".to_owned(),
+                    McpServerPolicy::StreamableHttp {
+                        url: "https://mcp.example.com/mcp".to_owned(),
+                        tools: ServerToolPolicy::default(),
+                        http: McpHttpPolicy::default(),
+                    },
+                )]),
+                ..ToolCallPolicy::default()
+            },
+            inherited_environment_keys: BTreeSet::new(),
+            ..mcp_policy()
         }
     }
 
@@ -937,5 +957,42 @@ mod tests {
             .cgroup_parent = drifted.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
         config.egress_policy = Some(drifted);
         assert!(encode_bootstrap_document(config, &[5; 32]).is_err());
+    }
+
+    #[test]
+    fn remote_mcp_bootstrap_requires_authenticated_egress() {
+        let mut config = configuration();
+        let mcp = remote_mcp_policy();
+        config
+            .execution_broker
+            .as_mut()
+            .expect("execution broker")
+            .mcp_policy = Some(mcp.clone());
+        assert!(encode_bootstrap_document(config.clone(), &[6; 32]).is_err());
+
+        let network = sendbox_policy::NetworkPolicy {
+            default_action: Action::Allow,
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            allow_dns: true,
+            max_connections: None,
+            allowed_networks: Vec::new(),
+            blocked_networks: Vec::new(),
+            allowed_ports: Vec::new(),
+            dns: sendbox_policy::DnsPolicy::default(),
+        };
+        let egress = EgressRuntimePolicyDocument::for_session_with_mcp(
+            config.session_id,
+            network,
+            Some(&mcp.tool_policy),
+        )
+        .unwrap();
+        config
+            .execution_broker
+            .as_mut()
+            .expect("execution broker")
+            .cgroup_parent = egress.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
+        config.egress_policy = Some(egress);
+        assert!(encode_bootstrap_document(config, &[6; 32]).is_ok());
     }
 }

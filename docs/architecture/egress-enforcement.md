@@ -183,27 +183,29 @@ everything down.
 
 ## Authenticated production composition
 
-The host derives a schema-v1 `RuntimePolicyDocument` from the authenticated
-session ID and the configured `NetworkPolicy`. Apple and Kata bind that exact
-document into guest bootstrap together with the matching execution broker
-cgroup parent. The guest rejects session or cgroup drift before starting any
-service.
+The host derives a schema-v2 `RuntimePolicyDocument` from the authenticated
+session ID, configured `NetworkPolicy`, and any remote MCP origins. Apple and
+Kata bind that exact document into guest bootstrap together with the matching
+execution broker cgroup parent. The guest rejects session, cgroup, gateway-port,
+reserved-origin, or direct-IP-policy drift before starting any service.
 
 The guest supervisor makes Egress a mandatory service and makes Exec depend on
 it. The egress supervisor:
 
 1. validates and consumes its root-owned configuration;
 2. recovers the original resolver from root-owned state under `/run/sendbox`;
-3. starts a separate gateway child that binds DNS and SOCKS5 listeners but does
-   not serve yet;
+3. starts a separate gateway child that binds DNS, SOCKS5 CONNECT, and, when
+   required, the trusted MCP HTTP listener, but does not serve yet;
 4. arms delegated cgroups and nftables, then places the gateway in the broker
    cgroup;
 5. authorizes the gateway to serve, installs loopback resolver configuration,
    and only then publishes readiness.
 
 Workloads receive exact upper- and lower-case `ALL_PROXY`/`NO_PROXY` variables.
-The authenticated MCP broker receives the same fixed proxy environment, so MCP
-servers remain descendants of execution leaves and cannot bypass enforcement.
+The authenticated stdio MCP broker receives the same fixed proxy environment,
+so local server children remain descendants of execution leaves and cannot
+bypass enforcement. The remote MCP gateway remains in the broker cgroup and
+uses marked exact-address dials rather than the agent-facing CONNECT cache.
 Shutdown runs in reverse dependency order: Exec is fully stopped before Egress
 restores resolver state and attempts cgroup-then-nftables teardown. All service
 shutdown failures are aggregated rather than abandoning later cleanup.
@@ -238,18 +240,47 @@ agent ──(loopback)──▶ DNS broker ──validate name/CNAME/addr, budge
                                                             │ shared AuthorizationCache
 agent ──(loopback CONNECT)──▶ CONNECT broker ──pin validated ip, re-check policy──▶
                                     dial (SO_MARK) ──▶ upstream
+
+agent ──(loopback /mcp/<server-id>)──▶ MCP gateway
+       ──separate marked DNS, classify, reserve aliases/addresses, exact-IP dial──▶
+       configured upstream
 ```
 
 nftables drops any agent packet that is not headed to a loopback broker port,
 and any broker external packet that lacks the mark or targets metadata.
 
+## Remote MCP reservation and bypass protection
+
+Remote MCP is admitted only through the trusted application-layer gateway.
+Primary and redirect origins are normalized into the signed runtime policy.
+The agent-facing CONNECT broker checks those configured names and observed
+aliases before ordinary domain authorization and denies them first.
+
+While any remote MCP server is configured:
+
+- authenticated egress is mandatory even if the ordinary network policy would
+  otherwise be permissive;
+- nftables admits the exact MCP loopback port in addition to DNS and CONNECT;
+- all agent-facing direct-IP CONNECT is denied, preventing literal-IP and
+  shared-address bypasses;
+- gateway DNS uses a separate marked resolver and never grants authorization in
+  the agent cache;
+- every observed address is classified before reservation or dialing, metadata
+  addresses are always rejected, and reservation updates are bounded and
+  atomic;
+- only the broker cgroup can emit marked upstream packets.
+
+There is no direct-origin fallback if the gateway, DNS validation, TLS,
+reservation update, audit sink, or egress control fails.
+
 ## Policy source of truth
 
-`sendbox_policy::NetworkPolicy` remains authoritative. The crate adds only
-`#[serde(default)]` fields (`allowed_networks`, `blocked_networks`,
-`allowed_ports`, and a nested `dns` block), so every previously valid policy
-document still parses unchanged. `allow_dns = false` binds no DNS broker and
-installs no nftables DNS accept rule.
+`sendbox_policy::NetworkPolicy` remains authoritative for ordinary workload
+egress. The signed runtime document additionally carries policy-derived remote
+MCP origins, the trusted gateway port, and direct-IP denial. These fields must
+exactly match the signed MCP policy. `allow_dns = false` binds no agent-facing
+DNS broker and installs no nftables DNS accept rule; the trusted MCP gateway
+still uses its separate marked resolver when remote MCP is configured.
 
 Compilation and validation fail closed rather than substituting a
 success-shaped default for an invalid value:

@@ -265,6 +265,7 @@ pub async fn run_audit_service(policy_path: PathBuf) -> Result<(), GuestError> {
                 let (stream, _) =
                     accepted.map_err(|error| GuestError::io("accepting MCP audit event", error))?;
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    eprintln!("[sendbox-mcp-audit] connection capacity exceeded");
                     continue;
                 };
                 let sink = Arc::clone(&sink);

@@ -2,7 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use sendbox_policy::{
-    Action, BoundaryPolicy, DnsPolicy, DnsRecordType, NetworkPolicy, PolicyConfiguration, Protocol,
+    Action, BoundaryPolicy, DnsPolicy, DnsRecordType, McpHttpOrigin, NetworkPolicy,
+    PolicyConfiguration, Protocol,
 };
 
 fn workspace_path(relative: &str) -> PathBuf {
@@ -373,6 +374,42 @@ boundaries:
 "#;
     let policy: PolicyConfiguration = serde_yaml_ng::from_str(local_http).unwrap();
     policy.validate().unwrap();
+}
+
+#[test]
+fn remote_origin_reservations_include_exact_redirect_origins() {
+    let yaml = r#"
+commands: { default_action: deny, allowlist: [], denylist: [], log_blocked: true }
+network: { default_action: deny, allowed_domains: [], blocked_domains: [], allow_dns: true }
+boundaries:
+  tool_calls:
+    servers:
+      remote:
+        transport: streamable_http
+        url: "https://mcp.example.com/mcp"
+        http:
+          allow_redirects: true
+          redirect_allowlist:
+            - "https://mcp.example.com/mcp-v2"
+            - "https://edge.example.net:8443/mcp"
+"#;
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(yaml).unwrap();
+    policy.validate().unwrap();
+    assert_eq!(
+        policy.boundaries.tool_calls.remote_origins().unwrap(),
+        [
+            McpHttpOrigin {
+                host: "edge.example.net".to_owned(),
+                port: 8443,
+            },
+            McpHttpOrigin {
+                host: "mcp.example.com".to_owned(),
+                port: 443,
+            },
+        ]
+        .into_iter()
+        .collect()
+    );
 }
 
 #[test]

@@ -712,7 +712,62 @@ impl HttpGateway {
             .servers
             .get(server_id)
             .ok_or_else(|| HttpProblem::not_found("unknown MCP gateway route"))?;
-        validate_method(server.remote.transport, request.method())?;
+        let started = Instant::now();
+        let method = request.method().clone();
+        let incoming_headers = request.headers().clone();
+        let session_result = header_optional(&incoming_headers, "mcp-session-id");
+        let session_for_audit = session_result.as_ref().ok().cloned().flatten();
+        let request_bytes = incoming_headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let result = match session_result {
+            Ok(session_id) => {
+                self.handle_server_request(
+                    server,
+                    request,
+                    method,
+                    incoming_headers,
+                    session_id,
+                    started,
+                )
+                .await
+            }
+            Err(problem) => Err(problem),
+        };
+        match result {
+            Ok(response) => Ok(response),
+            Err(problem) if problem.fatal => Err(problem),
+            Err(problem) => {
+                let decision = transport_decision(
+                    &server.policy,
+                    "http/request",
+                    AuditOutcome::Denied,
+                    Some(problem.rpc_message.clone()),
+                );
+                self.record_decision(
+                    &decision,
+                    session_for_audit.as_deref(),
+                    request_bytes,
+                    None,
+                    Some(problem.status),
+                    started,
+                )?;
+                Err(problem)
+            }
+        }
+    }
+
+    async fn handle_server_request(
+        &self,
+        server: &GatewayServer,
+        request: Request<Incoming>,
+        method: Method,
+        incoming_headers: HeaderMap,
+        session_id: Option<String>,
+        started: Instant,
+    ) -> Result<Response<GatewayBody>, HttpProblem> {
+        validate_method(server.remote.transport, &method)?;
         let permit = timeout(
             Duration::from_secs(server.remote.http.request_timeout_seconds),
             Arc::clone(&server.concurrency).acquire_owned(),
@@ -720,11 +775,6 @@ impl HttpGateway {
         .await
         .map_err(|_| HttpProblem::unavailable("MCP server concurrency limit timed out"))?
         .map_err(|_| HttpProblem::fatal("MCP server concurrency control closed"))?;
-
-        let started = Instant::now();
-        let method = request.method().clone();
-        let incoming_headers = request.headers().clone();
-        let session_id = header_optional(&incoming_headers, "mcp-session-id")?;
         validate_session_headers(
             server.remote.transport,
             &method,
@@ -929,6 +979,16 @@ impl HttpGateway {
         require_upstream_media_type(&response.headers, "text/event-stream")?;
         ensure_no_sensitive_response_headers(&response.headers)?;
         let downstream_headers = downstream_response_headers(&response.headers, true)?;
+        let decision =
+            transport_decision(&server.policy, "session/get", AuditOutcome::Allowed, None);
+        self.record_decision(
+            &decision,
+            session_id,
+            Some(0),
+            None,
+            Some(response.status),
+            started,
+        )?;
         let stream = self.spawn_sse_stream(
             server,
             None,
@@ -1251,6 +1311,10 @@ impl HttpGateway {
         let policy = server.policy.clone();
         let remote = server.remote.clone();
         let fatal = self.fatal.clone();
+        let failure_audit = Arc::clone(&audit);
+        let failure_policy = policy.clone();
+        let failure_session = session_id.clone();
+        let failure_fatal = fatal.clone();
         tokio::spawn(async move {
             let processor = SseProcessor {
                 remote,
@@ -1269,6 +1333,20 @@ impl HttpGateway {
             };
             if let Err(error) = processor.run().await {
                 eprintln!("sendbox HTTP MCP SSE stream failed closed: {error}");
+                let decision = transport_decision(
+                    &failure_policy,
+                    "http/stream",
+                    AuditOutcome::Denied,
+                    Some("stream processing failed closed".to_owned()),
+                );
+                let mut event = BoundaryAuditEvent::from_decision(&decision);
+                event.session_id_hash = failure_session.as_deref().map(hash_sensitive_id);
+                event.status = Some(StatusCode::BAD_GATEWAY.as_u16());
+                event.duration_ms = Some(elapsed_ms(started));
+                if let Err(audit_error) = failure_audit.record(&event) {
+                    eprintln!("sendbox HTTP MCP SSE failure audit failed: {audit_error}");
+                    failure_fatal.cancel();
+                }
                 let _ = failure_sender
                     .send(Err(GatewayBodyError(error.to_string())))
                     .await;
@@ -2970,13 +3048,22 @@ fn streaming_response(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::net::Ipv4Addr;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use http_body_util::BodyExt as _;
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls::ServerConfig;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use sendbox_egress::dialer::DirectDialer;
+    use sendbox_egress::resolver::{ResolveError, ResolvedAddress, ResolvedChain};
     use sendbox_policy::{
         Action, McpHttpPolicy, McpServerPolicy, ServerToolPolicy, ToolCallPolicy,
     };
     use serde_json::json;
+    use tokio::task::JoinHandle;
+    use tokio_rustls::TlsAcceptor;
 
     use super::*;
 
@@ -3059,6 +3146,297 @@ mod tests {
         );
     }
 
+    struct MetadataResolver;
+
+    #[async_trait]
+    impl UpstreamResolver for MetadataResolver {
+        async fn resolve(&self, name: &Name) -> Result<ResolvedChain, ResolveError> {
+            Ok(ResolvedChain {
+                cname_chain: Vec::new(),
+                final_name: name.clone(),
+                addresses: vec![ResolvedAddress {
+                    ip: IpAddr::from([169, 254, 169, 254]),
+                    ttl_secs: 30,
+                }],
+            })
+        }
+    }
+
+    struct PanicDialer;
+
+    #[async_trait]
+    impl Dialer for PanicDialer {
+        async fn dial(
+            &self,
+            _addr: SocketAddr,
+            _connect_timeout: Duration,
+        ) -> io::Result<TcpStream> {
+            panic!("denied addresses must never be dialed")
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingReservation(AtomicUsize);
+
+    #[async_trait]
+    impl OriginReservation for CountingReservation {
+        async fn reserve(
+            &self,
+            _server_id: &str,
+            _endpoint: &HttpEndpoint,
+            _resolution: &OriginResolution,
+        ) -> Result<(), HttpGatewayError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_dns_results_are_never_reserved_or_dialed() {
+        let reservations = Arc::new(CountingReservation::default());
+        let client = ExactUpstreamClient::new(
+            Arc::new(MetadataResolver),
+            Arc::new(PanicDialer),
+            reservations.clone(),
+        );
+        let remote = remote("remote", ToolTransport::StreamableHttp);
+        let request = UpstreamRequest {
+            server_id: remote.id.clone(),
+            endpoint: remote.endpoint.clone(),
+            remote,
+            method: Method::POST,
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        };
+        assert!(client.execute(request).await.is_err());
+        assert_eq!(reservations.0.load(Ordering::SeqCst), 0);
+    }
+
+    struct LoopbackResolver;
+
+    #[async_trait]
+    impl UpstreamResolver for LoopbackResolver {
+        async fn resolve(&self, name: &Name) -> Result<ResolvedChain, ResolveError> {
+            Ok(ResolvedChain {
+                cname_chain: Vec::new(),
+                final_name: name.clone(),
+                addresses: vec![ResolvedAddress {
+                    ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    ttl_secs: 30,
+                }],
+            })
+        }
+    }
+
+    async fn spawn_tls_upstream() -> (SocketAddr, String, JoinHandle<()>) {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let certificate_pem = cert.pem();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key)
+            .unwrap();
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let Ok(stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let service = service_fn(|request: Request<Incoming>| async move {
+                assert_eq!(request.method(), Method::POST);
+                assert_eq!(request.uri().path(), "/mcp");
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Full::new(Bytes::from_static(br#"{"ok":true}"#)))
+                        .unwrap(),
+                )
+            });
+            server_http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+        (address, certificate_pem, server)
+    }
+
+    async fn spawn_http_upstream(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |request: Request<Incoming>| {
+                let headers = headers.clone();
+                let body = body.clone();
+                async move {
+                    assert_eq!(request.method(), Method::POST);
+                    let mut response = Response::builder()
+                        .status(status)
+                        .body(Full::new(body))
+                        .unwrap();
+                    response.headers_mut().extend(headers);
+                    Ok::<_, Infallible>(response)
+                }
+            });
+            server_http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+        (address, server)
+    }
+
+    fn exact_client() -> ExactUpstreamClient {
+        ExactUpstreamClient::new(
+            Arc::new(LoopbackResolver),
+            Arc::new(DirectDialer),
+            Arc::new(NoopOriginReservation),
+        )
+    }
+
+    fn upstream_request(remote: RemoteServerRuntime) -> UpstreamRequest {
+        UpstreamRequest {
+            server_id: remote.id.clone(),
+            endpoint: remote.endpoint.clone(),
+            remote,
+            method: Method::POST,
+            headers: HeaderMap::from_iter([(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )]),
+            body: br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec(),
+        }
+    }
+
+    async fn collect_upstream_body(
+        mut body: Box<dyn UpstreamResponseBody>,
+    ) -> Result<Vec<u8>, HttpGatewayError> {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next_chunk().await? {
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
+    #[tokio::test]
+    async fn exact_tls_requires_a_trusted_certificate_and_matching_hostname() {
+        let (address, certificate, server) = spawn_tls_upstream().await;
+        let mut trusted = remote("tls", ToolTransport::StreamableHttp);
+        trusted.endpoint =
+            HttpEndpoint::parse(&format!("https://localhost:{}/mcp", address.port())).unwrap();
+        trusted.http.allow_private_networks = true;
+        trusted.http.tls.trust_roots_pem = vec![certificate];
+        let response = exact_client()
+            .execute(upstream_request(trusted))
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            collect_upstream_body(response.body).await.unwrap(),
+            br#"{"ok":true}"#
+        );
+        server.await.unwrap();
+
+        let (address, certificate, server) = spawn_tls_upstream().await;
+        let mut wrong_hostname = remote("tls", ToolTransport::StreamableHttp);
+        wrong_hostname.endpoint =
+            HttpEndpoint::parse(&format!("https://wrong.example:{}/mcp", address.port())).unwrap();
+        wrong_hostname.http.allow_private_networks = true;
+        wrong_hostname.http.tls.trust_roots_pem = vec![certificate];
+        let error = exact_client()
+            .execute(upstream_request(wrong_hostname))
+            .await
+            .err()
+            .expect("hostname mismatch must fail");
+        assert!(error.to_string().contains("TLS handshake failed"));
+        server.await.unwrap();
+
+        let (address, _certificate, server) = spawn_tls_upstream().await;
+        let mut untrusted = remote("tls", ToolTransport::StreamableHttp);
+        untrusted.endpoint =
+            HttpEndpoint::parse(&format!("https://localhost:{}/mcp", address.port())).unwrap();
+        untrusted.http.allow_private_networks = true;
+        let error = exact_client()
+            .execute(upstream_request(untrusted))
+            .await
+            .err()
+            .expect("untrusted certificate must fail");
+        assert!(error.to_string().contains("TLS handshake failed"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirects_require_an_exact_allowlisted_target() {
+        let (target_address, target_server) = spawn_http_upstream(
+            StatusCode::OK,
+            HeaderMap::from_iter([(CONTENT_TYPE, HeaderValue::from_static("application/json"))]),
+            Bytes::from_static(br#"{"redirected":true}"#),
+        )
+        .await;
+        let target = format!("http://127.0.0.1:{}/mcp", target_address.port());
+        let (source_address, source_server) = spawn_http_upstream(
+            StatusCode::TEMPORARY_REDIRECT,
+            HeaderMap::from_iter([(LOCATION, HeaderValue::from_str(&target).unwrap())]),
+            Bytes::new(),
+        )
+        .await;
+        let mut allowed = remote("redirect", ToolTransport::StreamableHttp);
+        allowed.endpoint =
+            HttpEndpoint::parse(&format!("http://127.0.0.1:{}/mcp", source_address.port()))
+                .unwrap();
+        allowed.http.allow_plaintext_local = true;
+        allowed.http.allow_redirects = true;
+        allowed.http.max_redirects = 1;
+        allowed.http.redirect_allowlist = vec![target];
+        let response = exact_client()
+            .execute(upstream_request(allowed))
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            collect_upstream_body(response.body).await.unwrap(),
+            br#"{"redirected":true}"#
+        );
+        source_server.await.unwrap();
+        target_server.await.unwrap();
+
+        let denied_target = "http://127.0.0.1:9/denied";
+        let (source_address, source_server) = spawn_http_upstream(
+            StatusCode::TEMPORARY_REDIRECT,
+            HeaderMap::from_iter([(LOCATION, HeaderValue::from_static(denied_target))]),
+            Bytes::new(),
+        )
+        .await;
+        let mut denied = remote("redirect", ToolTransport::StreamableHttp);
+        denied.endpoint =
+            HttpEndpoint::parse(&format!("http://127.0.0.1:{}/mcp", source_address.port()))
+                .unwrap();
+        denied.http.allow_plaintext_local = true;
+        denied.http.allow_redirects = true;
+        denied.http.max_redirects = 1;
+        denied.http.redirect_allowlist = vec!["http://127.0.0.1:10/allowed".to_owned()];
+        let error = exact_client()
+            .execute(upstream_request(denied))
+            .await
+            .err()
+            .expect("unlisted redirect must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("redirect target is not exactly allowlisted")
+        );
+        source_server.await.unwrap();
+    }
+
     #[derive(Default)]
     struct MemoryAudit(StdMutex<Vec<BoundaryAuditEvent>>);
 
@@ -3066,6 +3444,18 @@ mod tests {
         fn record(&self, event: &BoundaryAuditEvent) -> Result<(), AuditError> {
             self.0.lock().unwrap().push(event.clone());
             Ok(())
+        }
+    }
+
+    struct NeverClient;
+
+    #[async_trait]
+    impl UpstreamHttpClient for NeverClient {
+        async fn execute(
+            &self,
+            _request: UpstreamRequest,
+        ) -> Result<UpstreamResponse, HttpGatewayError> {
+            panic!("not called")
         }
     }
 
@@ -3119,16 +3509,6 @@ mod tests {
             inherited_environment_keys: BTreeSet::new(),
             observation: None,
         };
-        struct NeverClient;
-        #[async_trait]
-        impl UpstreamHttpClient for NeverClient {
-            async fn execute(
-                &self,
-                _request: UpstreamRequest,
-            ) -> Result<UpstreamResponse, HttpGatewayError> {
-                panic!("not called")
-            }
-        }
         assert!(
             HttpGateway::new(
                 &policy,
@@ -3138,6 +3518,40 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn gateway_injects_bearer_credentials_only_into_upstream_requests() {
+        let mut policy = gateway_runtime_policy();
+        let McpServerPolicy::StreamableHttp { http, .. } =
+            policy.tool_policy.servers.get_mut("modern").unwrap()
+        else {
+            panic!("modern fixture must use Streamable HTTP");
+        };
+        http.authorization = Some(sendbox_policy::HttpAuthorizationPolicy {
+            bearer_secret: "MCP_TOKEN".to_owned(),
+        });
+        let gateway = HttpGateway::new(
+            &policy,
+            GatewayCredentialSet::new(BTreeMap::from([(
+                "MCP_TOKEN".to_owned(),
+                "fixture-token".to_owned(),
+            )])),
+            Arc::new(NeverClient),
+            Arc::new(MemoryAudit::default()),
+        )
+        .unwrap();
+        let upstream = gateway
+            .build_upstream_request(
+                &gateway.servers["modern"],
+                Method::POST,
+                &HeaderMap::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(upstream.headers[AUTHORIZATION], "Bearer fixture-token");
+        assert!(!format!("{gateway:?}").contains("fixture-token"));
     }
 
     #[derive(Clone, Default)]
@@ -3242,7 +3656,7 @@ mod tests {
                 &gateway_runtime_policy(),
                 GatewayCredentialSet::new(BTreeMap::new()),
                 Arc::new(client.clone()),
-                audit,
+                Arc::clone(&audit) as Arc<dyn BoundaryAuditSink>,
             )
             .unwrap(),
         );
@@ -3590,6 +4004,13 @@ mod tests {
         )
         .await;
         assert_eq!(expired.status, StatusCode::BAD_REQUEST);
+        let events = audit.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.method == "http/request" && event.outcome == "denied" })
+        );
+        assert!(events.iter().any(|event| event.method == "session/get"));
 
         cancellation.cancel();
         server.await.unwrap();
