@@ -114,11 +114,7 @@ impl RuntimePolicyDocument {
         if let Some(safe_outputs) = &self.safe_outputs {
             safe_outputs.validate().map_err(|error| error.to_string())?;
             let command = vec![SAFE_OUTPUTS_MCP_PATH.to_owned()];
-            if !self
-                .tool_policy
-                .allowed_server_commands
-                .contains(&command)
-            {
+            if !self.tool_policy.allowed_server_commands.contains(&command) {
                 return Err(
                     "Safe Outputs MCP command is not in the exact server command allowlist"
                         .to_owned(),

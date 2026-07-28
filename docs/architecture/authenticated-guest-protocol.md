@@ -58,9 +58,9 @@ Message kinds are:
 9. protocol error
 
 Capabilities are typed identifiers for lifecycle, exec, streamed I/O, signals,
-mounts, network, MCP, audit, and health. Authenticated framing remains version
-1. The first operational schema is separately versioned by
-`OPERATION_SCHEMA_VERSION = 1`: `agent.launch` carries an exact program,
+mounts, network, MCP, audit, health, and Safe Outputs. Authenticated framing
+remains version 1. The launch schema is separately versioned by
+`OPERATION_SCHEMA_VERSION = 2`: `agent.launch` carries an exact program,
 argument vector, absolute working directory, bounded non-secret environment,
 policy-bound secret envelopes, and timeout; its terminal response carries
 exit/signal or a typed cancellation/failure state plus broker cleanup
@@ -78,6 +78,14 @@ host does not read terminal input until the first grant arrives. `StandardInput`
 `StandardInputEof`, and `TerminalResize` retain their existing discriminants;
 `TerminalInputCredit` is appended as event kind 9, so old discriminants and persisted
 readers remain stable.
+
+Safe Outputs uses `safe_outputs.collect` schema version 1. The host can request
+it only after a terminal result with complete broker cleanup. The guest returns
+one bounded base64 artifact and authenticated seal, then rejects duplicate
+collection. Requiring Safe Outputs when capability 10 was not negotiated is a
+hard downgrade failure. When the capability is required, authenticated
+readiness must also include healthy mandatory `exec` and `safe_outputs` service
+identities.
 
 ## Handshake
 

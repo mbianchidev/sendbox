@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 getrandom = "0.3.4"
+reqwest.workspace = true
 rustix.workspace = true
 sendbox-agent = { path = "../sendbox-agent" }
 sendbox-boundary = { path = "../sendbox-boundary" }
@@ -30,11 +31,9 @@ sendbox-session-security = { path = "../sendbox-session-security" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -237,6 +237,31 @@ fn plan(
     .expect("run plan")
 }
 
+fn safe_outputs_plan(
+    resources: &TempResource,
+    capabilities: &RuntimeCapabilities,
+    session_id: SessionId,
+) -> RunPlan {
+    let mut configuration = configuration(resources.path().to_path_buf());
+    configuration.github.forward_auth = false;
+    configuration.github.ssh_key_path = None;
+    configuration.github.safe_outputs.enabled = true;
+    configuration.github.safe_outputs.write_token_env = "HOST_ONLY_WRITE_TOKEN".to_owned();
+    configuration.github.safe_outputs.allowed_repositories = vec!["example/repository".to_owned()];
+    configuration.github.safe_outputs.create_issue.enabled = true;
+    let mut request = request(resources, session_id);
+    request.boundary_plan = verified_boundary_plan(
+        &configuration,
+        session_id,
+        &request.image,
+        &request.guest_workspace,
+        &request.command,
+        &request.environment,
+        &request.mounts,
+    );
+    RunPlan::compile(&configuration, request, capabilities, plan_time()).expect("Safe Outputs plan")
+}
+
 fn interactive_plan(
     resources: &TempResource,
     capabilities: &RuntimeCapabilities,
@@ -754,6 +779,132 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             "cleanup",
         ]
     );
+}
+
+#[tokio::test]
+async fn safe_outputs_collection_follows_terminal_cleanup_without_forwarding_write_auth() {
+    let resources = TempResource::new().expect("resources");
+    resources.create_directory("state").expect("state");
+    let capabilities = runtime_capabilities();
+    let runtime = Arc::new(FakeRuntime::new(capabilities.clone()).expect("runtime"));
+    let session_id = SessionId::from_bytes([0x51; 16]);
+    let plan = safe_outputs_plan(&resources, &capabilities, session_id);
+    let expected_boundary_digest = plan.boundary_plan_digest();
+    let (host, guest) = tokio::io::duplex(16 * 1024);
+    runtime.set_control_stream(Box::new(host));
+    let guest_task = tokio::spawn(async move {
+        let configuration = HandshakeConfig::new(
+            session_id,
+            VersionRange::default(),
+            sendbox_protocol::agent_guest_capabilities(),
+            sendbox_protocol::agent_guest_required_capabilities(),
+            FrameLimits::default(),
+            BootstrapSecret::new([7; 32]).expect("bootstrap"),
+            expected_boundary_digest,
+        )
+        .expect("handshake config");
+        let mut handshake = GuestHandshake::new(configuration);
+        let connection = handshake.establish(guest).await.expect("guest handshake");
+        let (mut reader, mut writer) = connection.into_parts();
+        writer
+            .send(&Message::Event(Event {
+                stream_id: 0,
+                kind: EventKind::Lifecycle,
+                payload: br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true},{"id":"safe_outputs","mandatory":true,"healthy":true}]}"#
+                    .to_vec(),
+            }))
+            .await
+            .expect("readiness");
+        let Message::Request(Request {
+            request_id,
+            operation,
+            payload,
+        }) = reader.receive().await.expect("launch")
+        else {
+            panic!("expected launch request");
+        };
+        assert_eq!(operation, "agent.launch");
+        assert!(
+            !payload
+                .windows(b"HOST_ONLY_WRITE_TOKEN".len())
+                .any(|window| window == b"HOST_ONLY_WRITE_TOKEN")
+        );
+        assert!(
+            !payload
+                .windows(b"host-write-token-value".len())
+                .any(|window| window == b"host-write-token-value")
+        );
+        let launch: LaunchRequestV2 = serde_json::from_slice(&payload).expect("launch payload");
+        assert!(
+            launch
+                .secrets
+                .iter()
+                .all(|secret| secret.reference != "HOST_ONLY_WRITE_TOKEN")
+        );
+        writer
+            .send(&Message::Response(Response {
+                request_id,
+                status: ResponseStatus::Ok,
+                payload: serde_json::to_vec(&sendbox_protocol::TerminalResultV2 {
+                    schema_version: sendbox_protocol::OPERATION_SCHEMA_VERSION,
+                    terminal: sendbox_protocol::TerminalStateV1::Exited {
+                        exit_code: Some(0),
+                        signal: None,
+                    },
+                    cleanup_complete: true,
+                })
+                .expect("terminal"),
+            }))
+            .await
+            .expect("terminal response");
+
+        let Message::Request(Request {
+            request_id,
+            operation,
+            payload,
+        }) = reader.receive().await.expect("collection request")
+        else {
+            panic!("expected Safe Outputs collection request");
+        };
+        assert_eq!(operation, sendbox_protocol::SAFE_OUTPUTS_COLLECT_OPERATION);
+        let request: sendbox_protocol::SafeOutputsCollectRequestV1 =
+            serde_json::from_slice(&payload).expect("collection payload");
+        assert_eq!(request.boundary_plan_digest, expected_boundary_digest);
+        writer
+            .send(&Message::Response(Response {
+                request_id,
+                status: ResponseStatus::Ok,
+                payload: serde_json::to_vec(
+                    &sendbox_protocol::SafeOutputsCollectionV1::new(
+                        b"{\"accepted\":true}\n",
+                        b"{\"seal\":true}",
+                    )
+                    .expect("collection"),
+                )
+                .expect("collection response"),
+            }))
+            .await
+            .expect("collection response");
+        assert!(matches!(
+            reader.receive().await.expect("graceful close"),
+            Message::GracefulClose(_)
+        ));
+    });
+
+    let report = AgentOrchestrator::new(
+        runtime,
+        Arc::new(FakeSecrets),
+        Arc::new(ProtocolGuestConnector),
+        Arc::new(RecordingOutput::default()),
+        Arc::new(NoSignals),
+    )
+    .run(&plan, &CancellationToken::new())
+    .await
+    .expect("agent run");
+    guest_task.await.expect("guest task");
+    let collection = report.safe_outputs.expect("Safe Outputs collection");
+    assert_eq!(collection.artifact, b"{\"accepted\":true}\n");
+    assert_eq!(collection.seal, b"{\"seal\":true}");
 }
 
 #[tokio::test]

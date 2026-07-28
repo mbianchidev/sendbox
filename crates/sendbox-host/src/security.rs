@@ -104,12 +104,13 @@ pub(crate) fn validate_state_workspace_disjoint(
     Ok(())
 }
 
-pub(crate) async fn execute<F>(
+pub(crate) async fn execute<Factory, F>(
     context: HostSecurityContext,
-    runtime: F,
+    runtime: Factory,
     cancellation: &CancellationToken,
 ) -> Result<HostRunReport, HostError>
 where
+    Factory: FnOnce(AuditRecorder) -> F,
     F: Future<Output = Result<HostRunReport, HostError>>,
 {
     let _workspace_lease = acquire_workspace_lease(&context, cancellation).await?;
@@ -210,7 +211,7 @@ where
         BTreeMap::new(),
     )?;
 
-    match runtime.await {
+    match runtime(session.audit_recorder()).await {
         Ok(report) => finalize_report(session, &clock, report),
         Err(runtime_error) => finalize_runtime_error(session, &clock, runtime_error),
     }
@@ -959,6 +960,7 @@ impl HostError {
             Self::Credentials(_) => "credentials",
             Self::GitGuard(_) => "git_guard",
             Self::SecretStore(_) => "secret_store",
+            Self::SafeOutputs(_) => "safe_outputs",
             Self::Io { .. } => "io",
             Self::Bundle(_) => "bundle",
         }
@@ -1106,7 +1108,7 @@ mod tests {
         F: Future<Output = Result<HostRunReport, HostError>>,
     {
         let cancellation = CancellationToken::new();
-        execute(context, runtime, &cancellation).await
+        execute(context, move |_| runtime, &cancellation).await
     }
 
     #[tokio::test]
@@ -1355,7 +1357,7 @@ mod tests {
             tokio::spawn(async move {
                 execute(
                     waiting_context,
-                    async move {
+                    move |_| async move {
                         runtime_started.store(true, Ordering::SeqCst);
                         Ok(HostRunReport::OneShot(ProcessOutcome::successful(
                             Vec::new(),

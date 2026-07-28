@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod safe_outputs;
 mod security;
 
 use std::{
@@ -63,7 +64,7 @@ use sendbox_runtime_hyperlight::{
 use sendbox_runtime_kata::{KataProviderConfiguration, KataRuntimeProvider};
 use sendbox_secrets::{SecretName, SecretStore, SecretValue, requires_guarded_github_forwarding};
 use sendbox_security::{SecurityError, provenance::SigningKeyMaterial};
-use sendbox_session_security::SessionSecurityError;
+use sendbox_session_security::{AuditRecorder, SessionSecurityError};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -176,6 +177,8 @@ pub enum HostError {
     Credentials(#[from] CredentialBrokerError),
     #[error("secret store: {0}")]
     SecretStore(#[from] sendbox_secrets::SecretStoreError),
+    #[error("Safe Outputs: {0}")]
+    SafeOutputs(String),
     #[error("{context} `{path}`: {source}")]
     Io {
         context: &'static str,
@@ -191,6 +194,7 @@ pub struct PreparedHostRun {
     execution: HostExecution,
     secrets: Arc<HostSecretResolver>,
     security: security::HostSecurityContext,
+    safe_outputs: Option<safe_outputs::ProcessingContext>,
     signed_plan_path: PathBuf,
     terminal_source: Option<Arc<dyn TerminalSource>>,
 }
@@ -253,15 +257,23 @@ impl PreparedHostRun {
         signals: Arc<dyn SignalSource>,
         cancellation: &CancellationToken,
     ) -> Result<HostRunReport, HostError> {
-        let runtime = execute_runtime(
-            self.execution,
-            self.secrets,
-            output,
-            signals,
-            self.terminal_source,
+        security::execute(
+            self.security,
+            move |audit| {
+                execute_runtime(
+                    self.execution,
+                    self.secrets,
+                    self.safe_outputs,
+                    audit,
+                    output,
+                    signals,
+                    self.terminal_source,
+                    cancellation,
+                )
+            },
             cancellation,
-        );
-        security::execute(self.security, runtime, cancellation).await
+        )
+        .await
     }
 }
 
@@ -544,6 +556,20 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
             })
         }
     };
+    let safe_outputs = mcp_policy
+        .as_ref()
+        .and_then(|policy| policy.safe_outputs.clone())
+        .map(|policy| {
+            Ok::<_, HostError>(safe_outputs::ProcessingContext {
+                configuration: request.configuration.github.safe_outputs.clone(),
+                policy,
+                boundary_plan_digest: security_plan.digest(),
+                seal_key: secrets.safe_outputs_seal_key(session_id)?,
+                state_directory: state_directory.clone(),
+                workspace: workspace_source.clone(),
+            })
+        })
+        .transpose()?;
     let security = security::HostSecurityContext::new(
         security_plan,
         configuration_bytes,
@@ -557,6 +583,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         execution,
         secrets,
         security,
+        safe_outputs,
         signed_plan_path,
         terminal_source: None,
     })
@@ -565,6 +592,8 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
 async fn execute_runtime(
     execution: HostExecution,
     secrets: Arc<HostSecretResolver>,
+    safe_outputs: Option<safe_outputs::ProcessingContext>,
+    audit: AuditRecorder,
     output: Arc<dyn OutputSink>,
     signals: Arc<dyn SignalSource>,
     terminal_source: Option<Arc<dyn TerminalSource>>,
@@ -578,7 +607,7 @@ async fn execute_runtime(
         } => {
             let mut orchestrator = AgentOrchestrator::new(
                 provider,
-                secrets,
+                secrets.clone(),
                 Arc::new(ProtocolGuestConnector),
                 output,
                 signals,
@@ -591,13 +620,36 @@ async fn execute_runtime(
                 })?;
                 orchestrator = orchestrator.with_terminal(size, source);
             }
-            orchestrator
+            let report = orchestrator
                 .run(&plan, cancellation)
                 .await
-                .map(HostRunReport::Persistent)
-                .map_err(HostError::AgentRun)
+                .map_err(HostError::AgentRun)?;
+            drop(orchestrator);
+            drop(secrets);
+            match (safe_outputs.as_ref(), report.safe_outputs.as_ref()) {
+                (Some(context), Some(collection)) => {
+                    safe_outputs::process(context, collection, &audit).await?;
+                }
+                (Some(_), None) => {
+                    return Err(HostError::SafeOutputs(
+                        "guest omitted the required authenticated artifact".to_owned(),
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(HostError::SafeOutputs(
+                        "guest returned an unexpected Safe Outputs artifact".to_owned(),
+                    ));
+                }
+                (None, None) => {}
+            }
+            Ok(HostRunReport::Persistent(report))
         }
         HostExecution::Hyperlight(execution) => {
+            if safe_outputs.is_some() {
+                return Err(HostError::SafeOutputs(
+                    "Hyperlight cannot process Safe Outputs".to_owned(),
+                ));
+            }
             execute_hyperlight(execution, secrets, output, cancellation)
                 .await
                 .map(HostRunReport::OneShot)
@@ -969,6 +1021,11 @@ impl HostSecretResolver {
 
     fn bootstrap_material(&self) -> Result<BootstrapMaterial, HostError> {
         BootstrapMaterial::new(self.bootstrap.to_vec()).map_err(HostError::Runtime)
+    }
+
+    fn safe_outputs_seal_key(&self, session_id: SessionId) -> Result<[u8; 32], HostError> {
+        sendbox_mcp::safe_outputs::derive_seal_key(self.bootstrap.as_ref(), session_id)
+            .map_err(|error| HostError::SafeOutputs(format!("derive seal key: {error}")))
     }
 }
 
@@ -2472,6 +2529,68 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn safe_outputs_policy_admits_only_the_gateway_without_forwarding_the_write_token() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.github.safe_outputs.enabled = true;
+        configuration.github.safe_outputs.write_token_env = "HOST_ONLY_WRITE_TOKEN".to_owned();
+        configuration.github.safe_outputs.allowed_repositories =
+            vec!["example/repository".to_owned()];
+        configuration.github.safe_outputs.create_issue.enabled = true;
+        configuration.validate().expect("configuration");
+
+        let policy = make_mcp_policy(
+            ResolvedRuntime::Kata,
+            test_session(),
+            &configuration,
+            temp.path(),
+            Path::new("/workspace"),
+            Some((1000, 1000)),
+            None,
+        )
+        .expect("MCP policy")
+        .expect("Safe Outputs policy");
+        assert!(
+            policy
+                .tool_policy
+                .allowed_server_commands
+                .contains(&vec![SAFE_OUTPUTS_MCP_PATH.to_owned()])
+        );
+        assert!(
+            policy
+                .tool_policy
+                .allowlist
+                .contains(&"create_issue".to_owned())
+        );
+        assert!(
+            !policy
+                .fixed_environment
+                .contains_key("HOST_ONLY_WRITE_TOKEN")
+        );
+        assert!(
+            !policy
+                .inherited_environment_keys
+                .contains("HOST_ONLY_WRITE_TOKEN")
+        );
+        let encoded = serde_json::to_vec(&policy).expect("policy JSON");
+        assert!(
+            !encoded
+                .windows(b"HOST_ONLY_WRITE_TOKEN".len())
+                .any(|window| window == b"HOST_ONLY_WRITE_TOKEN")
+        );
+
+        let credentials = EffectiveCredentialSet {
+            values: BTreeMap::new(),
+            github_https_auth: false,
+            copilot_auth: false,
+            git_ssh_auth: false,
+        };
+        let features = boundary_features(&configuration, None, Some(&policy), None, &credentials)
+            .expect("features");
+        assert!(features.contains_key("github_safe_outputs"));
     }
 
     #[test]

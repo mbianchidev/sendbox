@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use sendbox_core::{Diagnostic, DiagnosticCode, ValidationFailure};
+use sendbox_git::normalize_branch;
 use sendbox_policy::PolicyConfiguration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -145,8 +146,7 @@ impl Default for BranchProtectionConfiguration {
 }
 
 pub const SAFE_OUTPUTS_MAX_ARTIFACT_BYTES: usize = 128 * 1024;
-pub const SAFE_OUTPUTS_WRITE_TOKEN_ENVIRONMENT: &str =
-    "SENDBOX_SAFE_OUTPUTS_GITHUB_TOKEN";
+pub const SAFE_OUTPUTS_WRITE_TOKEN_ENVIRONMENT: &str = "SENDBOX_SAFE_OUTPUTS_GITHUB_TOKEN";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -622,15 +622,12 @@ impl SandboxConfiguration {
 
     fn validate_safe_outputs(&self, diagnostics: &mut Vec<Diagnostic>) {
         let safe = &self.github.safe_outputs;
-        if safe.max_artifact_bytes == 0
-            || safe.max_artifact_bytes > SAFE_OUTPUTS_MAX_ARTIFACT_BYTES
+        if safe.max_artifact_bytes == 0 || safe.max_artifact_bytes > SAFE_OUTPUTS_MAX_ARTIFACT_BYTES
         {
             invalid_value(
                 diagnostics,
                 "github.safe_outputs.max_artifact_bytes",
-                format!(
-                    "must be between 1 and {SAFE_OUTPUTS_MAX_ARTIFACT_BYTES}"
-                ),
+                format!("must be between 1 and {SAFE_OUTPUTS_MAX_ARTIFACT_BYTES}"),
             );
         }
         if !valid_environment_name(&safe.write_token_env) {
@@ -638,17 +635,6 @@ impl SandboxConfiguration {
                 diagnostics,
                 "github.safe_outputs.write_token_env",
                 "must be a valid environment variable name",
-            );
-        }
-        if self
-            .secrets
-            .iter()
-            .any(|name| name == &safe.write_token_env)
-        {
-            incompatible(
-                diagnostics,
-                "github.safe_outputs.write_token_env",
-                "the Safe Outputs write token must not be forwarded as a sandbox secret",
             );
         }
         validate_count(
@@ -752,6 +738,15 @@ impl SandboxConfiguration {
             "github.safe_outputs.create_pull_request.base_branches",
             &safe.create_pull_request.base_branches,
         );
+        for branch in &safe.create_pull_request.base_branches {
+            if normalize_branch(branch).as_deref() != Some(branch.as_str()) {
+                invalid_value(
+                    diagnostics,
+                    "github.safe_outputs.create_pull_request.base_branches",
+                    format!("`{branch}` is not a normalized Git branch name"),
+                );
+            }
+        }
         validate_unique_nonempty(
             diagnostics,
             "github.safe_outputs.create_pull_request.allowed_paths",
@@ -781,6 +776,17 @@ impl SandboxConfiguration {
             );
         }
         if safe.enabled {
+            if self
+                .secrets
+                .iter()
+                .any(|name| name == &safe.write_token_env)
+            {
+                incompatible(
+                    diagnostics,
+                    "github.safe_outputs.write_token_env",
+                    "the Safe Outputs write token must not be forwarded as a sandbox secret",
+                );
+            }
             if self.github.forward_auth {
                 incompatible(
                     diagnostics,
@@ -793,6 +799,18 @@ impl SandboxConfiguration {
                     diagnostics,
                     "github.ssh_key_path",
                     "SSH write authentication is unavailable when Safe Outputs is enabled",
+                );
+            }
+            if self.github.forward_copilot_auth
+                && matches!(
+                    safe.write_token_env.as_str(),
+                    "COPILOT_GITHUB_TOKEN" | "GITHUB_COPILOT_TOKEN"
+                )
+            {
+                incompatible(
+                    diagnostics,
+                    "github.safe_outputs.write_token_env",
+                    "must not reuse a host Copilot token variable while Copilot authentication is forwarded",
                 );
             }
             if !self.policy.boundaries.enabled {
@@ -809,8 +827,7 @@ impl SandboxConfiguration {
                     "must contain at least one exact repository when a write tool is enabled",
                 );
             }
-            if safe.create_pull_request.enabled
-                && safe.create_pull_request.allowed_paths.is_empty()
+            if safe.create_pull_request.enabled && safe.create_pull_request.allowed_paths.is_empty()
             {
                 invalid_value(
                     diagnostics,
@@ -889,11 +906,7 @@ fn validate_short_prefix(diagnostics: &mut Vec<Diagnostic>, path: &str, prefix: 
     }
 }
 
-fn validate_unique_nonempty(
-    diagnostics: &mut Vec<Diagnostic>,
-    path: &str,
-    values: &[String],
-) {
+fn validate_unique_nonempty(diagnostics: &mut Vec<Diagnostic>, path: &str, values: &[String]) {
     let mut unique = std::collections::BTreeSet::new();
     for value in values {
         if value.trim().is_empty() {

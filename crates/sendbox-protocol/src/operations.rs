@@ -306,6 +306,12 @@ impl SafeOutputsCollectionV1 {
         if self.schema_version != SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION {
             return Err(SafeOutputsCollectionError::SchemaVersion);
         }
+        if self.artifact_base64.len() > maximum_base64_length(MAX_SAFE_OUTPUTS_ARTIFACT_BYTES) {
+            return Err(SafeOutputsCollectionError::ArtifactTooLarge);
+        }
+        if self.seal_base64.len() > maximum_base64_length(MAX_SAFE_OUTPUTS_SEAL_BYTES) {
+            return Err(SafeOutputsCollectionError::SealSize);
+        }
         let artifact = base64::engine::general_purpose::STANDARD
             .decode(self.artifact_base64)
             .map_err(|_| SafeOutputsCollectionError::Encoding)?;
@@ -315,6 +321,10 @@ impl SafeOutputsCollectionV1 {
         validate_safe_outputs_lengths(artifact.len(), seal.len())?;
         Ok((artifact, seal))
     }
+}
+
+const fn maximum_base64_length(bytes: usize) -> usize {
+    (bytes.saturating_add(2) / 3).saturating_mul(4)
 }
 
 fn validate_safe_outputs_lengths(
@@ -539,17 +549,22 @@ mod tests {
     #[test]
     fn safe_outputs_collection_round_trips_with_bounds() {
         let collection =
-            SafeOutputsCollectionV1::new(b"{\"record\":1}\n", b"{\"seal\":1}")
-                .expect("collection");
+            SafeOutputsCollectionV1::new(b"{\"record\":1}\n", b"{\"seal\":1}").expect("collection");
         let (artifact, seal) = collection.decode().expect("decode");
         assert_eq!(artifact, b"{\"record\":1}\n");
         assert_eq!(seal, b"{\"seal\":1}");
         assert!(
-            SafeOutputsCollectionV1::new(
-                &vec![0; MAX_SAFE_OUTPUTS_ARTIFACT_BYTES + 1],
-                b"seal"
-            )
-            .is_err()
+            SafeOutputsCollectionV1::new(&vec![0; MAX_SAFE_OUTPUTS_ARTIFACT_BYTES + 1], b"seal")
+                .is_err()
+        );
+        let oversized = SafeOutputsCollectionV1 {
+            schema_version: SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+            artifact_base64: "A".repeat(maximum_base64_length(MAX_SAFE_OUTPUTS_ARTIFACT_BYTES) + 1),
+            seal_base64: "c2VhbA==".to_owned(),
+        };
+        assert_eq!(
+            oversized.decode().expect_err("encoded bound must fail"),
+            SafeOutputsCollectionError::ArtifactTooLarge
         );
     }
 }

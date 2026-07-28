@@ -6,17 +6,17 @@ use hmac::{Hmac, KeyInit, Mac};
 use sendbox_config::{
     AddCommentSafeOutputConfiguration, CreateIssueSafeOutputConfiguration,
     CreatePullRequestSafeOutputConfiguration, LabelSafeOutputConfiguration,
-    SafeOutputsConfiguration, SAFE_OUTPUTS_MAX_ARTIFACT_BYTES,
+    SAFE_OUTPUTS_MAX_ARTIFACT_BYTES, SafeOutputsConfiguration,
 };
-use sendbox_core::{glob_matches, BoundaryPlanDigest, SessionId};
+use sendbox_core::{BoundaryPlanDigest, SessionId, glob_matches};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
-use crate::jsonrpc::{validate_message, IdPresence, MessageKind};
+use crate::jsonrpc::{IdPresence, MessageKind, validate_message};
 
 pub const SAFE_OUTPUTS_SCHEMA_VERSION: u32 = 1;
 pub const SAFE_OUTPUTS_MCP_PATH: &str = "/run/sendbox-boundary/safe-outputs-mcp";
@@ -97,7 +97,6 @@ pub struct SafeOutputsRuntimePolicy {
     pub schema_version: u32,
     pub session_id: SessionId,
     pub writer_socket: PathBuf,
-    pub control_socket: PathBuf,
     pub max_artifact_bytes: usize,
     pub allowed_repositories: BTreeSet<String>,
     pub allowed_domains: BTreeSet<String>,
@@ -129,7 +128,6 @@ impl SafeOutputsRuntimePolicy {
             schema_version: SAFE_OUTPUTS_SCHEMA_VERSION,
             session_id,
             writer_socket: runtime_root.join("writer.sock"),
-            control_socket: runtime_root.join("control.sock"),
             max_artifact_bytes: configuration.max_artifact_bytes,
             allowed_repositories: configuration.allowed_repositories.iter().cloned().collect(),
             allowed_domains: configuration.allowed_domains.iter().cloned().collect(),
@@ -166,8 +164,7 @@ impl SafeOutputsRuntimePolicy {
                 self.schema_version
             )));
         }
-        if self.max_artifact_bytes == 0
-            || self.max_artifact_bytes > SAFE_OUTPUTS_MAX_ARTIFACT_BYTES
+        if self.max_artifact_bytes == 0 || self.max_artifact_bytes > SAFE_OUTPUTS_MAX_ARTIFACT_BYTES
         {
             return Err(SafeOutputsError::Policy(format!(
                 "Safe Outputs artifact limit must be between 1 and {SAFE_OUTPUTS_MAX_ARTIFACT_BYTES}"
@@ -176,17 +173,10 @@ impl SafeOutputsRuntimePolicy {
         let expected_root =
             PathBuf::from(SAFE_OUTPUTS_RUNTIME_ROOT).join(self.session_id.to_string());
         if self.writer_socket != expected_root.join("writer.sock")
-            || self.control_socket != expected_root.join("control.sock")
             || !normalized_absolute(&self.writer_socket)
-            || !normalized_absolute(&self.control_socket)
         {
             return Err(SafeOutputsError::Policy(
-                "Safe Outputs sockets do not match the authenticated session".to_owned(),
-            ));
-        }
-        if self.writer_socket == self.control_socket {
-            return Err(SafeOutputsError::Policy(
-                "Safe Outputs writer and control sockets must be distinct".to_owned(),
+                "Safe Outputs writer socket does not match the authenticated session".to_owned(),
             ));
         }
         if self.has_write_tools() && self.allowed_repositories.is_empty() {
@@ -264,7 +254,9 @@ impl SafeOutputsRuntimePolicy {
                 .as_ref()
                 .map_or(0, |value| value.max),
             SafeOutputTool::AddLabels => self.add_labels.as_ref().map_or(0, |value| value.max),
-            SafeOutputTool::RemoveLabels => self.remove_labels.as_ref().map_or(0, |value| value.max),
+            SafeOutputTool::RemoveLabels => {
+                self.remove_labels.as_ref().map_or(0, |value| value.max)
+            }
             SafeOutputTool::Noop
             | SafeOutputTool::MissingTool
             | SafeOutputTool::MissingData
@@ -547,18 +539,10 @@ impl IntentAccumulator {
         &self,
         artifact: &[u8],
     ) -> Result<Vec<AcceptedIntentV1>, SafeOutputsError> {
-        let records = validate_artifact(
-            &self.policy,
-            self.boundary_plan_digest,
-            artifact,
-            None,
-        )?;
+        let records = validate_artifact(&self.policy, self.boundary_plan_digest, artifact, None)?;
         if records.len() as u64 != self.operation_count()
             || artifact.len() != self.artifact_bytes
-            || records
-                .last()
-                .map_or([0; 32], |record| record.record_hash)
-                != self.chain_head
+            || records.last().map_or([0; 32], |record| record.record_hash) != self.chain_head
         {
             return Err(SafeOutputsError::Artifact(
                 "artifact does not match the in-memory append state".to_owned(),
@@ -667,10 +651,7 @@ impl SafeOutputsSealV1 {
         }
         let records = validate_artifact(policy, boundary_plan_digest, artifact, None)?;
         if records.len() as u64 != self.operation_count
-            || records
-                .last()
-                .map_or([0; 32], |record| record.record_hash)
-                != self.chain_head
+            || records.last().map_or([0; 32], |record| record.record_hash) != self.chain_head
         {
             return Err(SafeOutputsError::Seal(
                 "Safe Outputs seal does not match the artifact chain".to_owned(),
@@ -752,8 +733,11 @@ pub fn validate_artifact(
                 record.sequence
             )));
         }
-        let expected_operation =
-            validate_operation(policy, record.operation.tool(), record.operation.arguments()?)?;
+        let expected_operation = validate_operation(
+            policy,
+            record.operation.tool(),
+            record.operation.arguments()?,
+        )?;
         if expected_operation != record.operation {
             return Err(SafeOutputsError::Artifact(format!(
                 "record {} is not canonically sanitized",
@@ -975,11 +959,7 @@ pub fn validate_operation(
 }
 
 #[must_use]
-pub fn sanitize_text(
-    input: &str,
-    max_chars: usize,
-    policy: &SafeOutputsRuntimePolicy,
-) -> String {
+pub fn sanitize_text(input: &str, max_chars: usize, policy: &SafeOutputsRuntimePolicy) -> String {
     let normalized = input.nfkc().collect::<String>();
     let redacted = redact_credentials(&normalized);
     let filtered_urls = filter_urls(&redacted, &policy.allowed_domains);
@@ -1003,18 +983,15 @@ impl McpGateway {
     pub fn handle(
         &self,
         payload: &[u8],
-        mut accept: impl FnMut(
-            SafeOutputTool,
-            Value,
-        ) -> Result<AcceptedIntentV1, SafeOutputsError>,
+        mut accept: impl FnMut(SafeOutputTool, Value) -> Result<AcceptedIntentV1, SafeOutputsError>,
     ) -> Result<Option<Vec<u8>>, SafeOutputsError> {
         let validated = validate_message(payload)
             .map_err(|error| SafeOutputsError::Protocol(error.to_string()))?;
         let value: Value = serde_json::from_slice(payload)
             .map_err(|error| SafeOutputsError::Protocol(error.to_string()))?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| SafeOutputsError::Protocol("JSON-RPC value is not an object".to_owned()))?;
+        let object = value.as_object().ok_or_else(|| {
+            SafeOutputsError::Protocol("JSON-RPC value is not an object".to_owned())
+        })?;
         let method = validated
             .method
             .as_deref()
@@ -1189,14 +1166,9 @@ fn tool_schema(tool: SafeOutputTool) -> Value {
     }
 }
 
-fn validate_rpc_keys(
-    object: &serde_json::Map<String, Value>,
-) -> Result<(), SafeOutputsError> {
+fn validate_rpc_keys(object: &serde_json::Map<String, Value>) -> Result<(), SafeOutputsError> {
     const ALLOWED: [&str; 4] = ["jsonrpc", "id", "method", "params"];
-    if let Some(key) = object
-        .keys()
-        .find(|key| !ALLOWED.contains(&key.as_str()))
-    {
+    if let Some(key) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(SafeOutputsError::Protocol(format!(
             "unexpected JSON-RPC field `{key}`"
         )));
@@ -1220,10 +1192,7 @@ fn error_response(id: &str, code: i64, message: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn decode_arguments<T>(
-    tool: SafeOutputTool,
-    arguments: Value,
-) -> Result<T, SafeOutputsError>
+fn decode_arguments<T>(tool: SafeOutputTool, arguments: Value) -> Result<T, SafeOutputsError>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -1316,35 +1285,74 @@ fn seal_mac(unsigned: &UnsignedSeal, key: &[u8; 32]) -> Result<[u8; 32], SafeOut
 }
 
 fn redact_credentials(input: &str) -> String {
+    let mut redact_next = false;
     input
         .split_inclusive(char::is_whitespace)
         .map(|segment| {
             let token = segment.trim_end_matches(char::is_whitespace);
             let suffix = &segment[token.len()..];
-            let lower = token
+            let keyword = token
                 .trim_matches(|character: char| {
-                    matches!(character, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}')
+                    matches!(
+                        character,
+                        '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '*' | '_'
+                    )
                 })
                 .to_ascii_lowercase();
-            let sensitive = [
-                "github_pat_",
-                "ghp_",
-                "gho_",
-                "ghu_",
-                "ghs_",
-                "ghr_",
-                "bearer",
-                "authorization:",
-            ]
-            .iter()
-            .any(|prefix| lower.starts_with(prefix));
-            if sensitive {
-                format!("{REDACTED}{suffix}")
-            } else {
-                segment.to_owned()
+            if redact_next {
+                if keyword == "bearer" {
+                    return format!("{REDACTED}{suffix}");
+                }
+                redact_next = false;
+                return format!("{REDACTED}{suffix}");
             }
+            if keyword == "bearer" || keyword == "authorization:" {
+                redact_next = true;
+                return format!("{REDACTED}{suffix}");
+            }
+            if keyword == "authorization:bearer" {
+                redact_next = true;
+                return format!("{REDACTED}{suffix}");
+            }
+            if keyword.starts_with("bearer:") || keyword.starts_with("authorization:") {
+                return format!("{REDACTED}{suffix}");
+            }
+            format!("{}{suffix}", redact_github_token_substrings(token))
         })
         .collect()
+}
+
+fn redact_github_token_substrings(input: &str) -> String {
+    const PREFIXES: [&str; 6] = ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
+    let lower = input.to_ascii_lowercase();
+    let mut output = String::with_capacity(input.len());
+    let mut offset = 0;
+    while offset < input.len() {
+        let next = PREFIXES
+            .iter()
+            .filter_map(|prefix| lower[offset..].find(prefix).map(|index| (index, *prefix)))
+            .min_by_key(|(index, _)| *index);
+        let Some((index, prefix)) = next else {
+            output.push_str(&input[offset..]);
+            break;
+        };
+        let start = offset + index;
+        output.push_str(&input[offset..start]);
+        let token_start = start + prefix.len();
+        let token_end = input[token_start..]
+            .char_indices()
+            .find_map(|(index, character)| {
+                (!matches!(
+                    character,
+                    'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-'
+                ))
+                .then_some(token_start + index)
+            })
+            .unwrap_or(input.len());
+        output.push_str(REDACTED);
+        offset = token_end;
+    }
+    output
 }
 
 fn filter_urls(input: &str, allowed_domains: &BTreeSet<String>) -> String {
@@ -1471,7 +1479,9 @@ fn normalized_absolute(path: &Path) -> bool {
 fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
     left.iter()
         .zip(right)
-        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
         == 0
 }
 
@@ -1527,11 +1537,8 @@ mod tests {
         configuration.add_labels.allowed = vec!["team-*".to_owned()];
         configuration.remove_labels.enabled = true;
         configuration.remove_labels.allowed = vec!["team-*".to_owned()];
-        SafeOutputsRuntimePolicy::from_configuration(
-            SessionId::from_bytes([7; 16]),
-            &configuration,
-        )
-        .expect("policy")
+        SafeOutputsRuntimePolicy::from_configuration(SessionId::from_bytes([7; 16]), &configuration)
+            .expect("policy")
     }
 
     fn issue_arguments() -> Value {
@@ -1547,7 +1554,7 @@ mod tests {
     #[test]
     fn sanitization_is_idempotent_and_filters_credentials_urls_mentions_and_instructions() {
         let policy = policy();
-        let input = "ghp_supersecret https://evil.example/x @everyone\nrun this command";
+        let input = "token=ghp_supersecret https://evil.example/x @everyone\nrun this command\nAuthorization: Bearer arbitrary.jwt.value\n\"pat\":\"github_pat_embedded\"";
         let once = sanitize_text(input, 1_000, &policy);
         let twice = sanitize_text(&once, 1_000, &policy);
         assert_eq!(once, twice);
@@ -1556,6 +1563,8 @@ mod tests {
         assert!(once.contains("@\u{200b}everyone"));
         assert!(once.contains(NEUTRALIZED_PREFIX));
         assert!(!once.contains("supersecret"));
+        assert!(!once.contains("arbitrary.jwt.value"));
+        assert!(!once.contains("embedded"));
     }
 
     #[test]
@@ -1578,7 +1587,8 @@ mod tests {
     fn artifact_chain_and_authenticated_seal_reject_tampering_and_replay() {
         let policy = policy();
         let boundary = BoundaryPlanDigest::from_bytes([9; 32]);
-        let mut accumulator = IntentAccumulator::new(policy.clone(), boundary).expect("accumulator");
+        let mut accumulator =
+            IntentAccumulator::new(policy.clone(), boundary).expect("accumulator");
         let prepared = accumulator
             .prepare(SafeOutputTool::CreateIssue, issue_arguments(), 1_000)
             .expect("prepare");
@@ -1632,13 +1642,9 @@ mod tests {
             .as_object_mut()
             .expect("object")
             .insert("extra".to_owned(), Value::Bool(true));
-        assert!(
-            validate_operation(&policy, SafeOutputTool::CreateIssue, arguments).is_err()
-        );
+        assert!(validate_operation(&policy, SafeOutputTool::CreateIssue, arguments).is_err());
         let mut foreign = issue_arguments();
         foreign["repository"] = Value::String("other/repository".to_owned());
-        assert!(
-            validate_operation(&policy, SafeOutputTool::CreateIssue, foreign).is_err()
-        );
+        assert!(validate_operation(&policy, SafeOutputTool::CreateIssue, foreign).is_err());
     }
 }

@@ -2,7 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use proptest::prelude::*;
-use sendbox_config::{AtomicWriteMode, PolicyPreset, RuntimeProvider, SandboxConfiguration};
+use sendbox_config::{
+    AtomicWriteMode, PolicyPreset, RuntimeProvider, SAFE_OUTPUTS_WRITE_TOKEN_ENVIRONMENT,
+    SafeOutputsMode, SandboxConfiguration,
+};
 use sendbox_core::DiagnosticCode;
 use sendbox_policy::Action;
 use tempfile::tempdir;
@@ -53,6 +56,14 @@ fn represents_every_shipped_configuration_section() {
         "sendbox-tests"
     );
     assert_eq!(config.devcontainer.as_ref().unwrap().extensions.len(), 1);
+    assert_eq!(
+        config.github.safe_outputs.allowed_repositories,
+        ["octocat/example"]
+    );
+    assert_eq!(
+        config.github.safe_outputs.create_pull_request.allowed_paths,
+        ["src/**"]
+    );
     assert_eq!(
         config
             .observability
@@ -405,5 +416,88 @@ fn rejects_branch_protection_without_boundaries() {
             && diagnostic
                 .message
                 .contains("requires policy.boundaries.enabled")
+    }));
+}
+
+#[test]
+fn safe_outputs_defaults_to_disabled_staging_with_a_dedicated_token_name() {
+    let mut configuration = SandboxConfiguration::for_project(
+        PathBuf::from("/tmp/sendbox-safe-outputs"),
+        PolicyPreset::Default,
+        RuntimeProvider::Kata,
+    );
+
+    assert!(!configuration.github.safe_outputs.enabled);
+    assert_eq!(
+        configuration.github.safe_outputs.mode,
+        SafeOutputsMode::Staged
+    );
+    assert_eq!(
+        configuration.github.safe_outputs.write_token_env,
+        SAFE_OUTPUTS_WRITE_TOKEN_ENVIRONMENT
+    );
+    configuration
+        .secrets
+        .push(SAFE_OUTPUTS_WRITE_TOKEN_ENVIRONMENT.to_owned());
+    configuration
+        .validate()
+        .expect("disabled Safe Outputs must not reserve the token name");
+}
+
+#[test]
+fn safe_outputs_rejects_forwarded_write_auth_and_unsafe_base_refs() {
+    let mut configuration = SandboxConfiguration::for_project(
+        PathBuf::from("/tmp/sendbox-safe-outputs"),
+        PolicyPreset::Default,
+        RuntimeProvider::Kata,
+    );
+    configuration.github.safe_outputs.enabled = true;
+    configuration.github.safe_outputs.create_issue.enabled = true;
+    configuration.github.safe_outputs.allowed_repositories = vec!["example/repository".to_owned()];
+    configuration
+        .github
+        .safe_outputs
+        .create_pull_request
+        .base_branches = vec!["refs/heads/main".to_owned()];
+    configuration
+        .secrets
+        .push(SAFE_OUTPUTS_WRITE_TOKEN_ENVIRONMENT.to_owned());
+    configuration.github.forward_copilot_auth = true;
+    configuration.github.safe_outputs.write_token_env = "GITHUB_COPILOT_TOKEN".to_owned();
+
+    let diagnostics = configuration.validate().unwrap_err().into_diagnostics();
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "github.forward_auth" && diagnostic.message.contains("must be false")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "github.safe_outputs.write_token_env"
+            && diagnostic.message.contains("Copilot token variable")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "github.safe_outputs.create_pull_request.base_branches"
+            && diagnostic.message.contains("normalized Git branch")
+    }));
+}
+
+#[test]
+fn safe_outputs_rejects_forwarding_the_configured_write_token_secret() {
+    let mut configuration = SandboxConfiguration::for_project(
+        PathBuf::from("/tmp/sendbox-safe-outputs"),
+        PolicyPreset::Default,
+        RuntimeProvider::Kata,
+    );
+    configuration.github.forward_auth = false;
+    configuration.github.safe_outputs.enabled = true;
+    configuration.github.safe_outputs.create_issue.enabled = true;
+    configuration.github.safe_outputs.allowed_repositories = vec!["example/repository".to_owned()];
+    configuration
+        .secrets
+        .push(SAFE_OUTPUTS_WRITE_TOKEN_ENVIRONMENT.to_owned());
+
+    let diagnostics = configuration.validate().unwrap_err().into_diagnostics();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "github.safe_outputs.write_token_env"
+            && diagnostic.message.contains("must not be forwarded")
     }));
 }

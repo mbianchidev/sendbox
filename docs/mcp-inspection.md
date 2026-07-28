@@ -29,6 +29,21 @@ broker:
 Remote HTTP/SSE MCP is not an authorization or inspection surface. Enabling HTTP
 inspection fails closed because the native runtime cannot observe TLS plaintext.
 
+## Safe Outputs gateway
+
+Safe Outputs uses the same exact-command broker admission but terminates at a
+root-owned guest recorder rather than an untrusted server process. Configure
+the client command as:
+
+```text
+/run/sendbox-boundary/mcp-broker -- /run/sendbox-boundary/safe-outputs-mcp
+```
+
+The signed runtime policy auto-admits only enabled Safe Outputs tool names.
+Recorder framing, schemas, sanitization, repository targets, counts, artifact
+size, sealing, and one-time collection remain independent of optional MCP
+observation. See [architecture/safe-outputs.md](architecture/safe-outputs.md).
+
 ## Project configuration
 
 The validator checks every existing Swift-recognized path:

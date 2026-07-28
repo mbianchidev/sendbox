@@ -1917,6 +1917,7 @@ dependencies = [
  "proptest",
  "rustix",
  "sendbox-core",
+ "sendbox-git",
  "sendbox-policy",
  "serde",
  "serde_json",
@@ -2042,6 +2043,7 @@ name = "sendbox-host"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "reqwest",
  "rustix",
  "sendbox-agent",
  "sendbox-boundary",

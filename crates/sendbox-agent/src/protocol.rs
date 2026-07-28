@@ -48,6 +48,9 @@ impl GuestConnector for ProtocolGuestConnector {
                 EnvelopeCipher::new(&material, configuration.session_id).map_err(|error| {
                     AgentError::Guest(format!("derive secret envelope key: {error}"))
                 })?;
+            let safe_outputs_required = configuration
+                .required_capabilities
+                .contains(sendbox_protocol::Capability::SafeOutputs);
             let handshake = HandshakeConfig::new(
                 configuration.session_id,
                 VersionRange::default(),
@@ -73,7 +76,7 @@ impl GuestConnector for ProtocolGuestConnector {
                     "guest readiness used an unexpected event kind".to_owned(),
                 ));
             }
-            validate_operational_readiness(&readiness.payload)?;
+            validate_operational_readiness(&readiness.payload, safe_outputs_required)?;
             Ok(Box::new(ProtocolGuestSession {
                 negotiated,
                 reader: Some(reader),
@@ -708,33 +711,41 @@ impl GuestExecution for ProtocolGuestExecution {
     }
 }
 
-fn validate_operational_readiness(payload: &[u8]) -> Result<(), AgentError> {
+fn validate_operational_readiness(
+    payload: &[u8],
+    safe_outputs_required: bool,
+) -> Result<(), AgentError> {
     let readiness: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|error| AgentError::Guest(format!("decode guest readiness: {error}")))?;
     let state_ready = readiness
         .get("state")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|state| state.eq_ignore_ascii_case("ready"));
-    let broker_live = readiness
+    let services = readiness
         .get("services")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|services| {
-            services.iter().any(|service| {
-                service.get("id").and_then(serde_json::Value::as_str) == Some("exec")
-                    && service
-                        .get("mandatory")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                    && service.get("healthy").and_then(serde_json::Value::as_bool) == Some(true)
-            })
-        });
-    if state_ready && broker_live {
-        Ok(())
-    } else {
-        Err(AgentError::Guest(
+        .ok_or_else(|| AgentError::Guest("guest readiness omitted service health".to_owned()))?;
+    let service_live = |id: &str| {
+        services.iter().any(|service| {
+            service.get("id").and_then(serde_json::Value::as_str) == Some(id)
+                && service
+                    .get("mandatory")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                && service.get("healthy").and_then(serde_json::Value::as_bool) == Some(true)
+        })
+    };
+    if !state_ready || !service_live("exec") {
+        return Err(AgentError::Guest(
             "guest readiness did not prove a live mandatory execution broker".to_owned(),
-        ))
+        ));
     }
+    if safe_outputs_required && !service_live("safe_outputs") {
+        return Err(AgentError::Guest(
+            "guest readiness did not prove a live mandatory Safe Outputs recorder".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn map_terminal(result: TerminalResultV2) -> GuestTerminal {
@@ -888,5 +899,15 @@ mod tests {
             }),
             GuestTerminal::Signaled { signal: 15 }
         );
+    }
+
+    #[test]
+    fn required_safe_outputs_service_must_be_present_and_healthy() {
+        let exec_only =
+            br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true}]}"#;
+        validate_operational_readiness(exec_only, false).expect("ordinary readiness");
+        assert!(validate_operational_readiness(exec_only, true).is_err());
+        let complete = br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true},{"id":"safe_outputs","mandatory":true,"healthy":true}]}"#;
+        validate_operational_readiness(complete, true).expect("Safe Outputs readiness");
     }
 }

@@ -635,8 +635,10 @@ async fn collect_safe_outputs<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let envelope: SafeOutputsCollectRequestV1 = serde_json::from_slice(&request.payload)
-        .map_err(|error| GuestError::Protocol(format!("decoding Safe Outputs collection: {error}")))?;
+    let envelope: SafeOutputsCollectRequestV1 =
+        serde_json::from_slice(&request.payload).map_err(|error| {
+            GuestError::Protocol(format!("decoding Safe Outputs collection: {error}"))
+        })?;
     if envelope.schema_version != SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION
         || envelope.boundary_plan_digest != services.secret_decryptor.boundary_plan_digest
     {
@@ -650,8 +652,9 @@ where
     let collected = safe_outputs.collect().await?;
     let collection = SafeOutputsCollectionV1::new(&collected.artifact, &collected.seal)
         .map_err(|error| GuestError::Protocol(error.to_string()))?;
-    let payload = serde_json::to_vec(&collection)
-        .map_err(|error| GuestError::Protocol(format!("encoding Safe Outputs collection: {error}")))?;
+    let payload = serde_json::to_vec(&collection).map_err(|error| {
+        GuestError::Protocol(format!("encoding Safe Outputs collection: {error}"))
+    })?;
     writer
         .send(&Message::Response(Response {
             request_id: request.request_id,

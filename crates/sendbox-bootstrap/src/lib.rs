@@ -52,6 +52,7 @@ pub enum ServiceId {
     Egress,
     Audit,
     Bpf,
+    SafeOutputs,
 }
 
 impl ServiceId {
@@ -64,6 +65,7 @@ impl ServiceId {
             Self::Egress => "egress",
             Self::Audit => "audit",
             Self::Bpf => "bpf",
+            Self::SafeOutputs => "safe_outputs",
         }
     }
 }
