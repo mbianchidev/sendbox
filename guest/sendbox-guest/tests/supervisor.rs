@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
+use sendbox_bootstrap::BOOTSTRAP_SCHEMA_VERSION;
 use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_guest::GuestError;
 use sendbox_guest::manifest::{
@@ -232,7 +233,7 @@ impl Fixture {
         fs::write(
             &bootstrap_file,
             serde_json::to_vec(&json!({
-                "schema_version": 2,
+                "schema_version": BOOTSTRAP_SCHEMA_VERSION,
                 "session_id": session_id,
                 "boundary_plan_digest": boundary_plan_digest,
                 "bootstrap_nonce": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,

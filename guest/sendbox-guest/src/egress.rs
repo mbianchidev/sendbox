@@ -368,12 +368,14 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
             )));
         }
     };
-    for child in &children {
-        let child_pid = child
+    for index in 0..children.len() {
+        let role = children[index].role;
+        let placement = children[index].placement;
+        let child_pid = children[index]
             .child
             .id()
-            .ok_or_else(|| GuestError::Runtime(format!("{} has no process ID", child.role)))?;
-        let placement = match child.placement {
+            .ok_or_else(|| GuestError::Runtime(format!("{role} has no process ID")))?;
+        let placement = match placement {
             ChildPlacement::Broker => armed.place_broker(child_pid),
             ChildPlacement::Registry => armed.place_registry(child_pid),
         };
@@ -382,7 +384,7 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
             let teardown = armed.teardown();
             return Err(GuestError::Runtime(format!(
                 "placing {} in its egress cgroup: {error}; teardown: {teardown:?}",
-                child.role
+                role
             )));
         }
     }
@@ -944,7 +946,9 @@ pub async fn run_registry_proxy(config_path: PathBuf) -> Result<(), GuestError> 
     let upstream = Arc::new(
         ReqwestUpstreamClient::new(
             &socks_proxy,
-            Duration::from_secs(config.registry.policy.limits.request_timeout_secs),
+            Duration::from_secs(u64::from(
+                config.registry.policy.limits.request_timeout_secs,
+            )),
         )
         .map_err(|error| GuestError::Runtime(format!("configuring registry upstream: {error}")))?,
     );
@@ -1040,17 +1044,26 @@ fn prepare_registry_directories(
         .report_path
         .parent()
         .ok_or_else(|| GuestError::Runtime("registry report path has no parent".to_owned()))?;
+    if !configuration.cache_root.exists() {
+        return Err(GuestError::Runtime(format!(
+            "package cache mount is missing: {}",
+            configuration.cache_root.display()
+        )));
+    }
+    if !report_parent.exists() {
+        let parent = report_parent.parent().ok_or_else(|| {
+            GuestError::Runtime("registry report directory has no parent".to_owned())
+        })?;
+        crate::secure_fs::open_directory_no_symlinks(parent)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(report_parent)
+            .map_err(|error| GuestError::io("creating package report directory", error))?;
+    }
     for (name, path) in [
         ("package cache", configuration.cache_root.as_path()),
         ("package report", report_parent),
     ] {
-        if !path.exists() {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(path)
-                .map_err(|error| GuestError::io(format!("creating {name} directory"), error))?;
-        }
         crate::secure_fs::open_directory_no_symlinks(path)?;
         let metadata = path
             .symlink_metadata()
@@ -1541,6 +1554,75 @@ fn require_root_cgroup_namespace() -> Result<(), GuestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn registry_configuration(root: &Path) -> RegistryProxyConfiguration {
+        let metadata = fs::metadata(root).expect("root metadata");
+        RegistryProxyConfiguration {
+            policy: sendbox_policy::PackageSupplyChainPolicy::default(),
+            proxy_port: 14_873,
+            trusted_upstream_port: 15_081,
+            cache_root: root.join("cache"),
+            report_path: root.join("runtime/registry/report.json"),
+            proxy_uid: metadata.uid(),
+            proxy_gid: metadata.gid(),
+            credentials: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registry_directory_preparation_requires_the_cache_mount() {
+        let root = tempfile::tempdir().expect("root");
+        fs::create_dir(root.path().join("runtime")).expect("runtime");
+        let configuration = registry_configuration(root.path());
+
+        let error = prepare_registry_directories(&configuration).expect_err("missing cache");
+
+        assert!(error.to_string().contains("package cache mount is missing"));
+        assert!(!root.path().join("runtime/registry").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registry_directory_preparation_creates_only_the_report_leaf() {
+        let root = tempfile::tempdir().expect("root");
+        fs::create_dir(root.path().join("cache")).expect("cache");
+        fs::create_dir(root.path().join("runtime")).expect("runtime");
+        let configuration = registry_configuration(root.path());
+
+        prepare_registry_directories(&configuration).expect("prepare directories");
+
+        let report =
+            fs::symlink_metadata(root.path().join("runtime/registry")).expect("report directory");
+        assert!(report.is_dir());
+        assert_eq!(report.permissions().mode() & 0o7777, 0o700);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registry_directory_preparation_rejects_a_report_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        fs::create_dir(root.path().join("cache")).expect("cache");
+        fs::create_dir(root.path().join("runtime")).expect("runtime");
+        fs::create_dir(root.path().join("attacker")).expect("attacker");
+        symlink(
+            root.path().join("attacker"),
+            root.path().join("runtime/registry"),
+        )
+        .expect("report symlink");
+        let configuration = registry_configuration(root.path());
+
+        let error = prepare_registry_directories(&configuration).expect_err("reject symlink");
+
+        assert!(
+            error
+                .to_string()
+                .contains("opening secure directory component")
+        );
+    }
 
     #[test]
     fn resolver_rewrite_preserves_non_nameserver_configuration() {
