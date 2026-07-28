@@ -1023,6 +1023,7 @@ fn bootstrap_payload(
                 mcp_policy: configuration.mcp_policy.clone(),
             }),
             egress_policy: configuration.egress_policy.clone(),
+            registry_proxy: None,
         },
         secret,
     )

@@ -9,15 +9,19 @@ use sendbox_egress::runtime::{
 };
 use sendbox_git::GuardPolicyDocument;
 use sendbox_mcp::runtime::RuntimePolicyDocument;
-use sendbox_policy::CommandPolicy;
+use sendbox_policy::{CommandPolicy, PackageSupplyChainPolicy};
 use sendbox_protocol::BootstrapSecret;
 use serde::de::{SeqAccess, Visitor};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 2;
+pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 3;
 pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
+pub const MAX_REGISTRY_CREDENTIALS: usize = 16;
+pub const MAX_REGISTRY_CREDENTIAL_BYTES: usize = 16 * 1024;
+pub const MAX_REGISTRY_CREDENTIAL_TOTAL_BYTES: usize = 32 * 1024;
 pub const REQUIRED_RUNTIME_CONTROLS: [ControlKind; 3] = [
     ControlKind::PrivilegeDrop,
     ControlKind::Capabilities,
@@ -171,6 +175,82 @@ pub struct ExecutionBrokerBootstrap {
     pub mcp_policy: Option<RuntimePolicyDocument>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct RegistryCredential {
+    pub secret_reference: String,
+    token: Zeroizing<Vec<u8>>,
+}
+
+impl RegistryCredential {
+    pub fn new(
+        secret_reference: impl Into<String>,
+        token: Vec<u8>,
+    ) -> Result<Self, BootstrapError> {
+        let credential = Self {
+            secret_reference: secret_reference.into(),
+            token: Zeroizing::new(token),
+        };
+        validate_registry_credential(&credential)?;
+        Ok(credential)
+    }
+
+    #[must_use]
+    pub fn expose_to_registry_proxy(&self) -> &[u8] {
+        self.token.as_slice()
+    }
+}
+
+impl fmt::Debug for RegistryCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegistryCredential")
+            .field("secret_reference", &self.secret_reference)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Serialize for RegistryCredential {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("RegistryCredential", 2)?;
+        state.serialize_field("secret_reference", &self.secret_reference)?;
+        state.serialize_field("token", self.token.as_slice())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RegistryCredential {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            secret_reference: String,
+            token: Vec<u8>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        RegistryCredential::new(wire.secret_reference, wire.token).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryProxyConfiguration {
+    pub policy: PackageSupplyChainPolicy,
+    pub proxy_port: u16,
+    pub trusted_upstream_port: u16,
+    pub cache_root: PathBuf,
+    pub report_path: PathBuf,
+    #[serde(default)]
+    pub credentials: Vec<RegistryCredential>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapDocumentConfiguration {
     pub session_id: SessionId,
@@ -184,6 +264,7 @@ pub struct BootstrapDocumentConfiguration {
     pub services: Vec<ServiceSpec>,
     pub execution_broker: Option<ExecutionBrokerConfiguration>,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
+    pub registry_proxy: Option<RegistryProxyConfiguration>,
 }
 
 pub struct BootstrapDocument {
@@ -200,6 +281,7 @@ pub struct BootstrapDocument {
     pub services: Vec<ServiceSpec>,
     pub execution_broker: Option<ExecutionBrokerBootstrap>,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
+    pub registry_proxy: Option<RegistryProxyConfiguration>,
 }
 
 #[derive(Debug, Error)]
@@ -236,6 +318,8 @@ struct BootstrapWire {
     execution_broker: Option<ExecutionBrokerBootstrap>,
     #[serde(default)]
     egress_policy: Option<EgressRuntimePolicyDocument>,
+    #[serde(default)]
+    registry_proxy: Option<RegistryProxyConfiguration>,
 }
 
 struct SecretBytes(Zeroizing<[u8; 32]>);
@@ -336,6 +420,7 @@ pub fn encode_bootstrap_document(
         services: configuration.services,
         execution_broker,
         egress_policy: configuration.egress_policy,
+        registry_proxy: configuration.registry_proxy,
     };
     let encoded = serde_json::to_vec(&wire).map_err(BootstrapError::Encode)?;
     if encoded.len() > MAX_BOOTSTRAP_BYTES {
@@ -387,6 +472,10 @@ fn validate_configuration(
             .as_ref()
             .map(|broker| &broker.cgroup_parent),
     )?;
+    validate_registry_proxy(
+        configuration.registry_proxy.as_ref(),
+        configuration.egress_policy.as_ref(),
+    )?;
     Ok(())
 }
 
@@ -429,6 +518,7 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
             .as_ref()
             .map(|broker| &broker.cgroup_parent),
     )?;
+    validate_registry_proxy(wire.registry_proxy.as_ref(), wire.egress_policy.as_ref())?;
     let bootstrap_secret = BootstrapSecret::new(wire.bootstrap_secret.0.as_ref().to_vec())
         .map_err(|_| BootstrapError::Invalid("bootstrap secret is invalid".to_owned()))?;
     Ok(BootstrapDocument {
@@ -445,7 +535,118 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         services: wire.services,
         execution_broker: wire.execution_broker,
         egress_policy: wire.egress_policy,
+        registry_proxy: wire.registry_proxy,
     })
+}
+
+fn validate_registry_proxy(
+    registry: Option<&RegistryProxyConfiguration>,
+    egress: Option<&EgressRuntimePolicyDocument>,
+) -> Result<(), BootstrapError> {
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    if !registry.policy.enabled {
+        return Err(BootstrapError::Invalid(
+            "registry proxy bootstrap requires enabled package policy".to_owned(),
+        ));
+    }
+    registry
+        .policy
+        .validate()
+        .map_err(|error| BootstrapError::Invalid(error.to_string()))?;
+    let egress = egress.ok_or_else(|| {
+        BootstrapError::Invalid("registry proxy requires authenticated egress policy".to_owned())
+    })?;
+    if registry.proxy_port == 0
+        || registry.trusted_upstream_port == 0
+        || registry.proxy_port == registry.trusted_upstream_port
+        || registry.proxy_port == egress.connect_port
+        || registry.trusted_upstream_port == egress.connect_port
+        || egress.dns_port.is_some_and(|port| {
+            port == registry.proxy_port || port == registry.trusted_upstream_port
+        })
+    {
+        return Err(BootstrapError::Invalid(
+            "registry proxy ports must be non-zero and distinct from egress ports".to_owned(),
+        ));
+    }
+    for (name, path) in [
+        ("cache root", &registry.cache_root),
+        ("report", &registry.report_path),
+    ] {
+        if !path.is_absolute() {
+            return Err(BootstrapError::Invalid(format!(
+                "registry proxy {name} path must be absolute"
+            )));
+        }
+    }
+    if registry.cache_root == registry.report_path
+        || registry.report_path.starts_with(&registry.cache_root)
+    {
+        return Err(BootstrapError::Invalid(
+            "registry proxy report must be outside the package cache".to_owned(),
+        ));
+    }
+    if registry.credentials.len() > MAX_REGISTRY_CREDENTIALS {
+        return Err(BootstrapError::Invalid(
+            "registry proxy has too many credentials".to_owned(),
+        ));
+    }
+    let mut total = 0_usize;
+    let mut references = std::collections::BTreeSet::new();
+    for credential in &registry.credentials {
+        validate_registry_credential(credential)?;
+        total = total.checked_add(credential.token.len()).ok_or_else(|| {
+            BootstrapError::Invalid("registry credential byte count overflowed".to_owned())
+        })?;
+        if !references.insert(credential.secret_reference.as_str()) {
+            return Err(BootstrapError::Invalid(
+                "registry proxy credentials contain a duplicate reference".to_owned(),
+            ));
+        }
+    }
+    if total > MAX_REGISTRY_CREDENTIAL_TOTAL_BYTES {
+        return Err(BootstrapError::Invalid(
+            "registry proxy credentials exceed the total byte limit".to_owned(),
+        ));
+    }
+    let expected = registry
+        .policy
+        .registries
+        .iter()
+        .filter_map(|entry| entry.credential_secret.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    if references != expected {
+        return Err(BootstrapError::Invalid(
+            "registry proxy credentials do not exactly match package policy references".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registry_credential(credential: &RegistryCredential) -> Result<(), BootstrapError> {
+    if credential.secret_reference.is_empty()
+        || credential.secret_reference.len() > 128
+        || !credential
+            .secret_reference
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| {
+                byte == b'_'
+                    || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+            })
+    {
+        return Err(BootstrapError::Invalid(
+            "registry credential reference is invalid".to_owned(),
+        ));
+    }
+    if credential.token.is_empty() || credential.token.len() > MAX_REGISTRY_CREDENTIAL_BYTES {
+        return Err(BootstrapError::Invalid(format!(
+            "registry credential must contain 1-{MAX_REGISTRY_CREDENTIAL_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_egress(
@@ -644,6 +845,7 @@ mod tests {
                 mcp_policy: None,
             }),
             egress_policy: None,
+            registry_proxy: None,
         }
     }
 
@@ -778,5 +980,106 @@ mod tests {
             .cgroup_parent = drifted.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
         config.egress_policy = Some(drifted);
         assert!(encode_bootstrap_document(config, &[5; 32]).is_err());
+    }
+
+    #[test]
+    fn authenticated_bootstrap_round_trips_redacted_registry_credentials() {
+        let mut config = configuration();
+        let network = sendbox_policy::NetworkPolicy {
+            default_action: Action::Deny,
+            allowed_domains: vec!["registry.example.com".to_owned()],
+            blocked_domains: Vec::new(),
+            allow_dns: true,
+            max_connections: None,
+            allowed_networks: Vec::new(),
+            blocked_networks: Vec::new(),
+            allowed_ports: Vec::new(),
+            dns: sendbox_policy::DnsPolicy::default(),
+        };
+        let egress = EgressRuntimePolicyDocument::for_session(config.session_id, network);
+        config
+            .execution_broker
+            .as_mut()
+            .expect("execution broker")
+            .cgroup_parent = egress.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
+        config.egress_policy = Some(egress);
+        let policy = sendbox_policy::PackageSupplyChainPolicy {
+            enabled: true,
+            registries: vec![sendbox_policy::PackageRegistryPolicy {
+                url: "https://registry.example.com/".to_owned(),
+                credential_secret: Some("PRIVATE_NPM_TOKEN".to_owned()),
+                ..sendbox_policy::PackageRegistryPolicy::default()
+            }],
+            ..sendbox_policy::PackageSupplyChainPolicy::default()
+        };
+        config.registry_proxy = Some(RegistryProxyConfiguration {
+            policy,
+            proxy_port: 15_081,
+            trusted_upstream_port: 15_082,
+            cache_root: PathBuf::from("/var/cache/sendbox/packages"),
+            report_path: PathBuf::from("/run/sendbox/package-report.json"),
+            credentials: vec![
+                RegistryCredential::new("PRIVATE_NPM_TOKEN", b"top-secret".to_vec()).unwrap(),
+            ],
+        });
+
+        let encoded = encode_bootstrap_document(config, &[6; 32]).expect("encode bootstrap");
+        assert!(!String::from_utf8_lossy(&encoded).contains("top-secret"));
+        let decoded = decode_bootstrap_document(&encoded).expect("decode bootstrap");
+        let registry = decoded.registry_proxy.expect("registry proxy");
+        assert_eq!(
+            registry.credentials[0].expose_to_registry_proxy(),
+            b"top-secret"
+        );
+        assert_eq!(
+            format!("{:?}", registry.credentials[0]),
+            "RegistryCredential { secret_reference: \"PRIVATE_NPM_TOKEN\", token: \"[REDACTED]\" }"
+        );
+    }
+
+    #[test]
+    fn authenticated_bootstrap_rejects_missing_or_oversized_registry_credentials() {
+        let mut config = configuration();
+        let network = sendbox_policy::NetworkPolicy {
+            default_action: Action::Deny,
+            allowed_domains: vec!["registry.example.com".to_owned()],
+            blocked_domains: Vec::new(),
+            allow_dns: true,
+            max_connections: None,
+            allowed_networks: Vec::new(),
+            blocked_networks: Vec::new(),
+            allowed_ports: Vec::new(),
+            dns: sendbox_policy::DnsPolicy::default(),
+        };
+        let egress = EgressRuntimePolicyDocument::for_session(config.session_id, network);
+        config
+            .execution_broker
+            .as_mut()
+            .expect("execution broker")
+            .cgroup_parent = egress.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
+        config.egress_policy = Some(egress);
+        config.registry_proxy = Some(RegistryProxyConfiguration {
+            policy: sendbox_policy::PackageSupplyChainPolicy {
+                enabled: true,
+                registries: vec![sendbox_policy::PackageRegistryPolicy {
+                    credential_secret: Some("PRIVATE_NPM_TOKEN".to_owned()),
+                    ..sendbox_policy::PackageRegistryPolicy::default()
+                }],
+                ..sendbox_policy::PackageSupplyChainPolicy::default()
+            },
+            proxy_port: 15_081,
+            trusted_upstream_port: 15_082,
+            cache_root: PathBuf::from("/var/cache/sendbox/packages"),
+            report_path: PathBuf::from("/run/sendbox/package-report.json"),
+            credentials: Vec::new(),
+        });
+        assert!(encode_bootstrap_document(config, &[6; 32]).is_err());
+        assert!(
+            RegistryCredential::new(
+                "PRIVATE_NPM_TOKEN",
+                vec![7; MAX_REGISTRY_CREDENTIAL_BYTES + 1]
+            )
+            .is_err()
+        );
     }
 }

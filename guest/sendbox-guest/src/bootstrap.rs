@@ -198,6 +198,7 @@ mod tests {
                 services: Vec::new(),
                 execution_broker: None,
                 egress_policy: None,
+                registry_proxy: None,
             },
             &secret,
         )

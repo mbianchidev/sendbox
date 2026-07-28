@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use proptest::prelude::*;
 use sendbox_config::{AtomicWriteMode, PolicyPreset, RuntimeProvider, SandboxConfiguration};
 use sendbox_core::DiagnosticCode;
-use sendbox_policy::Action;
+use sendbox_policy::{Action, PackageRegistryPolicy};
 use tempfile::tempdir;
 
 fn workspace_path(relative: &str) -> PathBuf {
@@ -405,5 +405,42 @@ fn rejects_branch_protection_without_boundaries() {
             && diagnostic
                 .message
                 .contains("requires policy.boundaries.enabled")
+    }));
+}
+
+#[test]
+fn rejects_registry_credentials_exposed_to_the_workload() {
+    let mut config = SandboxConfiguration::for_project(
+        PathBuf::from("/projects/private-npm"),
+        PolicyPreset::Default,
+        RuntimeProvider::Kata,
+    );
+    config.policy.packages.enabled = true;
+    config.policy.packages.registries = vec![PackageRegistryPolicy {
+        credential_secret: Some("NPM_TOKEN".to_owned()),
+        ..PackageRegistryPolicy::default()
+    }];
+    config.secrets.push("NPM_TOKEN".to_owned());
+
+    let diagnostics = config.validate().unwrap_err().into_diagnostics();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "policy.packages.registries[0].credential_secret"
+            && diagnostic.message.contains("workload secrets")
+    }));
+}
+
+#[test]
+fn rejects_package_proxy_with_hyperlight() {
+    let mut config = SandboxConfiguration::for_project(
+        PathBuf::from("/projects/packages"),
+        PolicyPreset::Default,
+        RuntimeProvider::Hyperlight,
+    );
+    config.policy.packages.enabled = true;
+    config.policy.packages.registries = vec![PackageRegistryPolicy::default()];
+
+    let diagnostics = config.validate().unwrap_err().into_diagnostics();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "policy.packages.enabled" && diagnostic.message.contains("not supported")
     }));
 }

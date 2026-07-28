@@ -556,6 +556,7 @@ impl AppleRuntime {
                     mcp_policy: self.configuration.mcp_policy.clone(),
                 }),
                 egress_policy: self.configuration.egress_policy.clone(),
+                registry_proxy: None,
             },
             channel.bootstrap_material.as_bytes(),
         )

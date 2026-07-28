@@ -5,9 +5,13 @@ use std::path::Path;
 
 use sendbox_core::{Diagnostic, DiagnosticCode, ValidationFailure};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 const BPFTRACE_STRING_LENGTH: usize = 4096;
 const MAX_SERVER_COMMAND_PARTS: usize = 16;
+pub const MAX_PACKAGE_REGISTRIES: usize = 16;
+pub const MAX_PACKAGE_FINDING_RULES: usize = 64;
+pub const MAX_PACKAGE_EXCEPTIONS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -285,6 +289,204 @@ pub struct BoundaryPolicy {
     pub log_path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageEcosystem {
+    Npm,
+    Pypi,
+    Cargo,
+    GoModules,
+    Maven,
+    Oci,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageAction {
+    Allow,
+    Deny,
+    Quarantine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageFindingKind {
+    LifecycleScript,
+    ArchiveTraversal,
+    AbsoluteArchivePath,
+    UnsafeSymlink,
+    UnsafeHardlink,
+    DeviceEntry,
+    FifoEntry,
+    SparseEntry,
+    UnsupportedArchiveEntry,
+    DecompressionLimit,
+    OversizedEntry,
+    UnexpectedExecutable,
+    NativeAddon,
+    PrebuiltBinary,
+    EmbeddedExecutable,
+    SubprocessApi,
+    ShellApi,
+    IntegrityFailure,
+    IdentityMismatch,
+    SignatureFailure,
+    ProvenanceFailure,
+    UnsupportedContent,
+    ScannerFailure,
+    Timeout,
+}
+
+impl PackageFindingKind {
+    #[must_use]
+    pub const fn is_fail_closed(self) -> bool {
+        matches!(
+            self,
+            Self::DecompressionLimit
+                | Self::IntegrityFailure
+                | Self::IdentityMismatch
+                | Self::SignatureFailure
+                | Self::ProvenanceFailure
+                | Self::UnsupportedContent
+                | Self::ScannerFailure
+                | Self::Timeout
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceRequirement {
+    IfPresent,
+    Required,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PackageRegistryPolicy {
+    pub ecosystem: PackageEcosystem,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_secret: Option<String>,
+    pub allow_insecure_http: bool,
+    pub signature: EvidenceRequirement,
+    pub provenance: EvidenceRequirement,
+}
+
+impl Default for PackageRegistryPolicy {
+    fn default() -> Self {
+        Self {
+            ecosystem: PackageEcosystem::Npm,
+            url: "https://registry.npmjs.org/".to_owned(),
+            credential_secret: None,
+            allow_insecure_http: false,
+            signature: EvidenceRequirement::IfPresent,
+            provenance: EvidenceRequirement::IfPresent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageFindingPolicy {
+    pub finding: PackageFindingKind,
+    pub action: PackageAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageExceptionRule {
+    pub ecosystem: PackageEcosystem,
+    pub package: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub artifact_digest: String,
+    pub findings: Vec<PackageFindingKind>,
+    pub action: PackageAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PackageAnalysisLimits {
+    pub max_metadata_bytes: u64,
+    pub max_download_bytes: u64,
+    pub max_unpacked_bytes: u64,
+    pub max_entry_bytes: u64,
+    pub max_entries: u32,
+    pub max_path_bytes: u32,
+    pub max_depth: u32,
+    pub max_source_scan_bytes: u64,
+    pub request_timeout_secs: u32,
+    pub scan_timeout_secs: u32,
+    pub max_report_findings: u32,
+}
+
+impl Default for PackageAnalysisLimits {
+    fn default() -> Self {
+        Self {
+            max_metadata_bytes: 16 * 1024 * 1024,
+            max_download_bytes: 256 * 1024 * 1024,
+            max_unpacked_bytes: 1024 * 1024 * 1024,
+            max_entry_bytes: 64 * 1024 * 1024,
+            max_entries: 100_000,
+            max_path_bytes: 4096,
+            max_depth: 64,
+            max_source_scan_bytes: 8 * 1024 * 1024,
+            request_timeout_secs: 120,
+            scan_timeout_secs: 30,
+            max_report_findings: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PackageCachePolicy {
+    pub enabled: bool,
+    pub max_bytes: u64,
+    pub max_entries: u32,
+    pub retain_quarantined: bool,
+}
+
+impl Default for PackageCachePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes: 4 * 1024 * 1024 * 1024,
+            max_entries: 100_000,
+            retain_quarantined: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PackageSupplyChainPolicy {
+    pub enabled: bool,
+    pub registries: Vec<PackageRegistryPolicy>,
+    pub default_finding_action: PackageAction,
+    pub finding_actions: Vec<PackageFindingPolicy>,
+    pub exceptions: Vec<PackageExceptionRule>,
+    pub allow_legacy_sha1: bool,
+    pub limits: PackageAnalysisLimits,
+    pub cache: PackageCachePolicy,
+}
+
+impl Default for PackageSupplyChainPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            registries: Vec::new(),
+            default_finding_action: PackageAction::Deny,
+            finding_actions: Vec::new(),
+            exceptions: Vec::new(),
+            allow_legacy_sha1: true,
+            limits: PackageAnalysisLimits::default(),
+            cache: PackageCachePolicy::default(),
+        }
+    }
+}
+
 impl Default for BoundaryPolicy {
     fn default() -> Self {
         Self {
@@ -303,6 +505,8 @@ pub struct PolicyConfiguration {
     pub network: NetworkPolicy,
     #[serde(default)]
     pub boundaries: BoundaryPolicy,
+    #[serde(default)]
+    pub packages: PackageSupplyChainPolicy,
 }
 
 impl PolicyConfiguration {
@@ -350,6 +554,7 @@ impl PolicyConfiguration {
         self.network.dns.validate(&mut diagnostics);
 
         self.boundaries.validate(&mut diagnostics);
+        self.packages.validate_into(&mut diagnostics);
 
         if diagnostics.is_empty() {
             Ok(())
@@ -372,6 +577,7 @@ impl BoundaryPolicy {
                 "must be greater than zero",
             ));
         }
+
         if !Path::new(&self.log_path).is_absolute() {
             diagnostics.push(Diagnostic::new(
                 DiagnosticCode::InvalidPath,
@@ -460,6 +666,265 @@ impl BoundaryPolicy {
             }
         }
     }
+}
+
+impl PackageSupplyChainPolicy {
+    pub fn validate(&self) -> Result<(), ValidationFailure> {
+        let mut diagnostics = Vec::new();
+        self.validate_into(&mut diagnostics);
+        if diagnostics.is_empty() {
+            Ok(())
+        } else {
+            Err(ValidationFailure::new(diagnostics))
+        }
+    }
+
+    fn validate_into(&self, diagnostics: &mut Vec<Diagnostic>) {
+        if !self.enabled {
+            return;
+        }
+        if self.registries.is_empty() {
+            invalid_value(
+                diagnostics,
+                "policy.packages.registries",
+                "must list at least one registry when package analysis is enabled",
+            );
+        }
+        if self.registries.len() > MAX_PACKAGE_REGISTRIES {
+            invalid_value(
+                diagnostics,
+                "policy.packages.registries",
+                "contains too many registries",
+            );
+        }
+        let mut registries = HashSet::new();
+        for (index, registry) in self.registries.iter().enumerate() {
+            let path = format!("policy.packages.registries[{index}]");
+            match Url::parse(&registry.url) {
+                Ok(url) => {
+                    let http_allowed = registry.allow_insecure_http
+                        && url.scheme() == "http"
+                        && url.host_str().is_some_and(|host| {
+                            host == "localhost"
+                                || host
+                                    .parse::<std::net::IpAddr>()
+                                    .is_ok_and(|address| address.is_loopback())
+                        });
+                    if url.scheme() != "https" && !http_allowed {
+                        invalid_value(
+                            diagnostics,
+                            format!("{path}.url"),
+                            "must use HTTPS unless insecure HTTP is explicitly limited to loopback",
+                        );
+                    }
+                    if !url.username().is_empty()
+                        || url.password().is_some()
+                        || url.query().is_some()
+                        || url.fragment().is_some()
+                    {
+                        invalid_value(
+                            diagnostics,
+                            format!("{path}.url"),
+                            "must not contain credentials, a query, or a fragment",
+                        );
+                    }
+                    let mut normalized = url;
+                    normalized.set_query(None);
+                    normalized.set_fragment(None);
+                    let identity = (registry.ecosystem, normalized.to_string());
+                    if !registries.insert(identity) {
+                        invalid_value(
+                            diagnostics,
+                            format!("{path}.url"),
+                            "duplicates an earlier registry",
+                        );
+                    }
+                }
+                Err(_) => invalid_value(
+                    diagnostics,
+                    format!("{path}.url"),
+                    "must be an absolute registry URL",
+                ),
+            }
+            if let Some(secret) = registry.credential_secret.as_deref()
+                && !valid_secret_reference(secret)
+            {
+                invalid_value(
+                    diagnostics,
+                    format!("{path}.credential_secret"),
+                    "must be a valid secret reference",
+                );
+            }
+        }
+
+        if self.finding_actions.len() > MAX_PACKAGE_FINDING_RULES {
+            invalid_value(
+                diagnostics,
+                "policy.packages.finding_actions",
+                "contains too many finding rules",
+            );
+        }
+        let mut findings = HashSet::new();
+        for (index, rule) in self.finding_actions.iter().enumerate() {
+            if !findings.insert(rule.finding) {
+                invalid_value(
+                    diagnostics,
+                    format!("policy.packages.finding_actions[{index}].finding"),
+                    "duplicates an earlier finding rule",
+                );
+            }
+            if rule.finding.is_fail_closed() && rule.action != PackageAction::Deny {
+                invalid_value(
+                    diagnostics,
+                    format!("policy.packages.finding_actions[{index}].action"),
+                    "fail-closed findings cannot be allowed or quarantined",
+                );
+            }
+        }
+
+        if self.exceptions.len() > MAX_PACKAGE_EXCEPTIONS {
+            invalid_value(
+                diagnostics,
+                "policy.packages.exceptions",
+                "contains too many exception rules",
+            );
+        }
+        for (index, exception) in self.exceptions.iter().enumerate() {
+            let path = format!("policy.packages.exceptions[{index}]");
+            if exception.package.trim().is_empty() || exception.package.len() > 256 {
+                invalid_value(
+                    diagnostics,
+                    format!("{path}.package"),
+                    "must contain 1-256 bytes",
+                );
+            }
+            if exception
+                .version
+                .as_deref()
+                .is_some_and(|version| version.trim().is_empty() || version.len() > 128)
+            {
+                invalid_value(
+                    diagnostics,
+                    format!("{path}.version"),
+                    "must contain 1-128 bytes when configured",
+                );
+            }
+            if !valid_artifact_digest(&exception.artifact_digest) {
+                invalid_value(
+                    diagnostics,
+                    format!("{path}.artifact_digest"),
+                    "must be a lowercase sha256 or sha512 digest",
+                );
+            }
+            if exception.findings.is_empty() {
+                invalid_value(
+                    diagnostics,
+                    format!("{path}.findings"),
+                    "must list at least one finding",
+                );
+            }
+            let mut exception_findings = HashSet::new();
+            if exception
+                .findings
+                .iter()
+                .any(|finding| !exception_findings.insert(*finding))
+            {
+                invalid_value(
+                    diagnostics,
+                    format!("{path}.findings"),
+                    "must not contain duplicate findings",
+                );
+            }
+            if exception.action != PackageAction::Deny
+                && exception
+                    .findings
+                    .iter()
+                    .any(|finding| finding.is_fail_closed())
+            {
+                invalid_value(
+                    diagnostics,
+                    format!("{path}.action"),
+                    "fail-closed findings cannot be overridden by an exception",
+                );
+            }
+        }
+
+        let limits = &self.limits;
+        for (field, value) in [
+            ("max_metadata_bytes", limits.max_metadata_bytes),
+            ("max_download_bytes", limits.max_download_bytes),
+            ("max_unpacked_bytes", limits.max_unpacked_bytes),
+            ("max_entry_bytes", limits.max_entry_bytes),
+            ("max_source_scan_bytes", limits.max_source_scan_bytes),
+        ] {
+            if value == 0 {
+                invalid_value(
+                    diagnostics,
+                    format!("policy.packages.limits.{field}"),
+                    "must be greater than zero",
+                );
+            }
+        }
+        for (field, value) in [
+            ("max_entries", limits.max_entries),
+            ("max_path_bytes", limits.max_path_bytes),
+            ("max_depth", limits.max_depth),
+            ("request_timeout_secs", limits.request_timeout_secs),
+            ("scan_timeout_secs", limits.scan_timeout_secs),
+            ("max_report_findings", limits.max_report_findings),
+        ] {
+            if value == 0 {
+                invalid_value(
+                    diagnostics,
+                    format!("policy.packages.limits.{field}"),
+                    "must be greater than zero",
+                );
+            }
+        }
+        if limits.max_entry_bytes > limits.max_unpacked_bytes {
+            invalid_value(
+                diagnostics,
+                "policy.packages.limits.max_entry_bytes",
+                "must not exceed max_unpacked_bytes",
+            );
+        }
+        if self.cache.enabled && (self.cache.max_bytes == 0 || self.cache.max_entries == 0) {
+            invalid_value(
+                diagnostics,
+                "policy.packages.cache",
+                "enabled cache limits must be greater than zero",
+            );
+        }
+    }
+}
+
+fn valid_secret_reference(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+        })
+}
+
+fn valid_artifact_digest(value: &str) -> bool {
+    let (algorithm, digest) = value.split_once(':').unwrap_or(("", ""));
+    let expected = match algorithm {
+        "sha256" => 64,
+        "sha512" => 128,
+        _ => return false,
+    };
+    digest.len() == expected
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn invalid_value(
+    diagnostics: &mut Vec<Diagnostic>,
+    path: impl Into<String>,
+    message: impl Into<String>,
+) {
+    diagnostics.push(Diagnostic::new(DiagnosticCode::InvalidValue, path, message));
 }
 
 fn validate_nonempty_patterns(values: &[String], path: &str, diagnostics: &mut Vec<Diagnostic>) {

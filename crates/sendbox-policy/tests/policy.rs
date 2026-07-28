@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use sendbox_policy::{
-    Action, BoundaryPolicy, DnsPolicy, DnsRecordType, NetworkPolicy, PolicyConfiguration, Protocol,
+    Action, BoundaryPolicy, DnsPolicy, DnsRecordType, EvidenceRequirement, NetworkPolicy,
+    PackageAction, PackageEcosystem, PackageFindingKind, PackageRegistryPolicy,
+    PackageSupplyChainPolicy, PolicyConfiguration, Protocol,
 };
 
 fn workspace_path(relative: &str) -> PathBuf {
@@ -222,4 +224,170 @@ boundaries:
         diagnostic.path == "policy.boundaries.tool_calls.allowed_server_commands[0]"
             && diagnostic.message.contains("non-shell")
     }));
+}
+
+#[test]
+fn package_policy_defaults_disabled_and_fail_closed_when_enabled() {
+    let disabled = PackageSupplyChainPolicy::default();
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.default_finding_action, PackageAction::Deny);
+    assert!(disabled.cache.enabled);
+
+    let policy = PackageSupplyChainPolicy {
+        enabled: true,
+        registries: vec![PackageRegistryPolicy::default()],
+        ..PackageSupplyChainPolicy::default()
+    };
+    let config = PolicyConfiguration {
+        commands: sendbox_policy::CommandPolicy {
+            default_action: Action::Deny,
+            allowlist: Vec::new(),
+            denylist: Vec::new(),
+            log_blocked: true,
+        },
+        network: NetworkPolicy {
+            default_action: Action::Deny,
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            allow_dns: true,
+            max_connections: None,
+            allowed_networks: Vec::new(),
+            blocked_networks: Vec::new(),
+            allowed_ports: Vec::new(),
+            dns: DnsPolicy::default(),
+        },
+        boundaries: BoundaryPolicy::default(),
+        packages: policy,
+    };
+    config.validate().unwrap();
+    assert_eq!(
+        config.packages.registries[0].signature,
+        EvidenceRequirement::IfPresent
+    );
+}
+
+#[test]
+fn package_policy_rejects_insecure_remote_registries_and_weak_exceptions() {
+    let yaml = r#"
+commands:
+  default_action: deny
+  allowlist: []
+  denylist: []
+  log_blocked: true
+network:
+  default_action: deny
+  allowed_domains: []
+  blocked_domains: []
+  allow_dns: true
+packages:
+  enabled: true
+  registries:
+    - ecosystem: npm
+      url: http://registry.example.com/
+      allow_insecure_http: true
+  exceptions:
+    - ecosystem: npm
+      package: risky
+      artifact_digest: latest
+      findings: []
+      action: allow
+"#;
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(yaml).unwrap();
+    let diagnostics = policy.validate().unwrap_err().into_diagnostics();
+    for path in [
+        "policy.packages.registries[0].url",
+        "policy.packages.exceptions[0].artifact_digest",
+        "policy.packages.exceptions[0].findings",
+    ] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.path == path),
+            "missing diagnostic for {path}"
+        );
+    }
+}
+
+#[test]
+fn package_policy_accepts_digest_bound_lifecycle_exception() {
+    let digest = format!("sha512:{}", "a".repeat(128));
+    let yaml = format!(
+        r#"
+commands:
+  default_action: deny
+  allowlist: []
+  denylist: []
+  log_blocked: true
+network:
+  default_action: deny
+  allowed_domains: []
+  blocked_domains: []
+  allow_dns: true
+packages:
+  enabled: true
+  registries:
+    - ecosystem: npm
+      url: https://registry.npmjs.org/
+      signature: required
+      provenance: if_present
+  exceptions:
+    - ecosystem: npm
+      package: "@acme/build"
+      version: 1.2.3
+      artifact_digest: "{digest}"
+      findings: [lifecycle_script]
+      action: allow
+"#
+    );
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(&yaml).unwrap();
+    policy.validate().unwrap();
+    let exception = &policy.packages.exceptions[0];
+    assert_eq!(exception.ecosystem, PackageEcosystem::Npm);
+    assert_eq!(
+        exception.findings,
+        vec![PackageFindingKind::LifecycleScript]
+    );
+}
+
+#[test]
+fn package_policy_rejects_overrides_for_fail_closed_findings() {
+    let digest = format!("sha512:{}", "b".repeat(128));
+    let yaml = format!(
+        r#"
+commands:
+  default_action: deny
+  allowlist: []
+  denylist: []
+  log_blocked: true
+network:
+  default_action: deny
+  allowed_domains: []
+  blocked_domains: []
+  allow_dns: true
+packages:
+  enabled: true
+  registries:
+    - ecosystem: npm
+      url: https://registry.npmjs.org/
+  finding_actions:
+    - finding: scanner_failure
+      action: allow
+  exceptions:
+    - ecosystem: npm
+      package: risky
+      artifact_digest: "{digest}"
+      findings: [integrity_failure]
+      action: quarantine
+"#
+    );
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(&yaml).unwrap();
+    let diagnostics = policy.validate().unwrap_err().into_diagnostics();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.path == "policy.packages.finding_actions[0].action" })
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.path == "policy.packages.exceptions[0].action" })
+    );
 }
