@@ -21,10 +21,12 @@ sendbox-host = { path = "../sendbox-host" }
 sendbox-mcp = { path = "../sendbox-mcp" }
 sendbox-policy = { path = "../sendbox-policy" }
 sendbox-project = { path = "../sendbox-project" }
+sendbox-registry = { path = "../sendbox-registry" }
 sendbox-runtime = { path = "../sendbox-runtime" }
 sendbox-secrets = { path = "../sendbox-secrets" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["io-std", "rt", "signal", "sync"] }
 
 [target.'cfg(unix)'.dependencies]

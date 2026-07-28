@@ -126,7 +126,11 @@ impl RegistryProxy {
             configuration.policy.cache.clone(),
         )?;
         let report = PackageSecurityReport::enabled();
-        persist_report(&configuration.report_path, &report)?;
+        persist_report(
+            &configuration.report_path,
+            &report,
+            configuration.policy.limits.max_report_bytes,
+        )?;
         Ok(Self {
             inner: Arc::new(RegistryProxyInner {
                 base_url: configuration.base_url,
@@ -582,11 +586,14 @@ impl RegistryProxy {
             .map_err(RegistryError::Inspection)?;
         let report_path = self.inner.report_path.clone();
         let persisted = next.clone();
-        tokio::task::spawn_blocking(move || persist_report(&report_path, &persisted))
-            .await
-            .map_err(|error| {
-                RegistryError::Cache(format!("join report persistence task: {error}"))
-            })??;
+        let maximum_bytes = self.inner.policy.limits.max_report_bytes;
+        tokio::task::spawn_blocking(move || {
+            persist_report(&report_path, &persisted, maximum_bytes)
+        })
+        .await
+        .map_err(|error| {
+            RegistryError::Cache(format!("join report persistence task: {error}"))
+        })??;
         *report = next;
         Ok(())
     }
@@ -814,9 +821,18 @@ fn decode_hex_digit(byte: u8) -> RegistryResult<u8> {
     }
 }
 
-fn persist_report(path: &Path, report: &PackageSecurityReport) -> RegistryResult<()> {
+fn persist_report(
+    path: &Path,
+    report: &PackageSecurityReport,
+    maximum_bytes: u64,
+) -> RegistryResult<()> {
     let encoded = serde_json::to_vec(report)
         .map_err(|error| RegistryError::Cache(format!("encode package report: {error}")))?;
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > maximum_bytes {
+        return Err(RegistryError::Inspection(format!(
+            "package report exceeds the configured {maximum_bytes}-byte limit"
+        )));
+    }
     atomic_write_file(path, &encoded, REPORT_FILE_MODE, AtomicWriteMode::Replace)
         .map_err(|error| RegistryError::Cache(format!("write package report: {error}")))
 }
@@ -1163,6 +1179,28 @@ mod tests {
         });
         assert!(report.validate(1, 0).is_err());
         assert!(report.validate(1, 1).is_ok());
+    }
+
+    #[test]
+    fn report_persistence_enforces_the_byte_limit_before_installing() {
+        let temporary = tempdir().expect("temporary directory");
+        let path = temporary.path().join("report.json");
+        let report = PackageSecurityReport::enabled();
+        let encoded = serde_json::to_vec(&report).expect("encode report");
+        assert!(
+            persist_report(
+                &path,
+                &report,
+                u64::try_from(encoded.len()).expect("report length"),
+            )
+            .is_ok()
+        );
+        assert_eq!(std::fs::read(&path).expect("read report"), encoded);
+        assert!(persist_report(&path, &report, 1).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("previous report remains"),
+            serde_json::to_vec(&report).expect("encode report")
+        );
     }
 
     #[tokio::test]

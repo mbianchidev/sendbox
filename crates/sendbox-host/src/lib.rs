@@ -68,6 +68,7 @@ use sendbox_runtime_kata::{KataProviderConfiguration, KataRuntimeProvider};
 use sendbox_secrets::{SecretName, SecretStore, SecretValue, requires_guarded_github_forwarding};
 use sendbox_security::{SecurityError, provenance::SigningKeyMaterial};
 use sendbox_session_security::SessionSecurityError;
+use serde::Serialize;
 use thiserror::Error;
 use url::Url;
 use zeroize::Zeroizing;
@@ -87,7 +88,7 @@ const COPILOT_HOST_TOKEN_ENVIRONMENTS: &[&str] =
 const MCP_PROXY_ENVIRONMENT: &str = "SENDBOX_MCP_PROXY";
 const MAX_EXECUTION_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;
 const MAX_EXECUTION_ENVIRONMENT_BYTES: usize = 16 * 1024;
-const PACKAGE_REPORT_FILE: &str = "package-security-report.json";
+pub const PACKAGE_SECURITY_REPORT_FILE: &str = "package-security-report.json";
 #[cfg(target_os = "linux")]
 const SECRET_SERVICE: &str = "sendbox";
 
@@ -117,15 +118,70 @@ pub struct HostRunRequest {
 
 #[derive(Debug)]
 pub enum HostRunReport {
-    Persistent(AgentReport),
+    Persistent(PersistentHostRunReport),
     OneShot(ProcessOutcome),
+}
+
+#[derive(Debug)]
+pub struct PersistentHostRunReport {
+    session_id: SessionId,
+    agent: AgentReport,
+    package_report: Option<PersistedPackageReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersistedPackageReport {
+    path: PathBuf,
+    sha256: String,
+    proxy_enabled: bool,
+    records: u32,
+    allowed: u32,
+    denied: u32,
+    quarantined: u32,
+}
+
+impl PersistedPackageReport {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    #[must_use]
+    pub const fn proxy_enabled(&self) -> bool {
+        self.proxy_enabled
+    }
+
+    #[must_use]
+    pub const fn records(&self) -> u32 {
+        self.records
+    }
+
+    #[must_use]
+    pub const fn allowed(&self) -> u32 {
+        self.allowed
+    }
+
+    #[must_use]
+    pub const fn denied(&self) -> u32 {
+        self.denied
+    }
+
+    #[must_use]
+    pub const fn quarantined(&self) -> u32 {
+        self.quarantined
+    }
 }
 
 impl HostRunReport {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Persistent(report) => match &report.terminal {
+            Self::Persistent(report) => match &report.agent.terminal {
                 GuestTerminal::Exited { code } => *code,
                 GuestTerminal::Signaled { signal } => 128_i32.saturating_add(*signal),
                 GuestTerminal::Cancelled => 130,
@@ -141,7 +197,7 @@ impl HostRunReport {
     fn successful(&self) -> bool {
         match self {
             Self::Persistent(report) => {
-                matches!(report.terminal, GuestTerminal::Exited { code: 0 })
+                matches!(report.agent.terminal, GuestTerminal::Exited { code: 0 })
             }
             Self::OneShot(outcome) => outcome.status.success,
         }
@@ -151,6 +207,22 @@ impl HostRunReport {
         match self {
             Self::Persistent(_) => "persistent",
             Self::OneShot(_) => "one_shot",
+        }
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> Option<SessionId> {
+        match self {
+            Self::Persistent(report) => Some(report.session_id),
+            Self::OneShot(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn package_report(&self) -> Option<&PersistedPackageReport> {
+        match self {
+            Self::Persistent(report) => report.package_report.as_ref(),
+            Self::OneShot(_) => None,
         }
     }
 }
@@ -385,6 +457,8 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .map_err(|error| HostError::Invalid(error.to_string()))?;
     let policy_bytes = serde_json::to_vec(&request.configuration.policy)
         .map_err(|error| HostError::Invalid(error.to_string()))?;
+    let package_report_validation =
+        security::PackageReportValidation::from_policy(&request.configuration.policy.packages)?;
     let configuration_sha256 = sha256_hex(&configuration_bytes);
     let policy_sha256 = sha256_hex(&policy_bytes);
     let resources = runtime_resources(&request.configuration)?;
@@ -581,6 +655,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         workspace_source,
         state_directory,
         key,
+        package_report_validation,
     );
 
     Ok(PreparedHostRun {
@@ -621,10 +696,17 @@ async fn execute_runtime(
                 })?;
                 orchestrator = orchestrator.with_terminal(size, source);
             }
+            let session_id = plan.session_id();
             orchestrator
                 .run(&plan, cancellation)
                 .await
-                .map(HostRunReport::Persistent)
+                .map(|agent| {
+                    HostRunReport::Persistent(PersistentHostRunReport {
+                        session_id,
+                        agent,
+                        package_report: None,
+                    })
+                })
                 .map_err(HostError::AgentRun)
         }
         HostExecution::Hyperlight(execution) => {
@@ -1264,7 +1346,7 @@ fn prepare_registry_proxy(
             report_path: PathBuf::from("/run/sendbox")
                 .join(session_id.to_string())
                 .join("registry")
-                .join(PACKAGE_REPORT_FILE),
+                .join(PACKAGE_SECURITY_REPORT_FILE),
             proxy_uid: DEFAULT_REGISTRY_UID,
             proxy_gid: DEFAULT_REGISTRY_GID,
             credentials,

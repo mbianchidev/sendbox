@@ -17,9 +17,11 @@ pub use limits::{DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES};
 pub use operations::{
     AGENT_LAUNCH_OPERATION, EnvironmentEntryV2, HEALTH_OPERATION, HealthResponseV2,
     INTERACTIVE_LAUNCH_OPERATION, INTERACTIVE_OPERATION_SCHEMA_VERSION, InteractiveLaunchError,
-    InteractiveLaunchRequestV1, LaunchRequestV2, OPERATION_SCHEMA_VERSION, SecretEnvelopeV2,
-    TerminalResultV2, TerminalSizeV1, TerminalStateV1, agent_guest_capabilities,
-    agent_guest_required_capabilities, agent_host_capabilities, agent_host_required_capabilities,
+    InteractiveLaunchRequestV1, LaunchRequestV2, OPERATION_SCHEMA_VERSION,
+    PACKAGE_REPORT_OPERATION, PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1,
+    PackageReportResponseV1, SecretEnvelopeV2, TerminalResultV2, TerminalSizeV1, TerminalStateV1,
+    agent_guest_capabilities, agent_guest_required_capabilities, agent_host_capabilities,
+    agent_host_required_capabilities,
 };
 pub use types::{
     Cancellation, Capability, CapabilitySet, CloseCode, Event, EventKind, GracefulClose, Hello,

@@ -2,8 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use sendbox_policy::{
-    Action, BoundaryPolicy, DnsPolicy, DnsRecordType, EvidenceRequirement, NetworkPolicy,
-    PackageAction, PackageEcosystem, PackageFindingKind, PackageRegistryPolicy,
+    Action, BoundaryPolicy, CommandPolicy, DnsPolicy, DnsRecordType, EvidenceRequirement,
+    NetworkPolicy, PackageAction, PackageEcosystem, PackageFindingKind, PackageRegistryPolicy,
     PackageSupplyChainPolicy, PolicyConfiguration, Protocol,
 };
 
@@ -232,6 +232,10 @@ fn package_policy_defaults_disabled_and_fail_closed_when_enabled() {
     assert!(!disabled.enabled);
     assert_eq!(disabled.default_finding_action, PackageAction::Deny);
     assert!(disabled.cache.enabled);
+    assert_eq!(
+        disabled.limits.max_report_bytes,
+        sendbox_policy::MAX_PACKAGE_REPORT_BYTES
+    );
 
     let policy = PackageSupplyChainPolicy {
         enabled: true,
@@ -263,6 +267,43 @@ fn package_policy_defaults_disabled_and_fail_closed_when_enabled() {
     assert_eq!(
         config.packages.registries[0].signature,
         EvidenceRequirement::IfPresent
+    );
+}
+
+#[test]
+fn package_policy_rejects_reports_larger_than_the_protocol_budget() {
+    let mut policy = PackageSupplyChainPolicy {
+        enabled: true,
+        registries: vec![PackageRegistryPolicy::default()],
+        ..PackageSupplyChainPolicy::default()
+    };
+    policy.limits.max_report_bytes = sendbox_policy::MAX_PACKAGE_REPORT_BYTES + 1;
+    let config = PolicyConfiguration {
+        commands: CommandPolicy {
+            default_action: Action::Deny,
+            allowlist: Vec::new(),
+            denylist: Vec::new(),
+            log_blocked: true,
+        },
+        network: NetworkPolicy {
+            default_action: Action::Deny,
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            allow_dns: true,
+            max_connections: None,
+            allowed_networks: Vec::new(),
+            blocked_networks: Vec::new(),
+            allowed_ports: Vec::new(),
+            dns: DnsPolicy::default(),
+        },
+        boundaries: BoundaryPolicy::default(),
+        packages: policy,
+    };
+    let diagnostics = config.validate().unwrap_err().into_diagnostics();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.path == "policy.packages.limits.max_report_bytes" })
     );
 }
 

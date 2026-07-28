@@ -36,7 +36,10 @@ use sendbox_session_security::{
 };
 use serde::Serialize;
 
-use crate::{HostError, HostRunReport, atomic_write, unix_time};
+use crate::{
+    HostError, HostRunReport, PACKAGE_SECURITY_REPORT_FILE, PersistedPackageReport, atomic_write,
+    unix_time,
+};
 
 const SNAPSHOT_DIRECTORY: &str = "snapshots";
 const SUPERVISOR_STATE_FILE: &str = "permission-supervisor.json";
@@ -66,6 +69,34 @@ pub(crate) struct HostSecurityContext {
     state_directory: PathBuf,
     signing_key: SigningKeyMaterial,
     planned_secret_count: usize,
+    package_report_validation: Option<PackageReportValidation>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PackageReportValidation {
+    maximum_bytes: usize,
+    maximum_findings: usize,
+    policy_digest: String,
+}
+
+impl PackageReportValidation {
+    pub(crate) fn from_policy(
+        policy: &sendbox_policy::PackageSupplyChainPolicy,
+    ) -> Result<Option<Self>, HostError> {
+        if !policy.enabled {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            maximum_bytes: usize::try_from(policy.limits.max_report_bytes).map_err(|_| {
+                HostError::Invalid("package report byte limit is out of range".to_owned())
+            })?,
+            maximum_findings: usize::try_from(policy.limits.max_report_findings).map_err(|_| {
+                HostError::Invalid("package report finding limit is out of range".to_owned())
+            })?,
+            policy_digest: sendbox_registry::package_policy_digest(policy)
+                .map_err(|error| HostError::Invalid(error.to_string()))?,
+        }))
+    }
 }
 
 impl HostSecurityContext {
@@ -76,6 +107,7 @@ impl HostSecurityContext {
         workspace: PathBuf,
         state_directory: PathBuf,
         signing_key: SigningKeyMaterial,
+        package_report_validation: Option<PackageReportValidation>,
     ) -> Self {
         let planned_secret_count = verified_plan.plan().secrets.len();
         Self {
@@ -86,6 +118,7 @@ impl HostSecurityContext {
             state_directory,
             signing_key,
             planned_secret_count,
+            package_report_validation,
         }
     }
 }
@@ -211,9 +244,100 @@ where
     )?;
 
     match runtime.await {
-        Ok(report) => finalize_report(session, &clock, report),
+        Ok(mut report) => {
+            if let Err(error) = persist_package_report(&mut report, &context) {
+                return finalize_runtime_error(session, &clock, error);
+            }
+            finalize_report(session, &clock, report)
+        }
         Err(runtime_error) => finalize_runtime_error(session, &clock, runtime_error),
     }
+}
+
+fn persist_package_report(
+    report: &mut HostRunReport,
+    context: &HostSecurityContext,
+) -> Result<(), HostError> {
+    let raw = match report {
+        HostRunReport::Persistent(report) => report.agent.package_report.take(),
+        HostRunReport::OneShot(_) => None,
+    };
+    let Some(validation) = context.package_report_validation.as_ref() else {
+        if raw.is_some() {
+            return Err(HostError::Invalid(
+                "guest returned an unexpected package security report".to_owned(),
+            ));
+        }
+        return Ok(());
+    };
+    let raw = raw.ok_or_else(|| {
+        HostError::Invalid("guest omitted the required package security report".to_owned())
+    })?;
+    if raw.json.len() > validation.maximum_bytes {
+        return Err(HostError::Invalid(format!(
+            "package security report exceeds the configured {}-byte limit",
+            validation.maximum_bytes
+        )));
+    }
+    let actual_digest = format!("sha256:{}", sha256_hex(&raw.json));
+    if raw.sha256 != actual_digest {
+        return Err(HostError::Invalid(
+            "package security report digest does not match its contents".to_owned(),
+        ));
+    }
+    let parsed: sendbox_registry::PackageSecurityReport = serde_json::from_slice(&raw.json)
+        .map_err(|error| HostError::Invalid(format!("decode package security report: {error}")))?;
+    parsed
+        .validate(validation.maximum_findings, validation.maximum_findings)
+        .map_err(|error| {
+            HostError::Invalid(format!("validate package security report: {error}"))
+        })?;
+    if !parsed.proxy_enabled {
+        return Err(HostError::Invalid(
+            "package security report says the required proxy was disabled".to_owned(),
+        ));
+    }
+    let expected_session = context.verified_plan.plan().session_id.to_string();
+    for record in &parsed.records {
+        if record.requested_by_session != expected_session {
+            return Err(HostError::Invalid(
+                "package security report references a different session".to_owned(),
+            ));
+        }
+        if record.policy_digest != validation.policy_digest {
+            return Err(HostError::Invalid(
+                "package security report references a different package policy".to_owned(),
+            ));
+        }
+    }
+    let canonical = serde_json::to_vec(&parsed)
+        .map_err(|error| HostError::Invalid(format!("encode package security report: {error}")))?;
+    if canonical != raw.json {
+        return Err(HostError::Invalid(
+            "package security report is not in canonical transport form".to_owned(),
+        ));
+    }
+    let path = context.state_directory.join(PACKAGE_SECURITY_REPORT_FILE);
+    atomic_write(&path, &canonical, 0o600)?;
+    let records = u32::try_from(parsed.records.len()).map_err(|_| {
+        HostError::Invalid("package report record count is out of range".to_owned())
+    })?;
+    let persisted = PersistedPackageReport {
+        path,
+        sha256: actual_digest,
+        proxy_enabled: parsed.proxy_enabled,
+        records,
+        allowed: parsed.allowed,
+        denied: parsed.denied,
+        quarantined: parsed.quarantined,
+    };
+    let HostRunReport::Persistent(report) = report else {
+        return Err(HostError::Invalid(
+            "package report cannot be attached to a one-shot run".to_owned(),
+        ));
+    };
+    report.package_report = Some(persisted);
+    Ok(())
 }
 
 fn finalize_report(
@@ -221,6 +345,23 @@ fn finalize_report(
     clock: &dyn LifecycleClock,
     report: HostRunReport,
 ) -> Result<HostRunReport, HostError> {
+    if let Some(package) = report.package_report() {
+        record_or_abort(
+            &mut session,
+            clock,
+            AuditCategory::Provenance,
+            "package_security_report_persisted",
+            package.sha256().to_owned(),
+            AuditResult::Success,
+            BTreeMap::from([
+                ("file".to_owned(), PACKAGE_SECURITY_REPORT_FILE.to_owned()),
+                ("records".to_owned(), package.records().to_string()),
+                ("allowed".to_owned(), package.allowed().to_string()),
+                ("denied".to_owned(), package.denied().to_string()),
+                ("quarantined".to_owned(), package.quarantined().to_string()),
+            ]),
+        )?;
+    }
     let successful = report.successful();
     let result = if successful {
         AuditResult::Success
@@ -971,6 +1112,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use sendbox_agent::{AgentReport, GuestPackageReport, GuestTerminal};
     use sendbox_boundary::{
         Architecture, ArtifactIdentity, ArtifactKind, BOUNDARY_PLAN_FORMAT, BOUNDARY_PLAN_VERSION,
         BoundaryPlan, CommandDeclaration, ControlTransport, EnvironmentDeclaration, HostPlatform,
@@ -983,6 +1125,80 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn persistent_report(session_id: SessionId, json: Vec<u8>, sha256: String) -> HostRunReport {
+        HostRunReport::Persistent(crate::PersistentHostRunReport {
+            session_id,
+            agent: AgentReport {
+                terminal: GuestTerminal::Exited { code: 0 },
+                states: Vec::new(),
+                package_report: Some(GuestPackageReport { json, sha256 }),
+            },
+            package_report: None,
+        })
+    }
+
+    #[test]
+    fn package_report_is_revalidated_and_persisted_atomically() {
+        let temp = TempDir::new().expect("temporary directory");
+        let (mut context, _) = context(&temp, 10, 100);
+        context.package_report_validation = Some(PackageReportValidation {
+            maximum_bytes: 1024,
+            maximum_findings: 10,
+            policy_digest: "unused-for-empty-report".to_owned(),
+        });
+        let session_id = context.verified_plan.plan().session_id;
+        let json = serde_json::to_vec(&sendbox_registry::PackageSecurityReport::enabled())
+            .expect("report");
+        let digest = format!("sha256:{}", sha256_hex(&json));
+        let mut report = persistent_report(session_id, json.clone(), digest.clone());
+
+        persist_package_report(&mut report, &context).expect("persist report");
+
+        let persisted = report.package_report().expect("report metadata");
+        assert_eq!(persisted.sha256(), digest);
+        assert_eq!(fs::read(persisted.path()).expect("read persisted"), json);
+        assert_eq!(
+            fs::metadata(persisted.path())
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn package_report_rejects_digest_tampering_and_oversize() {
+        let temp = TempDir::new().expect("temporary directory");
+        let (mut context, _) = context(&temp, 10, 100);
+        context.package_report_validation = Some(PackageReportValidation {
+            maximum_bytes: 1024,
+            maximum_findings: 10,
+            policy_digest: "unused-for-empty-report".to_owned(),
+        });
+        let session_id = context.verified_plan.plan().session_id;
+        let json = serde_json::to_vec(&sendbox_registry::PackageSecurityReport::enabled())
+            .expect("report");
+        let mut tampered = persistent_report(
+            session_id,
+            json.clone(),
+            format!("sha256:{}", "0".repeat(64)),
+        );
+        assert!(persist_package_report(&mut tampered, &context).is_err());
+
+        context
+            .package_report_validation
+            .as_mut()
+            .expect("validation")
+            .maximum_bytes = 1;
+        let mut oversized = persistent_report(
+            session_id,
+            json.clone(),
+            format!("sha256:{}", sha256_hex(&json)),
+        );
+        assert!(persist_package_report(&mut oversized, &context).is_err());
+    }
 
     fn context(
         temp: &TempDir,
@@ -1093,6 +1309,7 @@ mod tests {
                 workspace,
                 state_directory,
                 key,
+                None,
             ),
             identity,
         )

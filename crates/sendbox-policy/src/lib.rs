@@ -12,6 +12,7 @@ const MAX_SERVER_COMMAND_PARTS: usize = 16;
 pub const MAX_PACKAGE_REGISTRIES: usize = 16;
 pub const MAX_PACKAGE_FINDING_RULES: usize = 64;
 pub const MAX_PACKAGE_EXCEPTIONS: usize = 128;
+pub const MAX_PACKAGE_REPORT_BYTES: u64 = 96 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -420,6 +421,7 @@ pub struct PackageAnalysisLimits {
     pub request_timeout_secs: u32,
     pub scan_timeout_secs: u32,
     pub max_report_findings: u32,
+    pub max_report_bytes: u64,
 }
 
 impl Default for PackageAnalysisLimits {
@@ -436,6 +438,7 @@ impl Default for PackageAnalysisLimits {
             request_timeout_secs: 120,
             scan_timeout_secs: 30,
             max_report_findings: 4096,
+            max_report_bytes: MAX_PACKAGE_REPORT_BYTES,
         }
     }
 }
@@ -857,6 +860,7 @@ impl PackageSupplyChainPolicy {
             ("max_unpacked_bytes", limits.max_unpacked_bytes),
             ("max_entry_bytes", limits.max_entry_bytes),
             ("max_source_scan_bytes", limits.max_source_scan_bytes),
+            ("max_report_bytes", limits.max_report_bytes),
         ] {
             if value == 0 {
                 invalid_value(
@@ -887,6 +891,13 @@ impl PackageSupplyChainPolicy {
                 diagnostics,
                 "policy.packages.limits.max_entry_bytes",
                 "must not exceed max_unpacked_bytes",
+            );
+        }
+        if limits.max_report_bytes > MAX_PACKAGE_REPORT_BYTES {
+            invalid_value(
+                diagnostics,
+                "policy.packages.limits.max_report_bytes",
+                format!("must not exceed {MAX_PACKAGE_REPORT_BYTES} bytes"),
             );
         }
         if self.cache.enabled && (self.cache.max_bytes == 0 || self.cache.max_entries == 0) {

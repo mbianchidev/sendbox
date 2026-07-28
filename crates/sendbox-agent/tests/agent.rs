@@ -23,7 +23,9 @@ use sendbox_config::SandboxConfiguration;
 use sendbox_core::{BoundaryPlanDigest, SessionId};
 use sendbox_protocol::{
     BootstrapSecret, Capability, CapabilitySet, Event, EventKind, FrameLimits, GuestHandshake,
-    HandshakeConfig, LaunchRequestV2, Message, Request, Response, ResponseStatus, VersionRange,
+    HandshakeConfig, LaunchRequestV2, Message, PACKAGE_REPORT_OPERATION,
+    PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1, PackageReportResponseV1, Request,
+    Response, ResponseStatus, VersionRange,
 };
 use sendbox_runtime::{
     CancellationToken, ControlStream, ExecPurpose, ExecRequest, OutputStream, RuntimeCapabilities,
@@ -79,6 +81,14 @@ fn configuration(project_path: PathBuf) -> SandboxConfiguration {
 
 fn request(resources: &TempResource, session_id: SessionId) -> AgentRequest {
     let configuration = configuration(resources.path().to_path_buf());
+    request_for_configuration(resources, session_id, &configuration)
+}
+
+fn request_for_configuration(
+    resources: &TempResource,
+    session_id: SessionId,
+    configuration: &SandboxConfiguration,
+) -> AgentRequest {
     let image = format!("registry.example/sendbox-test@{IMAGE_DIGEST}");
     let guest_workspace = PathBuf::from("/workspace");
     let command = GuestCommand {
@@ -94,7 +104,7 @@ fn request(resources: &TempResource, session_id: SessionId) -> AgentRequest {
     let mounts = Vec::new();
     AgentRequest {
         boundary_plan: verified_boundary_plan(
-            &configuration,
+            configuration,
             session_id,
             &image,
             &guest_workspace,
@@ -235,6 +245,24 @@ fn plan(
         plan_time(),
     )
     .expect("run plan")
+}
+
+fn package_plan(
+    resources: &TempResource,
+    capabilities: &RuntimeCapabilities,
+    session_id: SessionId,
+) -> RunPlan {
+    let mut configuration = configuration(resources.path().to_path_buf());
+    configuration.policy.packages.enabled = true;
+    configuration.policy.packages.registries =
+        vec![sendbox_policy::PackageRegistryPolicy::default()];
+    RunPlan::compile(
+        &configuration,
+        request_for_configuration(resources, session_id, &configuration),
+        capabilities,
+        plan_time(),
+    )
+    .expect("package run plan")
 }
 
 fn interactive_plan(
@@ -621,7 +649,7 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
     let capabilities = runtime_capabilities();
     let runtime = Arc::new(FakeRuntime::new(capabilities.clone()).expect("runtime"));
     let session_id = SessionId::from_bytes([3; 16]);
-    let plan = plan(&resources, &capabilities, session_id);
+    let plan = package_plan(&resources, &capabilities, session_id);
     let expected_policy_digest = plan.policy_digest();
     let expected_boundary_digest = plan.boundary_plan_digest();
     let (host, guest) = tokio::io::duplex(16 * 1024);
@@ -710,6 +738,39 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             }))
             .await
             .expect("terminal response");
+        let message = reader.receive().await.expect("package report request");
+        let Message::Request(Request {
+            request_id,
+            operation,
+            payload,
+        }) = message
+        else {
+            panic!("expected package report request");
+        };
+        assert_eq!(request_id, 2);
+        assert_eq!(operation, PACKAGE_REPORT_OPERATION);
+        let report_request: PackageReportRequestV1 =
+            serde_json::from_slice(&payload).expect("report request");
+        report_request.validate().expect("valid report request");
+        let report_json = r#"{"schema_version":1,"proxy_enabled":true,"records":[],"allowed":0,"denied":0,"quarantined":0}"#;
+        let sha256 = format!("sha256:{}", sha256_hex(report_json.as_bytes()));
+        writer
+            .send(&Message::Response(Response {
+                request_id,
+                status: ResponseStatus::Ok,
+                payload: serde_json::to_vec(&PackageReportResponseV1 {
+                    schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+                    report_json: report_json.to_owned(),
+                    sha256,
+                })
+                .expect("report response"),
+            }))
+            .await
+            .expect("package report response");
+        assert!(matches!(
+            reader.receive().await.expect("graceful close"),
+            Message::GracefulClose(_)
+        ));
     });
     let output = Arc::new(RecordingOutput::default());
     let report = AgentOrchestrator::new(
@@ -725,6 +786,10 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
     guest_task.await.expect("guest task");
 
     assert_eq!(report.terminal, GuestTerminal::Exited { code: 0 });
+    assert_eq!(
+        report.package_report.expect("package report").json,
+        br#"{"schema_version":1,"proxy_enabled":true,"records":[],"allowed":0,"denied":0,"quarantined":0}"#
+    );
     assert_eq!(
         output
             .events

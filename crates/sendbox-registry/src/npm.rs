@@ -206,7 +206,7 @@ impl NpmAdapter {
         Ok(result)
     }
 
-    fn parse_metadata(&self, body: &[u8], requested: &str) -> RegistryResult<ResolvedMetadata> {
+    pub fn parse_metadata(&self, body: &[u8], requested: &str) -> RegistryResult<ResolvedMetadata> {
         let document: Value = serde_json::from_slice(body)
             .map_err(|error| RegistryError::Invalid(format!("decode npm metadata: {error}")))?;
         let object = document

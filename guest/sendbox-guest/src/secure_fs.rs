@@ -118,13 +118,32 @@ pub fn open_relative_regular(
 }
 
 pub fn read_bounded(file: &mut File, limit: usize) -> Result<Zeroizing<Vec<u8>>, GuestError> {
+    let bytes = read_up_to_limit(file, limit)?;
+    if bytes.len() > limit {
+        return Err(GuestError::BootstrapTooLarge(limit));
+    }
+    Ok(bytes)
+}
+
+pub fn read_bounded_named(
+    file: &mut File,
+    limit: usize,
+    subject: &str,
+) -> Result<Zeroizing<Vec<u8>>, GuestError> {
+    let bytes = read_up_to_limit(file, limit)?;
+    if bytes.len() > limit {
+        return Err(GuestError::Runtime(format!(
+            "{subject} exceeds the configured {limit}-byte limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn read_up_to_limit(file: &mut File, limit: usize) -> Result<Zeroizing<Vec<u8>>, GuestError> {
     let mut bytes = Zeroizing::new(Vec::new());
     file.take(u64::try_from(limit + 1).expect("bounded size fits u64"))
         .read_to_end(&mut bytes)
         .map_err(|error| GuestError::io("reading bounded file", error))?;
-    if bytes.len() > limit {
-        return Err(GuestError::BootstrapTooLarge(limit));
-    }
     Ok(bytes)
 }
 

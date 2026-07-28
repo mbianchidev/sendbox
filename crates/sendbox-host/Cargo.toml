@@ -21,6 +21,7 @@ sendbox-exec = { path = "../sendbox-exec" }
 sendbox-git = { path = "../sendbox-git" }
 sendbox-mcp = { path = "../sendbox-mcp" }
 sendbox-policy = { path = "../sendbox-policy" }
+sendbox-registry = { path = "../sendbox-registry" }
 sendbox-runtime = { path = "../sendbox-runtime" }
 sendbox-runtime-apple = { path = "../sendbox-runtime-apple" }
 sendbox-runtime-hyperlight = { path = "../sendbox-runtime-hyperlight" }

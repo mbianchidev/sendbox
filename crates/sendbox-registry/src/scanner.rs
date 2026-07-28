@@ -82,7 +82,7 @@ pub(crate) fn enumerate_npm_archive(
     Ok(entries)
 }
 
-pub(crate) fn inspect_npm_archive(
+pub fn inspect_npm_archive(
     artifact: &Path,
     _descriptor: &ArtifactDescriptor,
     manifest: &NormalizedManifest,
