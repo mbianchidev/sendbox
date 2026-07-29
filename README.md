@@ -231,9 +231,11 @@ SendBox follows a **deny-by-default** security posture:
 1. **Filesystem** — Only explicitly configured host paths are mounted into the
    guest. State and workspace roots cannot overlap.
 2. **Commands** — Deny rules win over allow rules for the brokered top-level
-   argv. Descendants inherit the guest execution boundary.
+   argv. Descendants inherit the guest execution boundary rather than being
+   recursively reinterpreted as shell text.
 3. **Network** — Persistent workloads can reach only the loopback DNS and SOCKS5
-   brokers. Kernel rules deny direct external agent traffic.
+   brokers. Kernel rules deny direct external agent traffic and unmarked broker
+   traffic.
 4. **Packages** — Configured npm artifacts are quarantined, verified, and
    inspected before release.
 5. **Secrets** — Repository, Copilot, MCP gateway, and package registry

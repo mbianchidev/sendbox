@@ -63,7 +63,6 @@ These documents record earlier experiments and are not the primary operator
 guides:
 
 - [Apple container adapter spike](apple-container-adapter-spike.md)
-- [Apple runtime adapter spike](apple-container-adapter-spike.md)
 - [Egress enforcement spike](egress-enforcement-spike.md)
 - [Execution broker phase 1](exec-broker-phase-1.md)
 - [Guest BPF spike](guest-bpf-spike.md)

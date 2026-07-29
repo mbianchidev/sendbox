@@ -60,7 +60,9 @@ sendbox run --interactive --separate-stderr \
   `TERM`.
 - Terminal output merges stdout and stderr by default. `--separate-stderr` gives
   file descriptor 2 a second, non-controlling pseudoterminal and reports it as
-  stderr. Ordering between stdout and stderr is no longer strict.
+  stderr. Both descriptors remain TTYs, but ordering between stdout and stderr
+  is no longer strict, so the flag is unsuitable for TUIs that draw through
+  file descriptor 2.
 - `--separate-stderr` requires `--interactive` and consumes one additional
   pseudoterminal pair per session.
 - Interactive input is lossless within a bounded 64 x 4 KiB credit window. End
