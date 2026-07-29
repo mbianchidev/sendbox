@@ -11,7 +11,7 @@ pub const DEFAULT_MCP_HTTP_GATEWAY_PORT: u16 = 15_082;
 
 const BPFTRACE_STRING_LENGTH: usize = 4096;
 const MAX_SERVER_COMMAND_PARTS: usize = 16;
-const MAX_MCP_SERVERS: usize = 64;
+pub const MAX_MCP_SERVERS: usize = 64;
 const MAX_MCP_SERVER_ID_BYTES: usize = 64;
 const MAX_HTTP_BODY_BYTES: i64 = 16 * 1024 * 1024;
 const MAX_HTTP_TIMEOUT_SECONDS: u64 = 300;

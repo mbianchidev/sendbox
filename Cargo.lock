@@ -2577,6 +2577,7 @@ dependencies = [
  "proptest",
  "rustix",
  "sendbox-core",
+ "sendbox-git",
  "sendbox-policy",
  "serde",
  "serde_json",
@@ -2704,6 +2705,7 @@ name = "sendbox-host"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "reqwest",
  "rustix",
  "sendbox-agent",
  "sendbox-bootstrap",
@@ -2742,6 +2744,8 @@ dependencies = [
  "base64",
  "bytes",
  "hickory-proto",
+ "hkdf",
+ "hmac",
  "http",
  "http-body-util",
  "hyper",
@@ -2764,6 +2768,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "unicode-normalization",
  "url",
  "zeroize",
 ]
@@ -2797,6 +2802,7 @@ dependencies = [
 name = "sendbox-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "getrandom 0.4.3",
  "hkdf",
  "hmac",

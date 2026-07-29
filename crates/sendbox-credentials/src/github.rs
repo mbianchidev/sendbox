@@ -697,6 +697,7 @@ mod tests {
             allow_private_repository_access,
             branch_protection: sendbox_config::BranchProtectionConfiguration::default(),
             ssh_key_path: None,
+            safe_outputs: sendbox_config::SafeOutputsConfiguration::default(),
         }
     }
 

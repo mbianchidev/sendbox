@@ -106,6 +106,7 @@ pub struct RunPlan {
     package_report_maximum_bytes: Option<usize>,
     policy_digest: [u8; 32],
     interactive: bool,
+    safe_outputs: bool,
 }
 
 impl RunPlan {
@@ -188,6 +189,7 @@ impl RunPlan {
         ))
         .or_else(|_| ContainerId::new(format!("sendbox-{}", boundary.session_id)))
         .map_err(AgentError::Runtime)?;
+        let safe_outputs = configuration.github.safe_outputs.enabled;
         Ok(Self {
             verified_boundary_plan: request.boundary_plan,
             resolved_runtime: boundary.selection.selected,
@@ -228,6 +230,7 @@ impl RunPlan {
             package_report_maximum_bytes,
             policy_digest,
             interactive: request.interactive,
+            safe_outputs,
         })
     }
 
@@ -235,6 +238,11 @@ impl RunPlan {
     #[must_use]
     pub const fn interactive(&self) -> bool {
         self.interactive
+    }
+
+    #[must_use]
+    pub const fn safe_outputs(&self) -> bool {
+        self.safe_outputs
     }
 
     #[must_use]

@@ -1827,6 +1827,7 @@ mod tests {
             fixed_environment: Default::default(),
             inherited_environment_keys: Default::default(),
             observation: None,
+            safe_outputs: None,
         };
         (egress, mcp)
     }

@@ -160,6 +160,30 @@ enum FixtureMode {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let invocation = invocation_name();
+    if invocation.as_deref() == Some("safe-outputs-mcp") {
+        if let Err(error) = verify_safe_outputs_invocation() {
+            eprintln!("[sendbox-safe-outputs] {error}");
+            return ExitCode::FAILURE;
+        }
+        return match sendbox_guest::mcp_broker::safe_outputs_writer_socket() {
+            Ok(socket) => stdio_bridge(StdioBridgeArgs {
+                socket,
+                connect_timeout_seconds: 30,
+            })
+            .await
+            .map_or_else(
+                |error| {
+                    eprintln!("[sendbox-safe-outputs] {error}");
+                    ExitCode::FAILURE
+                },
+                |()| ExitCode::SUCCESS,
+            ),
+            Err(error) => {
+                eprintln!("[sendbox-safe-outputs] {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if invocation.as_deref() == Some("mcp-broker") {
         let arguments = std::env::args().skip(1).collect::<Vec<_>>();
         return match sendbox_guest::mcp_broker::execute_current(&arguments).await {
@@ -219,6 +243,33 @@ fn invocation_name() -> Option<String> {
         .and_then(|name| Path::new(name).file_name())
         .and_then(|name| name.to_str())
         .map(str::to_owned)
+}
+
+fn verify_safe_outputs_invocation() -> Result<(), GuestError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let expected = Path::new(sendbox_mcp::safe_outputs::SAFE_OUTPUTS_MCP_PATH);
+    let current = std::env::current_exe()
+        .map_err(|error| GuestError::io("resolving Safe Outputs executable", error))?;
+    if current != expected {
+        return Err(GuestError::Runtime(format!(
+            "Safe Outputs MCP must be launched from {}",
+            expected.display()
+        )));
+    }
+    let metadata = expected
+        .symlink_metadata()
+        .map_err(|error| GuestError::io("inspecting Safe Outputs executable", error))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(GuestError::Runtime(
+            "Safe Outputs MCP executable ownership or mode is invalid".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn execute(cli: Cli) -> Result<(), GuestError> {

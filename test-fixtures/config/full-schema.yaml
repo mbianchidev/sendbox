@@ -60,6 +60,44 @@ github:
     protected_branches: [main]
     allowed_branch_patterns: ["octocat/*"]
   ssh_key_path: ~/.ssh/id_ed25519
+  safe_outputs:
+    enabled: false
+    mode: staged
+    write_token_env: SENDBOX_SAFE_OUTPUTS_GITHUB_TOKEN
+    allowed_repositories: [octocat/example]
+    allowed_domains: [github.com]
+    allowed_mentions: [octocat]
+    max_artifact_bytes: 131072
+    create_issue:
+      enabled: false
+      max: 1
+      title_prefix: "[sendbox] "
+      labels: [triage]
+      assignees: [octocat]
+    add_comment:
+      enabled: false
+      max: 2
+    create_pull_request:
+      enabled: false
+      max: 1
+      title_prefix: "[sendbox] "
+      base_branches: [main]
+      allowed_paths: ["src/**"]
+      protected_paths: [".github/workflows/**"]
+      max_changed_files: 50
+      max_patch_bytes: 524288
+    add_labels:
+      enabled: false
+      max: 3
+      max_labels_per_call: 3
+      allowed: [triage]
+      blocked: ["~*"]
+    remove_labels:
+      enabled: false
+      max: 3
+      max_labels_per_call: 3
+      allowed: [triage]
+      blocked: ["~*"]
 observability:
   mcp_inspection:
     enabled: true

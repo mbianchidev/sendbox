@@ -10,6 +10,9 @@ use url::{Host, Url};
 
 use crate::config::{ApprovedCommand, ProjectConfigValidator};
 use crate::policy::{ResolvedServerPolicy, http_fingerprint, resolve_stdio_server};
+use crate::safe_outputs::{
+    SAFE_OUTPUTS_MCP_PATH, SAFE_OUTPUTS_SERVER_ID, SafeOutputsRuntimePolicy,
+};
 
 pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const NATIVE_POLICY_PATH: &str = "/run/sendbox-boundary/mcp-policy.json";
@@ -43,6 +46,8 @@ pub struct RuntimePolicyDocument {
     pub inherited_environment_keys: BTreeSet<String>,
     #[serde(default)]
     pub observation: Option<RuntimeObservationConfiguration>,
+    #[serde(default)]
+    pub safe_outputs: Option<SafeOutputsRuntimePolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +191,65 @@ impl RuntimePolicyDocument {
                 return Err("MCP audit and observation logs must be different files".to_owned());
             }
         }
+        if let Some(safe_outputs) = &self.safe_outputs {
+            safe_outputs.validate().map_err(|error| error.to_string())?;
+            if self.tool_policy.uses_hierarchical_servers() {
+                let expected = safe_outputs.mcp_server_policy();
+                match self.tool_policy.servers.get(SAFE_OUTPUTS_SERVER_ID) {
+                    Some(actual) if actual == &expected => {}
+                    Some(_) => {
+                        return Err(
+                            "Safe Outputs MCP server policy does not match the authenticated Safe Outputs configuration"
+                                .to_owned(),
+                        );
+                    }
+                    None => {
+                        return Err(
+                            "Safe Outputs MCP server policy is missing from the hierarchical policy"
+                                .to_owned(),
+                        );
+                    }
+                }
+            } else {
+                let command = vec![SAFE_OUTPUTS_MCP_PATH.to_owned()];
+                if !self.tool_policy.allowed_server_commands.contains(&command) {
+                    return Err(
+                        "Safe Outputs MCP command is not in the exact server command allowlist"
+                            .to_owned(),
+                    );
+                }
+                for tool in safe_outputs.enabled_tools() {
+                    if !self
+                        .tool_policy
+                        .allowlist
+                        .iter()
+                        .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
+                    {
+                        return Err(format!(
+                            "Safe Outputs tool `{}` is not admitted by the MCP tool policy",
+                            tool.name()
+                        ));
+                    }
+                    if self
+                        .tool_policy
+                        .denylist
+                        .iter()
+                        .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
+                    {
+                        return Err(format!(
+                            "Safe Outputs tool `{}` is denied by the MCP tool policy",
+                            tool.name()
+                        ));
+                    }
+                }
+            }
+        } else if self
+            .tool_policy
+            .servers
+            .contains_key(SAFE_OUTPUTS_SERVER_ID)
+        {
+            return Err("reserved Safe Outputs MCP server policy is not enabled".to_owned());
+        }
         Ok(())
     }
 
@@ -320,6 +384,7 @@ mod tests {
                 max_payload_bytes: 4096,
                 log_path: PathBuf::from("/var/log/sendbox/mcp.log"),
             }),
+            safe_outputs: None,
         }
     }
 
@@ -374,5 +439,38 @@ mod tests {
         );
         assert_eq!(server.endpoint.authority(), "mcp.example.com:443");
         assert_eq!(server.transport, ToolTransport::StreamableHttp);
+    }
+
+    #[test]
+    fn hierarchical_safe_outputs_policy_must_match_the_runtime_configuration() {
+        let mut configuration = sendbox_config::SafeOutputsConfiguration::default();
+        configuration.enabled = true;
+        let safe_outputs = SafeOutputsRuntimePolicy::from_configuration(
+            sendbox_core::SessionId::from_bytes([7; 16]),
+            &configuration,
+        )
+        .expect("Safe Outputs policy");
+
+        let mut policy = policy();
+        policy.tool_policy = ToolCallPolicy {
+            servers: BTreeMap::from([(
+                SAFE_OUTPUTS_SERVER_ID.to_owned(),
+                safe_outputs.mcp_server_policy(),
+            )]),
+            ..ToolCallPolicy::default()
+        };
+        policy.safe_outputs = Some(safe_outputs);
+        policy.validate().expect("matching policy");
+
+        let McpServerPolicy::Stdio { tools, .. } = policy
+            .tool_policy
+            .servers
+            .get_mut(SAFE_OUTPUTS_SERVER_ID)
+            .expect("Safe Outputs server")
+        else {
+            panic!("Safe Outputs must use stdio");
+        };
+        tools.allowlist.pop();
+        assert!(policy.validate().is_err());
     }
 }

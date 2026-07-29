@@ -21,6 +21,8 @@ pub use operations::{
     InteractiveLaunchError, InteractiveLaunchRequestV1, InteractiveLaunchRequestV2,
     LaunchRequestV2, OPERATION_SCHEMA_VERSION, PACKAGE_REPORT_OPERATION,
     PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1, PackageReportResponseV1,
+    SAFE_OUTPUTS_COLLECT_OPERATION, SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+    SafeOutputsCollectRequestV1, SafeOutputsCollectionError, SafeOutputsCollectionV1,
     SecretEnvelopeV2, TerminalInputCreditError, TerminalInputCreditV1, TerminalResultV2,
     TerminalSizeV1, TerminalStateV1, agent_guest_capabilities, agent_guest_required_capabilities,
     agent_host_capabilities, agent_host_required_capabilities,

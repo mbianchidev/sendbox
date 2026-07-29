@@ -3521,6 +3521,7 @@ mod tests {
             fixed_environment: BTreeMap::new(),
             inherited_environment_keys: BTreeSet::new(),
             observation: None,
+            safe_outputs: None,
         };
         assert!(
             HttpGateway::new(
@@ -4196,6 +4197,7 @@ mod tests {
             fixed_environment: BTreeMap::new(),
             inherited_environment_keys: BTreeSet::new(),
             observation: None,
+            safe_outputs: None,
         }
     }
 }

@@ -6,7 +6,8 @@ readiness, service, and fail-closed semantics implemented by
 mandatory DNS/SOCKS5 egress service, and authenticated MCP policy. The host
 session lifecycle owns audit and snapshot persistence. The guest also starts the
 mandatory MCP audit service and, for remote MCP, a trusted HTTP gateway inside
-the egress broker. BPF activation remains explicit guest policy.
+the egress broker. When enabled, the supervisor also owns the Safe Outputs
+recorder and its seal key. BPF activation remains explicit guest policy.
 
 ## Process and command model
 
@@ -26,10 +27,16 @@ the egress broker. BPF activation remains explicit guest policy.
 - `mcp-audit` is the mandatory root-owned MCP audit sink.
 - invocation as the installed `mcp-broker` path runs the exact-command stdio
   broker selected by project MCP configuration.
+- `safe-outputs-mcp` is a root-installed stdio bridge to the authenticated
+  session recorder. The bridge never validates or persists operations itself.
 
-Typed service identifiers reserve `exec`, `mcp`, `dns`, `egress`, `audit`, and
-`bpf`. Exec depends on configured mandatory egress and audit services; readiness
-is not published until the complete dependency graph is healthy.
+Typed service identifiers reserve `exec`, `mcp`, `dns`, `egress`, `audit`,
+`bpf`, and `safe_outputs`. Reserving an identifier does not claim that its
+service is implemented. The Safe Outputs identity represents the mandatory
+in-process recorder rather than a separate child, so the bootstrap secret never
+crosses a process boundary. Exec depends on configured mandatory egress and
+audit services; readiness is not published until the complete dependency graph
+is healthy.
 
 ## Trust and immutable bootstrap
 

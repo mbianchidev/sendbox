@@ -42,6 +42,10 @@ provider with a narrower capability set.
   JSON-RPC validation, exact server identities, independent deny-first tool
   policies, filtered discovery, and one mandatory redacted audit path. See
   [docs/mcp-inspection.md](docs/mcp-inspection.md).
+- **Credential-free Safe Outputs** — An untrusted agent can declare a bounded
+  subset of GitHub writes through a root-owned MCP recorder. The host verifies
+  the sealed artifact after runtime teardown and only then resolves a dedicated
+  write token. See [docs/architecture/safe-outputs.md](docs/architecture/safe-outputs.md).
 - **Boundary Enforcement** — The host signs one immutable runtime plan before
   provider dispatch. The authenticated guest starts mandatory security services
   before workload execution and rejects session, policy, feature, or cgroup
@@ -416,6 +420,10 @@ github:
       - "{username}/*"
       - "copilot/*"
       - "feature/*"
+  safe_outputs:
+    enabled: false
+    mode: staged
+    write_token_env: SENDBOX_SAFE_OUTPUTS_GITHUB_TOKEN
 
 observability:
   mcp_inspection:
@@ -457,6 +465,16 @@ and a root-owned audit log. The gateway verifies TLS, revalidates DNS and
 redirect addresses, pins exact destinations, and keeps bearer credentials out
 of the agent environment. Legacy 2024 HTTP+SSE and Hyperlight MCP composition
 fail closed.
+
+Safe Outputs is disabled and staged by default. Enabling
+`github.safe_outputs` requires Apple or Kata, `policy.boundaries.enabled: true`,
+`github.forward_auth: false`, no SSH key forwarding, and exact repository and
+operation limits. The trusted guest installs
+`/run/sendbox-boundary/safe-outputs-mcp`; configure it behind the native broker.
+Apply mode reads `SENDBOX_SAFE_OUTPUTS_GITHUB_TOKEN` only after the guest,
+control channel, and secret resolver have been cleaned up. Asset uploads are not
+supported. A custom write-token name cannot reuse a forwarded Copilot token
+variable. See [the Safe Outputs architecture](docs/architecture/safe-outputs.md).
 
 ### Copilot credentials
 
@@ -526,6 +544,10 @@ false-positive handling, reports, and future ecosystem adapter contracts.
 | `github.branch_protection.username` | string | Username used to expand `{username}` patterns; auto-detected by default |
 | `github.branch_protection.protected_branches` | list | Branch names that push and pull can never target |
 | `github.branch_protection.allowed_branch_patterns` | list | Glob patterns allowed for selected-repository push and pull |
+| `github.safe_outputs` | object | Credential-free, sealed GitHub write declarations; disabled and staged by default |
+| `github.safe_outputs.mode` | enum | `staged` for preview-only or `apply` for host-only GitHub execution |
+| `github.safe_outputs.write_token_env` | string | Host-only environment variable read after runtime teardown |
+| `github.safe_outputs.allowed_repositories` | list | Exact `owner/repository` write targets |
 | `observability.mcp_inspection.enabled` | bool | Enable authenticated local stdio MCP observation on Apple or Kata |
 
 ### Run flags

@@ -578,7 +578,10 @@ fn random_nonce() -> Result<[u8; NONCE_BYTES], ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Capability, PROTOCOL_VERSION};
+    use crate::{
+        Capability, PROTOCOL_VERSION, agent_guest_capabilities, agent_guest_required_capabilities,
+        agent_host_capabilities, agent_host_required_capabilities,
+    };
 
     const SECRET: [u8; 32] = [0x23; 32];
 
@@ -612,6 +615,29 @@ mod tests {
         .into()
     }
 
+    fn legacy_host_capabilities() -> CapabilitySet {
+        [
+            Capability::Lifecycle,
+            Capability::Exec,
+            Capability::StreamedIo,
+            Capability::Signals,
+            Capability::Health,
+        ]
+        .into()
+    }
+
+    fn legacy_guest_capabilities() -> CapabilitySet {
+        [
+            Capability::Lifecycle,
+            Capability::Exec,
+            Capability::StreamedIo,
+            Capability::Signals,
+            Capability::Audit,
+            Capability::Health,
+        ]
+        .into()
+    }
+
     #[tokio::test]
     async fn negotiates_highest_version_capabilities_and_limit() {
         let session = [7; 16];
@@ -639,6 +665,72 @@ mod tests {
         let expected = [Capability::Lifecycle, Capability::Health].into();
         assert_eq!(host_connection.negotiated().version, 2);
         assert_eq!(host_connection.negotiated().capabilities, expected);
+        assert_eq!(host_connection.negotiated(), guest_connection.negotiated());
+    }
+
+    #[tokio::test]
+    async fn current_host_handshakes_with_legacy_guest_profile() {
+        let session = [8; 16];
+        let digest = BoundaryPlanDigest::from_bytes([0x42; 32]);
+        let (host_stream, guest_stream) = tokio::io::duplex(16 * 1024);
+        let mut host = HostHandshake::new(config(
+            session,
+            VersionRange::default(),
+            agent_host_capabilities(),
+            agent_host_required_capabilities(),
+            SECRET,
+            digest,
+        ));
+        let mut guest = GuestHandshake::new(config(
+            session,
+            VersionRange::default(),
+            legacy_guest_capabilities(),
+            agent_guest_required_capabilities(),
+            SECRET,
+            digest,
+        ));
+
+        let (host_result, guest_result) =
+            tokio::join!(host.establish(host_stream), guest.establish(guest_stream));
+        let host_connection = host_result.expect("host handshake");
+        let guest_connection = guest_result.expect("legacy guest handshake");
+        assert_eq!(
+            host_connection.negotiated().capabilities,
+            legacy_guest_capabilities()
+        );
+        assert_eq!(host_connection.negotiated(), guest_connection.negotiated());
+    }
+
+    #[tokio::test]
+    async fn current_guest_handshakes_with_legacy_host_profile() {
+        let session = [9; 16];
+        let digest = BoundaryPlanDigest::from_bytes([0x43; 32]);
+        let (host_stream, guest_stream) = tokio::io::duplex(16 * 1024);
+        let mut host = HostHandshake::new(config(
+            session,
+            VersionRange::default(),
+            legacy_host_capabilities(),
+            agent_host_required_capabilities(),
+            SECRET,
+            digest,
+        ));
+        let mut guest = GuestHandshake::new(config(
+            session,
+            VersionRange::default(),
+            agent_guest_capabilities(),
+            agent_guest_required_capabilities(),
+            SECRET,
+            digest,
+        ));
+
+        let (host_result, guest_result) =
+            tokio::join!(host.establish(host_stream), guest.establish(guest_stream));
+        let host_connection = host_result.expect("legacy host handshake");
+        let guest_connection = guest_result.expect("guest handshake");
+        assert_eq!(
+            host_connection.negotiated().capabilities,
+            legacy_host_capabilities()
+        );
         assert_eq!(host_connection.negotiated(), guest_connection.negotiated());
     }
 

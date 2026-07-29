@@ -20,8 +20,9 @@ use crate::protocol::{
     PackageReportSource, ProtocolServices, handshake_config, serve_authenticated,
 };
 use crate::runtime::{ReadinessSnapshot, RuntimeIdentity, RuntimeSession};
+use crate::safe_outputs;
 use crate::secure_fs::{leaf_name, open_directory_no_symlinks, validate_regular_metadata};
-use crate::service::{ServiceId, ServiceManager};
+use crate::service::{ServiceHealth, ServiceId, ServiceManager};
 use crate::state::{StartupState, StartupStateMachine};
 
 #[derive(Debug, Clone)]
@@ -113,6 +114,13 @@ pub async fn run<P: PlatformControls>(
             server_count.to_string(),
         );
     }
+    let safe_outputs_configuration = bootstrap.execution_broker.as_ref().and_then(|broker| {
+        broker
+            .mcp_policy
+            .as_ref()
+            .and_then(|policy| policy.safe_outputs.clone())
+            .map(|policy| (policy, broker.workload_uid, broker.workload_gid))
+    });
     let egress_configured = bootstrap.egress_policy.is_some();
     let registry_proxy = bootstrap.registry_proxy.take();
     let package_report = registry_proxy
@@ -213,16 +221,7 @@ pub async fn run<P: PlatformControls>(
 
     transition_and_write(&state, &audit, &runtime, StartupState::SelfTesting)?;
     platform.self_test(&controls)?;
-    let service_health = services.health();
-    if service_health
-        .iter()
-        .any(|service| service.mandatory && !service.healthy)
-    {
-        fail_and_cleanup(&state, &audit, &runtime, &mut services).await?;
-        return Err(GuestError::Runtime(
-            "mandatory service self-test failed".to_owned(),
-        ));
-    }
+    let mut service_health = services.health();
 
     fn prepare_private_root(path: &Path, identity: RuntimeIdentity) -> Result<(), GuestError> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -250,6 +249,61 @@ pub async fn run<P: PlatformControls>(
             .map_err(|error| GuestError::io("setting private guest root mode", error))
     }
 
+    let (safe_outputs, mut safe_outputs_task) = if let Some((policy, workload_uid, workload_gid)) =
+        safe_outputs_configuration
+    {
+        let seal_key = sendbox_mcp::safe_outputs::derive_seal_key(
+            bootstrap.bootstrap_secret.expose_for_key_derivation(),
+            bootstrap.session_id,
+        )
+        .map_err(|error| GuestError::Runtime(format!("deriving Safe Outputs seal key: {error}")))?;
+        let (handle, task) = safe_outputs::start(
+            policy,
+            bootstrap.boundary_plan_digest,
+            seal_key,
+            identity.uid,
+            identity.gid,
+            workload_uid,
+            workload_gid,
+        )?;
+        audit.lock().expect("audit mutex").record(
+            "safe_outputs_started",
+            bootstrap.session_id.to_string(),
+            "root-owned MCP intent recorder",
+        );
+        (Some(handle), Some(task))
+    } else {
+        (None, None)
+    };
+    if let Some(handle) = &safe_outputs {
+        service_health.push(ServiceHealth {
+            id: ServiceId::SafeOutputs,
+            mandatory: true,
+            healthy: handle.verified_live(),
+            restart_count: 0,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            output_truncated: false,
+        });
+    }
+    if service_health
+        .iter()
+        .any(|service| service.mandatory && !service.healthy)
+    {
+        if let Some(handle) = &safe_outputs {
+            handle.shutdown().await;
+        }
+        if let Some(task) = safe_outputs_task.take() {
+            task.await.map_err(|error| {
+                GuestError::Runtime(format!("joining Safe Outputs recorder: {error}"))
+            })??;
+        }
+        fail_and_cleanup(&state, &audit, &runtime, &mut services).await?;
+        return Err(GuestError::Runtime(
+            "mandatory service self-test failed".to_owned(),
+        ));
+    }
+
     let listener = UnixListener::bind(runtime.socket_path())
         .map_err(|error| GuestError::io("binding guest control socket", error))?;
     let service_readiness = services.readiness_gate();
@@ -272,6 +326,7 @@ pub async fn run<P: PlatformControls>(
                 .map_err(|error| GuestError::io("accepting guest control connection", error))
         }
         failure = services.wait_for_mandatory_failure() => Err(failure),
+        failure = wait_for_safe_outputs_failure(safe_outputs.as_ref()), if safe_outputs.is_some() => Err(failure),
     };
     let result = match stream {
         Ok(stream) => {
@@ -295,16 +350,30 @@ pub async fn run<P: PlatformControls>(
                         Arc::clone(&runtime),
                         readiness,
                         broker_client.as_ref().map(|(client, _)| client.clone()),
-                        package_report,
                         secret_decryptor,
-                    ),
+                    )
+                    .with_package_report(package_report)
+                    .with_safe_outputs(safe_outputs.clone()),
                 ) => protocol,
                 failure = services.wait_for_mandatory_failure() => Err(failure),
+                failure = wait_for_safe_outputs_failure(safe_outputs.as_ref()), if safe_outputs.is_some() => Err(failure),
             }
         }
+
         Err(error) => Err(error),
     };
 
+    if let Some(handle) = &safe_outputs {
+        handle.shutdown().await;
+    }
+    let safe_outputs_result = match safe_outputs_task {
+        Some(task) => task
+            .await
+            .map_err(|error| GuestError::Runtime(format!("joining Safe Outputs recorder: {error}")))
+            .and_then(|result| result),
+        None => Ok(()),
+    };
+    let result = result.and(safe_outputs_result);
     service_readiness.revoke();
     runtime.revoke_readiness()?;
     if result.is_err() {
@@ -317,6 +386,15 @@ pub async fn run<P: PlatformControls>(
     }
     shutdown(&state, &audit, &runtime, &mut services).await?;
     result
+}
+
+async fn wait_for_safe_outputs_failure(
+    handle: Option<&safe_outputs::SafeOutputsHandle>,
+) -> GuestError {
+    match handle {
+        Some(handle) => handle.wait_for_failure().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn wait_for_bootstrap(path: &Path) -> Result<(), GuestError> {

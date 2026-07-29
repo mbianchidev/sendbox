@@ -106,6 +106,25 @@ Direct upstream URLs, custom headers or credentials, URL drift, query strings,
 fragments, user information, env/cwd overrides, wrapper chains, unknown routes,
 and unsupported transports are rejected.
 
+## Safe Outputs gateway
+
+Safe Outputs uses the same exact-command broker admission but terminates at a
+root-owned guest recorder rather than an untrusted server process. Configure
+the client command as:
+
+```text
+/run/sendbox-boundary/mcp-broker -- /run/sendbox-boundary/safe-outputs-mcp
+```
+
+In hierarchical mode, the host reserves the `sendbox-safe-outputs` server ID and
+derives an exact default-deny stdio policy containing only enabled Safe Outputs
+tools. Legacy flat policies retain compatibility through exact command and tool
+augmentation. Configuration cannot override the reserved policy.
+
+Recorder framing, schemas, sanitization, repository targets, counts, artifact
+size, sealing, and one-time collection remain independent of optional MCP
+observation. See [architecture/safe-outputs.md](architecture/safe-outputs.md).
+
 ## HTTP transport modes
 
 - `streamable_http` implements modern Streamable HTTP with POST-only,
@@ -198,6 +217,12 @@ Inspection requires `policy.boundaries.enabled: true`. Paths outside
 `/var/log/sendbox`, duplicate transports, and unsupported transports are
 rejected. Payload text is omitted unless capture is explicitly enabled and is
 then truncated to the configured bound.
+
+The parser retains compatibility with legacy Swift trace lines:
+
+```text
+SENDBOX_MCP<TAB>ts<TAB>pid<TAB>comm<TAB>transport<TAB>direction<TAB>payload
+```
 
 ```bash
 sendbox mcp parse /var/log/sendbox/mcp-trace.log

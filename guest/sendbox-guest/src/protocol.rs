@@ -8,8 +8,10 @@ use sendbox_protocol::{
     LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, PACKAGE_REPORT_OPERATION,
     PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1, PackageReportResponseV1,
     ProtocolErrorCode, ProtocolErrorMessage, Request, Response, ResponseStatus,
-    TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1, TerminalStateV1, VersionRange,
-    agent_guest_capabilities, agent_guest_required_capabilities,
+    SAFE_OUTPUTS_COLLECT_OPERATION, SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+    SafeOutputsCollectRequestV1, SafeOutputsCollectionV1, TerminalInputCreditV1, TerminalResultV2,
+    TerminalSizeV1, TerminalStateV1, VersionRange, agent_guest_capabilities,
+    agent_guest_required_capabilities,
 };
 use sendbox_secrets::{
     EnvelopeBinding, EnvelopeCipher, RecipientRole, ReplayGuard, SecretName, SessionKeyMaterial,
@@ -23,6 +25,7 @@ use tokio::net::UnixStream;
 use crate::GuestError;
 use crate::broker::BrokerClientConfiguration;
 use crate::runtime::{ReadinessSnapshot, RuntimeSession};
+use crate::safe_outputs::SafeOutputsHandle;
 use crate::secure_fs::{
     leaf_name, open_directory_no_symlinks, open_relative_regular, read_bounded_named,
     validate_regular_metadata,
@@ -82,6 +85,7 @@ pub(crate) struct ProtocolServices {
     broker: Option<BrokerClientConfiguration>,
     package_report: Option<PackageReportSource>,
     secret_decryptor: GuestSecretDecryptor,
+    safe_outputs: Option<SafeOutputsHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +122,6 @@ impl ProtocolServices {
         runtime: Arc<RuntimeSession>,
         readiness: ReadinessSnapshot,
         broker: Option<BrokerClientConfiguration>,
-        package_report: Option<PackageReportSource>,
         secret_decryptor: GuestSecretDecryptor,
     ) -> Self {
         Self {
@@ -127,9 +130,25 @@ impl ProtocolServices {
             runtime,
             readiness,
             broker,
-            package_report,
+            package_report: None,
             secret_decryptor,
+            safe_outputs: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_package_report(
+        mut self,
+        package_report: Option<PackageReportSource>,
+    ) -> Self {
+        self.package_report = package_report;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_safe_outputs(mut self, safe_outputs: Option<SafeOutputsHandle>) -> Self {
+        self.safe_outputs = safe_outputs;
+        self
     }
 }
 
@@ -152,7 +171,12 @@ where
     let mut handshake = GuestHandshake::new(config);
     let connection = handshake.establish(stream).await?;
     let (mut reader, mut writer) = connection.into_parts();
-    if !services.service_readiness.verified_live() {
+    if !services.service_readiness.verified_live()
+        || services
+            .safe_outputs
+            .as_ref()
+            .is_some_and(|safe_outputs| !safe_outputs.verified_live())
+    {
         return Err(GuestError::Protocol(
             "mandatory service failed during authenticated handshake".to_owned(),
         ));
@@ -213,6 +237,11 @@ where
                 );
                 package_report_served = response.status == ResponseStatus::Ok;
                 writer.send(&Message::Response(response)).await?;
+            }
+            // Operation-name negotiation preserves the legacy capability wire
+            // profile while still making unsupported collection fail closed.
+            Message::Request(request) if request.operation == SAFE_OUTPUTS_COLLECT_OPERATION => {
+                collect_safe_outputs(request, &mut writer, &services).await?;
             }
             Message::Request(request) => {
                 let response =
@@ -411,7 +440,12 @@ async fn launch<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if !services.service_readiness.verified_live() {
+    if !services.service_readiness.verified_live()
+        || services
+            .safe_outputs
+            .as_ref()
+            .is_some_and(|safe_outputs| !safe_outputs.verified_live())
+    {
         return send_rejection(
             host_writer,
             request.request_id,
@@ -578,6 +612,7 @@ where
     let result = run_execution_loop(
         &request,
         &execution,
+        services,
         read,
         host_reader,
         host_writer,
@@ -623,6 +658,7 @@ struct BrokerInputSenders<'a> {
 async fn run_execution_loop<S>(
     request: &Request,
     execution: &sendbox_exec::ExecutionRequest,
+    services: &ProtocolServices,
     read: tokio::net::unix::OwnedReadHalf,
     host_reader: &mut sendbox_protocol::FramedReader<ReadHalf<S>>,
     host_writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
@@ -681,7 +717,17 @@ where
                         })).await?;
                     }
                     sendbox_exec::ExecutionEvent::Terminal { result, .. } => {
-                        let payload = serde_json::to_vec(&terminal_result(result))
+                        let terminal = terminal_result(result);
+                        if let Some(safe_outputs) = &services.safe_outputs {
+                            if !terminal.cleanup_complete {
+                                return Err(GuestError::Protocol(
+                                    "Safe Outputs cannot seal before execution cleanup completes"
+                                        .to_owned(),
+                                ));
+                            }
+                            safe_outputs.seal().await?;
+                        }
+                        let payload = serde_json::to_vec(&terminal)
                             .map_err(|error| GuestError::Protocol(format!("encoding terminal result: {error}")))?;
                         host_writer.send(&Message::Response(Response {
                             request_id: request.request_id,
@@ -690,6 +736,7 @@ where
                         })).await?;
                         return Ok(());
                     }
+
                 }
             }
             host_message = host_reader.receive() => {
@@ -734,6 +781,44 @@ where
             }
         }
     }
+}
+
+async fn collect_safe_outputs<S>(
+    request: Request,
+    writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
+    services: &ProtocolServices,
+) -> Result<(), GuestError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let envelope: SafeOutputsCollectRequestV1 =
+        serde_json::from_slice(&request.payload).map_err(|error| {
+            GuestError::Protocol(format!("decoding Safe Outputs collection: {error}"))
+        })?;
+    if envelope.schema_version != SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION
+        || envelope.boundary_plan_digest != services.secret_decryptor.boundary_plan_digest
+    {
+        return Err(GuestError::Protocol(
+            "Safe Outputs collection binding is invalid".to_owned(),
+        ));
+    }
+    let safe_outputs = services.safe_outputs.as_ref().ok_or_else(|| {
+        GuestError::Protocol("Safe Outputs collection was not configured".to_owned())
+    })?;
+    let collected = safe_outputs.collect().await?;
+    let collection = SafeOutputsCollectionV1::new(&collected.artifact, &collected.seal)
+        .map_err(|error| GuestError::Protocol(error.to_string()))?;
+    let payload = serde_json::to_vec(&collection).map_err(|error| {
+        GuestError::Protocol(format!("encoding Safe Outputs collection: {error}"))
+    })?;
+    writer
+        .send(&Message::Response(Response {
+            request_id: request.request_id,
+            status: ResponseStatus::Ok,
+            payload,
+        }))
+        .await?;
+    Ok(())
 }
 
 /// Validates and queues one host terminal event.
@@ -1278,7 +1363,6 @@ mod tests {
                     audit_events: Vec::new(),
                 },
                 None,
-                None,
                 GuestSecretDecryptor::new(
                     SessionId::from_bytes([3; 16]),
                     &[9; 32],
@@ -1342,7 +1426,6 @@ mod tests {
                 ReadinessGate::test_ready(),
                 runtime,
                 readiness,
-                None,
                 None,
                 GuestSecretDecryptor::new(session_id, &[8; 32], boundary_plan_digest)
                     .expect("secret decryptor"),
