@@ -694,7 +694,7 @@ mod tests {
         duplicate_port.mcp_gateway_port = Some(duplicate_port.connect_broker_tcp_port);
         assert!(matches!(
             duplicate_port.validate(),
-            Err(NftError::InvalidBrokerPorts)
+            Err(NftError::InvalidPortConfiguration)
         ));
 
         let mut iface = config();
