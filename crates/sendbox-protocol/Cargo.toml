@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 base64.workspace = true
+sendbox-policy = { path = "../sendbox-policy" }
 getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true

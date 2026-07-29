@@ -12,6 +12,7 @@ reqwest.workspace = true
 rustix.workspace = true
 sendbox-agent = { path = "../sendbox-agent" }
 sendbox-boundary = { path = "../sendbox-boundary" }
+sendbox-bootstrap = { path = "../sendbox-bootstrap" }
 sendbox-bundle = { path = "../sendbox-bundle" }
 sendbox-config = { path = "../sendbox-config" }
 sendbox-core = { path = "../sendbox-core" }
@@ -21,6 +22,7 @@ sendbox-exec = { path = "../sendbox-exec" }
 sendbox-git = { path = "../sendbox-git" }
 sendbox-mcp = { path = "../sendbox-mcp" }
 sendbox-policy = { path = "../sendbox-policy" }
+sendbox-registry = { path = "../sendbox-registry" }
 sendbox-runtime = { path = "../sendbox-runtime" }
 sendbox-runtime-apple = { path = "../sendbox-runtime-apple" }
 sendbox-runtime-hyperlight = { path = "../sendbox-runtime-hyperlight" }
@@ -34,6 +36,7 @@ thiserror.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

@@ -10,7 +10,7 @@ use std::{
 
 use sendbox_bootstrap::{
     BootstrapDocumentConfiguration, ExecutionBrokerConfiguration, REQUIRED_RUNTIME_CONTROLS,
-    encode_bootstrap_document,
+    RegistryProxyConfiguration, encode_bootstrap_document,
 };
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
 use sendbox_egress::runtime::{
@@ -64,6 +64,7 @@ pub struct AppleRuntimeConfiguration {
     pub git_guard_policy: Option<GuardPolicyDocument>,
     pub mcp_policy: Option<RuntimePolicyDocument>,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
+    pub registry_proxy: Option<RegistryProxyConfiguration>,
     pub workload_uid: u32,
     pub workload_gid: u32,
     pub launch: AppleLaunchConfiguration,
@@ -102,6 +103,7 @@ impl AppleRuntimeConfiguration {
             git_guard_policy: None,
             mcp_policy: None,
             egress_policy: None,
+            registry_proxy: None,
             workload_uid: 65_534,
             workload_gid: 65_534,
             launch: AppleLaunchConfiguration::default(),
@@ -556,6 +558,7 @@ impl AppleRuntime {
                     mcp_policy: self.configuration.mcp_policy.clone(),
                 }),
                 egress_policy: self.configuration.egress_policy.clone(),
+                registry_proxy: self.configuration.registry_proxy.clone(),
             },
             channel.bootstrap_material.as_bytes(),
         )

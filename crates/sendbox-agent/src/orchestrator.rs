@@ -10,8 +10,8 @@ use sendbox_runtime::{
 
 use crate::{
     AgentError, CleanupFailure, GuestConnectionConfiguration, GuestConnector, GuestEvent,
-    GuestExecution, GuestLaunchRequest, GuestSecretEnvelope, GuestSession, GuestTerminal,
-    OutputSink, RunFailure, RunPlan, SecretResolver, SignalSource,
+    GuestExecution, GuestLaunchRequest, GuestPackageReport, GuestSecretEnvelope, GuestSession,
+    GuestTerminal, OutputSink, RunFailure, RunPlan, SecretResolver, SignalSource,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +74,7 @@ pub struct AgentReport {
     pub terminal: GuestTerminal,
     pub states: Vec<AgentState>,
     pub safe_outputs: Option<crate::CollectedSafeOutputs>,
+    pub package_report: Option<GuestPackageReport>,
 }
 
 enum WorkloadStep {
@@ -160,6 +161,7 @@ impl AgentOrchestrator {
                     terminal,
                     states: context.states,
                     safe_outputs,
+                    package_report: context.package_report,
                 })
             }
             Ok(_) => Err(RunFailure {
@@ -348,7 +350,9 @@ impl AgentOrchestrator {
             .await?;
         context.execution = Some(execution);
         context.transition(AgentState::Running)?;
-        let terminal = self.monitor(cancellation, context).await?;
+        let terminal = self
+            .monitor(plan.package_report_maximum_bytes(), cancellation, context)
+            .await?;
         let safe_outputs = if plan.safe_outputs() {
             Some(
                 context
@@ -366,6 +370,7 @@ impl AgentOrchestrator {
 
     async fn monitor(
         &self,
+        package_report_maximum_bytes: Option<usize>,
         cancellation: &CancellationToken,
         context: &mut RunContext,
     ) -> Result<GuestTerminal, AgentError> {
@@ -406,7 +411,16 @@ impl AgentOrchestrator {
                             GuestEvent::TerminalInputCredit { credits } => {
                                 self.terminal.grant_input_credit(credits)?;
                             }
-                            GuestEvent::Terminal(terminal) => return Ok(terminal),
+                            GuestEvent::Terminal(terminal) => {
+                                if let Some(maximum_bytes) = package_report_maximum_bytes {
+                                    context.package_report = Some(
+                                        execution
+                                            .fetch_package_report(maximum_bytes, cancellation)
+                                            .await?,
+                                    );
+                                }
+                                return Ok(terminal);
+                            }
                         },
                         WorkloadStep::Terminal(Some(command)) => {
                             let ended = matches!(command, crate::HostTerminalCommand::InputEof);
@@ -511,6 +525,7 @@ struct RunContext {
     channel: Option<Box<dyn ProvisionedControlChannel>>,
     guest: Option<Box<dyn GuestSession>>,
     execution: Option<Box<dyn GuestExecution>>,
+    package_report: Option<GuestPackageReport>,
 }
 
 impl RunContext {
@@ -524,6 +539,7 @@ impl RunContext {
             channel: None,
             guest: None,
             execution: None,
+            package_report: None,
         }
     }
 

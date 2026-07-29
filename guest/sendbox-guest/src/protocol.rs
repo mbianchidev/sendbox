@@ -1,18 +1,22 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use sendbox_protocol::{
     AGENT_LAUNCH_OPERATION, BootstrapSecret, CloseCode, Event, EventKind, FrameLimits,
     GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, INTERACTIVE_LAUNCH_OPERATION,
     INTERACTIVE_LAUNCH_OPERATION_V2, InteractiveLaunchRequestV1, InteractiveLaunchRequestV2,
-    LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, ProtocolErrorCode, ProtocolErrorMessage,
-    Request, Response, ResponseStatus, SAFE_OUTPUTS_COLLECT_OPERATION,
-    SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION, SafeOutputsCollectRequestV1, SafeOutputsCollectionV1,
-    TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1, TerminalStateV1, VersionRange,
-    agent_guest_capabilities, agent_guest_required_capabilities,
+    LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, PACKAGE_REPORT_OPERATION,
+    PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1, PackageReportResponseV1,
+    ProtocolErrorCode, ProtocolErrorMessage, Request, Response, ResponseStatus,
+    SAFE_OUTPUTS_COLLECT_OPERATION, SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+    SafeOutputsCollectRequestV1, SafeOutputsCollectionV1, TerminalInputCreditV1, TerminalResultV2,
+    TerminalSizeV1, TerminalStateV1, VersionRange, agent_guest_capabilities,
+    agent_guest_required_capabilities,
 };
 use sendbox_secrets::{
     EnvelopeBinding, EnvelopeCipher, RecipientRole, ReplayGuard, SecretName, SessionKeyMaterial,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
 };
@@ -22,6 +26,10 @@ use crate::GuestError;
 use crate::broker::BrokerClientConfiguration;
 use crate::runtime::{ReadinessSnapshot, RuntimeSession};
 use crate::safe_outputs::SafeOutputsHandle;
+use crate::secure_fs::{
+    leaf_name, open_directory_no_symlinks, open_relative_regular, read_bounded_named,
+    validate_regular_metadata,
+};
 use crate::service::ReadinessGate;
 use crate::state::{StartupState, StartupStateMachine};
 
@@ -75,8 +83,36 @@ pub(crate) struct ProtocolServices {
     runtime: Arc<RuntimeSession>,
     readiness: ReadinessSnapshot,
     broker: Option<BrokerClientConfiguration>,
+    package_report: Option<PackageReportSource>,
     secret_decryptor: GuestSecretDecryptor,
     safe_outputs: Option<SafeOutputsHandle>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PackageReportSource {
+    path: PathBuf,
+    expected_uid: u32,
+    expected_gid: u32,
+    maximum_bytes: usize,
+}
+
+impl PackageReportSource {
+    pub(crate) fn new(
+        path: PathBuf,
+        expected_uid: u32,
+        expected_gid: u32,
+        maximum_bytes: u64,
+    ) -> Result<Self, GuestError> {
+        let maximum_bytes = usize::try_from(maximum_bytes).map_err(|_| {
+            GuestError::Bootstrap("package report byte limit is out of range".to_owned())
+        })?;
+        Ok(Self {
+            path,
+            expected_uid,
+            expected_gid,
+            maximum_bytes,
+        })
+    }
 }
 
 impl ProtocolServices {
@@ -86,6 +122,7 @@ impl ProtocolServices {
         runtime: Arc<RuntimeSession>,
         readiness: ReadinessSnapshot,
         broker: Option<BrokerClientConfiguration>,
+        package_report: Option<PackageReportSource>,
         secret_decryptor: GuestSecretDecryptor,
         safe_outputs: Option<SafeOutputsHandle>,
     ) -> Self {
@@ -95,6 +132,7 @@ impl ProtocolServices {
             runtime,
             readiness,
             broker,
+            package_report,
             secret_decryptor,
             safe_outputs,
         }
@@ -140,6 +178,8 @@ where
         }))
         .await?;
 
+    let mut terminal_response_sent = false;
+    let mut package_report_served = false;
     loop {
         match reader.receive().await? {
             Message::Request(request) if request.operation == AGENT_LAUNCH_OPERATION => {
@@ -151,6 +191,7 @@ where
                     LaunchMode::Headless,
                 )
                 .await?;
+                terminal_response_sent = true;
             }
             Message::Request(request) if request.operation == INTERACTIVE_LAUNCH_OPERATION => {
                 launch(
@@ -161,6 +202,7 @@ where
                     LaunchMode::InteractiveV1,
                 )
                 .await?;
+                terminal_response_sent = true;
             }
             Message::Request(request) if request.operation == INTERACTIVE_LAUNCH_OPERATION_V2 => {
                 launch(
@@ -171,6 +213,17 @@ where
                     LaunchMode::InteractiveV2,
                 )
                 .await?;
+                terminal_response_sent = true;
+            }
+            Message::Request(request) if request.operation == PACKAGE_REPORT_OPERATION => {
+                let response = handle_package_report_request(
+                    request,
+                    services.package_report.as_ref(),
+                    terminal_response_sent,
+                    package_report_served,
+                );
+                package_report_served = response.status == ResponseStatus::Ok;
+                writer.send(&Message::Response(response)).await?;
             }
             // Operation-name negotiation preserves the legacy capability wire
             // profile while still making unsupported collection fail closed.
@@ -182,6 +235,7 @@ where
                     handle_request(request, &services.service_readiness, &services.readiness)?;
                 writer.send(&Message::Response(response)).await?;
             }
+
             Message::GracefulClose(close) => {
                 writer
                     .send(&Message::GracefulClose(GracefulClose {
@@ -209,6 +263,103 @@ where
             }
         }
     }
+}
+
+fn handle_package_report_request(
+    request: Request,
+    source: Option<&PackageReportSource>,
+    terminal_response_sent: bool,
+    package_report_served: bool,
+) -> Response {
+    let reject = |reason: &'static str| Response {
+        request_id: request.request_id,
+        status: ResponseStatus::Rejected,
+        payload: serde_json::json!({"reason": reason})
+            .to_string()
+            .into_bytes(),
+    };
+    if !terminal_response_sent {
+        return reject("terminal-response-required");
+    }
+    if package_report_served {
+        return reject("package-report-already-served");
+    }
+    let Some(source) = source else {
+        return reject("package-report-not-configured");
+    };
+    let report_request: PackageReportRequestV1 = match serde_json::from_slice(&request.payload) {
+        Ok(request) => request,
+        Err(_) => return reject("invalid-package-report-request"),
+    };
+    let maximum_bytes = match usize::try_from(report_request.maximum_bytes) {
+        Ok(maximum_bytes)
+            if report_request.validate().is_ok() && maximum_bytes <= source.maximum_bytes =>
+        {
+            maximum_bytes
+        }
+        _ => return reject("invalid-package-report-request"),
+    };
+    let report_json = match read_package_report(source, maximum_bytes) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("sendbox-guest: package report retrieval failed: {error}");
+            return reject("package-report-unavailable");
+        }
+    };
+    let sha256 = sha256_label(report_json.as_bytes());
+    let payload = match serde_json::to_vec(&PackageReportResponseV1 {
+        schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+        report_json,
+        sha256,
+    }) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("sendbox-guest: encoding package report failed: {error}");
+            return reject("package-report-unavailable");
+        }
+    };
+    Response {
+        request_id: request.request_id,
+        status: ResponseStatus::Ok,
+        payload,
+    }
+}
+
+fn sha256_label(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut label = String::with_capacity("sha256:".len() + digest.len() * 2);
+    label.push_str("sha256:");
+    for byte in digest {
+        write!(&mut label, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    label
+}
+
+fn read_package_report(
+    source: &PackageReportSource,
+    maximum_bytes: usize,
+) -> Result<String, GuestError> {
+    if maximum_bytes > source.maximum_bytes {
+        return Err(GuestError::Protocol(
+            "package report request exceeds the configured byte limit".to_owned(),
+        ));
+    }
+    let (parent_path, name) = leaf_name(&source.path)?;
+    let parent = open_directory_no_symlinks(parent_path)?;
+    let mut opened = open_relative_regular(&parent, Path::new(name), "opening package report")?;
+    validate_regular_metadata(
+        &opened.stat,
+        0o600,
+        source.expected_uid,
+        source.expected_gid,
+        true,
+        "package report",
+    )?;
+    let bytes = read_bounded_named(&mut opened.file, maximum_bytes, "package report")?;
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| GuestError::Runtime("package report is not valid UTF-8 JSON".to_owned()))
 }
 
 fn handle_request(
@@ -1024,6 +1175,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
     use rustix::process::{getgid, getuid};
     use sendbox_core::{BoundaryPlanDigest, SessionId};
     use sendbox_protocol::{HostHandshake, Message, Request};
@@ -1031,6 +1185,70 @@ mod tests {
 
     use super::*;
     use crate::runtime::RuntimeIdentity;
+
+    fn report_request(maximum_bytes: u32) -> Request {
+        Request {
+            request_id: 2,
+            operation: PACKAGE_REPORT_OPERATION.to_owned(),
+            payload: serde_json::to_vec(&PackageReportRequestV1 {
+                schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+                maximum_bytes,
+            })
+            .expect("request"),
+        }
+    }
+
+    #[test]
+    fn package_report_is_terminal_only_and_read_without_following_links() {
+        let temporary = crate::secure_fs::secure_tempdir();
+        let report_path = temporary.path().join("report.json");
+        let report_json = r#"{"schema_version":1,"proxy_enabled":true,"records":[],"allowed":0,"denied":0,"quarantined":0}"#;
+        fs::write(&report_path, report_json).expect("write report");
+        fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600)).expect("report mode");
+        let source = PackageReportSource::new(
+            report_path.clone(),
+            getuid().as_raw(),
+            getgid().as_raw(),
+            1024,
+        )
+        .expect("source");
+
+        let before_terminal =
+            handle_package_report_request(report_request(1024), Some(&source), false, false);
+        assert_eq!(before_terminal.status, ResponseStatus::Rejected);
+
+        let response =
+            handle_package_report_request(report_request(1024), Some(&source), true, false);
+        assert_eq!(response.status, ResponseStatus::Ok);
+        let response: PackageReportResponseV1 =
+            serde_json::from_slice(&response.payload).expect("response");
+        assert_eq!(response.report_json, report_json);
+        response.validate(1024).expect("valid response");
+
+        fs::remove_file(&report_path).expect("remove report");
+        let target = temporary.path().join("target.json");
+        fs::write(&target, report_json).expect("write target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("target mode");
+        symlink(&target, &report_path).expect("symlink report");
+        let linked =
+            handle_package_report_request(report_request(1024), Some(&source), true, false);
+        assert_eq!(linked.status, ResponseStatus::Rejected);
+    }
+
+    #[test]
+    fn package_report_rejects_oversized_files_and_duplicate_fetches() {
+        let temporary = crate::secure_fs::secure_tempdir();
+        let report_path = temporary.path().join("report.json");
+        fs::write(&report_path, b"0123456789").expect("write report");
+        fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600)).expect("report mode");
+        let source = PackageReportSource::new(report_path, getuid().as_raw(), getgid().as_raw(), 8)
+            .expect("source");
+        let oversized =
+            handle_package_report_request(report_request(8), Some(&source), true, false);
+        assert_eq!(oversized.status, ResponseStatus::Rejected);
+        let duplicate = handle_package_report_request(report_request(8), Some(&source), true, true);
+        assert_eq!(duplicate.status, ResponseStatus::Rejected);
+    }
 
     #[test]
     fn legacy_terminal_input_keeps_its_pre_v2_frame_size() {
@@ -1132,6 +1350,7 @@ mod tests {
                     audit_events: Vec::new(),
                 },
                 None,
+                None,
                 GuestSecretDecryptor::new(
                     SessionId::from_bytes([3; 16]),
                     &[9; 32],
@@ -1196,6 +1415,7 @@ mod tests {
                 ReadinessGate::test_ready(),
                 runtime,
                 readiness,
+                None,
                 None,
                 GuestSecretDecryptor::new(session_id, &[8; 32], boundary_plan_digest)
                     .expect("secret decryptor"),

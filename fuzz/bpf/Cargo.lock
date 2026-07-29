@@ -1367,6 +1367,7 @@ dependencies = [
  "sendbox-core",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -1379,6 +1380,7 @@ dependencies = [
  "hmac",
  "minicbor",
  "sendbox-core",
+ "sendbox-policy",
  "serde",
  "sha2 0.11.0",
  "thiserror",

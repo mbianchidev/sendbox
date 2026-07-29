@@ -696,7 +696,7 @@ mod tests {
         let guest_connection = guest_result.expect("legacy guest handshake");
         assert_eq!(
             host_connection.negotiated().capabilities,
-            legacy_host_capabilities()
+            legacy_guest_capabilities()
         );
         assert_eq!(host_connection.negotiated(), guest_connection.negotiated());
     }

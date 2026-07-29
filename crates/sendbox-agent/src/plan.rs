@@ -9,7 +9,7 @@ use sendbox_boundary::{
 };
 use sendbox_config::SandboxConfiguration;
 use sendbox_core::{BoundaryPlanDigest, SessionId};
-use sendbox_protocol::{CapabilitySet, agent_host_required_capabilities};
+use sendbox_protocol::{Capability, CapabilitySet, agent_host_required_capabilities};
 use sendbox_runtime::{
     ContainerId, ControlEndpointKind, RuntimeCapabilities, RuntimeCapability, RuntimeResources,
 };
@@ -103,6 +103,7 @@ pub struct RunPlan {
     resources: RuntimeResources,
     required_runtime_capabilities: RuntimeCapabilities,
     required_guest_capabilities: CapabilitySet,
+    package_report_maximum_bytes: Option<usize>,
     policy_digest: [u8; 32],
     interactive: bool,
     safe_outputs: bool,
@@ -161,6 +162,26 @@ impl RunPlan {
                 .map_err(|error| AgentError::InvalidPlan(error.to_string()))?,
         )
         .into();
+        let package_report_maximum_bytes = configuration
+            .policy
+            .packages
+            .enabled
+            .then(|| {
+                usize::try_from(configuration.policy.packages.limits.max_report_bytes).map_err(
+                    |_| {
+                        AgentError::InvalidPlan(
+                            "package report byte limit is out of range".to_owned(),
+                        )
+                    },
+                )
+            })
+            .transpose()?;
+        let mut required_guest_capabilities = agent_host_required_capabilities()
+            .iter()
+            .collect::<Vec<_>>();
+        if package_report_maximum_bytes.is_some() {
+            required_guest_capabilities.push(Capability::Audit);
+        }
         let container_id = ContainerId::new(format!(
             "{}-{}",
             sanitize_identifier(&configuration.name),
@@ -169,7 +190,6 @@ impl RunPlan {
         .or_else(|_| ContainerId::new(format!("sendbox-{}", boundary.session_id)))
         .map_err(AgentError::Runtime)?;
         let safe_outputs = configuration.github.safe_outputs.enabled;
-        let required_guest_capabilities = agent_host_required_capabilities();
         Ok(Self {
             verified_boundary_plan: request.boundary_plan,
             resolved_runtime: boundary.selection.selected,
@@ -206,7 +226,8 @@ impl RunPlan {
                 memory_bytes: boundary.resources.memory_bytes,
             },
             required_runtime_capabilities,
-            required_guest_capabilities,
+            required_guest_capabilities: CapabilitySet::new(required_guest_capabilities),
+            package_report_maximum_bytes,
             policy_digest,
             interactive: request.interactive,
             safe_outputs,
@@ -318,6 +339,11 @@ impl RunPlan {
     #[must_use]
     pub const fn required_guest_capabilities(&self) -> &CapabilitySet {
         &self.required_guest_capabilities
+    }
+
+    #[must_use]
+    pub const fn package_report_maximum_bytes(&self) -> Option<usize> {
+        self.package_report_maximum_bytes
     }
 }
 

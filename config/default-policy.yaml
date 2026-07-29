@@ -312,3 +312,36 @@ network:
   #   blocked_domains: ["evil.example.com"]
   #   → all subdomains allowed except evil.example.com
   blocked_domains: []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Package Supply-chain Policy
+# ─────────────────────────────────────────────────────────────────────────────
+# Disabled by default because the npm-first proxy requires an Apple or Kata
+# persistent guest. When enabled, configure exactly one npm registry. The
+# workload is denied direct access to that upstream and receives only verified,
+# allowed artifacts from the loopback proxy.
+packages:
+  enabled: false
+  registries: []
+  default_finding_action: deny
+  finding_actions: []
+  exceptions: []
+  allow_legacy_sha1: true
+  limits:
+    max_metadata_bytes: 16777216
+    max_download_bytes: 268435456
+    max_unpacked_bytes: 1073741824
+    max_entry_bytes: 67108864
+    max_entries: 100000
+    max_path_bytes: 4096
+    max_depth: 64
+    max_source_scan_bytes: 8388608
+    request_timeout_secs: 120
+    scan_timeout_secs: 30
+    max_report_findings: 4096
+    max_report_bytes: 98304
+  cache:
+    enabled: true
+    max_bytes: 4294967296
+    max_entries: 100000
+    retain_quarantined: false

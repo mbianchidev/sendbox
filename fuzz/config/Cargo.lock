@@ -360,6 +360,7 @@ dependencies = [
  "sendbox-core",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

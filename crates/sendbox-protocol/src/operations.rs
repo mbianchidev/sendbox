@@ -22,6 +22,8 @@ pub const SAFE_OUTPUTS_COLLECT_OPERATION: &str = "safe_outputs.collect";
 pub const SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SAFE_OUTPUTS_ARTIFACT_BYTES: usize = 128 * 1024;
 pub const MAX_SAFE_OUTPUTS_SEAL_BYTES: usize = 4 * 1024;
+pub const PACKAGE_REPORT_OPERATION: &str = "package.report";
+pub const PACKAGE_REPORT_SCHEMA_VERSION: u32 = 1;
 
 /// Longest accepted `TERM` value; real terminfo names are far shorter.
 const MAX_TERM_BYTES: usize = 64;
@@ -208,6 +210,7 @@ pub fn agent_host_capabilities() -> CapabilitySet {
         Capability::Exec,
         Capability::StreamedIo,
         Capability::Signals,
+        Capability::Audit,
         Capability::Health,
     ])
 }
@@ -286,6 +289,27 @@ pub struct SafeOutputsCollectRequestV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PackageReportRequestV1 {
+    pub schema_version: u32,
+    pub maximum_bytes: u32,
+}
+
+impl PackageReportRequestV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != PACKAGE_REPORT_SCHEMA_VERSION {
+            return Err("unsupported package report request schema");
+        }
+        if self.maximum_bytes == 0
+            || u64::from(self.maximum_bytes) > sendbox_policy::MAX_PACKAGE_REPORT_BYTES
+        {
+            return Err("package report request exceeds the protocol byte limit");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SafeOutputsCollectionV1 {
     pub schema_version: u32,
     pub artifact_base64: String,
@@ -352,6 +376,34 @@ pub enum SafeOutputsCollectionError {
     Encoding,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageReportResponseV1 {
+    pub schema_version: u32,
+    pub report_json: String,
+    pub sha256: String,
+}
+
+impl PackageReportResponseV1 {
+    pub fn validate(&self, maximum_bytes: usize) -> Result<(), &'static str> {
+        if self.schema_version != PACKAGE_REPORT_SCHEMA_VERSION {
+            return Err("unsupported package report response schema");
+        }
+        if self.report_json.len() > maximum_bytes {
+            return Err("package report response exceeds the requested byte limit");
+        }
+        let digest = self.sha256.strip_prefix("sha256:").unwrap_or("");
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("package report response has an invalid SHA-256 digest");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +441,32 @@ mod tests {
         let negotiated = agent_host_capabilities().intersection(&agent_guest_capabilities());
         assert!(agent_host_required_capabilities().is_subset(&negotiated));
         assert!(agent_guest_required_capabilities().is_subset(&negotiated));
+    }
+
+    #[test]
+    fn package_report_schema_is_strict_and_bounded() {
+        let request = PackageReportRequestV1 {
+            schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+            maximum_bytes: 1024,
+        };
+        request.validate().expect("request");
+        let encoded = serde_json::to_vec(&request).expect("encode");
+        let decoded: PackageReportRequestV1 = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded, request);
+        assert!(
+            serde_json::from_str::<PackageReportRequestV1>(
+                r#"{"schema_version":1,"maximum_bytes":1,"extra":true}"#
+            )
+            .is_err()
+        );
+
+        let response = PackageReportResponseV1 {
+            schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+            report_json: "{}".to_owned(),
+            sha256: format!("sha256:{}", "a".repeat(64)),
+        };
+        response.validate(2).expect("response");
+        assert!(response.validate(1).is_err());
     }
 
     fn launch_request() -> LaunchRequestV2 {
@@ -537,13 +615,27 @@ mod tests {
     }
 
     #[test]
-    fn interactive_operation_name_differs_from_headless_launch() {
+    fn operation_names_are_distinct_and_stable() {
         assert_ne!(INTERACTIVE_LAUNCH_OPERATION, AGENT_LAUNCH_OPERATION);
         assert_ne!(
             INTERACTIVE_LAUNCH_OPERATION_V2,
             INTERACTIVE_LAUNCH_OPERATION
         );
+        assert_ne!(PACKAGE_REPORT_OPERATION, AGENT_LAUNCH_OPERATION);
+        assert_ne!(SAFE_OUTPUTS_COLLECT_OPERATION, AGENT_LAUNCH_OPERATION);
+        assert_ne!(PACKAGE_REPORT_OPERATION, INTERACTIVE_LAUNCH_OPERATION_V2);
+        assert_ne!(
+            SAFE_OUTPUTS_COLLECT_OPERATION,
+            INTERACTIVE_LAUNCH_OPERATION_V2
+        );
+        assert_ne!(PACKAGE_REPORT_OPERATION, SAFE_OUTPUTS_COLLECT_OPERATION);
         assert_eq!(AGENT_LAUNCH_OPERATION, "agent.launch");
+        assert_eq!(
+            INTERACTIVE_LAUNCH_OPERATION_V2,
+            "agent.launch.interactive.v2"
+        );
+        assert_eq!(PACKAGE_REPORT_OPERATION, "package.report");
+        assert_eq!(SAFE_OUTPUTS_COLLECT_OPERATION, "safe_outputs.collect");
     }
 
     #[test]

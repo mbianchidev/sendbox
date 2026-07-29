@@ -22,6 +22,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+sendbox-policy = { path = "../sendbox-policy" }
 sendbox-security = { path = "../sendbox-security" }
 sendbox-testkit = { path = "../sendbox-testkit" }
 tempfile.workspace = true

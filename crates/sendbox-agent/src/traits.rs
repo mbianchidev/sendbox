@@ -125,6 +125,22 @@ pub struct CollectedSafeOutputs {
     pub seal: Vec<u8>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct GuestPackageReport {
+    pub json: Vec<u8>,
+    pub sha256: String,
+}
+
+impl fmt::Debug for GuestPackageReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestPackageReport")
+            .field("json_bytes", &self.json.len())
+            .field("sha256", &self.sha256)
+            .finish()
+    }
+}
+
 pub trait GuestConnector: Send + Sync {
     fn connect<'a>(
         &'a self,
@@ -193,6 +209,19 @@ pub trait GuestExecution: Send {
         Box::pin(async {
             Err(AgentError::Guest(
                 "this execution did not negotiate Safe Outputs collection".to_owned(),
+            ))
+        })
+    }
+
+    fn fetch_package_report<'a>(
+        &'a mut self,
+        maximum_bytes: usize,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<GuestPackageReport, AgentError>> {
+        let _ = (maximum_bytes, cancellation);
+        Box::pin(async {
+            Err(AgentError::Guest(
+                "this execution does not support package report retrieval".to_owned(),
             ))
         })
     }

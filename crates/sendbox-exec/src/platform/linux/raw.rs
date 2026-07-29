@@ -43,6 +43,30 @@ const CHILD_STAGE_SECCOMP: u8 = 2;
 const CHILD_STAGE_EXEC: u8 = 3;
 const CHILD_STAGE_TERMINAL: u8 = 4;
 
+pub(crate) fn set_process_identity(uid: u32, gid: u32) -> io::Result<()> {
+    // SAFETY: the calls receive scalar IDs and a null supplementary-group
+    // pointer paired with a zero length. The process is still single-threaded
+    // when this helper is used by trusted service bootstrap.
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setresgid(gid, gid, gid) != 0
+            || libc::setresuid(uid, uid, uid) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::getuid() != uid
+            || libc::geteuid() != uid
+            || libc::getgid() != gid
+            || libc::getegid() != gid
+        {
+            return Err(io::Error::other(
+                "kernel-reported identity does not match requested uid/gid",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[repr(C)]
 struct OpenHow {
     flags: u64,

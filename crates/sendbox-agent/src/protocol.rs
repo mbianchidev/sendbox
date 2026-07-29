@@ -3,10 +3,12 @@ use sendbox_protocol::{
     AGENT_LAUNCH_OPERATION, BootstrapSecret, CapabilitySet, CloseCode, EnvironmentEntryV2, Event,
     EventKind, FrameLimits, GracefulClose, HandshakeConfig, HostHandshake,
     INTERACTIVE_LAUNCH_OPERATION_V2, INTERACTIVE_OPERATION_SCHEMA_VERSION_V2,
-    InteractiveLaunchRequestV2, LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, Request,
-    ResponseStatus, SAFE_OUTPUTS_COLLECT_OPERATION, SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
-    SafeOutputsCollectRequestV1, SafeOutputsCollectionV1, SecretEnvelopeV2, TerminalInputCreditV1,
-    TerminalResultV2, TerminalSizeV1, TerminalStateV1, VersionRange,
+    InteractiveLaunchRequestV2, LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION,
+    PACKAGE_REPORT_OPERATION, PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1,
+    PackageReportResponseV1, Request, ResponseStatus, SAFE_OUTPUTS_COLLECT_OPERATION,
+    SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION, SafeOutputsCollectRequestV1, SafeOutputsCollectionV1,
+    SecretEnvelopeV2, TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1, TerminalStateV1,
+    VersionRange,
 };
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
 use sendbox_secrets::{
@@ -21,11 +23,12 @@ use std::{
 
 use crate::{
     AgentError, BoxFuture, GuestConnectionConfiguration, GuestConnector, GuestEvent,
-    GuestExecution, GuestLaunchRequest, GuestSession, GuestTerminal,
+    GuestExecution, GuestLaunchRequest, GuestPackageReport, GuestSession, GuestTerminal,
 };
 
-const REQUEST_ID: u64 = 1;
-const SAFE_OUTPUTS_REQUEST_ID: u64 = 2;
+const LAUNCH_REQUEST_ID: u64 = 1;
+const PACKAGE_REPORT_REQUEST_ID: u64 = 2;
+const SAFE_OUTPUTS_REQUEST_ID: u64 = 3;
 const PROTOCOL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
@@ -178,7 +181,7 @@ impl GuestSession for ProtocolGuestSession {
                 "send guest launch request",
                 cancellation,
                 writer.send(&Message::Request(Request {
-                    request_id: REQUEST_ID,
+                    request_id: LAUNCH_REQUEST_ID,
                     operation: operation.to_owned(),
                     payload,
                 })),
@@ -197,6 +200,7 @@ impl GuestSession for ProtocolGuestSession {
                 flow_controlled: interactive,
                 input: TerminalInputState::default(),
                 boundary_plan_digest: self.boundary_plan_digest,
+                report_fetched: false,
             }) as Box<dyn GuestExecution>)
         })
     }
@@ -301,6 +305,7 @@ pub struct ProtocolGuestExecution {
     flow_controlled: bool,
     input: TerminalInputState,
     boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
+    report_fetched: bool,
 }
 
 #[derive(Debug, Default)]
@@ -517,7 +522,7 @@ impl GuestExecution for ProtocolGuestExecution {
                         "unexpected guest event kind {kind:?}"
                     ))),
                 },
-                Message::Response(response) if response.request_id == REQUEST_ID => {
+                Message::Response(response) if response.request_id == LAUNCH_REQUEST_ID => {
                     self.terminal = true;
                     if response.status == ResponseStatus::Ok {
                         let terminal: TerminalResultV2 = serde_json::from_slice(&response.payload)
@@ -627,7 +632,7 @@ impl GuestExecution for ProtocolGuestExecution {
                         )));
                     }
                     let event = Event {
-                        stream_id: REQUEST_ID,
+                        stream_id: LAUNCH_REQUEST_ID,
                         kind: sendbox_protocol::EventKind::StandardInput,
                         payload: bytes,
                     };
@@ -646,7 +651,7 @@ impl GuestExecution for ProtocolGuestExecution {
                 }
                 HostTerminalCommand::InputEof => {
                     let event = Event {
-                        stream_id: REQUEST_ID,
+                        stream_id: LAUNCH_REQUEST_ID,
                         kind: sendbox_protocol::EventKind::StandardInputEof,
                         payload: Vec::new(),
                     };
@@ -659,7 +664,7 @@ impl GuestExecution for ProtocolGuestExecution {
                         AgentError::Guest(format!("invalid terminal size: {error}"))
                     })?;
                     let event = Event {
-                        stream_id: REQUEST_ID,
+                        stream_id: LAUNCH_REQUEST_ID,
                         kind: sendbox_protocol::EventKind::TerminalResize,
                         payload: serde_json::to_vec(&size).map_err(|error| {
                             AgentError::Guest(format!("encode terminal resize: {error}"))
@@ -698,13 +703,96 @@ impl GuestExecution for ProtocolGuestExecution {
                 cancellation,
                 self.writer
                     .send_control(Message::Cancellation(sendbox_protocol::Cancellation {
-                        request_id: REQUEST_ID,
+                        request_id: LAUNCH_REQUEST_ID,
                         reason: Some("agent cancellation".to_owned()),
                     })),
             )
             .await?;
             self.cancelled = true;
             Ok(())
+        })
+    }
+
+    fn fetch_package_report<'a>(
+        &'a mut self,
+        maximum_bytes: usize,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<GuestPackageReport, AgentError>> {
+        Box::pin(async move {
+            if !self.terminal {
+                return Err(AgentError::Guest(
+                    "package report requested before terminal response".to_owned(),
+                ));
+            }
+            if self.report_fetched {
+                return Err(AgentError::Guest(
+                    "package report was already requested".to_owned(),
+                ));
+            }
+            let maximum_bytes = u32::try_from(maximum_bytes).map_err(|_| {
+                AgentError::Guest("package report byte limit is out of range".to_owned())
+            })?;
+            let request = PackageReportRequestV1 {
+                schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+                maximum_bytes,
+            };
+            request
+                .validate()
+                .map_err(|error| AgentError::Guest(error.to_owned()))?;
+            let payload = serde_json::to_vec(&request).map_err(|error| {
+                AgentError::Guest(format!("encode package report request: {error}"))
+            })?;
+            guest_io(
+                "send package report request",
+                cancellation,
+                self.writer.send_control(Message::Request(Request {
+                    request_id: PACKAGE_REPORT_REQUEST_ID,
+                    operation: PACKAGE_REPORT_OPERATION.to_owned(),
+                    payload,
+                })),
+            )
+            .await?;
+            self.report_fetched = true;
+            let message = protocol_io(
+                "receive package report response",
+                cancellation,
+                self.reader.receive(),
+            )
+            .await?;
+            let Message::Response(response) = message else {
+                return Err(AgentError::Guest(
+                    "guest returned an unexpected package report message".to_owned(),
+                ));
+            };
+            if response.request_id != PACKAGE_REPORT_REQUEST_ID {
+                return Err(AgentError::Guest(
+                    "guest returned a package report with the wrong request ID".to_owned(),
+                ));
+            }
+            if response.status != ResponseStatus::Ok {
+                return Err(AgentError::Guest(format!(
+                    "guest rejected package report retrieval with status {:?}",
+                    response.status
+                )));
+            }
+            let response: PackageReportResponseV1 = serde_json::from_slice(&response.payload)
+                .map_err(|error| {
+                    AgentError::Guest(format!("decode package report response: {error}"))
+                })?;
+            response
+                .validate(maximum_bytes as usize)
+                .map_err(|error| AgentError::Guest(error.to_owned()))?;
+            let json = response.report_json.into_bytes();
+            let actual_digest = format!("sha256:{}", sendbox_boundary::sha256_hex(&json));
+            if response.sha256 != actual_digest {
+                return Err(AgentError::Guest(
+                    "package report SHA-256 digest mismatch".to_owned(),
+                ));
+            }
+            Ok(GuestPackageReport {
+                json,
+                sha256: actual_digest,
+            })
         })
     }
 }
@@ -797,7 +885,7 @@ mod tests {
 
     fn terminal_event(kind: EventKind) -> Message {
         Message::Event(Event {
-            stream_id: REQUEST_ID,
+            stream_id: LAUNCH_REQUEST_ID,
             kind,
             payload: Vec::new(),
         })

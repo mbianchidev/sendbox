@@ -18,6 +18,10 @@ use sendbox_agent::{
     GuestTerminal, GuestTerminalSize, OutputSink, ProtocolGuestConnector, RunFailure, RunPlan,
     SecretEnvelope, SecretReference, SecretResolver, SignalSource, TerminalSource,
 };
+use sendbox_bootstrap::{
+    DEFAULT_REGISTRY_CACHE_ROOT, DEFAULT_REGISTRY_GID, DEFAULT_REGISTRY_UID, RegistryCredential,
+    RegistryProxyConfiguration,
+};
 use sendbox_boundary::{
     Architecture, ArtifactIdentity, ArtifactKind, BOUNDARY_PLAN_FORMAT, BOUNDARY_PLAN_VERSION,
     BoundaryError, BoundaryPlan, CommandDeclaration, ControlTransport, EnvironmentDeclaration,
@@ -35,6 +39,7 @@ use sendbox_credentials::{
     RepositoryIdentity as CredentialRepositoryIdentity, authorize_github,
 };
 use sendbox_egress::runtime::{
+    DEFAULT_REGISTRY_PROXY_PORT, DEFAULT_TRUSTED_REGISTRY_PORT,
     RuntimePolicyDocument as EgressRuntimePolicyDocument, requires_enforcement,
 };
 use sendbox_exec::{AdmissionDisposition, CompiledCommandPolicy};
@@ -65,7 +70,9 @@ use sendbox_runtime_kata::{KataProviderConfiguration, KataRuntimeProvider};
 use sendbox_secrets::{SecretName, SecretStore, SecretValue, requires_guarded_github_forwarding};
 use sendbox_security::{SecurityError, provenance::SigningKeyMaterial};
 use sendbox_session_security::{AuditRecorder, SessionSecurityError};
+use serde::Serialize;
 use thiserror::Error;
+use url::Url;
 use zeroize::Zeroizing;
 
 const PLAN_VALIDITY: Duration = Duration::from_secs(60 * 60);
@@ -83,6 +90,7 @@ const COPILOT_HOST_TOKEN_ENVIRONMENTS: &[&str] =
 const MCP_PROXY_ENVIRONMENT: &str = "SENDBOX_MCP_PROXY";
 const MAX_EXECUTION_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;
 const MAX_EXECUTION_ENVIRONMENT_BYTES: usize = 16 * 1024;
+pub const PACKAGE_SECURITY_REPORT_FILE: &str = "package-security-report.json";
 #[cfg(target_os = "linux")]
 const SECRET_SERVICE: &str = "sendbox";
 
@@ -112,15 +120,70 @@ pub struct HostRunRequest {
 
 #[derive(Debug)]
 pub enum HostRunReport {
-    Persistent(AgentReport),
+    Persistent(PersistentHostRunReport),
     OneShot(ProcessOutcome),
+}
+
+#[derive(Debug)]
+pub struct PersistentHostRunReport {
+    session_id: SessionId,
+    agent: AgentReport,
+    package_report: Option<PersistedPackageReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersistedPackageReport {
+    path: PathBuf,
+    sha256: String,
+    proxy_enabled: bool,
+    records: u32,
+    allowed: u32,
+    denied: u32,
+    quarantined: u32,
+}
+
+impl PersistedPackageReport {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    #[must_use]
+    pub const fn proxy_enabled(&self) -> bool {
+        self.proxy_enabled
+    }
+
+    #[must_use]
+    pub const fn records(&self) -> u32 {
+        self.records
+    }
+
+    #[must_use]
+    pub const fn allowed(&self) -> u32 {
+        self.allowed
+    }
+
+    #[must_use]
+    pub const fn denied(&self) -> u32 {
+        self.denied
+    }
+
+    #[must_use]
+    pub const fn quarantined(&self) -> u32 {
+        self.quarantined
+    }
 }
 
 impl HostRunReport {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Persistent(report) => match &report.terminal {
+            Self::Persistent(report) => match &report.agent.terminal {
                 GuestTerminal::Exited { code } => *code,
                 GuestTerminal::Signaled { signal } => 128_i32.saturating_add(*signal),
                 GuestTerminal::Cancelled => 130,
@@ -136,7 +199,7 @@ impl HostRunReport {
     fn successful(&self) -> bool {
         match self {
             Self::Persistent(report) => {
-                matches!(report.terminal, GuestTerminal::Exited { code: 0 })
+                matches!(report.agent.terminal, GuestTerminal::Exited { code: 0 })
             }
             Self::OneShot(outcome) => outcome.status.success,
         }
@@ -146,6 +209,22 @@ impl HostRunReport {
         match self {
             Self::Persistent(_) => "persistent",
             Self::OneShot(_) => "one_shot",
+        }
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> Option<SessionId> {
+        match self {
+            Self::Persistent(report) => Some(report.session_id),
+            Self::OneShot(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn package_report(&self) -> Option<&PersistedPackageReport> {
+        match self {
+            Self::Persistent(report) => report.package_report.as_ref(),
+            Self::OneShot(_) => None,
         }
     }
 }
@@ -344,6 +423,15 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         ResolvedRuntime::Hyperlight => None,
     };
     let session_id = random_session_id()?;
+    ensure_private_directory(&request.state_root)?;
+    let state_root = canonical_file_or_directory(&request.state_root, "runtime state root")?;
+    let registry_proxy = prepare_registry_proxy(
+        selected_runtime,
+        &request.configuration,
+        session_id,
+        &state_root,
+        workload_identity,
+    )?;
     let egress_policy = make_egress_policy(selected_runtime, &request.configuration, session_id)?;
     let git_guard_policy = make_git_guard_policy(
         selected_runtime,
@@ -385,8 +473,6 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         features: &features,
     })?;
 
-    ensure_private_directory(&request.state_root)?;
-    let state_root = canonical_file_or_directory(&request.state_root, "runtime state root")?;
     let prospective_state_directory = state_root.join("sessions").join(session_id.to_string());
     security::validate_state_workspace_disjoint(&workspace_source, &prospective_state_directory)?;
     let state_directory = create_session_directory(&state_root, session_id)?;
@@ -399,6 +485,8 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .map_err(|error| HostError::Invalid(error.to_string()))?;
     let policy_bytes = serde_json::to_vec(&request.configuration.policy)
         .map_err(|error| HostError::Invalid(error.to_string()))?;
+    let package_report_validation =
+        security::PackageReportValidation::from_policy(&request.configuration.policy.packages)?;
     let configuration_sha256 = sha256_hex(&configuration_bytes);
     let policy_sha256 = sha256_hex(&policy_bytes);
     let resources = runtime_resources(&request.configuration)?;
@@ -422,7 +510,18 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         git_guard_policy.as_ref(),
         mcp_policy.as_ref(),
         egress_policy.as_ref(),
+        registry_proxy.as_ref(),
     )?;
+    let registry_mounts = registry_proxy
+        .as_ref()
+        .map(|prepared| {
+            vec![MountDeclaration {
+                source: prepared.host_cache_root.clone(),
+                destination: prepared.bootstrap.cache_root.clone(),
+                writable: true,
+            }]
+        })
+        .unwrap_or_default();
     let workload = match selected_runtime {
         ResolvedRuntime::Hyperlight => WorkloadIdentity::GuestBundle {
             root: bundle_root.clone(),
@@ -458,7 +557,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
             arguments: command.1.clone(),
             working_directory: workspace_destination.display().to_string(),
         },
-        mounts: Vec::new(),
+        mounts: registry_mounts.clone(),
         environment: environment
             .iter()
             .map(|entry| EnvironmentDeclaration {
@@ -510,7 +609,14 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                     working_directory: "/workspace".to_owned(),
                 },
                 environment,
-                mounts: Vec::new(),
+                mounts: registry_mounts
+                    .into_iter()
+                    .map(|mount| sendbox_agent::MountIntent {
+                        source: mount.source,
+                        destination: mount.destination,
+                        writable: mount.writable,
+                    })
+                    .collect(),
                 bootstrap_reference,
                 readiness_timeout: request.readiness_timeout,
                 interactive: request.terminal.is_some(),
@@ -591,6 +697,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         workspace_source,
         state_directory,
         key,
+        package_report_validation,
     );
 
     Ok(PreparedHostRun {
@@ -637,13 +744,14 @@ async fn execute_runtime(
                 })?;
                 orchestrator = orchestrator.with_terminal(size, source);
             }
-            let report = orchestrator
+            let session_id = plan.session_id();
+            let agent = orchestrator
                 .run(&plan, cancellation)
                 .await
                 .map_err(HostError::AgentRun)?;
             drop(orchestrator);
             drop(secrets);
-            match (safe_outputs.as_ref(), report.safe_outputs.as_ref()) {
+            match (safe_outputs.as_ref(), agent.safe_outputs.as_ref()) {
                 (Some(context), Some(collection)) => {
                     safe_outputs::process(context, collection, &audit).await?;
                 }
@@ -659,7 +767,11 @@ async fn execute_runtime(
                 }
                 (None, None) => {}
             }
-            Ok(HostRunReport::Persistent(report))
+            Ok(HostRunReport::Persistent(PersistentHostRunReport {
+                session_id,
+                agent,
+                package_report: None,
+            }))
         }
         HostExecution::Hyperlight(execution) => {
             if safe_outputs.is_some() {
@@ -698,6 +810,7 @@ fn build_runtime(
     git_guard_policy: Option<&GuardPolicyDocument>,
     mcp_policy: Option<&RuntimePolicyDocument>,
     egress_policy: Option<&EgressRuntimePolicyDocument>,
+    registry_proxy: Option<&PreparedRegistryProxy>,
 ) -> Result<RuntimeBuild, HostError> {
     let manifest_path = bundle_root.join("manifest.json");
     let mut artifacts = vec![
@@ -735,6 +848,8 @@ fn build_runtime(
             configuration.git_guard_policy = git_guard_policy.cloned();
             configuration.mcp_policy = mcp_policy.cloned();
             configuration.egress_policy = egress_policy.cloned();
+            configuration.registry_proxy =
+                registry_proxy.map(|prepared| prepared.bootstrap.clone());
             configuration.workload_uid = workload_uid;
             configuration.workload_gid = workload_gid;
             configuration.launch.resources.cpus =
@@ -799,6 +914,7 @@ fn build_runtime(
                 git_guard_policy: git_guard_policy.cloned(),
                 mcp_policy: mcp_policy.cloned(),
                 egress_policy: egress_policy.cloned(),
+                registry_proxy: registry_proxy.map(|prepared| prepared.bootstrap.clone()),
                 workload_uid,
                 workload_gid,
             };
@@ -1172,7 +1288,8 @@ fn validate_runtime_features(
         ));
     }
     if selected_runtime == ResolvedRuntime::Hyperlight
-        && requires_enforcement(&configuration.policy.network)
+        && (requires_enforcement(&configuration.policy.network)
+            || configuration.policy.packages.enabled)
     {
         return Err(HostError::Invalid(
             "Hyperlight does not support authenticated production egress enforcement".to_owned(),
@@ -1186,7 +1303,9 @@ fn make_egress_policy(
     configuration: &SandboxConfiguration,
     session_id: SessionId,
 ) -> Result<Option<EgressRuntimePolicyDocument>, HostError> {
-    if !requires_enforcement(&configuration.policy.network) {
+    if !requires_enforcement(&configuration.policy.network)
+        && !configuration.policy.packages.enabled
+    {
         return Ok(None);
     }
     if selected_runtime == ResolvedRuntime::Hyperlight {
@@ -1194,12 +1313,119 @@ fn make_egress_policy(
             "Hyperlight does not support authenticated production egress enforcement".to_owned(),
         ));
     }
-    let policy =
-        EgressRuntimePolicyDocument::for_session(session_id, configuration.policy.network.clone());
+    let original = configuration.policy.network.clone();
+    let mut workload = original.clone();
+    if configuration.policy.packages.enabled {
+        for registry in &configuration.policy.packages.registries {
+            let url = Url::parse(&registry.url).map_err(|error| {
+                HostError::Invalid(format!("invalid package registry URL: {error}"))
+            })?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| HostError::Invalid("package registry URL has no host".to_owned()))?;
+            workload.blocked_domains.push(host.to_owned());
+        }
+        workload.blocked_domains.sort();
+        workload.blocked_domains.dedup();
+    }
+    let mut policy = EgressRuntimePolicyDocument::for_session(session_id, workload);
+    if configuration.policy.packages.enabled {
+        policy = policy.with_registry(
+            DEFAULT_REGISTRY_PROXY_PORT,
+            DEFAULT_TRUSTED_REGISTRY_PORT,
+            original,
+        );
+    }
     policy
         .validate()
         .map_err(|error| HostError::Invalid(format!("invalid egress runtime policy: {error}")))?;
     Ok(Some(policy))
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRegistryProxy {
+    bootstrap: RegistryProxyConfiguration,
+    host_cache_root: PathBuf,
+}
+
+fn prepare_registry_proxy(
+    selected_runtime: ResolvedRuntime,
+    configuration: &SandboxConfiguration,
+    session_id: SessionId,
+    state_root: &Path,
+    workload_identity: Option<(u32, u32)>,
+) -> Result<Option<PreparedRegistryProxy>, HostError> {
+    let policy = &configuration.policy.packages;
+    if !policy.enabled {
+        return Ok(None);
+    }
+    if selected_runtime == ResolvedRuntime::Hyperlight {
+        return Err(HostError::Invalid(
+            "Hyperlight does not support the authenticated package registry proxy".to_owned(),
+        ));
+    }
+    let npm_registries = policy
+        .registries
+        .iter()
+        .filter(|registry| registry.ecosystem == sendbox_policy::PackageEcosystem::Npm)
+        .collect::<Vec<_>>();
+    if npm_registries.len() != 1 || policy.registries.len() != 1 {
+        return Err(HostError::Invalid(
+            "the npm-first registry proxy currently requires exactly one npm registry".to_owned(),
+        ));
+    }
+    if workload_identity == Some((DEFAULT_REGISTRY_UID, DEFAULT_REGISTRY_GID)) {
+        return Err(HostError::Invalid(
+            "workload and registry proxy identities must differ".to_owned(),
+        ));
+    }
+    let configured_secrets = configuration.secrets.iter().collect::<BTreeSet<_>>();
+    let references = policy
+        .registries
+        .iter()
+        .filter_map(|registry| registry.credential_secret.as_ref())
+        .collect::<Vec<_>>();
+    if references
+        .iter()
+        .any(|reference| configured_secrets.contains(reference))
+    {
+        return Err(HostError::Invalid(
+            "registry credentials must not also be delivered to the workload".to_owned(),
+        ));
+    }
+    let credentials = if references.is_empty() {
+        Vec::new()
+    } else {
+        let store = native_secret_store()?;
+        references
+            .into_iter()
+            .map(|reference| {
+                let name = SecretName::new(reference.clone())?;
+                let secret = store.retrieve(&name)?;
+                RegistryCredential::new(reference.clone(), secret.value.expose_secret().to_vec())
+                    .map_err(|error| HostError::Invalid(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, HostError>>()?
+    };
+    let host_cache_root = state_root.join("package-cache");
+    ensure_private_directory(&host_cache_root)?;
+    let host_cache_root = canonical_file_or_directory(&host_cache_root, "package cache root")?;
+    Ok(Some(PreparedRegistryProxy {
+        host_cache_root,
+        bootstrap: RegistryProxyConfiguration {
+            policy: policy.clone(),
+            proxy_port: DEFAULT_REGISTRY_PROXY_PORT,
+            trusted_upstream_port: DEFAULT_TRUSTED_REGISTRY_PORT,
+            cache_root: PathBuf::from(DEFAULT_REGISTRY_CACHE_ROOT),
+            report_path: PathBuf::from("/run/sendbox")
+                .join(session_id.to_string())
+                .join("registry")
+                .join(PACKAGE_SECURITY_REPORT_FILE),
+            proxy_uid: DEFAULT_REGISTRY_UID,
+            proxy_gid: DEFAULT_REGISTRY_GID,
+            credentials,
+        },
+    }))
 }
 
 fn make_git_guard_policy(

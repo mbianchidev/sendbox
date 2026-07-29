@@ -494,6 +494,7 @@ impl SandboxConfiguration {
         self.validate_runtime(&mut diagnostics);
         self.validate_github(&mut diagnostics);
         self.validate_observability(&mut diagnostics);
+        self.validate_package_credentials(&mut diagnostics);
 
         for (index, secret) in self.secrets.iter().enumerate() {
             if secret.trim().is_empty() {
@@ -592,6 +593,13 @@ impl SandboxConfiguration {
                 diagnostics,
                 "runtime.provider",
                 "hyperlight requires policy.boundaries.enabled to be false",
+            );
+        }
+        if self.policy.packages.enabled {
+            incompatible(
+                diagnostics,
+                "policy.packages.enabled",
+                "the package registry proxy is not supported by the hyperlight runtime",
             );
         }
         if self
@@ -833,6 +841,21 @@ impl SandboxConfiguration {
                     diagnostics,
                     "github.safe_outputs.create_pull_request.allowed_paths",
                     "must contain at least one path pattern when pull-request creation is enabled",
+                );
+            }
+        }
+    }
+
+    fn validate_package_credentials(&self, diagnostics: &mut Vec<Diagnostic>) {
+        for (index, registry) in self.policy.packages.registries.iter().enumerate() {
+            let Some(secret) = registry.credential_secret.as_deref() else {
+                continue;
+            };
+            if self.secrets.iter().any(|workload| workload == secret) {
+                incompatible(
+                    diagnostics,
+                    format!("policy.packages.registries[{index}].credential_secret"),
+                    "registry credentials must not also be exposed as workload secrets",
                 );
             }
         }
