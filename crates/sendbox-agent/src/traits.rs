@@ -119,6 +119,12 @@ pub enum GuestEvent {
     Terminal(GuestTerminal),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedSafeOutputs {
+    pub artifact: Vec<u8>,
+    pub seal: Vec<u8>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct GuestPackageReport {
     pub json: Vec<u8>,
@@ -149,6 +155,7 @@ pub struct GuestConnectionConfiguration {
     pub boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     pub capabilities: CapabilitySet,
     pub required_capabilities: CapabilitySet,
+    pub safe_outputs_required: bool,
     pub bootstrap_secret: Vec<u8>,
     pub policy_digest: [u8; 32],
 }
@@ -161,6 +168,7 @@ impl fmt::Debug for GuestConnectionConfiguration {
             .field("boundary_plan_digest", &self.boundary_plan_digest)
             .field("capabilities", &self.capabilities)
             .field("required_capabilities", &self.required_capabilities)
+            .field("safe_outputs_required", &self.safe_outputs_required)
             .field("bootstrap_secret", &"[REDACTED]")
             .field("policy_digest", &self.policy_digest)
             .finish()
@@ -192,6 +200,18 @@ pub trait GuestExecution: Send {
         &'a mut self,
         cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), AgentError>>;
+
+    fn collect_safe_outputs<'a>(
+        &'a mut self,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<CollectedSafeOutputs, AgentError>> {
+        let _ = cancellation;
+        Box::pin(async {
+            Err(AgentError::Guest(
+                "this execution did not negotiate Safe Outputs collection".to_owned(),
+            ))
+        })
+    }
 
     fn fetch_package_report<'a>(
         &'a mut self,

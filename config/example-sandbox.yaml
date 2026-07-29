@@ -326,6 +326,18 @@ github:
       - "copilot/*"
       - "feature/*"
 
+  # Credential-free GitHub writes declared through the native Safe Outputs MCP
+  # gateway. Disabled and staged by default. When enabled, forward_auth and
+  # ssh_key_path must be disabled; the write token remains host-only.
+  safe_outputs:
+    enabled: false
+    mode: staged
+    write_token_env: SENDBOX_SAFE_OUTPUTS_GITHUB_TOKEN
+    allowed_repositories: []
+    allowed_domains: [github.com]
+    allowed_mentions: []
+    max_artifact_bytes: 131072
+
   # Path to an SSH private key to mount (read-only) into the container.
   # Use this if your project requires SSH-based git operations.
   # The key is mounted at ~/.ssh/ inside the container.

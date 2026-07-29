@@ -368,6 +368,20 @@ trusted guest broker with an exact allowlisted executable and argv. Unbrokered,
 remote, shell, package-runner, environment, and working-directory overrides fail
 closed.
 
+#### Credential-free Safe Outputs
+
+When `github.safe_outputs.enabled` is true, the only agent-facing GitHub write
+surface is the root-installed Safe Outputs MCP gateway. HTTPS GitHub auth, SSH
+write auth, and forwarding the dedicated write-token variable as a sandbox
+secret are rejected; a write-token variable also cannot alias forwarded Copilot
+authentication. The guest verifies the exact installed gateway path, reports
+the recorder as a mandatory healthy service, records validated and sanitized
+intents in a hash-chained root-owned artifact, seals it only after
+execution-cgroup cleanup, and permits one authenticated collection. The host
+verifies the seal and the complete batch again before resolving the host-only
+token. Staged mode never resolves a token. See
+[the Safe Outputs architecture](architecture/safe-outputs.md).
+
 ### Layer 6: Network Firewall
 
 Network access is controlled by the authenticated guest egress service:

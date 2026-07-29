@@ -2420,6 +2420,7 @@ dependencies = [
  "proptest",
  "rustix",
  "sendbox-core",
+ "sendbox-git",
  "sendbox-policy",
  "serde",
  "serde_json",
@@ -2546,6 +2547,7 @@ name = "sendbox-host"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "reqwest",
  "rustix",
  "sendbox-agent",
  "sendbox-bootstrap",
@@ -2581,6 +2583,8 @@ name = "sendbox-mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hkdf",
+ "hmac",
  "libc",
  "proptest",
  "sendbox-config",
@@ -2588,10 +2592,13 @@ dependencies = [
  "sendbox-policy",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
+ "unicode-normalization",
+ "url",
 ]
 
 [[package]]
@@ -2623,6 +2630,7 @@ dependencies = [
 name = "sendbox-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "getrandom 0.4.3",
  "hkdf",
  "hmac",

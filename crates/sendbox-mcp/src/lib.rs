@@ -15,5 +15,6 @@ pub mod jsonrpc;
 pub mod observation;
 pub mod policy;
 pub mod runtime;
+pub mod safe_outputs;
 
 pub use error::{BrokerError, ConfigError, FrameError, JsonRpcError, ObservationError};

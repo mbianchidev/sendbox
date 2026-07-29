@@ -549,12 +549,15 @@ mod tests {
     }
 
     #[test]
-    fn capability_wire_values_are_unchanged_by_interactive_support() {
-        // Interactive admission is negotiated by operation name, never by a new
-        // capability, because the codec rejects unknown capability values and a
-        // new variant would break mixed-version headless runs.
+    fn capability_wire_values_are_stable() {
+        // Operation extensions are negotiated by name so the legacy capability
+        // profile remains decodable by older peers.
         assert_eq!(Capability::COUNT, 9);
-        let capabilities = CapabilitySet::from([Capability::StreamedIo, Capability::Signals]);
+        let capabilities = CapabilitySet::from([
+            Capability::StreamedIo,
+            Capability::Signals,
+            Capability::Health,
+        ]);
         let mut encoder = Encoder::new(Vec::new());
         encode_capabilities(&mut encoder, &capabilities).expect("encode");
         let encoded = encoder.into_writer();
@@ -563,6 +566,13 @@ mod tests {
             decode_capabilities(&mut decoder).expect("decode"),
             capabilities
         );
+    }
+
+    #[test]
+    fn unknown_capabilities_are_still_rejected() {
+        let mut decoder = Decoder::new(&[10]);
+        let error = decode_capability(&mut decoder).expect_err("capability 10 is unassigned");
+        assert!(matches!(error, ProtocolError::MalformedEncoding(_)));
     }
 
     #[test]

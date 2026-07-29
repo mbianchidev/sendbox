@@ -5,8 +5,10 @@ use sendbox_protocol::{
     INTERACTIVE_LAUNCH_OPERATION_V2, INTERACTIVE_OPERATION_SCHEMA_VERSION_V2,
     InteractiveLaunchRequestV2, LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION,
     PACKAGE_REPORT_OPERATION, PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1,
-    PackageReportResponseV1, Request, ResponseStatus, SecretEnvelopeV2, TerminalInputCreditV1,
-    TerminalResultV2, TerminalSizeV1, TerminalStateV1, VersionRange,
+    PackageReportResponseV1, Request, ResponseStatus, SAFE_OUTPUTS_COLLECT_OPERATION,
+    SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION, SafeOutputsCollectRequestV1, SafeOutputsCollectionV1,
+    SecretEnvelopeV2, TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1, TerminalStateV1,
+    VersionRange,
 };
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
 use sendbox_secrets::{
@@ -26,6 +28,7 @@ use crate::{
 
 const LAUNCH_REQUEST_ID: u64 = 1;
 const PACKAGE_REPORT_REQUEST_ID: u64 = 2;
+const SAFE_OUTPUTS_REQUEST_ID: u64 = 3;
 const PROTOCOL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
@@ -48,6 +51,7 @@ impl GuestConnector for ProtocolGuestConnector {
                 EnvelopeCipher::new(&material, configuration.session_id).map_err(|error| {
                     AgentError::Guest(format!("derive secret envelope key: {error}"))
                 })?;
+            let safe_outputs_required = configuration.safe_outputs_required;
             let handshake = HandshakeConfig::new(
                 configuration.session_id,
                 VersionRange::default(),
@@ -73,7 +77,7 @@ impl GuestConnector for ProtocolGuestConnector {
                     "guest readiness used an unexpected event kind".to_owned(),
                 ));
             }
-            validate_operational_readiness(&readiness.payload)?;
+            validate_operational_readiness(&readiness.payload, safe_outputs_required)?;
             Ok(Box::new(ProtocolGuestSession {
                 negotiated,
                 reader: Some(reader),
@@ -195,6 +199,7 @@ impl GuestSession for ProtocolGuestSession {
                 interactive,
                 flow_controlled: interactive,
                 input: TerminalInputState::default(),
+                boundary_plan_digest: self.boundary_plan_digest,
                 report_fetched: false,
             }) as Box<dyn GuestExecution>)
         })
@@ -299,6 +304,7 @@ pub struct ProtocolGuestExecution {
     interactive: bool,
     flow_controlled: bool,
     input: TerminalInputState,
+    boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     report_fetched: bool,
 }
 
@@ -544,6 +550,62 @@ impl GuestExecution for ProtocolGuestExecution {
         })
     }
 
+    fn collect_safe_outputs<'a>(
+        &'a mut self,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<crate::CollectedSafeOutputs, AgentError>> {
+        Box::pin(async move {
+            if !self.terminal {
+                return Err(AgentError::Guest(
+                    "Safe Outputs collection requires a terminal response".to_owned(),
+                ));
+            }
+            let payload = serde_json::to_vec(&SafeOutputsCollectRequestV1 {
+                schema_version: SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+                boundary_plan_digest: self.boundary_plan_digest,
+            })
+            .map_err(|error| {
+                AgentError::Guest(format!("encode Safe Outputs collection request: {error}"))
+            })?;
+            guest_io(
+                "request Safe Outputs collection",
+                cancellation,
+                self.writer.send_control(Message::Request(Request {
+                    request_id: SAFE_OUTPUTS_REQUEST_ID,
+                    operation: SAFE_OUTPUTS_COLLECT_OPERATION.to_owned(),
+                    payload,
+                })),
+            )
+            .await?;
+            let message = protocol_io(
+                "receive Safe Outputs collection",
+                cancellation,
+                self.reader.receive(),
+            )
+            .await?;
+            let Message::Response(response) = message else {
+                return Err(AgentError::Guest(
+                    "guest omitted the Safe Outputs collection response".to_owned(),
+                ));
+            };
+            if response.request_id != SAFE_OUTPUTS_REQUEST_ID
+                || response.status != ResponseStatus::Ok
+            {
+                return Err(AgentError::Guest(
+                    "guest rejected Safe Outputs collection".to_owned(),
+                ));
+            }
+            let collection: SafeOutputsCollectionV1 = serde_json::from_slice(&response.payload)
+                .map_err(|error| {
+                    AgentError::Guest(format!("decode Safe Outputs collection: {error}"))
+                })?;
+            let (artifact, seal) = collection
+                .decode()
+                .map_err(|error| AgentError::Guest(error.to_string()))?;
+            Ok(crate::CollectedSafeOutputs { artifact, seal })
+        })
+    }
+
     fn send_terminal<'a>(
         &'a mut self,
         command: HostTerminalCommand,
@@ -735,33 +797,41 @@ impl GuestExecution for ProtocolGuestExecution {
     }
 }
 
-fn validate_operational_readiness(payload: &[u8]) -> Result<(), AgentError> {
+fn validate_operational_readiness(
+    payload: &[u8],
+    safe_outputs_required: bool,
+) -> Result<(), AgentError> {
     let readiness: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|error| AgentError::Guest(format!("decode guest readiness: {error}")))?;
     let state_ready = readiness
         .get("state")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|state| state.eq_ignore_ascii_case("ready"));
-    let broker_live = readiness
+    let services = readiness
         .get("services")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|services| {
-            services.iter().any(|service| {
-                service.get("id").and_then(serde_json::Value::as_str) == Some("exec")
-                    && service
-                        .get("mandatory")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                    && service.get("healthy").and_then(serde_json::Value::as_bool) == Some(true)
-            })
-        });
-    if state_ready && broker_live {
-        Ok(())
-    } else {
-        Err(AgentError::Guest(
+        .ok_or_else(|| AgentError::Guest("guest readiness omitted service health".to_owned()))?;
+    let service_live = |id: &str| {
+        services.iter().any(|service| {
+            service.get("id").and_then(serde_json::Value::as_str) == Some(id)
+                && service
+                    .get("mandatory")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                && service.get("healthy").and_then(serde_json::Value::as_bool) == Some(true)
+        })
+    };
+    if !state_ready || !service_live("exec") {
+        return Err(AgentError::Guest(
             "guest readiness did not prove a live mandatory execution broker".to_owned(),
-        ))
+        ));
     }
+    if safe_outputs_required && !service_live("safe_outputs") {
+        return Err(AgentError::Guest(
+            "guest readiness did not prove a live mandatory Safe Outputs recorder".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn map_terminal(result: TerminalResultV2) -> GuestTerminal {
@@ -915,5 +985,15 @@ mod tests {
             }),
             GuestTerminal::Signaled { signal: 15 }
         );
+    }
+
+    #[test]
+    fn required_safe_outputs_service_must_be_present_and_healthy() {
+        let exec_only =
+            br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true}]}"#;
+        validate_operational_readiness(exec_only, false).expect("ordinary readiness");
+        assert!(validate_operational_readiness(exec_only, true).is_err());
+        let complete = br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true},{"id":"safe_outputs","mandatory":true,"healthy":true}]}"#;
+        validate_operational_readiness(complete, true).expect("Safe Outputs readiness");
     }
 }

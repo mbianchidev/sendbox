@@ -86,6 +86,15 @@ host does not read terminal input until the first grant arrives. `StandardInput`
 `TerminalInputCredit` is appended as event kind 9, so old discriminants and persisted
 readers remain stable.
 
+Safe Outputs uses `safe_outputs.collect` schema version 1. The host can request
+it only after a terminal result with complete broker cleanup. The guest returns
+one bounded base64 artifact and authenticated seal, then rejects duplicate
+collection. It is negotiated solely by the distinct operation name so the
+legacy capability wire profile remains compatible with older peers. A required
+collection rejected as unsupported is a hard downgrade failure. When Safe
+Outputs is configured, authenticated readiness must also include healthy
+mandatory `exec` and `safe_outputs` service identities.
+
 The package report operational schema is independently versioned by
 `PACKAGE_REPORT_SCHEMA_VERSION = 1`. `package.report` uses request ID `2` after
 the launch request's terminal response. Its request contains a positive bounded
@@ -93,16 +102,21 @@ the launch request's terminal response. Its request contains a positive bounded
 `sha256:<lowercase-hex>` digest. Package-enabled plans require the `Audit`
 capability.
 
-## Terminal package-report ordering
+Safe Outputs uses request ID `3`, distinct from launch and package reporting.
+
+## Terminal post-processing ordering
 
 The launch request remains request ID `1`. If package analysis is configured,
-the host follows this exact sequence:
+or Safe Outputs is enabled, the host follows this exact sequence:
 
 1. receive the launch terminal response and all preceding output;
-2. send one `package.report` request with request ID `2`;
-3. validate response status, schema, byte limit, and digest;
+2. if configured, send one `package.report` request with request ID `2` and
+   validate response status, schema, byte limit, and digest;
+3. if configured, send one `safe_outputs.collect` request with request ID `3`
+   and validate the authenticated artifact and seal;
 4. send graceful close; and
-5. persist the independently revalidated report on the host.
+5. independently revalidate and persist or apply the collected host-side
+   reports and operations.
 
 The guest rejects a report request before the terminal response, after a
 successful report response, when no report source is configured, or when the

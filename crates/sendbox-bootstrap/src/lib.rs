@@ -59,6 +59,7 @@ pub enum ServiceId {
     Egress,
     Audit,
     Bpf,
+    SafeOutputs,
 }
 
 impl ServiceId {
@@ -71,6 +72,7 @@ impl ServiceId {
             Self::Egress => "egress",
             Self::Audit => "audit",
             Self::Bpf => "bpf",
+            Self::SafeOutputs => "safe_outputs",
         }
     }
 }
@@ -908,6 +910,7 @@ mod tests {
             fixed_environment: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
             inherited_environment_keys: BTreeSet::from(["TOKEN".to_owned()]),
             observation: None,
+            safe_outputs: None,
         }
     }
 

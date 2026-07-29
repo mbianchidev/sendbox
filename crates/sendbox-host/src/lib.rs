@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod safe_outputs;
 mod security;
 
 use std::{
@@ -52,6 +53,7 @@ use sendbox_mcp::config::{NATIVE_BROKER_PATH, PROJECT_CONFIG_PATHS};
 use sendbox_mcp::runtime::{
     RUNTIME_POLICY_SCHEMA_VERSION, RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
+use sendbox_mcp::safe_outputs::{SAFE_OUTPUTS_MCP_PATH, SafeOutputsRuntimePolicy};
 use sendbox_runtime::{
     BootstrapMaterial, CancellationToken, CommandArgument, CommandSpec, ContainerId, CreateRequest,
     InitializeRequest, OutputStream, ProcessOptions, ProcessOutcome, Program, RuntimeError,
@@ -67,7 +69,7 @@ use sendbox_runtime_hyperlight::{
 use sendbox_runtime_kata::{KataProviderConfiguration, KataRuntimeProvider};
 use sendbox_secrets::{SecretName, SecretStore, SecretValue, requires_guarded_github_forwarding};
 use sendbox_security::{SecurityError, provenance::SigningKeyMaterial};
-use sendbox_session_security::SessionSecurityError;
+use sendbox_session_security::{AuditRecorder, SessionSecurityError};
 use serde::Serialize;
 use thiserror::Error;
 use url::Url;
@@ -254,6 +256,8 @@ pub enum HostError {
     Credentials(#[from] CredentialBrokerError),
     #[error("secret store: {0}")]
     SecretStore(#[from] sendbox_secrets::SecretStoreError),
+    #[error("Safe Outputs: {0}")]
+    SafeOutputs(String),
     #[error("{context} `{path}`: {source}")]
     Io {
         context: &'static str,
@@ -269,7 +273,17 @@ pub struct PreparedHostRun {
     execution: HostExecution,
     secrets: Arc<HostSecretResolver>,
     security: security::HostSecurityContext,
+    safe_outputs: Option<safe_outputs::ProcessingContext>,
     signed_plan_path: PathBuf,
+    terminal_source: Option<Arc<dyn TerminalSource>>,
+}
+
+struct RuntimeInputs {
+    execution: HostExecution,
+    secrets: Arc<HostSecretResolver>,
+    safe_outputs: Option<safe_outputs::ProcessingContext>,
+    output: Arc<dyn OutputSink>,
+    signals: Arc<dyn SignalSource>,
     terminal_source: Option<Arc<dyn TerminalSource>>,
 }
 
@@ -331,15 +345,28 @@ impl PreparedHostRun {
         signals: Arc<dyn SignalSource>,
         cancellation: &CancellationToken,
     ) -> Result<HostRunReport, HostError> {
-        let runtime = execute_runtime(
-            self.execution,
-            self.secrets,
+        let PreparedHostRun {
+            execution,
+            secrets,
+            security,
+            safe_outputs,
+            signed_plan_path: _,
+            terminal_source,
+        } = self;
+        let runtime_inputs = RuntimeInputs {
+            execution,
+            secrets,
+            safe_outputs,
             output,
             signals,
-            self.terminal_source,
+            terminal_source,
+        };
+        security::execute(
+            security,
+            move |audit| execute_runtime(runtime_inputs, audit, cancellation),
             cancellation,
-        );
-        security::execute(self.security, runtime, cancellation).await
+        )
+        .await
     }
 }
 
@@ -416,6 +443,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     )?;
     let mcp_policy = make_mcp_policy(
         selected_runtime,
+        session_id,
         &request.configuration,
         &workspace_source,
         &workspace_destination,
@@ -648,6 +676,20 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
             })
         }
     };
+    let safe_outputs = mcp_policy
+        .as_ref()
+        .and_then(|policy| policy.safe_outputs.clone())
+        .map(|policy| {
+            Ok::<_, HostError>(safe_outputs::ProcessingContext {
+                configuration: request.configuration.github.safe_outputs.clone(),
+                policy,
+                boundary_plan_digest: security_plan.digest(),
+                seal_key: secrets.safe_outputs_seal_key(session_id)?,
+                state_directory: state_directory.clone(),
+                workspace: workspace_source.clone(),
+            })
+        })
+        .transpose()?;
     let security = security::HostSecurityContext::new(
         security_plan,
         configuration_bytes,
@@ -662,19 +704,25 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         execution,
         secrets,
         security,
+        safe_outputs,
         signed_plan_path,
         terminal_source: None,
     })
 }
 
 async fn execute_runtime(
-    execution: HostExecution,
-    secrets: Arc<HostSecretResolver>,
-    output: Arc<dyn OutputSink>,
-    signals: Arc<dyn SignalSource>,
-    terminal_source: Option<Arc<dyn TerminalSource>>,
+    inputs: RuntimeInputs,
+    audit: AuditRecorder,
     cancellation: &CancellationToken,
 ) -> Result<HostRunReport, HostError> {
+    let RuntimeInputs {
+        execution,
+        secrets,
+        safe_outputs,
+        output,
+        signals,
+        terminal_source,
+    } = inputs;
     match execution {
         HostExecution::Persistent {
             provider,
@@ -683,7 +731,7 @@ async fn execute_runtime(
         } => {
             let mut orchestrator = AgentOrchestrator::new(
                 provider,
-                secrets,
+                secrets.clone(),
                 Arc::new(ProtocolGuestConnector),
                 output,
                 signals,
@@ -697,19 +745,40 @@ async fn execute_runtime(
                 orchestrator = orchestrator.with_terminal(size, source);
             }
             let session_id = plan.session_id();
-            orchestrator
+            let agent = orchestrator
                 .run(&plan, cancellation)
                 .await
-                .map(|agent| {
-                    HostRunReport::Persistent(PersistentHostRunReport {
-                        session_id,
-                        agent,
-                        package_report: None,
-                    })
-                })
-                .map_err(HostError::AgentRun)
+                .map_err(HostError::AgentRun)?;
+            drop(orchestrator);
+            drop(secrets);
+            match (safe_outputs.as_ref(), agent.safe_outputs.as_ref()) {
+                (Some(context), Some(collection)) => {
+                    safe_outputs::process(context, collection, &audit).await?;
+                }
+                (Some(_), None) => {
+                    return Err(HostError::SafeOutputs(
+                        "guest omitted the required authenticated artifact".to_owned(),
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(HostError::SafeOutputs(
+                        "guest returned an unexpected Safe Outputs artifact".to_owned(),
+                    ));
+                }
+                (None, None) => {}
+            }
+            Ok(HostRunReport::Persistent(PersistentHostRunReport {
+                session_id,
+                agent,
+                package_report: None,
+            }))
         }
         HostExecution::Hyperlight(execution) => {
+            if safe_outputs.is_some() {
+                return Err(HostError::SafeOutputs(
+                    "Hyperlight cannot process Safe Outputs".to_owned(),
+                ));
+            }
             execute_hyperlight(execution, secrets, output, cancellation)
                 .await
                 .map(HostRunReport::OneShot)
@@ -1086,6 +1155,11 @@ impl HostSecretResolver {
     fn bootstrap_material(&self) -> Result<BootstrapMaterial, HostError> {
         BootstrapMaterial::new(self.bootstrap.to_vec()).map_err(HostError::Runtime)
     }
+
+    fn safe_outputs_seal_key(&self, session_id: SessionId) -> Result<[u8; 32], HostError> {
+        sendbox_mcp::safe_outputs::derive_seal_key(self.bootstrap.as_ref(), session_id)
+            .map_err(|error| HostError::SafeOutputs(format!("derive seal key: {error}")))
+    }
 }
 
 impl SecretResolver for HostSecretResolver {
@@ -1420,6 +1494,7 @@ fn make_git_guard_policy(
 
 fn make_mcp_policy(
     selected_runtime: ResolvedRuntime,
+    session_id: SessionId,
     configuration: &SandboxConfiguration,
     host_workspace: &Path,
     guest_workspace: &Path,
@@ -1434,6 +1509,7 @@ fn make_mcp_policy(
         .as_ref()
         .map(|observability| &observability.mcp_inspection)
         .filter(|inspection| inspection.enabled);
+    let safe_outputs_enabled = configuration.github.safe_outputs.enabled;
     if !has_project_configuration
         && configuration
             .policy
@@ -1442,6 +1518,7 @@ fn make_mcp_policy(
             .allowed_server_commands
             .is_empty()
         && inspection.is_none()
+        && !safe_outputs_enabled
     {
         return Ok(None);
     }
@@ -1461,6 +1538,7 @@ fn make_mcp_policy(
         .tool_calls
         .allowed_server_commands
         .is_empty()
+        && !safe_outputs_enabled
     {
         return Err(HostError::Invalid(
             "MCP composition requires at least one exactly approved server command".to_owned(),
@@ -1516,15 +1594,41 @@ fn make_mcp_policy(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let safe_outputs = safe_outputs_enabled
+        .then(|| {
+            SafeOutputsRuntimePolicy::from_configuration(
+                session_id,
+                &configuration.github.safe_outputs,
+            )
+        })
+        .transpose()
+        .map_err(|error| HostError::Invalid(format!("invalid Safe Outputs policy: {error}")))?;
+    let mut tool_policy = configuration.policy.boundaries.tool_calls.clone();
+    if let Some(safe_outputs) = &safe_outputs {
+        let command = vec![SAFE_OUTPUTS_MCP_PATH.to_owned()];
+        if !tool_policy.allowed_server_commands.contains(&command) {
+            tool_policy.allowed_server_commands.push(command);
+        }
+        for tool in safe_outputs.enabled_tools() {
+            if !tool_policy
+                .allowlist
+                .iter()
+                .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
+            {
+                tool_policy.allowlist.push(tool.name().to_owned());
+            }
+        }
+    }
     let policy = RuntimePolicyDocument {
         schema_version: RUNTIME_POLICY_SCHEMA_VERSION,
         workspace_root: guest_workspace.to_path_buf(),
         workload_uid,
         workload_gid,
-        tool_policy: configuration.policy.boundaries.tool_calls.clone(),
+        tool_policy,
         fixed_environment,
         inherited_environment_keys,
         observation,
+        safe_outputs,
     };
     policy
         .validate()
@@ -1591,7 +1695,7 @@ fn boundary_features(
                 "git_branch_protection".to_owned(),
                 FeatureAdmission {
                     decision: FeatureDecision::Enforced,
-                    mechanism,
+                    mechanism: mechanism.clone(),
                 },
             );
         }
@@ -1613,6 +1717,15 @@ fn boundary_features(
         if policy.observation.is_some() {
             features.insert(
                 "mcp_stdio_observation".to_owned(),
+                FeatureAdmission {
+                    decision: FeatureDecision::Enforced,
+                    mechanism: mechanism.clone(),
+                },
+            );
+        }
+        if policy.safe_outputs.is_some() {
+            features.insert(
+                "github_safe_outputs".to_owned(),
                 FeatureAdmission {
                     decision: FeatureDecision::Enforced,
                     mechanism,
@@ -1874,6 +1987,7 @@ fn validate_security_composition(composition: SecurityComposition<'_>) -> Result
     }
     let expected_mcp_policy = make_mcp_policy(
         selected_runtime,
+        session_id,
         configuration,
         host_workspace,
         guest_workspace,
@@ -2537,6 +2651,7 @@ mod tests {
         inspection.transports = vec![InspectionTransport::Stdio, InspectionTransport::Http];
         let error = make_mcp_policy(
             ResolvedRuntime::Kata,
+            test_session(),
             &mcp,
             temp.path(),
             Path::new("/workspace"),
@@ -2593,6 +2708,7 @@ mod tests {
 
         let policy = make_mcp_policy(
             ResolvedRuntime::Kata,
+            test_session(),
             &configuration,
             temp.path(),
             Path::new("/workspace"),
@@ -2659,6 +2775,68 @@ mod tests {
     }
 
     #[test]
+    fn safe_outputs_policy_admits_only_the_gateway_without_forwarding_the_write_token() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.github.safe_outputs.enabled = true;
+        configuration.github.safe_outputs.write_token_env = "HOST_ONLY_WRITE_TOKEN".to_owned();
+        configuration.github.safe_outputs.allowed_repositories =
+            vec!["example/repository".to_owned()];
+        configuration.github.safe_outputs.create_issue.enabled = true;
+        configuration.validate().expect("configuration");
+
+        let policy = make_mcp_policy(
+            ResolvedRuntime::Kata,
+            test_session(),
+            &configuration,
+            temp.path(),
+            Path::new("/workspace"),
+            Some((1000, 1000)),
+            None,
+        )
+        .expect("MCP policy")
+        .expect("Safe Outputs policy");
+        assert!(
+            policy
+                .tool_policy
+                .allowed_server_commands
+                .contains(&vec![SAFE_OUTPUTS_MCP_PATH.to_owned()])
+        );
+        assert!(
+            policy
+                .tool_policy
+                .allowlist
+                .contains(&"create_issue".to_owned())
+        );
+        assert!(
+            !policy
+                .fixed_environment
+                .contains_key("HOST_ONLY_WRITE_TOKEN")
+        );
+        assert!(
+            !policy
+                .inherited_environment_keys
+                .contains("HOST_ONLY_WRITE_TOKEN")
+        );
+        let encoded = serde_json::to_vec(&policy).expect("policy JSON");
+        assert!(
+            !encoded
+                .windows(b"HOST_ONLY_WRITE_TOKEN".len())
+                .any(|window| window == b"HOST_ONLY_WRITE_TOKEN")
+        );
+
+        let credentials = EffectiveCredentialSet {
+            values: BTreeMap::new(),
+            github_https_auth: false,
+            copilot_auth: false,
+            git_ssh_auth: false,
+        };
+        let features = boundary_features(&configuration, None, Some(&policy), None, &credentials)
+            .expect("features");
+        assert!(features.contains_key("github_safe_outputs"));
+    }
+
+    #[test]
     fn native_mcp_policy_rejects_unbrokered_project_server() {
         let temp = TempDir::new().expect("temp dir");
         fs::write(
@@ -2683,6 +2861,7 @@ mod tests {
             vec![vec!["/usr/bin/mcp-server".to_owned(), "--stdio".to_owned()]];
         let error = make_mcp_policy(
             ResolvedRuntime::Kata,
+            test_session(),
             &configuration,
             temp.path(),
             Path::new("/workspace"),
@@ -2724,6 +2903,7 @@ mod tests {
 
         let mcp = make_mcp_policy(
             ResolvedRuntime::Kata,
+            test_session(),
             &configuration,
             temp.path(),
             Path::new("/workspace"),

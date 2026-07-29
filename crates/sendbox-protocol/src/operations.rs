@@ -1,3 +1,4 @@
+use base64::Engine;
 use sendbox_core::BoundaryPlanDigest;
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,12 @@ pub const INTERACTIVE_OPERATION_SCHEMA_VERSION: u32 = 1;
 pub const INTERACTIVE_LAUNCH_OPERATION_V2: &str = "agent.launch.interactive.v2";
 pub const INTERACTIVE_OPERATION_SCHEMA_VERSION_V2: u32 = 2;
 pub const HEALTH_OPERATION: &str = "health";
+/// Safe Outputs collection uses a distinct operation so older peers can reject
+/// it without receiving an unknown capability discriminant during handshake.
+pub const SAFE_OUTPUTS_COLLECT_OPERATION: &str = "safe_outputs.collect";
+pub const SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION: u32 = 1;
+pub const MAX_SAFE_OUTPUTS_ARTIFACT_BYTES: usize = 128 * 1024;
+pub const MAX_SAFE_OUTPUTS_SEAL_BYTES: usize = 4 * 1024;
 pub const PACKAGE_REPORT_OPERATION: &str = "package.report";
 pub const PACKAGE_REPORT_SCHEMA_VERSION: u32 = 1;
 
@@ -275,6 +282,13 @@ pub struct HealthResponseV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SafeOutputsCollectRequestV1 {
+    pub schema_version: u32,
+    pub boundary_plan_digest: BoundaryPlanDigest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackageReportRequestV1 {
     pub schema_version: u32,
     pub maximum_bytes: u32,
@@ -292,6 +306,74 @@ impl PackageReportRequestV1 {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeOutputsCollectionV1 {
+    pub schema_version: u32,
+    pub artifact_base64: String,
+    pub seal_base64: String,
+}
+
+impl SafeOutputsCollectionV1 {
+    pub fn new(artifact: &[u8], seal: &[u8]) -> Result<Self, SafeOutputsCollectionError> {
+        validate_safe_outputs_lengths(artifact.len(), seal.len())?;
+        Ok(Self {
+            schema_version: SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+            artifact_base64: base64::engine::general_purpose::STANDARD.encode(artifact),
+            seal_base64: base64::engine::general_purpose::STANDARD.encode(seal),
+        })
+    }
+
+    pub fn decode(self) -> Result<(Vec<u8>, Vec<u8>), SafeOutputsCollectionError> {
+        if self.schema_version != SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION {
+            return Err(SafeOutputsCollectionError::SchemaVersion);
+        }
+        if self.artifact_base64.len() > maximum_base64_length(MAX_SAFE_OUTPUTS_ARTIFACT_BYTES) {
+            return Err(SafeOutputsCollectionError::ArtifactTooLarge);
+        }
+        if self.seal_base64.len() > maximum_base64_length(MAX_SAFE_OUTPUTS_SEAL_BYTES) {
+            return Err(SafeOutputsCollectionError::SealSize);
+        }
+        let artifact = base64::engine::general_purpose::STANDARD
+            .decode(self.artifact_base64)
+            .map_err(|_| SafeOutputsCollectionError::Encoding)?;
+        let seal = base64::engine::general_purpose::STANDARD
+            .decode(self.seal_base64)
+            .map_err(|_| SafeOutputsCollectionError::Encoding)?;
+        validate_safe_outputs_lengths(artifact.len(), seal.len())?;
+        Ok((artifact, seal))
+    }
+}
+
+const fn maximum_base64_length(bytes: usize) -> usize {
+    (bytes.saturating_add(2) / 3).saturating_mul(4)
+}
+
+fn validate_safe_outputs_lengths(
+    artifact_bytes: usize,
+    seal_bytes: usize,
+) -> Result<(), SafeOutputsCollectionError> {
+    if artifact_bytes > MAX_SAFE_OUTPUTS_ARTIFACT_BYTES {
+        return Err(SafeOutputsCollectionError::ArtifactTooLarge);
+    }
+    if seal_bytes == 0 || seal_bytes > MAX_SAFE_OUTPUTS_SEAL_BYTES {
+        return Err(SafeOutputsCollectionError::SealSize);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SafeOutputsCollectionError {
+    #[error("Safe Outputs collection schema version is unsupported")]
+    SchemaVersion,
+    #[error("Safe Outputs artifact exceeds the protocol limit")]
+    ArtifactTooLarge,
+    #[error("Safe Outputs seal size is invalid")]
+    SealSize,
+    #[error("Safe Outputs collection is not canonical base64")]
+    Encoding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,12 +615,48 @@ mod tests {
     }
 
     #[test]
-    fn interactive_operation_name_differs_from_headless_launch() {
+    fn operation_names_are_distinct_and_stable() {
         assert_ne!(INTERACTIVE_LAUNCH_OPERATION, AGENT_LAUNCH_OPERATION);
         assert_ne!(
             INTERACTIVE_LAUNCH_OPERATION_V2,
             INTERACTIVE_LAUNCH_OPERATION
         );
+        assert_ne!(PACKAGE_REPORT_OPERATION, AGENT_LAUNCH_OPERATION);
+        assert_ne!(SAFE_OUTPUTS_COLLECT_OPERATION, AGENT_LAUNCH_OPERATION);
+        assert_ne!(PACKAGE_REPORT_OPERATION, INTERACTIVE_LAUNCH_OPERATION_V2);
+        assert_ne!(
+            SAFE_OUTPUTS_COLLECT_OPERATION,
+            INTERACTIVE_LAUNCH_OPERATION_V2
+        );
+        assert_ne!(PACKAGE_REPORT_OPERATION, SAFE_OUTPUTS_COLLECT_OPERATION);
         assert_eq!(AGENT_LAUNCH_OPERATION, "agent.launch");
+        assert_eq!(
+            INTERACTIVE_LAUNCH_OPERATION_V2,
+            "agent.launch.interactive.v2"
+        );
+        assert_eq!(PACKAGE_REPORT_OPERATION, "package.report");
+        assert_eq!(SAFE_OUTPUTS_COLLECT_OPERATION, "safe_outputs.collect");
+    }
+
+    #[test]
+    fn safe_outputs_collection_round_trips_with_bounds() {
+        let collection =
+            SafeOutputsCollectionV1::new(b"{\"record\":1}\n", b"{\"seal\":1}").expect("collection");
+        let (artifact, seal) = collection.decode().expect("decode");
+        assert_eq!(artifact, b"{\"record\":1}\n");
+        assert_eq!(seal, b"{\"seal\":1}");
+        assert!(
+            SafeOutputsCollectionV1::new(&vec![0; MAX_SAFE_OUTPUTS_ARTIFACT_BYTES + 1], b"seal")
+                .is_err()
+        );
+        let oversized = SafeOutputsCollectionV1 {
+            schema_version: SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+            artifact_base64: "A".repeat(maximum_base64_length(MAX_SAFE_OUTPUTS_ARTIFACT_BYTES) + 1),
+            seal_base64: "c2VhbA==".to_owned(),
+        };
+        assert_eq!(
+            oversized.decode().expect_err("encoded bound must fail"),
+            SafeOutputsCollectionError::ArtifactTooLarge
+        );
     }
 }

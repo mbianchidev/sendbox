@@ -4,8 +4,9 @@ Status: **production runtime integration**. This document defines the trust, boo
 readiness, service, and fail-closed semantics implemented by
 `guest/sendbox-guest`. Apple and Kata integrate the production execution broker,
 mandatory DNS/SOCKS5 egress service, and authenticated MCP policy. The host
-session lifecycle owns audit and snapshot persistence; BPF activation remains
-explicit guest policy.
+session lifecycle owns audit and snapshot persistence. When enabled, the
+supervisor also owns the Safe Outputs recorder and its seal key; BPF activation
+remains explicit guest policy.
 
 ## Process and command model
 
@@ -20,9 +21,14 @@ explicit guest policy.
   qualification.
 - `inject-bootstrap` and `tunnel` are hidden runtime-only Kata controls.
 - `exec-broker` is the mandatory one-session production broker service.
+- `safe-outputs-mcp` is a root-installed stdio bridge to the authenticated
+  session recorder. The bridge never validates or persists operations itself.
 
-Typed service identifiers reserve `exec`, `mcp`, `dns`, `egress`, `audit`, and
-`bpf`. Reserving an identifier does not claim that its service is implemented.
+Typed service identifiers reserve `exec`, `mcp`, `dns`, `egress`, `audit`,
+`bpf`, and `safe_outputs`. Reserving an identifier does not claim that its
+service is implemented. The Safe Outputs identity represents the mandatory
+in-process recorder rather than a separate child, so the bootstrap secret never
+crosses a process boundary.
 
 ## Trust and immutable bootstrap
 
