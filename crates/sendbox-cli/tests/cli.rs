@@ -82,6 +82,32 @@ fn root_help_uses_the_final_command_name_and_only_implemented_surfaces() {
             .lines()
             .any(|line| line.trim_start().starts_with("script"))
     );
+    let run_help = String::from_utf8(run(&["run", "--help"]).stdout).unwrap();
+    assert!(run_help.contains("--interactive"));
+    assert!(run_help.contains("--separate-stderr"));
+}
+
+#[test]
+fn separate_stderr_requires_an_interactive_run() {
+    let output = run(&[
+        "run",
+        "--config",
+        "config/example-sandbox.yaml",
+        "--bundle",
+        ".",
+        "--trust-root",
+        "Cargo.toml",
+        "--separate-stderr",
+        "--",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--interactive"),
+        "clap did not name the required flag: {stderr}"
+    );
 }
 
 #[test]

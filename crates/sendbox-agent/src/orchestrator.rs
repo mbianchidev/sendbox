@@ -391,6 +391,9 @@ impl AgentOrchestrator {
                             GuestEvent::Output { stream, bytes } => {
                                 self.output.write(stream, &bytes, cancellation).await?;
                             }
+                            GuestEvent::TerminalInputCredit { credits } => {
+                                self.terminal.grant_input_credit(credits)?;
+                            }
                             GuestEvent::Terminal(terminal) => {
                                 if let Some(maximum_bytes) = package_report_maximum_bytes {
                                     context.package_report = Some(

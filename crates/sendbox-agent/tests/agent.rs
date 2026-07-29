@@ -1284,6 +1284,7 @@ async fn interactive_run(
             columns: 120,
             rows: 40,
             term: "xterm-256color".to_owned(),
+            separate_stderr: false,
         },
         Arc::new(ScriptedTerminal {
             commands: Mutex::new(commands),

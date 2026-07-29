@@ -241,7 +241,22 @@ sendbox run --interactive \
 
 Keystrokes ride the same authenticated control channel as workload output, so they inherit
 its message authentication, replay protection and session binding. No additional port,
-socket or privilege is introduced.
+socket or privilege is introduced. The launcher grants a bounded window of 64 input chunks,
+each at most 4 KiB, and the CLI stops reading stdin when that credit is exhausted. A workload
+that temporarily stops reading therefore applies backpressure instead of losing pasted bytes.
+
+stderr remains merged into the controlling terminal by default. Use `--separate-stderr` when
+diagnostics need their own stream while remaining a TTY:
+
+```bash
+sendbox run --interactive --separate-stderr \
+  --config .sendbox.yaml \
+  --runtime kata \
+  --image registry.example/workload@sha256:<digest> \
+  --bundle /usr/local/share/sendbox/guest/x86_64/bundle \
+  --trust-root /usr/local/share/sendbox/guest/x86_64/release-public.key \
+  -- /usr/bin/copilot
+```
 
 Requirements and behaviour:
 
@@ -255,8 +270,14 @@ Requirements and behaviour:
 - `Ctrl-C`, `Ctrl-Z` and `Ctrl-D` are delivered to the *workload's* terminal, not to
   `sendbox`. Use the agent's own quit command to end the session.
 - The host `TERM` is authoritative for the workload; it replaces any configured `TERM`.
-- Terminal output merges the workload's stdout and stderr, because a terminal is a single
-  device. Drop `--interactive` when the two streams must stay separate.
+- Terminal output merges stdout and stderr by default. `--separate-stderr` gives fd 2 a
+  second, non-controlling pseudoterminal and reports it as stderr. Both descriptors remain
+  TTYs, but ordering between stdout and stderr is no longer strict, so the flag is unsuitable
+  for TUIs that draw through fd 2.
+- `--separate-stderr` requires `--interactive` and consumes one additional pseudoterminal
+  pair per session.
+- Interactive input is lossless within a bounded 64 x 4 KiB credit window. End of file is
+  outside the credit budget and remains ordered behind preceding input.
 - Window size changes are tracked through `SIGWINCH` for as long as the run lasts.
 
 See [interactive terminals](docs/architecture/interactive-terminal.md) for the design,
@@ -270,6 +291,9 @@ Troubleshooting:
 | `--interactive requires the foreground process group` | Started with `&` or under a job-control shell in the background | Bring the job to the foreground |
 | `the hyperlight runtime cannot provide an interactive terminal` | `--runtime hyperlight` | Use `--runtime apple` or `--runtime kata` |
 | `interactive execution needs a controlling terminal, but the command policy denies: ioctl` | `policy.boundaries.syscalls.additional_denylist` blocks terminal syscalls | Remove `ioctl`, `setsid`, `dup2` and `dup3` from the denylist, or run without `--interactive` |
+| The guest rejects `agent.launch.interactive.v2` | The host is using an older guest bundle that predates credit flow control | Install the guest bundle shipped with the same SendBox release |
+| Pseudoterminal allocation reports resource exhaustion | Concurrent interactive sessions reached the host PTY limit | Reduce concurrency or inspect `/proc/sys/kernel/pty/max` and `/proc/sys/kernel/pty/nr` |
+| stdout and stderr appear out of order | `--separate-stderr` uses independent PTY buffers | Remove `--separate-stderr` for a single strictly ordered terminal stream |
 | The agent renders as garbled boxes | The guest image has no terminfo entry for the host `TERM` | Set `TERM=xterm-256color` before running |
 
 ## Configuration

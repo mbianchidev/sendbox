@@ -93,6 +93,10 @@ struct RunArgs {
     /// keystrokes and window size to it.
     #[arg(long, conflicts_with = "json")]
     interactive: bool,
+    /// Give stderr its own non-controlling pseudoterminal. This loses strict
+    /// ordering with stdout and is unsuitable for TUIs that draw through fd 2.
+    #[arg(long, requires = "interactive")]
+    separate_stderr: bool,
     #[arg(last = true, required = true, num_args = 1..)]
     command: Vec<String>,
 }
@@ -401,7 +405,7 @@ async fn run(arguments: RunArgs) -> ExitCode {
         }
     };
     let session = if arguments.interactive {
-        match terminal::TerminalSession::start() {
+        match terminal::TerminalSession::start(arguments.separate_stderr) {
             Ok(session) => Some(session),
             Err(error) => {
                 emit_run_error(
