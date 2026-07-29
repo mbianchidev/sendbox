@@ -535,7 +535,7 @@ fn run(
     // All pump threads start only after clone3, so the single-thread guard
     // above still holds for the raw child branch.
     let mut readers = Vec::new();
-    let terminal_io_done = Arc::new(AtomicBool::new(false));
+    let terminal_io_shutdown = Arc::new(TerminalIoShutdown::default());
     let mut terminal_writer = None;
     if let Some(device) = terminal_device {
         let writer = match TerminalWriter::new(device, request.stdin.uses_flow_control()) {
@@ -559,7 +559,7 @@ fn run(
             primary,
             StreamKind::Stdout,
             sender.clone(),
-            Arc::clone(&terminal_io_done),
+            Arc::clone(&terminal_io_shutdown),
         ));
         if let Some(stderr) = writer.devices.stderr_primary() {
             let primary = match stderr.try_clone() {
@@ -576,7 +576,7 @@ fn run(
                 primary,
                 StreamKind::Stderr,
                 sender.clone(),
-                Arc::clone(&terminal_io_done),
+                Arc::clone(&terminal_io_shutdown),
             ));
         }
         if let Some(queue) = terminal_input {
@@ -584,7 +584,7 @@ fn run(
                 writer,
                 queue,
                 cancellation.clone(),
-                Arc::clone(&terminal_io_done),
+                Arc::clone(&terminal_io_shutdown),
                 sender.clone(),
                 request.stdin.uses_flow_control(),
             ));
@@ -651,7 +651,7 @@ fn run(
         terminal = TerminalState::Exited(status);
     }
 
-    terminal_io_done.store(true, Ordering::Release);
+    terminal_io_shutdown.stop_input();
     drain_after_cleanup(
         &receiver,
         sink,
@@ -660,6 +660,7 @@ fn run(
         &mut terminal,
         Duration::from_millis(250),
     );
+    terminal_io_shutdown.stop_output();
     drop(receiver);
     if let Some(writer) = terminal_writer {
         let _ = writer.join();
@@ -722,6 +723,30 @@ enum LauncherEvent {
     TerminalInputCredit(u16),
 }
 
+#[derive(Debug, Default)]
+struct TerminalIoShutdown {
+    input: AtomicBool,
+    output: AtomicBool,
+}
+
+impl TerminalIoShutdown {
+    fn stop_input(&self) {
+        self.input.store(true, Ordering::Release);
+    }
+
+    fn stop_output(&self) {
+        self.output.store(true, Ordering::Release);
+    }
+
+    fn input_stopped(&self) -> bool {
+        self.input.load(Ordering::Acquire)
+    }
+
+    fn output_stopped(&self) -> bool {
+        self.output.load(Ordering::Acquire)
+    }
+}
+
 fn spawn_reader(
     descriptor: OwnedFd,
     stream: StreamKind,
@@ -762,7 +787,7 @@ fn spawn_terminal_reader(
     descriptor: OwnedFd,
     stream: StreamKind,
     sender: SyncSender<LauncherEvent>,
-    done: Arc<AtomicBool>,
+    shutdown: Arc<TerminalIoShutdown>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut file = File::from(descriptor);
@@ -783,7 +808,7 @@ fn spawn_terminal_reader(
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if !wait_readable(&file, &done) {
+                    if !wait_readable(&file, &shutdown) {
                         break;
                     }
                 }
@@ -793,7 +818,7 @@ fn spawn_terminal_reader(
     })
 }
 
-fn wait_readable(primary: &File, done: &AtomicBool) -> bool {
+fn wait_readable(primary: &File, shutdown: &TerminalIoShutdown) -> bool {
     let primary = primary.as_fd();
     let mut fds = [rustix::event::PollFd::new(
         &primary,
@@ -803,7 +828,7 @@ fn wait_readable(primary: &File, done: &AtomicBool) -> bool {
         tv_sec: 0,
         tv_nsec: 10_000_000,
     };
-    while !done.load(Ordering::Acquire) {
+    while !shutdown.output_stopped() {
         match rustix::event::poll(&mut fds, Some(&timeout)) {
             Ok(0) => {}
             Ok(_) => return true,
@@ -1206,7 +1231,7 @@ fn spawn_terminal_writer(
     device: TerminalWriter,
     input: Arc<ChannelInput>,
     cancellation: CancellationFlag,
-    done: Arc<AtomicBool>,
+    shutdown: Arc<TerminalIoShutdown>,
     events: SyncSender<LauncherEvent>,
     flow_controlled: bool,
 ) -> thread::JoinHandle<()> {
@@ -1221,7 +1246,7 @@ fn spawn_terminal_writer(
         {
             return;
         }
-        while !done.load(Ordering::Acquire) {
+        while !shutdown.input_stopped() {
             if !matches!(cancellation.cause(), CancellationCause::None) {
                 return;
             }
@@ -1722,6 +1747,74 @@ mod tests {
                 .expect("poll pseudoterminal hangup"),
             "pseudoterminal hangup must return control to the cancellation loop"
         );
+    }
+
+    #[test]
+    fn stopping_terminal_input_preserves_delayed_trailing_output() {
+        const TRAILING: &[u8] = b"trailing-output";
+
+        let mut devices =
+            super::super::pty::TerminalDevices::open(80, 24, false).expect("allocate pty");
+        let primary = devices
+            .controlling_primary()
+            .try_clone()
+            .expect("duplicate primary");
+        let secondary = devices
+            .controlling_secondary()
+            .expect("secondary")
+            .try_clone_to_owned()
+            .expect("duplicate secondary");
+        devices.release_secondaries();
+
+        let shutdown = Arc::new(TerminalIoShutdown::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader =
+            spawn_terminal_reader(primary, StreamKind::Stdout, sender, Arc::clone(&shutdown));
+        shutdown.stop_input();
+        assert!(shutdown.input_stopped());
+        assert!(!shutdown.output_stopped());
+
+        let producer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            File::from(secondary)
+                .write_all(TRAILING)
+                .expect("write trailing output");
+        });
+        let correlation_id =
+            crate::api::CorrelationId::new("trailing-output").expect("correlation");
+        let mut sequence = 0;
+        let mut terminal = TerminalState::Exited(crate::api::ExitStatus {
+            exit_code: Some(0),
+            signal: None,
+        });
+        let mut output = Vec::new();
+        let mut sink = |event| {
+            if let ExecutionEvent::Output { data, .. } = event {
+                output.extend(data);
+            }
+            Ok(())
+        };
+        drain_after_cleanup(
+            &receiver,
+            &mut sink,
+            &correlation_id,
+            &mut sequence,
+            &mut terminal,
+            Duration::from_millis(250),
+        );
+        shutdown.stop_output();
+        drop(receiver);
+        producer.join().expect("trailing output producer");
+        reader.join().expect("terminal reader");
+
+        assert_eq!(
+            terminal,
+            TerminalState::Exited(crate::api::ExitStatus {
+                exit_code: Some(0),
+                signal: None,
+            })
+        );
+        assert_eq!(output, TRAILING);
     }
 
     #[test]

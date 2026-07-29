@@ -148,9 +148,10 @@ until every byte fits, so polling for writability first would bound nothing
 (`POLLOUT` only promises one byte of room). Since `O_NONBLOCK` is file-status state shared by every
 descriptor for the same open file, and a pty primary cannot be reopened to get
 an independent file description, the output pump is `poll`-driven too.
-After cleanup, terminal readers drain bytes already buffered by the kernel and
-then stop on a bounded poll interval, so joining them never depends on a delayed
-PTY hangup.
+After cleanup, terminal input stops immediately, but terminal readers retain a
+separate shutdown state and keep polling through the bounded drain window. This
+preserves bytes that become readable at process exit without making reader joins
+depend on a delayed PTY hangup.
 
 ## End of file
 
@@ -201,6 +202,7 @@ Live Linux coverage in `crates/sendbox-exec/tests/linux_live.rs`:
 | `interactive_launch_forwards_input_and_window_size_changes` | keystrokes reach the workload; a mid-run resize is observed |
 | `interactive_launch_ends_the_workload_when_host_input_ends` | `StandardInputEof` closes the workload's stdin |
 | `interactive_launch_survives_simultaneous_input_and_heavy_output` | full-duplex traffic does not deadlock or truncate |
+| `interactive_launch_preserves_all_output_written_through_exit` | every exact byte written through clean process exit survives the post-cleanup drain |
 | `flow_controlled_terminal_delivers_a_paste_larger_than_the_launcher_window` | a credit-aware paste larger than 256 KiB arrives byte-for-byte |
 | `flow_controlled_terminal_cancellation_stays_prompt_when_input_is_blocked` | cancellation remains prompt while a raw-mode workload never reads |
 | `interactive_launch_is_rejected_when_the_policy_denies_terminal_syscalls` | admission names the denied syscall |

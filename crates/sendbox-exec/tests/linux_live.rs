@@ -1453,6 +1453,53 @@ fn interactive_launch_survives_simultaneous_input_and_heavy_output() {
 }
 
 #[test]
+fn interactive_launch_preserves_all_output_written_through_exit() {
+    const OUTPUT_BYTES: usize = 512 * 1024;
+    const TRAILER: &[u8] = b"sendbox-final-output";
+
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    let script = format!(
+        "import os\n\
+         remaining = {OUTPUT_BYTES}\n\
+         chunk = b'x' * 4096\n\
+         while remaining:\n\
+         \x20   written = os.write(1, chunk[:remaining])\n\
+         \x20   remaining -= written\n\
+         os.write(1, b'sendbox-final-output')\n"
+    );
+    let invocation = launcher_invocation(
+        &session,
+        parent,
+        interactive_case("live-pty-trailing-output", &executable, &python, &script),
+    );
+
+    let (result, output) = invoke_launcher(&invocation);
+
+    assert_clean_exit(&result.terminal);
+    assert!(
+        result.cleanup.is_complete(),
+        "trailing output cleanup failed: {:?}",
+        result.cleanup.failures
+    );
+    assert_eq!(
+        output.len(),
+        OUTPUT_BYTES + TRAILER.len(),
+        "workload output was truncated at exit"
+    );
+    assert!(
+        output[..OUTPUT_BYTES].iter().all(|byte| *byte == b'x'),
+        "workload output was corrupted before the trailer"
+    );
+    assert_eq!(&output[OUTPUT_BYTES..], TRAILER);
+}
+
+#[test]
 fn flow_controlled_terminal_delivers_a_paste_larger_than_the_launcher_window() {
     const EXTRA_CHUNKS: usize = 16;
     let paste_chunks = usize::from(sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS) + EXTRA_CHUNKS;
