@@ -524,9 +524,14 @@ fn tls_config(remote: &RemoteServerRuntime) -> Result<ClientConfig, HttpGatewayE
             }
         )));
     }
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|error| {
+                HttpGatewayError::Upstream(format!("configuring TLS protocol versions: {error}"))
+            })?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
 }
@@ -3238,10 +3243,13 @@ mod tests {
             generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         let certificate_pem = cert.pem();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.der().clone()], key)
-            .unwrap();
+        let mut server_config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.der().clone()], key)
+                .unwrap();
         server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
