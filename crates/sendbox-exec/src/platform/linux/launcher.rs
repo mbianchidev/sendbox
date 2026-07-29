@@ -1435,7 +1435,15 @@ impl TerminalWriter {
         )];
         match rustix::event::poll(&mut fds, Some(&timeout)) {
             Ok(0) => Ok(false),
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                let events = fds[0].revents();
+                Ok(events.contains(rustix::event::PollFlags::OUT)
+                    && !events.intersects(
+                        rustix::event::PollFlags::ERR
+                            | rustix::event::PollFlags::HUP
+                            | rustix::event::PollFlags::NVAL,
+                    ))
+            }
             Err(rustix::io::Errno::INTR) => Ok(false),
             Err(error) => Err(io::Error::from_raw_os_error(error.raw_os_error())),
         }
@@ -1700,6 +1708,19 @@ mod tests {
         assert!(
             slowest < INPUT_WRITE_SLICE * 8,
             "terminal input parked on a workload that does not read it: {slowest:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_hangup_is_not_reported_as_writable() {
+        let device = super::super::pty::TerminalDevices::open(80, 24, false).expect("allocate pty");
+        let mut writer = TerminalWriter::new(device, true).expect("terminal writer");
+        writer.devices.release_secondaries();
+
+        assert!(
+            !TerminalWriter::writable(&writer.primary, INPUT_WRITE_SLICE)
+                .expect("poll pseudoterminal hangup"),
+            "pseudoterminal hangup must return control to the cancellation loop"
         );
     }
 
