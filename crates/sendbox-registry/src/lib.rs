@@ -28,7 +28,7 @@ pub use provenance::NpmPackageProvenanceVerifier;
 pub use report::{
     CacheOutcome, PackageFinding, PackageSecurityReport, PackageVerdictRecord, Verdict,
 };
-pub use scanner::inspect_npm_archive;
+pub use scanner::{enumerate_npm_archive, inspect_npm_archive};
 pub use service::{ArtifactAnalysis, RegistryProxy, RegistryProxyConfiguration};
 
 pub const REGISTRY_REPORT_SCHEMA_VERSION: u32 = 1;

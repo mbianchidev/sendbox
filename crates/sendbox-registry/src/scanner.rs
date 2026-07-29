@@ -69,7 +69,7 @@ pub(crate) fn normalize_npm_manifest(
     manifest.ok_or_else(|| RegistryError::Inspection("npm archive omitted package.json".to_owned()))
 }
 
-pub(crate) fn enumerate_npm_archive(
+pub fn enumerate_npm_archive(
     artifact: &Path,
     limits: &PackageAnalysisLimits,
 ) -> RegistryResult<Vec<ArchiveEntry>> {

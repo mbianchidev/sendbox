@@ -1,0 +1,31 @@
+[package]
+name = "sendbox-registry-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+sendbox-policy = { path = "../../crates/sendbox-policy" }
+sendbox-registry = { path = "../../crates/sendbox-registry" }
+tempfile = "3.27.0"
+
+[[bin]]
+name = "npm_metadata"
+path = "fuzz_targets/npm_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "npm_archive"
+path = "fuzz_targets/npm_archive.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

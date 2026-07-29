@@ -16,6 +16,7 @@ the same name.
 | `analyze` / `devcontainer generate` | Retains the existing native project-analysis subset. |
 | `secrets` | Adds, lists, and removes versioned secrets through Keychain on macOS or the descriptor-safe protected file store on Linux without printing values. |
 | `mcp parse` / `mcp report` | Parses native or legacy observations with optional redaction and deterministic JSON. It does not generate executable inspection scripts. |
+| `package status` / `package report` | Securely loads the latest or selected session's owner-only package report, rejects symlinks, malformed/cross-session data, bad modes/ownership, and oversize files, then prints a verdict summary or the complete report. |
 | `boundary inspect` | Emits the structured native boundary declaration without scripts or secret values. |
 | `run` | Resolves and verifies a signed immutable boundary plan, selects Apple/Kata/Hyperlight without fallback, and dispatches either an authenticated persistent guest session or the explicit authenticated Hyperlight one-shot path. |
 
@@ -49,4 +50,5 @@ Persistent Apple and Kata execution waits for authenticated guest readiness and
 the required capability set before resolving workload secrets or launching the
 command. Hyperlight is explicit-only and rejects every feature its one-shot
 boundary cannot enforce. Text errors use stderr; `--json` emits one error or
-result object to stdout.
+result object to stdout. Package-enabled persistent results include report path,
+digest, proxy state, record count, and allow/deny/quarantine totals.

@@ -119,7 +119,7 @@ fn production_run_rejects_relative_guest_commands_deterministically() {
     let config = temporary.path().join("sandbox.yaml");
     let source = std::fs::read_to_string(workspace_root().join("config/example-sandbox.yaml"))
         .unwrap()
-        .replace("secrets:\n  - NPM_TOKEN\n  - DATABASE_URL", "secrets: []");
+        .replace("secrets:\n  - DATABASE_URL", "secrets: []");
     std::fs::write(&config, source).unwrap();
     let output = run(&[
         "run",

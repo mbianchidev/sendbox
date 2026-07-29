@@ -1184,7 +1184,8 @@ mod tests {
     #[test]
     fn report_persistence_enforces_the_byte_limit_before_installing() {
         let temporary = tempdir().expect("temporary directory");
-        let path = temporary.path().join("report.json");
+        let root = temporary.path().canonicalize().expect("canonical temp dir");
+        let path = root.join("report.json");
         let report = PackageSecurityReport::enabled();
         let encoded = serde_json::to_vec(&report).expect("encode report");
         assert!(
