@@ -615,8 +615,9 @@ Contributions are welcome! Please:
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-change`)
-3. Make sure tests pass (`make test`)
-4. Lint your code (`make lint`)
+3. Run `make lint` (this also compiles every standalone fuzz workspace with
+   its committed lockfile)
+4. Run `make test`, `make release`, and `make audit`
 5. Open a pull request
 
 For larger changes, please open an issue first to discuss the approach.
