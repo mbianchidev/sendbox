@@ -443,8 +443,10 @@ mod tests {
 
     #[test]
     fn hierarchical_safe_outputs_policy_must_match_the_runtime_configuration() {
-        let mut configuration = sendbox_config::SafeOutputsConfiguration::default();
-        configuration.enabled = true;
+        let configuration = sendbox_config::SafeOutputsConfiguration {
+            enabled: true,
+            ..sendbox_config::SafeOutputsConfiguration::default()
+        };
         let safe_outputs = SafeOutputsRuntimePolicy::from_configuration(
             sendbox_core::SessionId::from_bytes([7; 16]),
             &configuration,
