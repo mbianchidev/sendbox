@@ -3,3 +3,4 @@ fuzz/*/target/
 node_modules/
 .DS_Store
 .sendbox.yaml
+sendbox-release.key
