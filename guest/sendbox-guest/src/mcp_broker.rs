@@ -31,6 +31,7 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "execution-broker")]
 use crate::service::{HealthCheck, RestartPolicy, ServiceId, ServiceSpec};
 
 const BOUNDARY_ROOT: &str = "/run/sendbox-boundary";
@@ -198,6 +199,7 @@ fn install_with_paths(
 }
 
 #[must_use]
+#[cfg(feature = "execution-broker")]
 pub fn audit_service() -> ServiceSpec {
     ServiceSpec {
         id: ServiceId::Audit,
