@@ -84,6 +84,7 @@ pub struct GuestTerminalSize {
     pub columns: u16,
     pub rows: u16,
     pub term: String,
+    pub separate_stderr: bool,
 }
 
 impl fmt::Debug for GuestLaunchRequest<'_> {
@@ -112,7 +113,26 @@ pub enum GuestEvent {
         stream: OutputStream,
         bytes: Vec<u8>,
     },
+    TerminalInputCredit {
+        credits: u16,
+    },
     Terminal(GuestTerminal),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct GuestPackageReport {
+    pub json: Vec<u8>,
+    pub sha256: String,
+}
+
+impl fmt::Debug for GuestPackageReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestPackageReport")
+            .field("json_bytes", &self.json.len())
+            .field("sha256", &self.sha256)
+            .finish()
+    }
 }
 
 pub trait GuestConnector: Send + Sync {
@@ -173,6 +193,19 @@ pub trait GuestExecution: Send {
         cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), AgentError>>;
 
+    fn fetch_package_report<'a>(
+        &'a mut self,
+        maximum_bytes: usize,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<GuestPackageReport, AgentError>> {
+        let _ = (maximum_bytes, cancellation);
+        Box::pin(async {
+            Err(AgentError::Guest(
+                "this execution does not support package report retrieval".to_owned(),
+            ))
+        })
+    }
+
     /// Forwards one host terminal command to the guest.
     ///
     /// The default rejects the command, so a transport that never negotiated
@@ -223,6 +256,10 @@ impl fmt::Debug for HostTerminalCommand {
 /// Source of host terminal commands for an interactive run.
 pub trait TerminalSource: Send + Sync {
     fn next_command<'a>(&'a self) -> BoxFuture<'a, Option<HostTerminalCommand>>;
+
+    fn grant_input_credit(&self, _credits: u16) -> Result<(), AgentError> {
+        Ok(())
+    }
 }
 
 /// Terminal source for headless runs, which never produce commands.

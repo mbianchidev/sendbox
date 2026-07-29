@@ -59,6 +59,28 @@ token is retrieved only after complete pagination succeeds. Apple and Kata runs
 deliver approved credentials through authenticated, policy-bound secret
 envelopes.
 
+### Production package mediation
+
+The Rust [`sendbox-registry`](package-supply-chain.md) component is a trusted
+pre-delivery boundary for configured npm registries. The untrusted workload is
+forced to a loopback proxy and denied direct access to the upstream registry.
+The proxy runs outside the workload process tree, in a third cgroup identity
+that can reach only a registry-only SOCKS gateway and cannot set the broker
+socket mark.
+
+Artifacts remain in a private quarantine store while SendBox verifies package
+identity, npm integrity, advertised signatures and provenance, archive bounds,
+and normalized static risk findings. Inspection never extracts into the
+workspace or executes package code. Only an `allow` verdict exposes bytes.
+Integrity, identity, evidence, unsupported-content, scanner, timeout, and limit
+failures always deny delivery.
+
+Private registry tokens are resolved from the host vault into the authenticated
+proxy bootstrap. They cannot overlap workload secret references and are absent
+from workload environment variables, launch secrets, reports, and audit logs.
+The terminal package report is retrieved once over the authenticated protocol,
+revalidated by the host, and persisted as owner-only session evidence.
+
 ### Production guest artifacts and BPF observation
 
 Production static guest binaries, the execution launcher, CO-RE BPF objects,
@@ -88,7 +110,7 @@ and fixed working directory.
 
 The remote path uses a mandatory loopback Streamable HTTP gateway. Project
 configuration contains only
-`http://127.0.0.1:15081/mcp/<server-id>` and an exact supported transport type;
+`http://127.0.0.1:15082/mcp/<server-id>` and an exact supported transport type;
 it cannot contain the upstream URL, headers, or credentials. The gateway
 validates JSON-RPC and protocol metadata, bounds request/SSE/session state,
 verifies TLS and hostnames, resolves each connection independently, rejects
@@ -412,6 +434,9 @@ Network access is controlled by the authenticated guest egress service:
   gateway with configured connection and DNS budgets
 - **Kernel containment:** nftables and cgroup v2 bind policy to the exact
   delegated execution hierarchy, including nested descendants
+- **Registry isolation:** package-enabled npm traffic reaches an isolated
+  loopback proxy; the workload cannot reach its npm upstream or trusted
+  registry SOCKS listener, and the proxy cannot dial externally
 - **Fail-closed lifecycle:** Egress readiness gates Exec startup; service failure
   revokes readiness and reverse-order shutdown stops Exec before network teardown
 - **No host access:** loopback, link-local, metadata, private, multicast, and
@@ -459,6 +484,8 @@ Secrets management prevents credential exposure:
 
 - Secrets are stored in **macOS Keychain** or mode-restricted files on Linux
 - Injected as environment variables at container creation
+- Package registry credentials are an exception: they are delivered only to
+  the trusted proxy and are rejected if also configured as workload secrets
 - **Never written to disk** in plaintext inside the VM
 - Environment is **cleaned up on VM shutdown**
 - Sensitive environment variables (e.g., `LD_PRELOAD`, `LD_LIBRARY_PATH`) are stripped from the agent environment by the hardening process
@@ -512,6 +539,10 @@ These are threats SendBox is designed to defend against:
 |--------|---------|
 | Agent attempts to access host filesystem | VM isolation — no host filesystem visible; only explicit virtiofs mounts |
 | Agent attempts to contact unauthorized network endpoints | Network firewall — default-deny with domain allowlist |
+| Agent overrides npm's registry or requests an upstream tarball directly | Kernel egress rules deny workload access to the configured upstream; npm receives only the loopback proxy |
+| Malicious npm package relies on lifecycle hooks, archive escape, executable/native content, or subprocess APIs | Pre-delivery verification and non-executing archive inspection with fail-closed verdicts; npm scripts are disabled in the workload |
+| Compromised package proxy attempts direct external access | Separate registry cgroup can reach only the trusted loopback SOCKS listener and cannot set `SO_MARK` |
+| Agent attempts to obtain a private registry token | Registry credential is isolated in the authenticated proxy bootstrap and never enters workload secrets or environment |
 | Agent attempts to execute dangerous commands | Command policy — allowlist/denylist with pipeline parsing |
 | Agent attempts to escalate privileges within the VM | Capability dropping, seccomp, `PR_SET_NO_NEW_PRIVS`, sysctl hardening |
 | Agent attempts to exfiltrate secrets | Secrets are env vars, not files; network firewall blocks unauthorized endpoints |
@@ -539,6 +570,7 @@ These threats are not addressed by SendBox:
 | Social engineering of the host user | User-level risk; SendBox cannot prevent the user from disabling protections |
 | Denial-of-service against the host | VM resource limits (CPU/memory) mitigate but don't eliminate resource exhaustion |
 | Supply chain attacks on the base VM image | Image provenance and signing are the user's responsibility |
+| Proving arbitrary package source code is safe | Static package findings are policy signals, not a complete malware detector |
 | Zero-day hypervisor escapes | No software sandbox can eliminate hypervisor zero-day risk |
 | Semantic authorization of separately launched local MCP binaries or alternate local clients | Protocol authorization applies to traffic through the installed stdio broker or HTTP gateway; command policy and image minimization remain defense in depth |
 | Direct GitHub API/GraphQL ref mutation or alternate Git clients | The bundled-git guard cannot constrain arbitrary bearer-token API calls or independently installed clients; use GitHub server-side rulesets |
@@ -570,7 +602,7 @@ sendbox boundary inspect --config config/example-sandbox.yaml --json
 ```
 
 The inspection is deterministic and reports the resolved runtime, resources, command and network
-policy, secret names, devcontainer and GitHub settings, plus the MCP observer boundary
+policy, package policy, secret names, devcontainer and GitHub settings, plus the MCP observer boundary
 (transports, authorization boundary, runtime integration, and allowed server command patterns).
 
 The workspace test suite verifies that:
@@ -578,6 +610,9 @@ The workspace test suite verifies that:
 - Each dangerous capability is dropped
 - Each dangerous syscall is blocked by seccomp
 - Egress rules, the Git guard, and the MCP broker reject the denied cases
+- Package metadata rewriting, verification, malicious fixtures, digest-bound
+  cache reuse, concurrent analysis, policy invalidation, credential isolation,
+  and report tamper handling fail closed
 - Configuration validation catches unsafe settings
 
 ```bash

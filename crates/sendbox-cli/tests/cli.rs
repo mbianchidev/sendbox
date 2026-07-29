@@ -28,6 +28,15 @@ fn run_in(arguments: &[&str], current_dir: &std::path::Path) -> Output {
         .unwrap()
 }
 
+fn run_with_home(arguments: &[&str], home: &std::path::Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sendbox"))
+        .current_dir(workspace_root())
+        .env("HOME", home)
+        .args(arguments)
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn prints_version() {
     let output = run(&["--version"]);
@@ -50,6 +59,7 @@ fn root_help_uses_the_final_command_name_and_only_implemented_surfaces() {
         "devcontainer",
         "init",
         "mcp",
+        "package",
         "policy",
         "run",
         "secrets",
@@ -57,6 +67,7 @@ fn root_help_uses_the_final_command_name_and_only_implemented_surfaces() {
     ] {
         assert!(stdout.contains(command));
     }
+
     let mcp = String::from_utf8(run(&["mcp", "--help"]).stdout).unwrap();
     assert!(mcp.contains("parse"));
     assert!(mcp.contains("report"));
@@ -71,6 +82,61 @@ fn root_help_uses_the_final_command_name_and_only_implemented_surfaces() {
             .lines()
             .any(|line| line.trim_start().starts_with("script"))
     );
+    let run_help = String::from_utf8(run(&["run", "--help"]).stdout).unwrap();
+    assert!(run_help.contains("--interactive"));
+    assert!(run_help.contains("--separate-stderr"));
+}
+
+#[test]
+fn separate_stderr_requires_an_interactive_run() {
+    let output = run(&[
+        "run",
+        "--config",
+        "config/example-sandbox.yaml",
+        "--bundle",
+        ".",
+        "--trust-root",
+        "Cargo.toml",
+        "--separate-stderr",
+        "--",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--interactive"),
+        "clap did not name the required flag: {stderr}"
+    );
+}
+
+#[test]
+fn package_status_and_report_read_the_latest_persisted_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempdir().unwrap();
+    let session_id = "a".repeat(32);
+    let session = temporary
+        .path()
+        .join(".sendbox/run/sessions")
+        .join(&session_id);
+    std::fs::create_dir_all(&session).unwrap();
+    let path = session.join(sendbox_host::PACKAGE_SECURITY_REPORT_FILE);
+    let report = sendbox_registry::PackageSecurityReport::enabled();
+    std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let status = run_with_home(&["package", "status", "--json"], temporary.path());
+    assert!(status.status.success(), "{status:?}");
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["session_id"], session_id);
+    assert_eq!(status["verdict"], "allow");
+    assert_eq!(status["records"], 0);
+
+    let output = run_with_home(&["package", "report", "--json"], temporary.path());
+    assert!(output.status.success(), "{output:?}");
+    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(actual, serde_json::to_value(report).unwrap());
 }
 
 #[test]
@@ -79,7 +145,7 @@ fn production_run_rejects_relative_guest_commands_deterministically() {
     let config = temporary.path().join("sandbox.yaml");
     let source = std::fs::read_to_string(workspace_root().join("config/example-sandbox.yaml"))
         .unwrap()
-        .replace("secrets:\n  - NPM_TOKEN\n  - DATABASE_URL", "secrets: []");
+        .replace("secrets:\n  - DATABASE_URL", "secrets: []");
     std::fs::write(&config, source).unwrap();
     let output = run(&[
         "run",

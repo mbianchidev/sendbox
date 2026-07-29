@@ -96,7 +96,7 @@ ID:
   "mcpServers": {
     "docs": {
       "type": "streamable-http",
-      "url": "http://127.0.0.1:15081/mcp/remote-docs"
+      "url": "http://127.0.0.1:15082/mcp/remote-docs"
     }
   }
 }

@@ -1,6 +1,6 @@
 //! Authenticated production runtime policy for guest egress enforcement.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use sendbox_core::SessionId;
@@ -13,9 +13,11 @@ use thiserror::Error;
 
 use crate::policy::{PolicyEngine, PolicyError};
 
-pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 2;
+pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_CONNECT_PORT: u16 = 15_080;
 pub const DEFAULT_DNS_PORT: u16 = 53;
+pub const DEFAULT_REGISTRY_PROXY_PORT: u16 = 14_873;
+pub const DEFAULT_TRUSTED_REGISTRY_PORT: u16 = 15_081;
 pub const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const INSTANCE_ID_HEX_BYTES: usize = 12;
 const TABLE_PREFIX: &str = "sbxeg_";
@@ -34,7 +36,17 @@ pub struct RuntimePolicyDocument {
     pub reserved_mcp_origins: Vec<McpHttpOrigin>,
     pub deny_direct_ip: bool,
     pub network_policy: NetworkPolicy,
+    #[serde(default)]
+    pub registry: Option<RegistryEgressPolicy>,
     pub proxy_environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryEgressPolicy {
+    pub proxy_port: u16,
+    pub trusted_upstream_port: u16,
+    pub upstream_network_policy: NetworkPolicy,
 }
 
 #[derive(Debug, Error)]
@@ -53,9 +65,9 @@ pub enum RuntimePolicyError {
     InvalidDnsPort,
     #[error("remote MCP egress state does not match the signed reserved origins")]
     InvalidRemoteMcp,
-    #[error("egress loopback broker ports must be non-zero and distinct")]
+    #[error("egress loopback service ports must be non-zero and pairwise distinct")]
     InvalidLoopbackPorts,
-    #[error("egress proxy environment does not match the signed SOCKS5 endpoint")]
+    #[error("egress proxy environment does not match the signed endpoints")]
     InvalidProxyEnvironment,
     #[error("invalid network policy: {0}")]
     InvalidNetworkPolicy(#[from] PolicyError),
@@ -105,8 +117,25 @@ impl RuntimePolicyDocument {
             reserved_mcp_origins,
             deny_direct_ip: remote_mcp_active,
             network_policy,
-            proxy_environment: proxy_environment(connect_port),
+            registry: None,
+            proxy_environment: proxy_environment(connect_port, None),
         })
+    }
+
+    #[must_use]
+    pub fn with_registry(
+        mut self,
+        proxy_port: u16,
+        trusted_upstream_port: u16,
+        upstream_network_policy: NetworkPolicy,
+    ) -> Self {
+        self.registry = Some(RegistryEgressPolicy {
+            proxy_port,
+            trusted_upstream_port,
+            upstream_network_policy,
+        });
+        self.proxy_environment = proxy_environment(self.connect_port, Some(proxy_port));
+        self
     }
 
     pub fn validate(&self) -> Result<(), RuntimePolicyError> {
@@ -139,18 +168,11 @@ impl RuntimePolicyDocument {
         {
             return Err(RuntimePolicyError::InvalidRemoteMcp);
         }
-        if self.mcp_gateway_port == Some(self.connect_port)
-            || self
-                .mcp_gateway_port
-                .is_some_and(|port| self.dns_port == Some(port))
-        {
-            return Err(RuntimePolicyError::InvalidLoopbackPorts);
-        }
         let origins = self
             .reserved_mcp_origins
             .iter()
             .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         if origins.len() != self.reserved_mcp_origins.len()
             || origins.iter().any(|origin| {
                 origin.port == 0
@@ -169,7 +191,27 @@ impl RuntimePolicyDocument {
         {
             return Err(RuntimePolicyError::InvalidRemoteMcp);
         }
-        if self.proxy_environment != proxy_environment(self.connect_port) {
+
+        let mut loopback_ports = vec![self.connect_port];
+        loopback_ports.extend(self.dns_port);
+        loopback_ports.extend(self.mcp_gateway_port);
+        if let Some(registry) = &self.registry {
+            loopback_ports.extend([registry.proxy_port, registry.trusted_upstream_port]);
+            PolicyEngine::compile(&registry.upstream_network_policy)?;
+        }
+        loopback_ports.sort_unstable();
+        if loopback_ports.first() == Some(&0)
+            || loopback_ports.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(RuntimePolicyError::InvalidLoopbackPorts);
+        }
+
+        if self.proxy_environment
+            != proxy_environment(
+                self.connect_port,
+                self.registry.as_ref().map(|registry| registry.proxy_port),
+            )
+        {
             return Err(RuntimePolicyError::InvalidProxyEnvironment);
         }
         PolicyEngine::compile(&self.network_policy)?;
@@ -199,19 +241,34 @@ pub fn requires_enforcement(network: &NetworkPolicy) -> bool {
 }
 
 #[must_use]
-pub fn proxy_environment(connect_port: u16) -> BTreeMap<String, String> {
+pub fn proxy_environment(
+    connect_port: u16,
+    registry_proxy_port: Option<u16>,
+) -> BTreeMap<String, String> {
     let proxy = format!("socks5h://127.0.0.1:{connect_port}");
-    BTreeMap::from([
+    let mut environment = BTreeMap::from([
         ("ALL_PROXY".to_owned(), proxy.clone()),
         ("NO_PROXY".to_owned(), NO_PROXY_VALUE.to_owned()),
         ("all_proxy".to_owned(), proxy),
         ("no_proxy".to_owned(), NO_PROXY_VALUE.to_owned()),
-    ])
+    ]);
+    if let Some(port) = registry_proxy_port {
+        let registry = format!("http://127.0.0.1:{port}/");
+        environment.extend([
+            ("NPM_CONFIG_IGNORE_SCRIPTS".to_owned(), "true".to_owned()),
+            ("NPM_CONFIG_REGISTRY".to_owned(), registry.clone()),
+            ("npm_config_ignore_scripts".to_owned(), "true".to_owned()),
+            ("npm_config_registry".to_owned(), registry),
+        ]);
+    }
+    environment
 }
 
 #[cfg(test)]
 mod tests {
-    use sendbox_policy::{Action, NetworkPolicy};
+    use sendbox_policy::{
+        Action, McpHttpPolicy, McpServerPolicy, NetworkPolicy, ServerToolPolicy, ToolCallPolicy,
+    };
 
     use super::*;
 
@@ -239,6 +296,7 @@ mod tests {
         assert_eq!(first.instance_id.len(), 24);
         assert_eq!(first.table_name.len(), 30);
         assert_ne!(first.broker_mark, 0);
+        assert!(first.registry.is_none());
         assert_eq!(
             first.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT)),
             Path::new(DEFAULT_CGROUP_ROOT)
@@ -247,6 +305,79 @@ mod tests {
                 .join("agent")
         );
         first.validate().expect("valid policy");
+    }
+
+    #[test]
+    fn registry_policy_adds_only_local_npm_environment() {
+        let original = network_policy();
+        let policy =
+            RuntimePolicyDocument::for_session(SessionId::from_bytes([9; 16]), original.clone())
+                .with_registry(
+                    DEFAULT_REGISTRY_PROXY_PORT,
+                    DEFAULT_TRUSTED_REGISTRY_PORT,
+                    original,
+                );
+        policy.validate().unwrap();
+        assert_eq!(
+            policy.proxy_environment["npm_config_registry"],
+            "http://127.0.0.1:14873/"
+        );
+        assert_eq!(
+            policy.proxy_environment["NPM_CONFIG_IGNORE_SCRIPTS"],
+            "true"
+        );
+    }
+
+    #[test]
+    fn remote_mcp_and_registry_use_distinct_fail_closed_ports() {
+        let tool_policy = ToolCallPolicy {
+            servers: BTreeMap::from([(
+                "remote".to_owned(),
+                McpServerPolicy::StreamableHttp {
+                    url: "https://mcp.example.com/mcp".to_owned(),
+                    tools: ServerToolPolicy::default(),
+                    http: McpHttpPolicy::default(),
+                },
+            )]),
+            ..ToolCallPolicy::default()
+        };
+        let original = network_policy();
+        let policy = RuntimePolicyDocument::for_session_with_mcp(
+            SessionId::from_bytes([10; 16]),
+            original.clone(),
+            Some(&tool_policy),
+        )
+        .unwrap()
+        .with_registry(
+            DEFAULT_REGISTRY_PROXY_PORT,
+            DEFAULT_TRUSTED_REGISTRY_PORT,
+            original,
+        );
+
+        policy.validate().unwrap();
+        assert_eq!(policy.mcp_gateway_port, Some(DEFAULT_MCP_HTTP_GATEWAY_PORT));
+        assert_eq!(
+            policy.registry.as_ref().map(|registry| registry.proxy_port),
+            Some(DEFAULT_REGISTRY_PROXY_PORT)
+        );
+        assert_eq!(
+            policy
+                .registry
+                .as_ref()
+                .map(|registry| registry.trusted_upstream_port),
+            Some(DEFAULT_TRUSTED_REGISTRY_PORT)
+        );
+
+        let mut colliding = policy;
+        colliding
+            .registry
+            .as_mut()
+            .expect("registry policy")
+            .trusted_upstream_port = DEFAULT_MCP_HTTP_GATEWAY_PORT;
+        assert!(matches!(
+            colliding.validate(),
+            Err(RuntimePolicyError::InvalidLoopbackPorts)
+        ));
     }
 
     #[test]

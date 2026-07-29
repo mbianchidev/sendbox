@@ -1,6 +1,6 @@
 use sendbox_policy::{
-    Action, BoundaryPolicy, CommandPolicy, NetworkPolicy, PolicyConfiguration, SyscallPolicy,
-    ToolCallPolicy,
+    Action, BoundaryPolicy, CommandPolicy, NetworkPolicy, PackageSupplyChainPolicy,
+    PolicyConfiguration, SyscallPolicy, ToolCallPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +88,7 @@ fn default_policy() -> PolicyConfiguration {
             None,
         ),
         boundaries: BoundaryPolicy::default(),
+        packages: PackageSupplyChainPolicy::default(),
     }
 }
 
@@ -132,6 +133,7 @@ fn permissive_policy() -> PolicyConfiguration {
             },
             ..BoundaryPolicy::default()
         },
+        packages: PackageSupplyChainPolicy::default(),
     }
 }
 
@@ -171,6 +173,7 @@ fn strict_policy() -> PolicyConfiguration {
             syscalls: SyscallPolicy::default(),
             ..BoundaryPolicy::default()
         },
+        packages: PackageSupplyChainPolicy::default(),
     }
 }
 

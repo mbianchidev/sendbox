@@ -20,6 +20,9 @@ provider with a narrower capability set.
 - **Network Firewall** — Apple and Kata sessions route DNS and TCP CONNECT
   through loopback brokers backed by cgroup-v2 identity, `SO_MARK`, and atomic
   nftables rules. UDP/QUIC and direct external agent traffic are denied.
+- **Package Supply-chain Proxy** — npm metadata and artifacts traverse an
+  isolated trusted proxy that verifies, scans, caches, and reports verdicts
+  before any package bytes reach the workload.
 - **Runtime Providers** — `auto` selects Apple on macOS arm64 and Kata on Linux.
   Explicit Apple, Kata, and Hyperlight requests never fall back silently.
 - **Hyperlight Execution** — Verified one-shot commands run in
@@ -239,7 +242,22 @@ sendbox run --interactive \
 
 Keystrokes ride the same authenticated control channel as workload output, so they inherit
 its message authentication, replay protection and session binding. No additional port,
-socket or privilege is introduced.
+socket or privilege is introduced. The launcher grants a bounded window of 64 input chunks,
+each at most 4 KiB, and the CLI stops reading stdin when that credit is exhausted. A workload
+that temporarily stops reading therefore applies backpressure instead of losing pasted bytes.
+
+stderr remains merged into the controlling terminal by default. Use `--separate-stderr` when
+diagnostics need their own stream while remaining a TTY:
+
+```bash
+sendbox run --interactive --separate-stderr \
+  --config .sendbox.yaml \
+  --runtime kata \
+  --image registry.example/workload@sha256:<digest> \
+  --bundle /usr/local/share/sendbox/guest/x86_64/bundle \
+  --trust-root /usr/local/share/sendbox/guest/x86_64/release-public.key \
+  -- /usr/bin/copilot
+```
 
 Requirements and behaviour:
 
@@ -253,8 +271,14 @@ Requirements and behaviour:
 - `Ctrl-C`, `Ctrl-Z` and `Ctrl-D` are delivered to the *workload's* terminal, not to
   `sendbox`. Use the agent's own quit command to end the session.
 - The host `TERM` is authoritative for the workload; it replaces any configured `TERM`.
-- Terminal output merges the workload's stdout and stderr, because a terminal is a single
-  device. Drop `--interactive` when the two streams must stay separate.
+- Terminal output merges stdout and stderr by default. `--separate-stderr` gives fd 2 a
+  second, non-controlling pseudoterminal and reports it as stderr. Both descriptors remain
+  TTYs, but ordering between stdout and stderr is no longer strict, so the flag is unsuitable
+  for TUIs that draw through fd 2.
+- `--separate-stderr` requires `--interactive` and consumes one additional pseudoterminal
+  pair per session.
+- Interactive input is lossless within a bounded 64 x 4 KiB credit window. End of file is
+  outside the credit budget and remains ordered behind preceding input.
 - Window size changes are tracked through `SIGWINCH` for as long as the run lasts.
 
 See [interactive terminals](docs/architecture/interactive-terminal.md) for the design,
@@ -268,6 +292,9 @@ Troubleshooting:
 | `--interactive requires the foreground process group` | Started with `&` or under a job-control shell in the background | Bring the job to the foreground |
 | `the hyperlight runtime cannot provide an interactive terminal` | `--runtime hyperlight` | Use `--runtime apple` or `--runtime kata` |
 | `interactive execution needs a controlling terminal, but the command policy denies: ioctl` | `policy.boundaries.syscalls.additional_denylist` blocks terminal syscalls | Remove `ioctl`, `setsid`, `dup2` and `dup3` from the denylist, or run without `--interactive` |
+| The guest rejects `agent.launch.interactive.v2` | The host is using an older guest bundle that predates credit flow control | Install the guest bundle shipped with the same SendBox release |
+| Pseudoterminal allocation reports resource exhaustion | Concurrent interactive sessions reached the host PTY limit | Reduce concurrency or inspect `/proc/sys/kernel/pty/max` and `/proc/sys/kernel/pty/nr` |
+| stdout and stderr appear out of order | `--separate-stderr` uses independent PTY buffers | Remove `--separate-stderr` for a single strictly ordered terminal stream |
 | The agent renders as garbled boxes | The guest image has no terminfo entry for the host `TERM` | Set `TERM=xterm-256color` before running |
 
 ## Configuration
@@ -315,6 +342,22 @@ policy:
       - registry.npmjs.org
     blocked_domains: []
 
+  packages:
+    enabled: true
+    registries:
+      - ecosystem: npm
+        url: https://registry.npmjs.org/
+        allow_insecure_http: false
+        signature: if_present
+        provenance: if_present
+    default_finding_action: deny
+    finding_actions:
+      - finding: lifecycle_script
+        action: deny
+    exceptions: []
+    limits:
+      max_report_bytes: 98304
+
   boundaries:
     # Set to false when using Hyperlight.
     enabled: true
@@ -355,7 +398,7 @@ policy:
     log_path: /var/log/sendbox/boundary.log
 
 secrets:
-  - NPM_TOKEN
+  - DATABASE_URL
 
 devcontainer:
   auto_generate: true
@@ -406,7 +449,7 @@ or protect alternate clients and direct GitHub API calls.
 Local stdio MCP configuration must use
 `/run/sendbox-boundary/mcp-broker -- <exact-approved-command>`. Remote project
 definitions must use the deterministic
-`http://127.0.0.1:15081/mcp/<server-id>` route and the configured
+`http://127.0.0.1:15082/mcp/<server-id>` route and the configured
 `streamable-http` or `streamable-http-2025` type; direct upstream URLs and
 project-supplied credentials are rejected. Stdio and HTTP share exact server
 resolution, deny-first tool policy, `tools/list` filtering, call-time checks,
@@ -435,6 +478,21 @@ Whichever host variable supplied the value, the guest receives it as
 wrapper script or duplicated GitHub token is required. Errors name the supported variables
 and never print a credential value.
 
+### Package registry credentials
+
+`policy.packages.enabled: true` activates the npm-first proxy on Apple and Kata
+persistent guests. The current implementation requires exactly one npm
+registry. For private registries, set
+`registries[].credential_secret` to a SendBox vault reference. That reference
+must not also appear in top-level `secrets`: registry tokens are delivered only
+to the isolated trusted proxy and are never exposed to the workload.
+
+The proxy forces npm to its loopback endpoint, disables lifecycle scripts,
+denies direct workload access to the configured upstream, and withholds
+tarballs until verification and inspection allow them. See
+[Package supply-chain proxy](docs/package-supply-chain.md) for setup, policy,
+false-positive handling, reports, and future ecosystem adapter contracts.
+
 ### Configuration Reference
 
 | Section | Key | Description |
@@ -452,6 +510,9 @@ and never print a credential value.
 | `resources.disk_size_mb` | int | Requested writable-layer size |
 | `policy.commands` | object | Command allowlist/denylist policy |
 | `policy.network` | object | Outbound network policy |
+| `policy.packages` | object | npm proxy, verification, finding actions, limits, exceptions, and cache policy |
+| `policy.packages.registries[].credential_secret` | string | Vault reference isolated from workload secrets |
+| `policy.packages.limits.max_report_bytes` | int | Bounded package report size, up to 98304 bytes |
 | `policy.boundaries.enabled` | bool | Install fail-closed MCP and syscall boundaries |
 | `policy.boundaries.tool_calls` | object | Exact stdio/HTTP MCP servers with independent tool and transport policy |
 | `policy.boundaries.syscalls.additional_denylist` | list | Extra syscall names blocked by seccomp |
@@ -508,7 +569,8 @@ See the architecture documents for
 [session security](docs/architecture/session-security-lifecycle.md),
 [execution brokerage](docs/architecture/execution-broker.md),
 [interactive terminals](docs/architecture/interactive-terminal.md), plus
-[egress enforcement](docs/architecture/egress-enforcement.md).
+[egress enforcement](docs/architecture/egress-enforcement.md) and the
+[package registry proxy](docs/architecture/package-registry-proxy.md).
 
 See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
 The production Apple adapter, qualification command, transport design, and
@@ -523,10 +585,11 @@ SendBox follows a **deny-by-default** security posture:
 1. **Filesystem** — Only explicitly configured host paths are mounted into the guest. State and workspace roots cannot overlap.
 2. **Commands** — Deny rules win over allow rules for the brokered top-level argv. Descendants are constrained by the guest execution boundary, not recursively reinterpreted as shell text.
 3. **Network** — Persistent workloads can reach only the loopback DNS and SOCKS5 brokers. Kernel rules deny direct external agent traffic and unmarked broker traffic.
-4. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when repository scope matches policy. Gateway credential names form a separate signed partition and their values never enter the agent environment.
-5. **Isolation** — Apple and Kata provide persistent Linux VMs; Hyperlight provides explicit Linux/KVM one-shot isolation. Missing host or runtime capabilities are errors, never silent fallbacks.
-6. **Boundaries** — Signed guest services must become ready before execution. Stdio MCP calls traverse the installed broker; remote MCP calls traverse the loopback gateway. Direct upstream access, unknown routes, unsupported transports, and authorization fallback fail closed.
-7. **Branches** — Trusted Git wrappers restrict selected-repository push and pull operations. Alternate clients and direct hosting-provider APIs remain outside this local guard, so server-side rules stay required.
+4. **Packages** — Configured npm artifacts are quarantined, verified, and inspected before release. Workloads cannot reach their configured npm upstream directly.
+5. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when repository scope matches policy. MCP gateway names form a separate signed credential partition, package registry credentials remain proxy-only, and neither value set enters the agent environment.
+6. **Isolation** — Apple and Kata provide persistent Linux VMs; Hyperlight provides explicit Linux/KVM one-shot isolation. Missing host or runtime capabilities are errors, never silent fallbacks.
+7. **Boundaries** — Signed guest services must become ready before execution. Stdio MCP calls traverse the installed broker; remote MCP calls traverse the loopback gateway. Direct upstream access, unknown routes, unsupported transports, and authorization fallback fail closed.
+8. **Branches** — Trusted Git wrappers restrict selected-repository push and pull operations. Alternate clients and direct hosting-provider APIs remain outside this local guard, so server-side rules stay required.
 
 ## CLI Reference
 
@@ -542,6 +605,7 @@ SUBCOMMANDS:
   secrets       Add, remove, or list stored secrets
   policy        Show or validate policies
   mcp           Parse and summarize native or legacy MCP observations
+  package       Show package verdict status or a complete security report
   boundary      Inspect the structured native boundary plan
   completions   Install or print shell completions
   help          Show help for any subcommand
@@ -569,6 +633,10 @@ sendbox policy validate --config sendbox.yaml
 # Show the effective policy as deterministic JSON
 sendbox policy show --config sendbox.yaml --json
 
+# Show the latest package-enabled run and its complete report
+sendbox package status
+sendbox package report --json
+
 # Print or install generated shell completions
 sendbox completions print --shell zsh
 sendbox completions install --shell fish
@@ -593,8 +661,9 @@ Contributions are welcome! Please:
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-change`)
-3. Make sure tests pass (`make test`)
-4. Lint your code (`make lint`)
+3. Run `make lint` (this also compiles every standalone fuzz workspace with
+   its committed lockfile)
+4. Run `make test`, `make release`, and `make audit`
 5. Open a pull request
 
 For larger changes, please open an issue first to discuss the approach.

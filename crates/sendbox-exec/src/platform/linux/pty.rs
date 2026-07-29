@@ -24,8 +24,7 @@ const DEFAULT_VEOF: u8 = 0x04;
 
 /// An allocated pseudoterminal pair.
 ///
-/// The primary stays in the launcher and is pumped as merged workload output;
-/// the secondary is handed to the child as its controlling terminal and is
+/// The primary stays in the launcher; the secondary is handed to the child and
 /// closed in the launcher immediately after `clone3` returns.
 #[derive(Debug)]
 pub(crate) struct PseudoTerminal {
@@ -161,6 +160,80 @@ impl PseudoTerminal {
     }
 }
 
+/// One controlling terminal plus an optional non-controlling stderr terminal.
+#[derive(Debug)]
+pub(crate) struct TerminalDevices {
+    controlling: PseudoTerminal,
+    stderr: Option<PseudoTerminal>,
+}
+
+impl TerminalDevices {
+    pub(crate) fn open(
+        columns: u16,
+        rows: u16,
+        separate_stderr: bool,
+    ) -> Result<Self, PlatformError> {
+        let controlling = PseudoTerminal::open(columns, rows)?;
+        let stderr = separate_stderr
+            .then(|| PseudoTerminal::open(columns, rows))
+            .transpose()?;
+        Ok(Self {
+            controlling,
+            stderr,
+        })
+    }
+
+    pub(crate) fn transfer_secondaries_to(&self, user: ExecutionUser) -> Result<(), PlatformError> {
+        self.controlling.transfer_secondary_to(user)?;
+        if let Some(stderr) = self.stderr.as_ref() {
+            stderr.transfer_secondary_to(user)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn secondary_raw_fds(&self) -> Result<(RawFd, Option<RawFd>), PlatformError> {
+        Ok((
+            self.controlling.secondary_raw_fd()?,
+            self.stderr
+                .as_ref()
+                .map(PseudoTerminal::secondary_raw_fd)
+                .transpose()?,
+        ))
+    }
+
+    pub(crate) fn release_secondaries(&mut self) {
+        self.controlling.release_secondary();
+        if let Some(stderr) = self.stderr.as_mut() {
+            stderr.release_secondary();
+        }
+    }
+
+    pub(crate) fn controlling_primary(&self) -> &OwnedFd {
+        self.controlling.primary()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controlling_secondary(&self) -> Result<BorrowedFd<'_>, PlatformError> {
+        self.controlling.secondary()
+    }
+
+    pub(crate) fn stderr_primary(&self) -> Option<&OwnedFd> {
+        self.stderr.as_ref().map(PseudoTerminal::primary)
+    }
+
+    pub(crate) fn end_of_file_byte(&self) -> Result<u8, PlatformError> {
+        self.controlling.end_of_file_byte()
+    }
+
+    pub(crate) fn resize(&self, columns: u16, rows: u16) -> Result<(), PlatformError> {
+        self.controlling.resize(columns, rows)?;
+        if let Some(stderr) = self.stderr.as_ref() {
+            stderr.resize(columns, rows)?;
+        }
+        Ok(())
+    }
+}
+
 impl AsFd for PseudoTerminal {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.primary.as_fd()
@@ -256,5 +329,24 @@ mod tests {
             "{:?}",
             &buffer[..length]
         );
+    }
+
+    #[test]
+    fn separated_stderr_uses_a_distinct_mirrored_terminal() {
+        let terminals = TerminalDevices::open(80, 24, true).expect("allocate terminal devices");
+        let (_, stderr_secondary) = terminals.secondary_raw_fds().expect("secondaries");
+        assert!(stderr_secondary.is_some());
+        terminals.resize(132, 50).expect("resize both terminals");
+
+        for primary in [
+            Some(terminals.controlling_primary()),
+            terminals.stderr_primary(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let size = rustix::termios::tcgetwinsize(primary).expect("read size");
+            assert_eq!((size.ws_col, size.ws_row), (132, 50));
+        }
     }
 }

@@ -10,7 +10,13 @@ pub const AGENT_LAUNCH_OPERATION: &str = "agent.launch";
 /// workload with null stdin.
 pub const INTERACTIVE_LAUNCH_OPERATION: &str = "agent.launch.interactive";
 pub const INTERACTIVE_OPERATION_SCHEMA_VERSION: u32 = 1;
+/// Flow-controlled interactive launches use another operation name so an older
+/// guest rejects the request before it can emit or receive V2-only event kinds.
+pub const INTERACTIVE_LAUNCH_OPERATION_V2: &str = "agent.launch.interactive.v2";
+pub const INTERACTIVE_OPERATION_SCHEMA_VERSION_V2: u32 = 2;
 pub const HEALTH_OPERATION: &str = "health";
+pub const PACKAGE_REPORT_OPERATION: &str = "package.report";
+pub const PACKAGE_REPORT_SCHEMA_VERSION: u32 = 1;
 
 /// Longest accepted `TERM` value; real terminfo names are far shorter.
 const MAX_TERM_BYTES: usize = 64;
@@ -116,16 +122,75 @@ impl InteractiveLaunchRequestV1 {
         if self.schema_version != INTERACTIVE_OPERATION_SCHEMA_VERSION {
             return Err(InteractiveLaunchError::SchemaVersion);
         }
-        self.terminal.validate()?;
-        if self.term.is_empty() || self.term.len() > MAX_TERM_BYTES {
-            return Err(InteractiveLaunchError::TermLength);
+        validate_terminal(self.terminal, &self.term)
+    }
+}
+
+/// Flow-controlled interactive launch request.
+///
+/// A distinct request and operation preserve the V1 decoder for mixed-version
+/// peers while negotiating both credit events and optional stderr separation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractiveLaunchRequestV2 {
+    pub schema_version: u32,
+    pub launch: LaunchRequestV2,
+    pub terminal: TerminalSizeV1,
+    pub term: String,
+    pub separate_stderr: bool,
+}
+
+impl InteractiveLaunchRequestV2 {
+    pub fn validate(&self) -> Result<(), InteractiveLaunchError> {
+        if self.schema_version != INTERACTIVE_OPERATION_SCHEMA_VERSION_V2 {
+            return Err(InteractiveLaunchError::SchemaVersion);
         }
-        if !self
-            .term
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'+'))
-        {
-            return Err(InteractiveLaunchError::TermCharset);
+        validate_terminal(self.terminal, &self.term)
+    }
+}
+
+fn validate_terminal(terminal: TerminalSizeV1, term: &str) -> Result<(), InteractiveLaunchError> {
+    terminal.validate()?;
+    if term.is_empty() || term.len() > MAX_TERM_BYTES {
+        return Err(InteractiveLaunchError::TermLength);
+    }
+    if !term
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'+'))
+    {
+        return Err(InteractiveLaunchError::TermCharset);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TerminalInputCreditError {
+    #[error("terminal input credit must be non-zero")]
+    Empty,
+    #[error("terminal input credit exceeds the negotiated window")]
+    ExceedsWindow,
+}
+
+/// Number of bounded terminal-input chunks the host may send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalInputCreditV1 {
+    pub credits: u16,
+}
+
+impl TerminalInputCreditV1 {
+    pub fn new(credits: u16) -> Result<Self, TerminalInputCreditError> {
+        let credit = Self { credits };
+        credit.validate()?;
+        Ok(credit)
+    }
+
+    pub fn validate(self) -> Result<(), TerminalInputCreditError> {
+        if self.credits == 0 {
+            return Err(TerminalInputCreditError::Empty);
+        }
+        if self.credits > sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS {
+            return Err(TerminalInputCreditError::ExceedsWindow);
         }
         Ok(())
     }
@@ -138,6 +203,7 @@ pub fn agent_host_capabilities() -> CapabilitySet {
         Capability::Exec,
         Capability::StreamedIo,
         Capability::Signals,
+        Capability::Audit,
         Capability::Health,
     ])
 }
@@ -207,6 +273,55 @@ pub struct HealthResponseV2 {
     pub release_sequence: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageReportRequestV1 {
+    pub schema_version: u32,
+    pub maximum_bytes: u32,
+}
+
+impl PackageReportRequestV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != PACKAGE_REPORT_SCHEMA_VERSION {
+            return Err("unsupported package report request schema");
+        }
+        if self.maximum_bytes == 0
+            || u64::from(self.maximum_bytes) > sendbox_policy::MAX_PACKAGE_REPORT_BYTES
+        {
+            return Err("package report request exceeds the protocol byte limit");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageReportResponseV1 {
+    pub schema_version: u32,
+    pub report_json: String,
+    pub sha256: String,
+}
+
+impl PackageReportResponseV1 {
+    pub fn validate(&self, maximum_bytes: usize) -> Result<(), &'static str> {
+        if self.schema_version != PACKAGE_REPORT_SCHEMA_VERSION {
+            return Err("unsupported package report response schema");
+        }
+        if self.report_json.len() > maximum_bytes {
+            return Err("package report response exceeds the requested byte limit");
+        }
+        let digest = self.sha256.strip_prefix("sha256:").unwrap_or("");
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("package report response has an invalid SHA-256 digest");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +361,32 @@ mod tests {
         assert!(agent_guest_required_capabilities().is_subset(&negotiated));
     }
 
+    #[test]
+    fn package_report_schema_is_strict_and_bounded() {
+        let request = PackageReportRequestV1 {
+            schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+            maximum_bytes: 1024,
+        };
+        request.validate().expect("request");
+        let encoded = serde_json::to_vec(&request).expect("encode");
+        let decoded: PackageReportRequestV1 = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded, request);
+        assert!(
+            serde_json::from_str::<PackageReportRequestV1>(
+                r#"{"schema_version":1,"maximum_bytes":1,"extra":true}"#
+            )
+            .is_err()
+        );
+
+        let response = PackageReportResponseV1 {
+            schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+            report_json: "{}".to_owned(),
+            sha256: format!("sha256:{}", "a".repeat(64)),
+        };
+        response.validate(2).expect("response");
+        assert!(response.validate(1).is_err());
+    }
+
     fn launch_request() -> LaunchRequestV2 {
         LaunchRequestV2 {
             schema_version: OPERATION_SCHEMA_VERSION,
@@ -271,6 +412,19 @@ mod tests {
         }
     }
 
+    fn interactive_request_v2() -> InteractiveLaunchRequestV2 {
+        InteractiveLaunchRequestV2 {
+            schema_version: INTERACTIVE_OPERATION_SCHEMA_VERSION_V2,
+            launch: launch_request(),
+            terminal: TerminalSizeV1 {
+                columns: 120,
+                rows: 40,
+            },
+            term: "xterm-256color".to_owned(),
+            separate_stderr: true,
+        }
+    }
+
     #[test]
     fn interactive_request_round_trips_and_embeds_launch_verbatim() {
         let request = interactive_request();
@@ -291,6 +445,42 @@ mod tests {
         let error = serde_json::from_value::<InteractiveLaunchRequestV1>(value)
             .expect_err("unknown fields must fail");
         assert!(error.to_string().contains("extra"), "error: {error}");
+    }
+
+    #[test]
+    fn interactive_v2_request_round_trips_and_rejects_unknown_fields() {
+        let request = interactive_request_v2();
+        let encoded = serde_json::to_vec(&request).expect("encode");
+        let decoded: InteractiveLaunchRequestV2 = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded, request);
+        decoded.validate().expect("valid request");
+
+        let mut value = serde_json::to_value(request).expect("encode");
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("extra".to_owned(), serde_json::Value::Bool(true));
+        let error = serde_json::from_value::<InteractiveLaunchRequestV2>(value)
+            .expect_err("unknown fields must fail");
+        assert!(error.to_string().contains("extra"), "error: {error}");
+    }
+
+    #[test]
+    fn terminal_input_credit_is_bounded_by_the_negotiated_window() {
+        let maximum = TerminalInputCreditV1::new(sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS)
+            .expect("maximum credit");
+        assert_eq!(maximum.credits, sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS);
+        assert_eq!(
+            TerminalInputCreditV1::new(0).expect_err("zero credit"),
+            TerminalInputCreditError::Empty
+        );
+        assert_eq!(
+            TerminalInputCreditV1::new(
+                sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS.saturating_add(1)
+            )
+            .expect_err("oversized credit"),
+            TerminalInputCreditError::ExceedsWindow
+        );
     }
 
     #[test]
@@ -345,6 +535,10 @@ mod tests {
     #[test]
     fn interactive_operation_name_differs_from_headless_launch() {
         assert_ne!(INTERACTIVE_LAUNCH_OPERATION, AGENT_LAUNCH_OPERATION);
+        assert_ne!(
+            INTERACTIVE_LAUNCH_OPERATION_V2,
+            INTERACTIVE_LAUNCH_OPERATION
+        );
         assert_eq!(AGENT_LAUNCH_OPERATION, "agent.launch");
     }
 }

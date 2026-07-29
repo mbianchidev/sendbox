@@ -2453,7 +2453,7 @@ fn validate_downstream_envelope(request: &Request<Incoming>) -> Result<(), HttpP
     if let Some(host) = header_optional(request.headers(), HOST.as_str())?
         && !matches!(
             host.as_str(),
-            "127.0.0.1:15081" | "localhost:15081" | "[::1]:15081"
+            "127.0.0.1:15082" | "localhost:15082" | "[::1]:15082"
         )
     {
         return Err(HttpProblem::new(
@@ -3471,7 +3471,7 @@ mod tests {
             transport,
             fingerprint: "fingerprint".to_owned(),
             endpoint,
-            gateway_url: format!("http://127.0.0.1:15081/mcp/{id}"),
+            gateway_url: format!("http://127.0.0.1:15082/mcp/{id}"),
             tools: ServerToolPolicy {
                 default_action: Action::Deny,
                 allowlist: vec!["read_*".to_owned()],
@@ -4126,7 +4126,7 @@ mod tests {
         let mut request = Request::builder()
             .method(method)
             .uri(path)
-            .header(HOST, "127.0.0.1:15081")
+            .header(HOST, "127.0.0.1:15082")
             .body(GatewayBody::full(body))
             .unwrap();
         request.headers_mut().extend(headers);

@@ -9,26 +9,26 @@ must satisfy to integrate it.
 ## Trust boundary
 
 ```text
-┌─────────────────────────── sandbox network namespace ───────────────────────────┐
-│                                                                                  │
-│  UNTRUSTED                          TRUSTED (this crate)                          │
-│  ┌───────────────┐   loopback only  ┌──────────────────────────────────────┐     │
-│  │ exec descendants│───────────────▶│ egress gateway (DNS + CONNECT brokers)│──┐  │
-│  │ (agent ancestor)│◀───────────────│ (broker cgroup + SO_MARK)             │  │  │
-│  └───────────────┘                  └──────────────────────────────────────┘  │  │
-│         │  ▲  everything else dropped by nftables default policy               │  │
-│         ▼  │  (cgroup identity + mark enforced in the kernel)                  ▼  │
-│     ✗ direct egress                                             external network │
-└──────────────────────────────────────────────────────────────────────────────────┘
+untrusted workload (agent cgroup)
+  |-- loopback DNS/public SOCKS --> trusted gateways (broker cgroup + SO_MARK)
+  `-- loopback npm HTTP ---------> trusted package proxy (registry cgroup)
+                                      `-- registry-only loopback SOCKS
+                                          --> trusted gateway (broker + SO_MARK)
+
+nftables default-drop denies every other cgroup/destination combination
 ```
 
 - **Untrusted:** every workload process beneath the delegated agent ancestor. It
   runs in nested execution leaves and may reach *only* the loopback DNS and
-  CONNECT broker ports.
-- **Trusted:** the broker/gateway (in the broker cgroup, marking its external
-  sockets) and the supervisor that arms enforcement. The broker enforces
-  `PolicyEngine` in userspace; nftables enforces identity + reachability in the
-  kernel as defense in depth.
+  public CONNECT broker ports plus the workload-facing npm proxy when enabled.
+- **Trusted broker:** DNS/SOCKS gateways in the broker cgroup mark their
+  external sockets and enforce `PolicyEngine` in userspace.
+- **Trusted registry proxy:** the package analyzer runs as a separate
+  unprivileged identity in the registry cgroup. It can reach only its
+  registry-only loopback SOCKS listener and cannot set `SO_MARK`.
+- **Trusted supervisor:** arms enforcement and places every service in its
+  expected cgroup. nftables enforces identity and reachability in the kernel as
+  defense in depth.
 - The boundary is a Linux network namespace with the crate-owned nftables table.
   The crate never modifies anything outside its owned table, cgroup subtree, and
   namespace.
@@ -36,16 +36,20 @@ must satisfy to integrate it.
 ## What the kernel layer enforces
 
 - The agent cgroup can originate traffic **only** to the exact loopback broker
-  ports (CONNECT always; DNS only when `allow_dns = true`).
+  ports (CONNECT always; DNS only when `allow_dns = true`) and the configured
+  npm proxy port.
+- The registry cgroup can originate traffic **only** to the exact
+  registry-only SOCKS port. It cannot reach public broker ports or external
+  destinations.
 - The broker cgroup can originate external traffic **only** when the socket
   carries the fixed `SO_MARK`, and never to cloud-metadata addresses.
-- Any other process (a sibling in neither cgroup) is denied both the broker
+- Any other process (a sibling in none of the owned cgroups) is denied the broker
   ports and external egress. This is the concrete improvement over UID-based
   isolation: sharing a UID no longer grants broker-class reachability.
 - New inbound to the broker's own loopback ports is scoped by `iif lo` + exact
   destination + port. The originating identity is not visible at the input hook,
-  but the **output** chain already prevents any non-agent cgroup from
-  originating that traffic in the first place.
+  but the **output** chain already permits only the intended source-cgroup and
+  destination-port pair.
 - All UDP/QUIC from the agent (other than DNS to the broker) is dropped; the
   CONNECT broker additionally answers `UnsupportedProtocol` (native protocol) or
   `Command not supported` (SOCKS5 `BIND`/`UDP ASSOCIATE`) for any non-TCP
@@ -80,7 +84,9 @@ must satisfy to integrate it.
 
 | Threat | Mitigation |
 |---|---|
-| Direct outbound bypassing the broker | Kernel default-drop; the agent ancestor match confines every nested execution leaf to loopback broker ports. |
+| Direct outbound bypassing the broker | Kernel default-drop; the agent ancestor match confines every nested execution leaf to public loopback broker ports and the optional npm proxy. |
+| Workload bypasses package analysis with an npm registry override or direct tarball URL | The workload policy denies the configured npm upstream and the agent cgroup cannot reach the registry-only SOCKS listener. |
+| Compromised package proxy dials externally or reaches the public broker | The registry cgroup can reach only the trusted registry SOCKS port and has no `SO_MARK` capability. |
 | Sharing the broker's identity to egress | cgroup v2 identity + required `SO_MARK`; a sibling process is denied. |
 | DNS rebinding | Expiring `(name, ip)` authorization pins the exact validated address. |
 | SSRF to cloud metadata | Address-class denial in policy **and** an explicit kernel drop for the broker. |
@@ -131,21 +137,24 @@ A runtime supervisor integrating this crate must:
    It refuses to arm unless enforcement is fully installed and verified.
 3. Retain `CAP_NET_ADMIN` in the namespace for the broker (to set `SO_MARK` and
    load nftables); preflight probes this.
-4. Start the **broker** placed in the broker cgroup (`place_broker`), configured
-   with the `MarkDialer` and a `ForwardingResolver` carrying the same mark. Pick
-   the CONNECT front end (`ConnectFrontend::Custom` or `Socks5`) to match the
-   agent toolchain (e.g. SOCKS5 when the agent honors `ALL_PROXY=socks5h://…`);
-   the choice is fixed configuration, never negotiated from client bytes.
-5. For production execution, arm with controller delegation, keep the agent
+4. Start every DNS/SOCKS **gateway** in the broker cgroup, configured with the
+   `MarkDialer` and a `ForwardingResolver` carrying the same mark. Pick the
+   CONNECT front end (`ConnectFrontend::Custom` or `Socks5`) to match the
+   client; the choice is fixed configuration, never negotiated from bytes.
+5. If package analysis is enabled, start the proxy in the registry cgroup with
+   a distinct UID/GID, cleared capabilities, `no_new_privs`, and no socket-mark
+   privilege. Expose its trusted SOCKS listener only to that cgroup.
+6. For production execution, arm with controller delegation, keep the agent
    ancestor empty, and start workloads only in descendant execution leaves.
    Direct `place_agent` is deliberately rejected in delegated mode.
-6. Run the agent unprivileged with `CAP_NET_RAW` dropped (raw sockets are out of
+7. Run the agent unprivileged with `CAP_NET_RAW` dropped (raw sockets are out of
    the `inet` hooks' scope) and `no_new_privs` set.
-7. Keep the broker cgroup stable across broker process restarts — re-place the
-   new pid, do not recreate the cgroup, so the loaded nftables cgroup ids stay
-   valid.
-8. On shutdown, stop the agent, then drop/`teardown` the guard. Teardown is
-   fail-closed ordered (cgroups before nftables), idempotent, and absent-safe;
+8. Keep the broker and registry cgroups stable across service restarts —
+   re-place new pids rather than recreating cgroups, so loaded nftables cgroup
+   identities stay valid.
+9. On shutdown, stop the agent and registry proxy, then drop/`teardown` the
+   guard. Teardown is fail-closed ordered (cgroups before nftables), idempotent,
+   and absent-safe;
    a surfaced error means enforcement was deliberately retained and must be
    logged and retried, not ignored.
 

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use sendbox_bootstrap::{
     BootstrapDocumentConfiguration, ExecutionBrokerConfiguration, GatewayCredential,
-    REQUIRED_RUNTIME_CONTROLS, encode_bootstrap_document,
+    REQUIRED_RUNTIME_CONTROLS, RegistryProxyConfiguration, encode_bootstrap_document,
 };
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
 use sendbox_egress::runtime::{
@@ -66,6 +66,7 @@ pub struct KataProviderConfiguration {
     pub mcp_policy: Option<RuntimePolicyDocument>,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
     pub gateway_credentials: Vec<GatewayCredential>,
+    pub registry_proxy: Option<RegistryProxyConfiguration>,
     pub workload_uid: u32,
     pub workload_gid: u32,
 }
@@ -1025,6 +1026,7 @@ fn bootstrap_payload(
             }),
             egress_policy: configuration.egress_policy.clone(),
             gateway_credentials: configuration.gateway_credentials.clone(),
+            registry_proxy: configuration.registry_proxy.clone(),
         },
         secret,
     )
@@ -1388,6 +1390,7 @@ mod tests {
             mcp_policy: None,
             egress_policy: None,
             gateway_credentials: Vec::new(),
+            registry_proxy: None,
             workload_uid: 65_534,
             workload_gid: 65_534,
         }

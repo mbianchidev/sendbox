@@ -20,7 +20,7 @@ Long-lived trust roots, release signing, policy signing, and rollback floors are
 separate versioned trust domains rather than protocol-session keys.
 
 Apple and Kata bootstrap also carry the schema-v3 signed boundary plan, the
-session-derived schema-v2 egress runtime policy, the exact hierarchical MCP
+session-derived schema-v3 egress runtime policy, the exact hierarchical MCP
 runtime policy, the delegated execution cgroup parent, and gateway-only
 credential material. The guest validates policy equivalence before starting
 mandatory services. Gateway credential names must exactly match the signed MCP
@@ -28,6 +28,13 @@ policy and remain disjoint from workload secret names; values are zeroized after
 delivery to the trusted gateway. Egress and MCP audit become ready before Exec,
 and remote MCP readiness additionally requires the loopback HTTP gateway,
 reserved-origin policy, marked dialing path, and kernel rules to be armed.
+
+When package analysis is enabled, the encrypted bootstrap additionally carries
+the strict package policy, workload-facing and registry-only ports, private
+cache and report paths, the dedicated proxy UID/GID, and zeroizing registry
+credentials. Registry credential references are separate from
+`agent.launch` secrets and cannot overlap them. Readiness then also requires
+the trusted registry SOCKS gateway and isolated npm proxy.
 
 ## Roles and versions
 
@@ -64,12 +71,55 @@ Message kinds are:
 
 Capabilities are typed identifiers for lifecycle, exec, streamed I/O, signals,
 mounts, network, MCP, audit, and health. Authenticated framing remains version
-1. The first operational schema is separately versioned by
-`OPERATION_SCHEMA_VERSION = 1`: `agent.launch` carries an exact program,
+1. The launch operational schema is separately versioned by
+`OPERATION_SCHEMA_VERSION = 2`: `agent.launch` carries an exact program,
 argument vector, absolute working directory, bounded non-secret environment,
 policy-bound secret envelopes, and timeout; its terminal response carries
 exit/signal or a typed cancellation/failure state plus broker cleanup
 completion. Existing frame vectors are unchanged.
+
+Interactive launch schemas are negotiated by operation name rather than by adding a
+wire capability. Legacy hosts use `agent.launch.interactive` with the V1 request.
+Flow-controlled hosts use `agent.launch.interactive.v2`, whose request also selects
+optional stderr separation. A new guest accepts both operations; an old guest rejects
+the unknown V2 operation before either peer can exchange V2-only event kinds.
+
+After accepting V2, the guest may emit `TerminalInputCredit` events carrying a
+strictly positive credit count no larger than the negotiated 64-chunk window. The
+host does not read terminal input until the first grant arrives. `StandardInput`,
+`StandardInputEof`, and `TerminalResize` retain their existing discriminants;
+`TerminalInputCredit` is appended as event kind 9, so old discriminants and persisted
+readers remain stable.
+
+The package report operational schema is independently versioned by
+`PACKAGE_REPORT_SCHEMA_VERSION = 1`. `package.report` uses request ID `2` after
+the launch request's terminal response. Its request contains a positive bounded
+`maximum_bytes`; its response contains the exact report JSON and a
+`sha256:<lowercase-hex>` digest. Package-enabled plans require the `Audit`
+capability.
+
+## Terminal package-report ordering
+
+The launch request remains request ID `1`. If package analysis is configured,
+the host follows this exact sequence:
+
+1. receive the launch terminal response and all preceding output;
+2. send one `package.report` request with request ID `2`;
+3. validate response status, schema, byte limit, and digest;
+4. send graceful close; and
+5. persist the independently revalidated report on the host.
+
+The guest rejects a report request before the terminal response, after a
+successful report response, when no report source is configured, or when the
+request exceeds the policy/protocol limit. It reads the source
+descriptor-relatively without following symlinks and requires the configured
+owner, group, mode, regular-file type, and link count. Retrieval failure is an
+explicit rejected response and fails a package-enabled run.
+
+The report carries no credentials. Authentication protects correlation and
+integrity in transit; the host still recomputes the digest and checks canonical
+JSON, summary counts, session ID, package-policy digest, record and finding
+limits before accepting it.
 
 ## Handshake
 
@@ -124,11 +174,16 @@ state and terminally poisons the connection.
 
 - Hard frame ceiling: 1 MiB.
 - Default frame ceiling: 256 KiB.
+- Package report policy ceiling: 96 KiB, leaving room for JSON escaping and
+  operation framing below the default frame ceiling.
 - Peers may configure lower limits; the handshake authenticates the lower value.
 - The decoder reads only the four-byte prefix before validating the declared
   length. Payload storage is allocated only after validation.
 - Receive buffering never exceeds the validated frame plus its prefix.
 - Async writes use `write_all` and naturally apply transport backpressure.
+- V2 terminal input is additionally bounded to 64 authenticated chunks of at most
+  4 KiB each. Credits travel guest-to-host without blocking the guest socket reader,
+  and end of file remains outside the credit budget.
 
 Dropping a receive future is resumable because already-read bytes remain in the
 bounded reader buffer. Dropping a send future can leave a partial frame on the

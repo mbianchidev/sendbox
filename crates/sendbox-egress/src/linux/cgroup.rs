@@ -121,6 +121,8 @@ pub struct CgroupHierarchy {
     agent_rel: String,
     /// Mount-relative broker leaf `sendbox/<instance>/broker` (filesystem ops).
     broker_rel: String,
+    /// Mount-relative registry leaf `sendbox/<instance>/registry`.
+    registry_rel: String,
     /// Whether this instance's base cgroup directory already existed when the
     /// hierarchy was (re)created. Used by the supervisor to avoid tearing down a
     /// live instance's cgroups on a failed re-arm.
@@ -130,6 +132,8 @@ pub struct CgroupHierarchy {
     agent: CgroupIdentity,
     /// nft `socket cgroupv2` identity for the broker.
     broker: CgroupIdentity,
+    /// nft `socket cgroupv2` identity for the registry proxy.
+    registry: CgroupIdentity,
 }
 
 impl CgroupHierarchy {
@@ -161,6 +165,7 @@ impl CgroupHierarchy {
         let base_rel = format!("{SENDBOX_CGROUP_PREFIX}/{instance_id}");
         let agent_rel = format!("{base_rel}/agent");
         let broker_rel = format!("{base_rel}/broker");
+        let registry_rel = format!("{base_rel}/registry");
 
         // Record whether this instance's base cgroup already existed *before* we
         // (idempotently) create it. A re-arm of a live instance must not tear
@@ -174,14 +179,17 @@ impl CgroupHierarchy {
             preexisting,
             agent: CgroupIdentity::new(agent_rel.clone())?,
             broker: CgroupIdentity::new(broker_rel.clone())?,
+            registry: CgroupIdentity::new(registry_rel.clone())?,
             agent_rel,
             broker_rel,
+            registry_rel,
         };
 
         for rel in [
             &hierarchy.base_rel,
             &hierarchy.agent_rel,
             &hierarchy.broker_rel,
+            &hierarchy.registry_rel,
         ] {
             hierarchy.create_dir_relative(rel)?;
         }
@@ -214,6 +222,11 @@ impl CgroupHierarchy {
         &self.broker
     }
 
+    #[must_use]
+    pub fn registry_identity(&self) -> &CgroupIdentity {
+        &self.registry
+    }
+
     /// Whether this instance's base cgroup directory already existed when the
     /// hierarchy was created (i.e. this is a re-arm of a possibly-live
     /// instance), rather than being freshly created by this call.
@@ -237,6 +250,11 @@ impl CgroupHierarchy {
         self.root_path.join(&self.broker_rel)
     }
 
+    #[must_use]
+    pub fn registry_dir(&self) -> PathBuf {
+        self.root_path.join(&self.registry_rel)
+    }
+
     /// Local filesystem path of the agent cgroup's `cgroup.procs`, for a helper
     /// (e.g. the live harness) that self-places by writing its pid. This is the
     /// *mount-relative* path, never the global nft identity.
@@ -249,6 +267,11 @@ impl CgroupHierarchy {
     #[must_use]
     pub fn broker_procs_path(&self) -> PathBuf {
         self.broker_dir().join("cgroup.procs")
+    }
+
+    #[must_use]
+    pub fn registry_procs_path(&self) -> PathBuf {
+        self.registry_dir().join("cgroup.procs")
     }
 
     /// Enables the execution broker's required controllers down the complete
@@ -322,6 +345,11 @@ impl CgroupHierarchy {
         self.place(&self.broker_rel, pid)
     }
 
+    /// Moves the package registry proxy into its dedicated cgroup.
+    pub fn place_registry(&self, pid: u32) -> Result<(), CgroupError> {
+        self.place(&self.registry_rel, pid)
+    }
+
     fn place(&self, leaf_rel: &str, pid: u32) -> Result<(), CgroupError> {
         let procs_rel = format!("{leaf_rel}/cgroup.procs");
         // Descriptor-relative open with write+create (no truncate): the kernel
@@ -348,6 +376,7 @@ impl CgroupHierarchy {
     pub fn teardown(&self) -> Vec<CgroupError> {
         let mut errors = Vec::new();
         for rel in [
+            self.registry_rel.clone(),
             self.broker_rel.clone(),
             self.agent_rel.clone(),
             self.base_rel.clone(),
@@ -390,7 +419,7 @@ fn shared_top_level_is_still_owned(error: &io::Error) -> bool {
 
 fn is_valid_instance_id(id: &str) -> bool {
     !id.is_empty()
-        && id.len() <= 32
+        && id.len() <= 24
         && id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
@@ -459,8 +488,13 @@ tmpfs /run tmpfs rw 0 0
             hierarchy.broker_identity().relative_path(),
             "sendbox/inst01/broker"
         );
+        assert_eq!(
+            hierarchy.registry_identity().relative_path(),
+            "sendbox/inst01/registry"
+        );
         assert!(hierarchy.agent_dir().is_dir());
         assert!(hierarchy.broker_dir().is_dir());
+        assert!(hierarchy.registry_dir().is_dir());
     }
 
     #[test]
@@ -476,6 +510,11 @@ tmpfs /run tmpfs rw 0 0
             hierarchy
                 .broker_procs_path()
                 .ends_with("sendbox/inst01/broker/cgroup.procs")
+        );
+        assert!(
+            hierarchy
+                .registry_procs_path()
+                .ends_with("sendbox/inst01/registry/cgroup.procs")
         );
         hierarchy.place_agent(4242).unwrap();
         let contents = std::fs::read_to_string(hierarchy.agent_procs_path()).unwrap();
@@ -515,6 +554,10 @@ tmpfs /run tmpfs rw 0 0
         hierarchy.place_broker(4243).unwrap();
         let broker = std::fs::read_to_string(hierarchy.broker_dir().join("cgroup.procs")).unwrap();
         assert_eq!(broker, "4243\n");
+        hierarchy.place_registry(4244).unwrap();
+        let registry =
+            std::fs::read_to_string(hierarchy.registry_dir().join("cgroup.procs")).unwrap();
+        assert_eq!(registry, "4244\n");
     }
 
     #[test]
@@ -570,6 +613,7 @@ tmpfs /run tmpfs rw 0 0
         let errors = hierarchy.teardown();
         assert!(errors.is_empty(), "teardown errors: {errors:?}");
         assert!(!hierarchy.agent_dir().exists());
+        assert!(!hierarchy.registry_dir().exists());
         // The owned top-level directory is removed when empty.
         assert!(!root.path().join("sendbox").exists());
         let again = hierarchy.teardown();

@@ -149,10 +149,14 @@ pub enum StandardInput {
     Null,
     /// Allocate a pseudoterminal and make it the workload's controlling
     /// terminal, so `isatty` succeeds and full-screen agents render normally.
-    ///
-    /// A terminal has a single device for both output streams, so stdout and
-    /// stderr are unavoidably merged and reported as [`StreamKind::Stdout`].
-    Terminal { columns: u16, rows: u16 },
+    Terminal {
+        columns: u16,
+        rows: u16,
+        #[serde(default)]
+        separate_stderr: bool,
+        #[serde(default)]
+        flow_controlled: bool,
+    },
 }
 
 impl StandardInput {
@@ -167,8 +171,30 @@ impl StandardInput {
     pub const fn terminal_size(self) -> Option<(u16, u16)> {
         match self {
             Self::Null => None,
-            Self::Terminal { columns, rows } => Some((columns, rows)),
+            Self::Terminal { columns, rows, .. } => Some((columns, rows)),
         }
+    }
+
+    #[must_use]
+    pub const fn separates_stderr(self) -> bool {
+        matches!(
+            self,
+            Self::Terminal {
+                separate_stderr: true,
+                ..
+            }
+        )
+    }
+
+    #[must_use]
+    pub const fn uses_flow_control(self) -> bool {
+        matches!(
+            self,
+            Self::Terminal {
+                flow_controlled: true,
+                ..
+            }
+        )
     }
 }
 
@@ -386,6 +412,10 @@ pub enum ExecutionEvent {
         stream: StreamKind,
         sequence: u64,
         data: Vec<u8>,
+    },
+    TerminalInputCredit {
+        correlation_id: CorrelationId,
+        credits: u16,
     },
     Terminal {
         correlation_id: CorrelationId,

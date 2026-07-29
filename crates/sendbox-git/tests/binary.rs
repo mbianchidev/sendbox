@@ -30,7 +30,10 @@ fn policy(workspace: &Path) -> GuardPolicyDocument {
         environment: EnvironmentPolicy::default(),
         github_https_auth: false,
         git_ssh_auth: false,
-        limits: GuardLimits::default(),
+        limits: GuardLimits {
+            probe_timeout_ms: 10_000,
+            ..GuardLimits::default()
+        },
     }
 }
 

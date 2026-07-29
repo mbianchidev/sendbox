@@ -94,6 +94,8 @@ pub struct NftConfig {
     pub agent: CgroupIdentity,
     /// The broker cgroup identity (may reach external only when marked).
     pub broker: CgroupIdentity,
+    /// The registry proxy cgroup identity (may reach only trusted loopback SOCKS).
+    pub registry: CgroupIdentity,
     /// The fixed `SO_MARK` the broker sets on its external sockets. Must be
     /// non-zero so the `meta mark` match is meaningful.
     pub broker_mark: u32,
@@ -106,6 +108,10 @@ pub struct NftConfig {
     /// The loopback HTTP MCP gateway port, or `None` when no remote MCP server
     /// is configured.
     pub mcp_gateway_port: Option<u16>,
+    /// Workload-facing registry proxy port and registry-only trusted SOCKS port.
+    /// Both are configured together or both omitted.
+    pub registry_proxy_tcp_port: Option<u16>,
+    pub trusted_registry_tcp_port: Option<u16>,
     /// Cloud metadata IPv4 addresses always dropped for the broker.
     pub metadata_v4_addresses: Vec<Ipv4Addr>,
     /// Cloud metadata IPv6 addresses always dropped for the broker.
@@ -121,12 +127,14 @@ pub enum NftError {
     InvalidTableName(String),
     #[error("invalid cgroup path '{0}'")]
     InvalidCgroupPath(String),
-    #[error("agent and broker cgroup identities must differ")]
+    #[error("agent, broker, and registry cgroup identities must all differ")]
     IdentitiesMustDiffer,
+    #[error("registry proxy and trusted registry ports must be configured together")]
+    RegistryPortsMustPair,
+    #[error("egress loopback service ports must be non-zero and pairwise distinct")]
+    InvalidPortConfiguration,
     #[error("broker_mark must be non-zero")]
     ZeroMark,
-    #[error("loopback broker ports must be non-zero and distinct")]
-    InvalidBrokerPorts,
     #[error("invalid fixture interface name '{0}'")]
     InvalidInterface(String),
     #[error("nft command failed to execute: {0}")]
@@ -148,23 +156,32 @@ impl NftConfig {
         if !valid_name {
             return Err(NftError::InvalidTableName(self.table_name.clone()));
         }
-        if self.agent == self.broker {
+        if self.agent == self.broker || self.agent == self.registry || self.broker == self.registry
+        {
             return Err(NftError::IdentitiesMustDiffer);
+        }
+        if self.registry_proxy_tcp_port.is_some() != self.trusted_registry_tcp_port.is_some() {
+            return Err(NftError::RegistryPortsMustPair);
+        }
+        let mut ports = vec![self.connect_broker_tcp_port];
+        if let Some(port) = self.dns_broker_port {
+            ports.push(port);
+        }
+        if let Some(port) = self.mcp_gateway_port {
+            ports.push(port);
+        }
+        if let Some(port) = self.registry_proxy_tcp_port {
+            ports.push(port);
+        }
+        if let Some(port) = self.trusted_registry_tcp_port {
+            ports.push(port);
+        }
+        ports.sort_unstable();
+        if ports.first() == Some(&0) || ports.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(NftError::InvalidPortConfiguration);
         }
         if self.broker_mark == 0 {
             return Err(NftError::ZeroMark);
-        }
-        let mut ports = vec![self.connect_broker_tcp_port];
-        ports.extend(self.dns_broker_port);
-        ports.extend(self.mcp_gateway_port);
-        if ports.contains(&0)
-            || ports
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                != ports.len()
-        {
-            return Err(NftError::InvalidBrokerPorts);
         }
         if let Some(iface) = &self.fixture_iface
             && !is_valid_iface(iface)
@@ -207,6 +224,12 @@ impl NftConfig {
         if let Some(mcp_port) = self.mcp_gateway_port {
             self.push_loopback_accept(&mut out, "    iif lo", "tcp", mcp_port);
         }
+        if let Some(proxy_port) = self.registry_proxy_tcp_port {
+            self.push_loopback_accept(&mut out, "    iif lo", "tcp", proxy_port);
+        }
+        if let Some(trusted_port) = self.trusted_registry_tcp_port {
+            self.push_loopback_accept(&mut out, "    iif lo", "tcp", trusted_port);
+        }
         out.push_str("  }\n\n");
 
         // ── output chain ─────────────────────────────────────────────────
@@ -230,6 +253,15 @@ impl NftConfig {
         }
         if let Some(mcp_port) = self.mcp_gateway_port {
             self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", mcp_port);
+        }
+        if let Some(proxy_port) = self.registry_proxy_tcp_port {
+            self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", proxy_port);
+        }
+
+        if let Some(trusted_port) = self.trusted_registry_tcp_port {
+            let registry = self.registry_match();
+            let _ = writeln!(out, "    # registry cgroup -> trusted loopback SOCKS only");
+            self.push_cgroup_loopback_accept(&mut out, &registry, "tcp", trusted_port);
         }
 
         let broker = self.broker_match();
@@ -271,6 +303,14 @@ impl NftConfig {
             "socket cgroupv2 level {} \"{}\"",
             self.broker.level(),
             self.broker.relative_path()
+        )
+    }
+
+    fn registry_match(&self) -> String {
+        format!(
+            "socket cgroupv2 level {} \"{}\"",
+            self.registry.level(),
+            self.registry.relative_path()
         )
     }
 
@@ -455,10 +495,13 @@ mod tests {
             table_name: "sendbox_egress_test".to_owned(),
             agent: identity("sendbox/inst01/agent"),
             broker: identity("sendbox/inst01/broker"),
+            registry: identity("sendbox/inst01/registry"),
             broker_mark: 0x5b0e,
             connect_broker_tcp_port: 15080,
             dns_broker_port: Some(15053),
-            mcp_gateway_port: Some(15081),
+            mcp_gateway_port: Some(15082),
+            registry_proxy_tcp_port: Some(14873),
+            trusted_registry_tcp_port: Some(15081),
             metadata_v4_addresses: crate::address::METADATA_V4_ADDRESSES.to_vec(),
             metadata_v6_addresses: crate::address::METADATA_V6_ADDRESSES.to_vec(),
             fixture_iface: Some("sbxg01".to_owned()),
@@ -489,6 +532,7 @@ mod tests {
         let text = config().render();
         assert!(text.contains("socket cgroupv2 level 3 \"sendbox/inst01/agent\""));
         assert!(text.contains("socket cgroupv2 level 3 \"sendbox/inst01/broker\""));
+        assert!(text.contains("socket cgroupv2 level 3 \"sendbox/inst01/registry\""));
         // cgroup v1 net_cls syntax must never appear.
         assert!(!text.contains("meta cgroup"));
     }
@@ -503,14 +547,32 @@ mod tests {
             "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip daddr 127.0.0.1 udp dport 15053 accept"
         ));
         assert!(text.contains(
-            "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip daddr 127.0.0.1 tcp dport 15081 accept"
+            "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip daddr 127.0.0.1 tcp dport 15082 accept"
         ));
         assert!(text.contains(
-            "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip6 daddr ::1 tcp dport 15081 accept"
+            "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip6 daddr ::1 tcp dport 15082 accept"
         ));
         // The agent identity never gets a blanket accept.
         assert!(!text.contains("\"sendbox/inst01/agent\" meta mark"));
         assert!(!text.contains("\"sendbox/inst01/agent\" accept"));
+    }
+
+    #[test]
+    fn render_isolates_registry_proxy_and_trusted_socks_ports() {
+        let text = config().render();
+        assert!(text.contains(
+            "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip daddr 127.0.0.1 tcp dport 14873 accept"
+        ));
+        assert!(text.contains(
+            "socket cgroupv2 level 3 \"sendbox/inst01/registry\" ip daddr 127.0.0.1 tcp dport 15081 accept"
+        ));
+        assert!(!text.contains(
+            "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip daddr 127.0.0.1 tcp dport 15081 accept"
+        ));
+        assert!(!text.contains(
+            "socket cgroupv2 level 3 \"sendbox/inst01/registry\" ip daddr 127.0.0.1 tcp dport 15080 accept"
+        ));
+        assert!(!text.contains("\"sendbox/inst01/registry\" meta mark"));
     }
 
     #[test]
@@ -601,6 +663,27 @@ mod tests {
         assert!(matches!(
             equal.validate(),
             Err(NftError::IdentitiesMustDiffer)
+        ));
+
+        let mut equal_registry = config();
+        equal_registry.registry = equal_registry.agent.clone();
+        assert!(matches!(
+            equal_registry.validate(),
+            Err(NftError::IdentitiesMustDiffer)
+        ));
+
+        let mut unpaired = config();
+        unpaired.trusted_registry_tcp_port = None;
+        assert!(matches!(
+            unpaired.validate(),
+            Err(NftError::RegistryPortsMustPair)
+        ));
+
+        let mut conflict = config();
+        conflict.trusted_registry_tcp_port = Some(conflict.connect_broker_tcp_port);
+        assert!(matches!(
+            conflict.validate(),
+            Err(NftError::InvalidPortConfiguration)
         ));
 
         let mut zero = config();

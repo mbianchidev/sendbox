@@ -216,6 +216,8 @@ pub enum EventKind {
     StandardInputEof = 7,
     /// Carries an encoded `TerminalSizeV1` after a host terminal resize.
     TerminalResize = 8,
+    /// Carries an encoded `TerminalInputCreditV1` after a V2 interactive launch.
+    TerminalInputCredit = 9,
 }
 
 impl EventKind {

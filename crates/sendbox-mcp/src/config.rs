@@ -631,15 +631,15 @@ mod tests {
         write_config(
             &temp,
             ".mcp.json",
-            r#"{"servers":{"alias":{"type":"streamable-http","url":"http://127.0.0.1:15081/mcp/modern"},"old":{"type":"streamable-http-2025","url":"http://127.0.0.1:15081/mcp/compat"}}}"#,
+            r#"{"servers":{"alias":{"type":"streamable-http","url":"http://127.0.0.1:15082/mcp/modern"},"old":{"type":"streamable-http-2025","url":"http://127.0.0.1:15082/mcp/compat"}}}"#,
         );
         validator.validate_project(temp.path()).unwrap();
 
         for invalid in [
             r#"{"servers":{"x":{"type":"streamable-http","url":"https://mcp.example.com/mcp"}}}"#,
-            r#"{"servers":{"x":{"type":"streamable-http-2025","url":"http://127.0.0.1:15081/mcp/modern"}}}"#,
-            r#"{"servers":{"x":{"type":"sse","url":"http://127.0.0.1:15081/mcp/compat"}}}"#,
-            r#"{"servers":{"x":{"type":"streamable-http","url":"http://127.0.0.1:15081/mcp/modern","headers":{"Authorization":"secret"}}}}"#,
+            r#"{"servers":{"x":{"type":"streamable-http-2025","url":"http://127.0.0.1:15082/mcp/modern"}}}"#,
+            r#"{"servers":{"x":{"type":"sse","url":"http://127.0.0.1:15082/mcp/compat"}}}"#,
+            r#"{"servers":{"x":{"type":"streamable-http","url":"http://127.0.0.1:15082/mcp/modern","headers":{"Authorization":"secret"}}}}"#,
         ] {
             fs::write(temp.path().join(".mcp.json"), invalid).unwrap();
             assert!(validator.validate_project(temp.path()).is_err());

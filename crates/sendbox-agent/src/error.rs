@@ -22,6 +22,8 @@ pub enum AgentError {
     Secret { reference: String, message: String },
     #[error("output delivery failed: {0}")]
     Output(String),
+    #[error("terminal input failed: {0}")]
+    TerminalInput(String),
     #[error("agent run was cancelled")]
     Cancelled,
     #[error("guest readiness timed out")]

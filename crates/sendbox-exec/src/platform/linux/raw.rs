@@ -43,6 +43,30 @@ const CHILD_STAGE_SECCOMP: u8 = 2;
 const CHILD_STAGE_EXEC: u8 = 3;
 const CHILD_STAGE_TERMINAL: u8 = 4;
 
+pub(crate) fn set_process_identity(uid: u32, gid: u32) -> io::Result<()> {
+    // SAFETY: the calls receive scalar IDs and a null supplementary-group
+    // pointer paired with a zero length. The process is still single-threaded
+    // when this helper is used by trusted service bootstrap.
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setresgid(gid, gid, gid) != 0
+            || libc::setresuid(uid, uid, uid) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::getuid() != uid
+            || libc::geteuid() != uid
+            || libc::getgid() != gid
+            || libc::getegid() != gid
+        {
+            return Err(io::Error::other(
+                "kernel-reported identity does not match requested uid/gid",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[repr(C)]
 struct OpenHow {
     flags: u64,
@@ -87,9 +111,15 @@ pub(crate) enum ChildStdio {
         stdout_pipe: [RawFd; 2],
         stderr_pipe: [RawFd; 2],
     },
-    /// Interactive: a pseudoterminal secondary becomes the controlling
-    /// terminal for all three descriptors.
-    Terminal { secondary_fd: RawFd },
+    /// Interactive: the first secondary is the controlling terminal on stdin
+    /// and stdout; stderr optionally uses a second non-controlling terminal.
+    Terminal(TerminalStdio),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TerminalStdio {
+    pub(crate) controlling_secondary: RawFd,
+    pub(crate) stderr_secondary: Option<RawFd>,
 }
 
 /// Parent-owned descriptors created atomically with the cgroup-placed child.
@@ -180,9 +210,8 @@ pub(crate) fn identity(fd: RawFd) -> Result<FileIdentity, PlatformError> {
 /// Creates a child directly in `cgroup_fd` and returns its pidfd and output
 /// descriptors. No fork/spawn fallback exists.
 ///
-/// `pty_secondary`, when present, is a pseudoterminal secondary allocated by
-/// the caller *before* the seccomp filter was installed; the child makes it its
-/// controlling terminal instead of creating stdout/stderr pipes.
+/// `terminal_stdio`, when present, contains pseudoterminal secondaries allocated
+/// by the caller before the seccomp filter was installed.
 pub(crate) fn clone3_exec(
     cgroup_fd: RawFd,
     executable_fd: RawFd,
@@ -190,7 +219,7 @@ pub(crate) fn clone3_exec(
     argv: &[CString],
     environment: &[CString],
     run_as: Option<ExecutionUser>,
-    pty_secondary: Option<RawFd>,
+    terminal_stdio: Option<TerminalStdio>,
 ) -> Result<SpawnedProcess, PlatformError> {
     if argv.is_empty() {
         return Err(PlatformError::io(
@@ -211,7 +240,7 @@ pub(crate) fn clone3_exec(
     let capability_last = read_capability_last()?;
 
     let error_pipe = create_pipe()?;
-    let stdio = match prepare_child_stdio(pty_secondary) {
+    let stdio = match prepare_child_stdio(terminal_stdio) {
         Ok(stdio) => stdio,
         Err(error) => {
             close_pipe(error_pipe);
@@ -225,7 +254,12 @@ pub(crate) fn clone3_exec(
             stdout_pipe,
             stderr_pipe,
         } => preserved.extend_from_slice(&[null_fd, stdout_pipe[1], stderr_pipe[1]]),
-        ChildStdio::Terminal { secondary_fd } => preserved.push(secondary_fd),
+        ChildStdio::Terminal(terminal) => {
+            preserved.push(terminal.controlling_secondary);
+            if let Some(stderr) = terminal.stderr_secondary {
+                preserved.push(stderr);
+            }
+        }
     }
     let close_fds = match collect_child_close_fds(&preserved) {
         Ok(fds) => fds,
@@ -307,7 +341,7 @@ pub(crate) fn clone3_exec(
         }
         // The caller owns the secondary and closes it once clone3 returns, so
         // the primary reports EOF when the workload exits.
-        ChildStdio::Terminal { .. } => (None, None),
+        ChildStdio::Terminal(_) => (None, None),
     };
     if pidfd < 0 {
         close_raw(error_pipe[0]);
@@ -333,9 +367,9 @@ pub(crate) fn clone3_exec(
     })
 }
 
-fn prepare_child_stdio(pty_secondary: Option<RawFd>) -> Result<ChildStdio, PlatformError> {
-    if let Some(secondary_fd) = pty_secondary {
-        return Ok(ChildStdio::Terminal { secondary_fd });
+fn prepare_child_stdio(terminal_stdio: Option<TerminalStdio>) -> Result<ChildStdio, PlatformError> {
+    if let Some(terminal) = terminal_stdio {
+        return Ok(ChildStdio::Terminal(terminal));
     }
     let stdout_pipe = create_pipe()?;
     let stderr_pipe = match create_pipe() {
@@ -709,15 +743,18 @@ fn child_exec(context: ChildExec<'_>) -> ! {
                     child_fail(context.error_pipe[1], CHILD_STAGE_SETUP);
                 }
             }
-            ChildStdio::Terminal { secondary_fd } => {
+            ChildStdio::Terminal(terminal) => {
                 // A controlling terminal can only be claimed by a session
                 // leader that does not already have one, so setsid must come
                 // first and TIOCSCTTY before any privilege drop.
+                let stderr_fd = terminal
+                    .stderr_secondary
+                    .unwrap_or(terminal.controlling_secondary);
                 if libc::setsid() < 0
-                    || libc::ioctl(secondary_fd, libc::TIOCSCTTY, 0) < 0
-                    || libc::dup2(secondary_fd, libc::STDIN_FILENO) < 0
-                    || libc::dup2(secondary_fd, libc::STDOUT_FILENO) < 0
-                    || libc::dup2(secondary_fd, libc::STDERR_FILENO) < 0
+                    || libc::ioctl(terminal.controlling_secondary, libc::TIOCSCTTY, 0) < 0
+                    || libc::dup2(terminal.controlling_secondary, libc::STDIN_FILENO) < 0
+                    || libc::dup2(terminal.controlling_secondary, libc::STDOUT_FILENO) < 0
+                    || libc::dup2(stderr_fd, libc::STDERR_FILENO) < 0
                 {
                     child_fail(context.error_pipe[1], CHILD_STAGE_TERMINAL);
                 }
@@ -753,9 +790,15 @@ fn child_exec(context: ChildExec<'_>) -> ! {
                 libc::close(stderr_pipe[1]);
                 libc::close(null_fd);
             }
-            ChildStdio::Terminal { secondary_fd } => {
-                if secondary_fd > libc::STDERR_FILENO {
-                    libc::close(secondary_fd);
+            ChildStdio::Terminal(terminal) => {
+                if let Some(stderr) = terminal.stderr_secondary
+                    && stderr > libc::STDERR_FILENO
+                    && stderr != terminal.controlling_secondary
+                {
+                    libc::close(stderr);
+                }
+                if terminal.controlling_secondary > libc::STDERR_FILENO {
+                    libc::close(terminal.controlling_secondary);
                 }
             }
         }

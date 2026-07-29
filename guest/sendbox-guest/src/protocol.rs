@@ -1,16 +1,20 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use sendbox_protocol::{
     AGENT_LAUNCH_OPERATION, BootstrapSecret, CloseCode, Event, EventKind, FrameLimits,
     GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, INTERACTIVE_LAUNCH_OPERATION,
-    InteractiveLaunchRequestV1, LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION,
-    ProtocolErrorCode, ProtocolErrorMessage, Request, Response, ResponseStatus, TerminalResultV2,
-    TerminalSizeV1, TerminalStateV1, VersionRange, agent_guest_capabilities,
-    agent_guest_required_capabilities,
+    INTERACTIVE_LAUNCH_OPERATION_V2, InteractiveLaunchRequestV1, InteractiveLaunchRequestV2,
+    LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, PACKAGE_REPORT_OPERATION,
+    PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1, PackageReportResponseV1,
+    ProtocolErrorCode, ProtocolErrorMessage, Request, Response, ResponseStatus,
+    TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1, TerminalStateV1, VersionRange,
+    agent_guest_capabilities, agent_guest_required_capabilities,
 };
 use sendbox_secrets::{
     EnvelopeBinding, EnvelopeCipher, RecipientRole, ReplayGuard, SecretName, SessionKeyMaterial,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
 };
@@ -19,6 +23,10 @@ use tokio::net::UnixStream;
 use crate::GuestError;
 use crate::broker::BrokerClientConfiguration;
 use crate::runtime::{ReadinessSnapshot, RuntimeSession};
+use crate::secure_fs::{
+    leaf_name, open_directory_no_symlinks, open_relative_regular, read_bounded_named,
+    validate_regular_metadata,
+};
 use crate::service::ReadinessGate;
 use crate::state::{StartupState, StartupStateMachine};
 
@@ -72,7 +80,35 @@ pub(crate) struct ProtocolServices {
     runtime: Arc<RuntimeSession>,
     readiness: ReadinessSnapshot,
     broker: Option<BrokerClientConfiguration>,
+    package_report: Option<PackageReportSource>,
     secret_decryptor: GuestSecretDecryptor,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PackageReportSource {
+    path: PathBuf,
+    expected_uid: u32,
+    expected_gid: u32,
+    maximum_bytes: usize,
+}
+
+impl PackageReportSource {
+    pub(crate) fn new(
+        path: PathBuf,
+        expected_uid: u32,
+        expected_gid: u32,
+        maximum_bytes: u64,
+    ) -> Result<Self, GuestError> {
+        let maximum_bytes = usize::try_from(maximum_bytes).map_err(|_| {
+            GuestError::Bootstrap("package report byte limit is out of range".to_owned())
+        })?;
+        Ok(Self {
+            path,
+            expected_uid,
+            expected_gid,
+            maximum_bytes,
+        })
+    }
 }
 
 impl ProtocolServices {
@@ -82,6 +118,7 @@ impl ProtocolServices {
         runtime: Arc<RuntimeSession>,
         readiness: ReadinessSnapshot,
         broker: Option<BrokerClientConfiguration>,
+        package_report: Option<PackageReportSource>,
         secret_decryptor: GuestSecretDecryptor,
     ) -> Self {
         Self {
@@ -90,6 +127,7 @@ impl ProtocolServices {
             runtime,
             readiness,
             broker,
+            package_report,
             secret_decryptor,
         }
     }
@@ -129,19 +167,59 @@ where
         }))
         .await?;
 
+    let mut terminal_response_sent = false;
+    let mut package_report_served = false;
     loop {
         match reader.receive().await? {
             Message::Request(request) if request.operation == AGENT_LAUNCH_OPERATION => {
-                launch(request, &mut reader, &mut writer, &services, false).await?;
+                launch(
+                    request,
+                    &mut reader,
+                    &mut writer,
+                    &services,
+                    LaunchMode::Headless,
+                )
+                .await?;
+                terminal_response_sent = true;
             }
             Message::Request(request) if request.operation == INTERACTIVE_LAUNCH_OPERATION => {
-                launch(request, &mut reader, &mut writer, &services, true).await?;
+                launch(
+                    request,
+                    &mut reader,
+                    &mut writer,
+                    &services,
+                    LaunchMode::InteractiveV1,
+                )
+                .await?;
+                terminal_response_sent = true;
+            }
+            Message::Request(request) if request.operation == INTERACTIVE_LAUNCH_OPERATION_V2 => {
+                launch(
+                    request,
+                    &mut reader,
+                    &mut writer,
+                    &services,
+                    LaunchMode::InteractiveV2,
+                )
+                .await?;
+                terminal_response_sent = true;
+            }
+            Message::Request(request) if request.operation == PACKAGE_REPORT_OPERATION => {
+                let response = handle_package_report_request(
+                    request,
+                    services.package_report.as_ref(),
+                    terminal_response_sent,
+                    package_report_served,
+                );
+                package_report_served = response.status == ResponseStatus::Ok;
+                writer.send(&Message::Response(response)).await?;
             }
             Message::Request(request) => {
                 let response =
                     handle_request(request, &services.service_readiness, &services.readiness)?;
                 writer.send(&Message::Response(response)).await?;
             }
+
             Message::GracefulClose(close) => {
                 writer
                     .send(&Message::GracefulClose(GracefulClose {
@@ -169,6 +247,103 @@ where
             }
         }
     }
+}
+
+fn handle_package_report_request(
+    request: Request,
+    source: Option<&PackageReportSource>,
+    terminal_response_sent: bool,
+    package_report_served: bool,
+) -> Response {
+    let reject = |reason: &'static str| Response {
+        request_id: request.request_id,
+        status: ResponseStatus::Rejected,
+        payload: serde_json::json!({"reason": reason})
+            .to_string()
+            .into_bytes(),
+    };
+    if !terminal_response_sent {
+        return reject("terminal-response-required");
+    }
+    if package_report_served {
+        return reject("package-report-already-served");
+    }
+    let Some(source) = source else {
+        return reject("package-report-not-configured");
+    };
+    let report_request: PackageReportRequestV1 = match serde_json::from_slice(&request.payload) {
+        Ok(request) => request,
+        Err(_) => return reject("invalid-package-report-request"),
+    };
+    let maximum_bytes = match usize::try_from(report_request.maximum_bytes) {
+        Ok(maximum_bytes)
+            if report_request.validate().is_ok() && maximum_bytes <= source.maximum_bytes =>
+        {
+            maximum_bytes
+        }
+        _ => return reject("invalid-package-report-request"),
+    };
+    let report_json = match read_package_report(source, maximum_bytes) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("sendbox-guest: package report retrieval failed: {error}");
+            return reject("package-report-unavailable");
+        }
+    };
+    let sha256 = sha256_label(report_json.as_bytes());
+    let payload = match serde_json::to_vec(&PackageReportResponseV1 {
+        schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+        report_json,
+        sha256,
+    }) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("sendbox-guest: encoding package report failed: {error}");
+            return reject("package-report-unavailable");
+        }
+    };
+    Response {
+        request_id: request.request_id,
+        status: ResponseStatus::Ok,
+        payload,
+    }
+}
+
+fn sha256_label(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut label = String::with_capacity("sha256:".len() + digest.len() * 2);
+    label.push_str("sha256:");
+    for byte in digest {
+        write!(&mut label, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    label
+}
+
+fn read_package_report(
+    source: &PackageReportSource,
+    maximum_bytes: usize,
+) -> Result<String, GuestError> {
+    if maximum_bytes > source.maximum_bytes {
+        return Err(GuestError::Protocol(
+            "package report request exceeds the configured byte limit".to_owned(),
+        ));
+    }
+    let (parent_path, name) = leaf_name(&source.path)?;
+    let parent = open_directory_no_symlinks(parent_path)?;
+    let mut opened = open_relative_regular(&parent, Path::new(name), "opening package report")?;
+    validate_regular_metadata(
+        &opened.stat,
+        0o600,
+        source.expected_uid,
+        source.expected_gid,
+        true,
+        "package report",
+    )?;
+    let bytes = read_bounded_named(&mut opened.file, maximum_bytes, "package report")?;
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| GuestError::Runtime("package report is not valid UTF-8 JSON".to_owned()))
 }
 
 fn handle_request(
@@ -209,12 +384,29 @@ fn handle_request(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchMode {
+    Headless,
+    InteractiveV1,
+    InteractiveV2,
+}
+
+impl LaunchMode {
+    const fn is_interactive(self) -> bool {
+        !matches!(self, Self::Headless)
+    }
+
+    const fn uses_flow_control(self) -> bool {
+        matches!(self, Self::InteractiveV2)
+    }
+}
+
 async fn launch<S>(
     request: Request,
     host_reader: &mut sendbox_protocol::FramedReader<ReadHalf<S>>,
     host_writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
     services: &ProtocolServices,
-    interactive: bool,
+    mode: LaunchMode,
 ) -> Result<(), GuestError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -235,19 +427,47 @@ where
         )
         .await;
     };
-    let (launch, terminal) = if interactive {
-        let envelope: InteractiveLaunchRequestV1 = serde_json::from_slice(&request.payload)
-            .map_err(|error| {
-                GuestError::Protocol(format!("decoding interactive launch request: {error}"))
-            })?;
-        if let Err(error) = envelope.validate() {
-            return send_rejection(host_writer, request.request_id, &error.to_string()).await;
+    let (launch, terminal) = match mode {
+        LaunchMode::Headless => {
+            let launch: LaunchRequestV2 =
+                serde_json::from_slice(&request.payload).map_err(|error| {
+                    GuestError::Protocol(format!("decoding launch request: {error}"))
+                })?;
+            (launch, None)
         }
-        (envelope.launch, Some((envelope.terminal, envelope.term)))
-    } else {
-        let launch: LaunchRequestV2 = serde_json::from_slice(&request.payload)
-            .map_err(|error| GuestError::Protocol(format!("decoding launch request: {error}")))?;
-        (launch, None)
+        LaunchMode::InteractiveV1 => {
+            let envelope: InteractiveLaunchRequestV1 = serde_json::from_slice(&request.payload)
+                .map_err(|error| {
+                    GuestError::Protocol(format!("decoding interactive launch request: {error}"))
+                })?;
+            if let Err(error) = envelope.validate() {
+                return send_rejection(host_writer, request.request_id, &error.to_string()).await;
+            }
+            (
+                envelope.launch,
+                Some((envelope.terminal, envelope.term, false, false)),
+            )
+        }
+        LaunchMode::InteractiveV2 => {
+            let envelope: InteractiveLaunchRequestV2 = serde_json::from_slice(&request.payload)
+                .map_err(|error| {
+                    GuestError::Protocol(format!(
+                        "decoding flow-controlled interactive launch request: {error}"
+                    ))
+                })?;
+            if let Err(error) = envelope.validate() {
+                return send_rejection(host_writer, request.request_id, &error.to_string()).await;
+            }
+            (
+                envelope.launch,
+                Some((
+                    envelope.terminal,
+                    envelope.term,
+                    envelope.separate_stderr,
+                    true,
+                )),
+            )
+        }
     };
     if launch.schema_version != OPERATION_SCHEMA_VERSION {
         return send_rejection(
@@ -296,13 +516,53 @@ where
     // can never delay a cancel.
     let (control_sender, mut control_receiver) = tokio::sync::mpsc::channel(BROKER_CONTROL_DEPTH);
     let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(BROKER_INPUT_DEPTH);
+    let (eof_sender, mut eof_receiver) = tokio::sync::mpsc::channel(1);
+    let (resize_sender, mut resize_receiver) =
+        tokio::sync::watch::channel::<Option<sendbox_exec::service::ClientFrame>>(None);
     let writer_task = tokio::spawn(async move {
+        let mut eof_pending = None;
         loop {
+            if let Some(eof) = eof_pending.take() {
+                if let Ok(control) = control_receiver.try_recv() {
+                    eof_pending = Some(eof);
+                    if send_broker_frame(&mut write, &control).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                match input_receiver.try_recv() {
+                    Ok(input) => {
+                        eof_pending = Some(eof);
+                        if send_broker_frame(&mut write, &input).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        if send_broker_frame(&mut write, &eof).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
             let frame = tokio::select! {
                 biased;
                 control = control_receiver.recv() => match control {
                     Some(frame) => frame,
                     None => return,
+                },
+                eof = eof_receiver.recv() => {
+                    eof_pending = eof;
+                    continue;
+                },
+                changed = resize_receiver.changed() => match changed {
+                    Ok(()) => resize_receiver
+                        .borrow_and_update()
+                        .clone()
+                        .expect("resize notification always carries a frame"),
+                    Err(_) => continue,
                 },
                 input = input_receiver.recv() => match input {
                     Some(frame) => frame,
@@ -322,13 +582,19 @@ where
         host_reader,
         host_writer,
         &control_sender,
-        &input_sender,
-        interactive,
+        BrokerInputSenders {
+            input: &input_sender,
+            eof: &eof_sender,
+            resize: &resize_sender,
+        },
+        mode,
         &mut input_ended,
     )
     .await;
     drop(control_sender);
     drop(input_sender);
+    drop(eof_sender);
+    drop(resize_sender);
     writer_task.abort();
     result
 }
@@ -338,12 +604,20 @@ where
 const TERM_ENVIRONMENT: &str = "TERM";
 
 const BROKER_CONTROL_DEPTH: usize = 4;
-/// Queue depth for pending terminal input frames.
-const BROKER_INPUT_DEPTH: usize = 256;
+/// Queue depth for the credited input window. EOF and resize use independent
+/// reserved lanes.
+const BROKER_INPUT_DEPTH: usize = sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize;
 
 /// How long a terminal input frame may wait for the broker writer before it is
 /// dropped so the execution loop can keep draining broker output.
 const INPUT_OFFER_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Clone, Copy)]
+struct BrokerInputSenders<'a> {
+    input: &'a tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
+    eof: &'a tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
+    resize: &'a tokio::sync::watch::Sender<Option<sendbox_exec::service::ClientFrame>>,
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn run_execution_loop<S>(
@@ -353,8 +627,8 @@ async fn run_execution_loop<S>(
     host_reader: &mut sendbox_protocol::FramedReader<ReadHalf<S>>,
     host_writer: &mut sendbox_protocol::FramedWriter<WriteHalf<S>>,
     control_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
-    input_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
-    interactive: bool,
+    input_senders: BrokerInputSenders<'_>,
+    mode: LaunchMode,
     input_ended: &mut bool,
 ) -> Result<(), GuestError>
 where
@@ -381,6 +655,29 @@ where
                             stream_id: request.request_id,
                             kind,
                             payload: data,
+                        })).await?;
+                    }
+                    sendbox_exec::ExecutionEvent::TerminalInputCredit { credits, .. } => {
+                        if !mode.uses_flow_control() {
+                            return Err(GuestError::Protocol(
+                                "execution broker emitted terminal input credit for a V1 launch"
+                                    .to_owned(),
+                            ));
+                        }
+                        let credit = TerminalInputCreditV1::new(credits).map_err(|error| {
+                            GuestError::Protocol(format!(
+                                "execution broker emitted invalid terminal input credit: {error}"
+                            ))
+                        })?;
+                        let payload = serde_json::to_vec(&credit).map_err(|error| {
+                            GuestError::Protocol(format!(
+                                "encoding terminal input credit: {error}"
+                            ))
+                        })?;
+                        host_writer.send(&Message::Event(Event {
+                            stream_id: request.request_id,
+                            kind: EventKind::TerminalInputCredit,
+                            payload,
                         })).await?;
                     }
                     sendbox_exec::ExecutionEvent::Terminal { result, .. } => {
@@ -414,8 +711,8 @@ where
                             &event,
                             request,
                             execution,
-                            input_sender,
-                            interactive,
+                            input_senders,
+                            mode,
                             input_ended,
                         ).await {
                             host_writer.send(&Message::ProtocolError(ProtocolErrorMessage {
@@ -442,15 +739,28 @@ where
 /// Validates and queues one host terminal event.
 ///
 /// Input bytes are never logged; failures report only the reason.
+fn validate_terminal_input_payload(mode: LaunchMode, payload: &[u8]) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("terminal input chunk must not be empty".to_owned());
+    }
+    if mode.uses_flow_control() && payload.len() > sendbox_core::TERMINAL_INPUT_CHUNK_BYTES {
+        return Err(format!(
+            "terminal input chunk must contain 1..={} bytes",
+            sendbox_core::TERMINAL_INPUT_CHUNK_BYTES
+        ));
+    }
+    Ok(())
+}
+
 async fn forward_terminal_event(
     event: &Event,
     request: &Request,
     execution: &sendbox_exec::ExecutionRequest,
-    input_sender: &tokio::sync::mpsc::Sender<sendbox_exec::service::ClientFrame>,
-    interactive: bool,
+    input_senders: BrokerInputSenders<'_>,
+    mode: LaunchMode,
     input_ended: &mut bool,
 ) -> Result<(), String> {
-    if !interactive {
+    if !mode.is_interactive() {
         return Err("terminal input is only accepted for an interactive launch".to_owned());
     }
     if event.stream_id != request.request_id {
@@ -460,44 +770,78 @@ async fn forward_terminal_event(
         return Err("terminal input was already ended".to_owned());
     }
     let correlation_id = execution.correlation_id.clone();
-    let frame = match event.kind {
-        EventKind::StandardInput => sendbox_exec::service::ClientFrame::Input {
-            correlation_id,
-            data: event.payload.clone(),
-        },
+    match event.kind {
+        EventKind::StandardInput => {
+            validate_terminal_input_payload(mode, &event.payload)?;
+            let frame = sendbox_exec::service::ClientFrame::Input {
+                correlation_id,
+                data: event.payload.clone(),
+            };
+            if mode.uses_flow_control() {
+                match input_senders.input.try_send(frame) {
+                    Ok(()) => Ok(()),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(
+                        "terminal input credit invariant failed: broker writer queue is full"
+                            .to_owned(),
+                    ),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        Err("broker writer stopped".to_owned())
+                    }
+                }
+            } else {
+                if let Err(error) = input_senders
+                    .input
+                    .send_timeout(frame, INPUT_OFFER_BOUND)
+                    .await
+                {
+                    let dropped = match error {
+                        tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => {
+                            "queue is saturated"
+                        }
+                        tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => {
+                            "broker writer stopped"
+                        }
+                    };
+                    eprintln!("sendbox-guest: dropping terminal input: {dropped}");
+                }
+                Ok(())
+            }
+        }
         EventKind::StandardInputEof => {
-            *input_ended = true;
-            sendbox_exec::service::ClientFrame::InputEof { correlation_id }
+            let frame = sendbox_exec::service::ClientFrame::InputEof { correlation_id };
+            match input_senders.eof.try_send(frame) {
+                Ok(()) => {
+                    *input_ended = true;
+                    Ok(())
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    Err("terminal end-of-file reservation is already occupied".to_owned())
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Err("broker writer stopped".to_owned())
+                }
+            }
         }
         EventKind::TerminalResize => {
             let size: TerminalSizeV1 = serde_json::from_slice(&event.payload)
                 .map_err(|error| format!("decoding terminal resize: {error}"))?;
             size.validate().map_err(|error| error.to_string())?;
-            sendbox_exec::service::ClientFrame::Resize {
-                correlation_id,
-                columns: size.columns,
-                rows: size.rows,
-            }
+            input_senders
+                .resize
+                .send(Some(sendbox_exec::service::ClientFrame::Resize {
+                    correlation_id,
+                    columns: size.columns,
+                    rows: size.rows,
+                }))
+                .map_err(|_| "broker writer stopped".to_owned())
         }
-        _ => return Err("unsupported terminal event kind".to_owned()),
-    };
-    // A bounded wait absorbs bursts such as a large paste. Blocking without a
-    // bound would stop this loop from draining broker output, which is the
-    // very thing the writer task is waiting on -- so saturation drops the frame
-    // loudly rather than deadlocking the session.
-    if let Err(error) = input_sender.send_timeout(frame, INPUT_OFFER_BOUND).await {
-        let dropped = match error {
-            tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => "queue is saturated",
-            tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => "broker writer stopped",
-        };
-        eprintln!("sendbox-guest: dropping terminal input: {dropped}");
+        _ => Err("unsupported terminal event kind".to_owned()),
     }
-    Ok(())
 }
 
 fn build_execution_request(
     launch: &LaunchRequestV2,
-    terminal: Option<(TerminalSizeV1, String)>,
+    terminal: Option<(TerminalSizeV1, String, bool, bool)>,
     broker: &BrokerClientConfiguration,
     secret_decryptor: &GuestSecretDecryptor,
 ) -> Result<sendbox_exec::ExecutionRequest, GuestError> {
@@ -510,7 +854,7 @@ fn build_execution_request(
     argv.push(launch.program.clone());
     argv.extend(launch.arguments.clone());
     let mut environment = decrypt_environment(launch, secret_decryptor)?;
-    if let Some((_, term)) = terminal.as_ref() {
+    if let Some((_, term, _, _)) = terminal.as_ref() {
         // The host's terminal type is authoritative for an interactive run: a
         // stale configured TERM would make the workload render for the wrong
         // terminal on the operator's screen.
@@ -538,10 +882,14 @@ fn build_execution_request(
         environment,
         stdin: match terminal {
             None => sendbox_exec::StandardInput::Null,
-            Some((size, _)) => sendbox_exec::StandardInput::Terminal {
-                columns: size.columns,
-                rows: size.rows,
-            },
+            Some((size, _, separate_stderr, flow_controlled)) => {
+                sendbox_exec::StandardInput::Terminal {
+                    columns: size.columns,
+                    rows: size.rows,
+                    separate_stderr,
+                    flow_controlled,
+                }
+            }
         },
         timeout,
         containment: sendbox_exec::ContainmentProfile {
@@ -755,6 +1103,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
     use rustix::process::{getgid, getuid};
     use sendbox_core::{BoundaryPlanDigest, SessionId};
     use sendbox_protocol::{HostHandshake, Message, Request};
@@ -762,6 +1113,134 @@ mod tests {
 
     use super::*;
     use crate::runtime::RuntimeIdentity;
+
+    fn report_request(maximum_bytes: u32) -> Request {
+        Request {
+            request_id: 2,
+            operation: PACKAGE_REPORT_OPERATION.to_owned(),
+            payload: serde_json::to_vec(&PackageReportRequestV1 {
+                schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+                maximum_bytes,
+            })
+            .expect("request"),
+        }
+    }
+
+    #[test]
+    fn package_report_is_terminal_only_and_read_without_following_links() {
+        let temporary = crate::secure_fs::secure_tempdir();
+        let report_path = temporary.path().join("report.json");
+        let report_json = r#"{"schema_version":1,"proxy_enabled":true,"records":[],"allowed":0,"denied":0,"quarantined":0}"#;
+        fs::write(&report_path, report_json).expect("write report");
+        fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600)).expect("report mode");
+        let source = PackageReportSource::new(
+            report_path.clone(),
+            getuid().as_raw(),
+            getgid().as_raw(),
+            1024,
+        )
+        .expect("source");
+
+        let before_terminal =
+            handle_package_report_request(report_request(1024), Some(&source), false, false);
+        assert_eq!(before_terminal.status, ResponseStatus::Rejected);
+
+        let response =
+            handle_package_report_request(report_request(1024), Some(&source), true, false);
+        assert_eq!(response.status, ResponseStatus::Ok);
+        let response: PackageReportResponseV1 =
+            serde_json::from_slice(&response.payload).expect("response");
+        assert_eq!(response.report_json, report_json);
+        response.validate(1024).expect("valid response");
+
+        fs::remove_file(&report_path).expect("remove report");
+        let target = temporary.path().join("target.json");
+        fs::write(&target, report_json).expect("write target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("target mode");
+        symlink(&target, &report_path).expect("symlink report");
+        let linked =
+            handle_package_report_request(report_request(1024), Some(&source), true, false);
+        assert_eq!(linked.status, ResponseStatus::Rejected);
+    }
+
+    #[test]
+    fn package_report_rejects_oversized_files_and_duplicate_fetches() {
+        let temporary = crate::secure_fs::secure_tempdir();
+        let report_path = temporary.path().join("report.json");
+        fs::write(&report_path, b"0123456789").expect("write report");
+        fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600)).expect("report mode");
+        let source = PackageReportSource::new(report_path, getuid().as_raw(), getgid().as_raw(), 8)
+            .expect("source");
+        let oversized =
+            handle_package_report_request(report_request(8), Some(&source), true, false);
+        assert_eq!(oversized.status, ResponseStatus::Rejected);
+        let duplicate = handle_package_report_request(report_request(8), Some(&source), true, true);
+        assert_eq!(duplicate.status, ResponseStatus::Rejected);
+    }
+
+    #[test]
+    fn legacy_terminal_input_keeps_its_pre_v2_frame_size() {
+        let payload = vec![b'x'; sendbox_core::TERMINAL_INPUT_CHUNK_BYTES + 1];
+        validate_terminal_input_payload(LaunchMode::InteractiveV1, &payload)
+            .expect("V1 input remains frame-bounded, not chunk-bounded");
+        assert!(
+            validate_terminal_input_payload(LaunchMode::InteractiveV2, &payload).is_err(),
+            "V2 must enforce the credited chunk size"
+        );
+    }
+
+    #[test]
+    fn broker_writer_reserves_eof_and_coalesces_resizes() {
+        let (input_sender, _input_receiver) = tokio::sync::mpsc::channel(BROKER_INPUT_DEPTH);
+        let (eof_sender, _eof_receiver) = tokio::sync::mpsc::channel(1);
+        let (resize_sender, resize_receiver) =
+            tokio::sync::watch::channel::<Option<sendbox_exec::service::ClientFrame>>(None);
+        let correlation_id =
+            sendbox_exec::CorrelationId::new("queue-reservations").expect("correlation");
+
+        for _ in 0..BROKER_INPUT_DEPTH {
+            input_sender
+                .try_send(sendbox_exec::service::ClientFrame::Input {
+                    correlation_id: correlation_id.clone(),
+                    data: vec![b'x'],
+                })
+                .expect("credited input");
+        }
+        assert!(matches!(
+            input_sender.try_send(sendbox_exec::service::ClientFrame::Input {
+                correlation_id: correlation_id.clone(),
+                data: vec![b'x'],
+            }),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+        eof_sender
+            .try_send(sendbox_exec::service::ClientFrame::InputEof {
+                correlation_id: correlation_id.clone(),
+            })
+            .expect("reserved end of file");
+        resize_sender
+            .send(Some(sendbox_exec::service::ClientFrame::Resize {
+                correlation_id: correlation_id.clone(),
+                columns: 80,
+                rows: 24,
+            }))
+            .expect("first resize");
+        resize_sender
+            .send(Some(sendbox_exec::service::ClientFrame::Resize {
+                correlation_id,
+                columns: 120,
+                rows: 40,
+            }))
+            .expect("replacement resize");
+        assert!(matches!(
+            resize_receiver.borrow().as_ref(),
+            Some(sendbox_exec::service::ClientFrame::Resize {
+                columns: 120,
+                rows: 40,
+                ..
+            })
+        ));
+    }
 
     #[tokio::test]
     async fn handshake_is_unreachable_before_local_readiness() {
@@ -798,6 +1277,7 @@ mod tests {
                     services: Vec::new(),
                     audit_events: Vec::new(),
                 },
+                None,
                 None,
                 GuestSecretDecryptor::new(
                     SessionId::from_bytes([3; 16]),
@@ -862,6 +1342,7 @@ mod tests {
                 ReadinessGate::test_ready(),
                 runtime,
                 readiness,
+                None,
                 None,
                 GuestSecretDecryptor::new(session_id, &[8; 32], boundary_plan_digest)
                     .expect("secret decryptor"),

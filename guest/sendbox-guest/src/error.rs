@@ -31,15 +31,18 @@ pub enum GuestError {
     Protocol(String),
     #[error("I/O failed while {context}: {source}")]
     Io {
-        context: &'static str,
+        context: String,
         #[source]
         source: io::Error,
     },
 }
 
 impl GuestError {
-    pub fn io(context: &'static str, source: io::Error) -> Self {
-        Self::Io { context, source }
+    pub fn io(context: impl Into<String>, source: io::Error) -> Self {
+        Self::Io {
+            context: context.into(),
+            source,
+        }
     }
 }
 

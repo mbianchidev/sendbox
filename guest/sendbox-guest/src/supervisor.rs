@@ -16,7 +16,9 @@ use crate::git_guard;
 use crate::manifest::{VerifiedManifest, verify_manifest};
 use crate::mcp_broker;
 use crate::platform::PlatformControls;
-use crate::protocol::{ProtocolServices, handshake_config, serve_authenticated};
+use crate::protocol::{
+    PackageReportSource, ProtocolServices, handshake_config, serve_authenticated,
+};
 use crate::runtime::{ReadinessSnapshot, RuntimeIdentity, RuntimeSession};
 use crate::secure_fs::{leaf_name, open_directory_no_symlinks, validate_regular_metadata};
 use crate::service::{ServiceId, ServiceManager};
@@ -112,16 +114,30 @@ pub async fn run<P: PlatformControls>(
         );
     }
     let egress_configured = bootstrap.egress_policy.is_some();
+    let registry_proxy = bootstrap.registry_proxy.take();
+    let package_report = registry_proxy
+        .as_ref()
+        .map(|registry| {
+            PackageReportSource::new(
+                registry.report_path.clone(),
+                registry.proxy_uid,
+                registry.proxy_gid,
+                registry.policy.limits.max_report_bytes,
+            )
+        })
+        .transpose()?;
     if let Some(policy) = bootstrap.egress_policy.take() {
         let instance_id = policy.instance_id.clone();
         let mut service = egress::prepare(
             runtime.session_dir(),
+            bootstrap.session_id,
             policy,
             bootstrap
                 .execution_broker
                 .as_ref()
                 .and_then(|broker| broker.mcp_policy.clone()),
             std::mem::take(&mut bootstrap.gateway_credentials),
+            registry_proxy,
         )?;
         if bootstrap.required_services.contains(&ServiceId::Audit)
             && !service.dependencies.contains(&ServiceId::Audit)
@@ -279,6 +295,7 @@ pub async fn run<P: PlatformControls>(
                         Arc::clone(&runtime),
                         readiness,
                         broker_client.as_ref().map(|(client, _)| client.clone()),
+                        package_report,
                         secret_decryptor,
                     ),
                 ) => protocol,

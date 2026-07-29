@@ -370,7 +370,7 @@ mod tests {
         );
         assert_eq!(
             server.gateway_url,
-            "http://127.0.0.1:15081/mcp/remote-github"
+            "http://127.0.0.1:15082/mcp/remote-github"
         );
         assert_eq!(server.endpoint.authority(), "mcp.example.com:443");
         assert_eq!(server.transport, ToolTransport::StreamableHttp);

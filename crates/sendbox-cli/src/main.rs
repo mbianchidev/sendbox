@@ -3,6 +3,7 @@
 mod boundary;
 mod completions;
 mod mcp;
+mod package;
 mod secrets;
 mod terminal;
 
@@ -55,6 +56,7 @@ enum Command {
     Devcontainer(Box<DevContainerArgs>),
     Init(InitArgs),
     Mcp(mcp::McpArgs),
+    Package(package::PackageArgs),
     Policy(PolicyArgs),
     /// Run one exact argv workload through an authenticated runtime boundary.
     Run(RunArgs),
@@ -91,6 +93,10 @@ struct RunArgs {
     /// keystrokes and window size to it.
     #[arg(long, conflicts_with = "json")]
     interactive: bool,
+    /// Give stderr its own non-controlling pseudoterminal. This loses strict
+    /// ordering with stdout and is unsuitable for TUIs that draw through fd 2.
+    #[arg(long, requires = "interactive")]
+    separate_stderr: bool,
     #[arg(last = true, required = true, num_args = 1..)]
     command: Vec<String>,
 }
@@ -343,6 +349,13 @@ async fn main() -> ExitCode {
         },
         Command::Init(arguments) => init(arguments),
         Command::Mcp(arguments) => mcp::execute(arguments),
+        Command::Package(arguments) => match runtime_state_directory() {
+            Ok(state_root) => package::execute(arguments, &state_root),
+            Err(error) => {
+                eprintln!("sendbox package: {error}");
+                ExitCode::from(RUNTIME_EXIT)
+            }
+        },
         Command::Policy(policy) => match policy.command {
             PolicyCommand::Show(arguments) => show_policy(arguments),
             PolicyCommand::Validate(arguments) => validate(arguments),
@@ -392,7 +405,7 @@ async fn run(arguments: RunArgs) -> ExitCode {
         }
     };
     let session = if arguments.interactive {
-        match terminal::TerminalSession::start() {
+        match terminal::TerminalSession::start(arguments.separate_stderr) {
             Ok(session) => Some(session),
             Err(error) => {
                 emit_run_error(
@@ -465,10 +478,20 @@ async fn run(arguments: RunArgs) -> ExitCode {
                     "event": "result",
                     "ok": code == 0,
                     "exit_code": code,
-                    "execution": match report {
+                    "execution": match &report {
                         HostRunReport::Persistent(_) => "persistent_guest",
                         HostRunReport::OneShot(_) => "authenticated_one_shot",
                     },
+                    "session_id": report.session_id().map(|session_id| session_id.to_string()),
+                    "package_report": report.package_report().map(|package| serde_json::json!({
+                        "path": package.path(),
+                        "sha256": package.sha256(),
+                        "proxy_enabled": package.proxy_enabled(),
+                        "records": package.records(),
+                        "allowed": package.allowed(),
+                        "denied": package.denied(),
+                        "quarantined": package.quarantined(),
+                    })),
                 }));
             }
             exit_code(code)

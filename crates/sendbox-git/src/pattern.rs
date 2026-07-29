@@ -141,14 +141,16 @@ pub fn normalize_branch(branch: &str) -> Option<String> {
     while let Some(remainder) = value.strip_prefix('+') {
         value = remainder;
     }
-    if matches!(value, "HEAD" | "@") {
-        return None;
-    }
+    value = value.trim();
     if let Some(remainder) = value.strip_prefix("refs/heads/") {
         value = remainder;
     } else if let Some(remainder) = value.strip_prefix("refs/remotes/") {
         value = remainder.split_once('/')?.1;
     } else if value.starts_with("refs/") {
+        return None;
+    }
+    value = value.trim();
+    if matches!(value, "HEAD" | "@") || value.starts_with('+') || value.starts_with("refs/") {
         return None;
     }
     valid_branch_name(value).then(|| value.to_owned())
@@ -232,6 +234,18 @@ mod tests {
         assert!(normalize_branch("HEAD").is_none());
         assert!(normalize_branch("refs/tags/v1").is_none());
         assert!(normalize_branch("feature/*").is_none());
+    }
+
+    #[test]
+    fn canonicalizes_or_rejects_names_exposed_by_refspec_wrappers() {
+        assert_eq!(
+            normalize_branch("+\u{2000}\u{ffd2}").as_deref(),
+            Some("\u{ffd2}")
+        );
+        assert!(normalize_branch("refs/heads/HEAD").is_none());
+        assert!(normalize_branch("refs/remotes/origin/HEAD").is_none());
+        assert!(normalize_branch("refs/heads/+main").is_none());
+        assert!(normalize_branch("refs/remotes/origin/refs/heads/main").is_none());
     }
 
     proptest! {

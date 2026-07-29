@@ -1607,6 +1607,7 @@ dependencies = [
  "hmac",
  "minicbor",
  "sendbox-core",
+ "sendbox-policy",
  "serde",
  "sha2 0.11.0",
  "thiserror",

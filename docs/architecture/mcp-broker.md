@@ -27,7 +27,7 @@ flowchart LR
     StdioBroker --> Frame[Bounded frame + JSON-RPC validation]
     Frame --> Resolve
 
-    HttpClient[MCP client HTTP] --> Route[127.0.0.1:15081/mcp/server-id]
+    HttpClient[MCP client HTTP] --> Route[127.0.0.1:15082/mcp/server-id]
     Route --> Gateway[Trusted Streamable HTTP gateway]
     Gateway --> Resolve
 
@@ -75,7 +75,7 @@ Remote project definitions never contain an upstream URL or credentials. They
 select only the deterministic loopback route:
 
 ```text
-http://127.0.0.1:15081/mcp/<server-id>
+http://127.0.0.1:15082/mcp/<server-id>
 ```
 
 The route ID is untrusted input and must be one canonical path segment exactly

@@ -11,6 +11,8 @@ pub use glob::glob_matches;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const SHA256_DIGEST_BYTES: usize = 32;
+pub const TERMINAL_INPUT_CHUNK_BYTES: usize = 4 * 1024;
+pub const TERMINAL_INPUT_WINDOW_CREDITS: u16 = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

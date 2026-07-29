@@ -23,6 +23,8 @@ permits, and do so with a mechanism that:
   shared UID that any process could assume;
 - validates DNS answers and pins the exact validated address, defeating DNS
   rebinding;
+- gives the package registry proxy a third kernel identity that can reach only
+  its trusted loopback SOCKS gateway;
 - bounds DNS query-name exfiltration deterministically, without entropy
   heuristics;
 - forbids `unsafe` Rust and never shells out.
@@ -56,7 +58,7 @@ each module plus the portable `tests/gateway_integration.rs` suite.
 
 | Module | Responsibility |
 |---|---|
-| `linux::cgroup` | Supervisor-owned stable cgroup v2 hierarchy (`sendbox/<instance>/{agent,broker}`), with optional `pids`/`memory`/`cpu` delegation through the agent ancestor for descendant execution leaves. |
+| `linux::cgroup` | Supervisor-owned stable cgroup v2 hierarchy (`sendbox/<instance>/{agent,broker,registry}`), with optional `pids`/`memory`/`cpu` delegation through the agent ancestor for descendant execution leaves. |
 | `linux::mark` | `SO_MARK` socket helpers (via `socket2`) and the `MarkDialer`. |
 | `linux::nft` | Deterministic nftables rendering keyed on `socket cgroupv2` + `meta mark`; atomic apply/validate/cleanup/verify via `nft -f -` (stdin, no shell, no temp files). |
 | `linux::preflight` | cgroup v2, `nft socket cgroupv2` support, `CAP_NET_ADMIN`, and `SO_MARK` probes. |
@@ -68,14 +70,20 @@ The spike keyed nftables on `meta skuid` (UID). Any process sharing that UID
 could originate broker-class traffic. The production layer instead keys on
 `socket cgroupv2 level N "path"`:
 
-- The supervisor owns a stable hierarchy `sendbox/<instance>/agent` and
-  `sendbox/<instance>/broker` under the cgroup v2 root. The `level` in each
-  nftables rule equals the number of path components.
+- The supervisor owns a stable hierarchy `sendbox/<instance>/agent`,
+  `sendbox/<instance>/broker`, and `sendbox/<instance>/registry` under the
+  cgroup v2 root. The `level` in each nftables rule equals the number of path
+  components.
 - The **agent cgroup ancestor**, including every nested execution leaf beneath
-  it, may only originate traffic to the loopback DNS and CONNECT broker ports.
+  it, may only originate traffic to the loopback DNS and public CONNECT broker
+  ports plus the workload-facing npm proxy port when package analysis is
+  enabled.
 - The **broker cgroup** may originate external traffic **only when the socket
   also carries the fixed `SO_MARK`** (`meta mark`), and never to cloud-metadata
   addresses.
+- The **registry cgroup** may originate traffic only to the registry-only
+  loopback SOCKS port. It cannot reach the public broker ports, external
+  destinations, or obtain the broker mark.
 
 `meta cgroup` (cgroup v1 `net_cls`) is deliberately never emitted; a test
 asserts its absence.
@@ -144,8 +152,8 @@ exactly that **mount-relative** path: nftables userspace *stats*
 `/sys/fs/cgroup/<identifier>` to resolve a `socket cgroupv2` rule, and the kernel
 adds the current cgroup-namespace subtree level internally — it is not a
 process-cgroup-prefixed global path. The same mount-relative path is reused for
-the filesystem operations and for the `agent_procs_path()`/`broker_procs_path()`
-accessors a self-placing helper writes to.
+the filesystem operations and for the agent, broker, and registry process
+placement accessors.
 
 Because that resolution is a userspace `stat` in nft's *own* mount namespace,
 whatever executes `nft` must keep the supervisor's mount view of
@@ -183,29 +191,37 @@ everything down.
 
 ## Authenticated production composition
 
-The host derives a schema-v2 `RuntimePolicyDocument` from the authenticated
-session ID, configured `NetworkPolicy`, and any remote MCP origins. Apple and
-Kata bind that exact document into guest bootstrap together with the matching
-execution broker cgroup parent. The guest rejects session, cgroup, gateway-port,
-reserved-origin, or direct-IP-policy drift before starting any service.
+The host derives a schema-v3 `RuntimePolicyDocument` from the authenticated
+session ID, configured `NetworkPolicy`, any remote MCP origins, and any package
+registry isolation. Apple and Kata bind that exact document into guest bootstrap
+together with the matching execution broker cgroup parent. The guest rejects
+session, cgroup, gateway-port, reserved-origin, registry, or direct-IP-policy
+drift before starting any service.
 
 The guest supervisor makes Egress a mandatory service and makes Exec depend on
 it. The egress supervisor:
 
 1. validates and consumes its root-owned configuration;
 2. recovers the original resolver from root-owned state under `/run/sendbox`;
-3. starts a separate gateway child that binds DNS, SOCKS5 CONNECT, and, when
-   required, the trusted MCP HTTP listener, but does not serve yet;
-4. arms delegated cgroups and nftables, then places the gateway in the broker
-   cgroup;
-5. authorizes the gateway to serve, installs loopback resolver configuration,
-   and only then publishes readiness.
+3. starts gateway children that bind the public DNS/SOCKS listeners, the
+   optional trusted MCP HTTP listener, and the optional registry-only SOCKS
+   listener, but do not serve yet;
+4. arms delegated cgroups and nftables, then places only the gateways in the
+   broker cgroup;
+5. starts the npm proxy as UID/GID 65532 in the registry cgroup with cleared
+   capabilities, no `SO_MARK`, and a bounded seccomp/resource profile;
+6. authorizes the gateways and proxy to serve, installs loopback resolver
+   configuration, and only then publishes readiness.
 
 Workloads receive exact upper- and lower-case `ALL_PROXY`/`NO_PROXY` variables.
 The authenticated stdio MCP broker receives the same fixed proxy environment,
-so local server children remain descendants of execution leaves and cannot
-bypass enforcement. The remote MCP gateway remains in the broker cgroup and
-uses marked exact-address dials rather than the agent-facing CONNECT cache.
+so local servers remain descendants of execution leaves and cannot bypass
+enforcement. The remote MCP gateway remains in the broker cgroup and uses
+marked exact-address dials rather than the agent-facing CONNECT cache.
+Package-enabled workloads also receive upper- and lower-case npm registry and
+`ignore-scripts` variables. The public gateway uses a derived policy that denies
+the configured npm upstream; the trusted registry gateway keeps the original
+policy and is reachable only from the registry cgroup.
 Shutdown runs in reverse dependency order: Exec is fully stopped before Egress
 restores resolver state and attempts cgroup-then-nftables teardown. All service
 shutdown failures are aggregated rather than abandoning later cleanup.
@@ -244,10 +260,15 @@ agent ──(loopback CONNECT)──▶ CONNECT broker ──pin validated ip, r
 agent ──(loopback /mcp/<server-id>)──▶ MCP gateway
        ──separate marked DNS, classify, reserve aliases/addresses, exact-IP dial──▶
        configured upstream
+
+agent ──(loopback HTTP)──▶ npm proxy ──verify/scan/cache──▶ trusted SOCKS broker
+                                                      ──(SO_MARK)──▶ npm upstream
 ```
 
 nftables drops any agent packet that is not headed to a loopback broker port,
-and any broker external packet that lacks the mark or targets metadata.
+the optional MCP gateway port, or the optional npm proxy port, and any broker
+external packet that lacks the mark or targets metadata. It drops every
+registry-cgroup packet except TCP to the trusted registry SOCKS port.
 
 ## Remote MCP reservation and bypass protection
 
@@ -282,6 +303,12 @@ exactly match the signed MCP policy. `allow_dns = false` binds no agent-facing
 DNS broker and installs no nftables DNS accept rule; the trusted MCP gateway
 still uses its separate marked resolver when remote MCP is configured.
 
+When package analysis is enabled, `sendbox-egress::runtime` derives a
+workload-facing policy that removes direct access to every configured npm
+upstream while preserving the original policy for the registry-only gateway.
+The package proxy is therefore mandatory rather than a convention expressed
+only through npm environment variables.
+
 Compilation and validation fail closed rather than substituting a
 success-shaped default for an invalid value:
 
@@ -299,7 +326,10 @@ success-shaped default for an invalid value:
 ## Testing and qualification
 
 - Portable unit tests live beside each module; portable integration tests are in
-  `tests/gateway_integration.rs`. Both run on macOS and Linux.
+  `tests/gateway_integration.rs`. Both run on macOS and Linux. Deterministic
+  nftables tests also prove that the workload can reach the npm proxy but not
+  the trusted registry SOCKS listener, that the registry cgroup can reach only
+  that trusted listener, and that no registry rule accepts `SO_MARK`.
 - The privileged live proof is `tests/live_netns.rs`, gated by
   `target_os = "linux"`, `SENDBOX_EGRESS_LIVE=1`, and a full `Preflight` (plus
   `setpriv`). It proves cgroup identity isolation, the mark requirement, a

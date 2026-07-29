@@ -160,7 +160,7 @@ policy:
         remote-docs:
           # Project MCP files must use:
           #   type: streamable-http
-          #   url: http://127.0.0.1:15081/mcp/remote-docs
+          #   url: http://127.0.0.1:15082/mcp/remote-docs
           transport: streamable_http
           url: https://mcp.example.com/mcp
           tools:
@@ -221,21 +221,72 @@ policy:
     # Domains that are always blocked (takes priority over allowed_domains).
     blocked_domains: []
 
+  # ── Package supply-chain analysis ───────────────────────────────────────
+  # Currently implemented for npm on Apple and Kata persistent guests. When
+  # enabled, npm is forced through the local proxy, lifecycle scripts are
+  # disabled, and direct access to configured upstream registries is removed
+  # from the workload network policy.
+  packages:
+    enabled: false
+    registries:
+      - ecosystem: npm
+        url: https://registry.npmjs.org/
+        # For a private registry, store the token with:
+        #   sendbox secrets add PRIVATE_NPM_TOKEN
+        # Then uncomment this reference. Do not also list it under `secrets`.
+        # credential_secret: PRIVATE_NPM_TOKEN
+        allow_insecure_http: false
+        signature: if_present
+        provenance: if_present
+    default_finding_action: deny
+    finding_actions:
+      - finding: lifecycle_script
+        action: deny
+      - finding: subprocess_api
+        action: deny
+      - finding: shell_api
+        action: deny
+      - finding: unexpected_executable
+        action: deny
+    # Exceptions must be pinned to the exact verified artifact digest. See
+    # docs/package-supply-chain.md for the false-positive review workflow.
+    exceptions: []
+    allow_legacy_sha1: true
+    limits:
+      max_metadata_bytes: 16777216
+      max_download_bytes: 268435456
+      max_unpacked_bytes: 1073741824
+      max_entry_bytes: 67108864
+      max_entries: 100000
+      max_path_bytes: 4096
+      max_depth: 64
+      max_source_scan_bytes: 8388608
+      request_timeout_secs: 120
+      scan_timeout_secs: 30
+      max_report_findings: 4096
+      max_report_bytes: 98304
+    cache:
+      enabled: true
+      max_bytes: 4294967296
+      max_entries: 100000
+      retain_quarantined: false
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Secrets
 # ─────────────────────────────────────────────────────────────────────────────
 # Names of secrets to inject as environment variables into the sandbox.
 # Secrets are stored in the sendbox vault (not in this file).
 #
-# To add a secret to the vault:
-#   sendbox secret set NPM_TOKEN
+# To add a workload secret to the vault:
+#   sendbox secrets add DATABASE_URL
 #
 # Secrets are injected at container start and are available as standard
-# environment variables (e.g., $NPM_TOKEN). GitHub tokens are handled by
-# the guarded GitHub auth forwarding configuration below. Secrets are never written
-# to disk inside the container.
+# environment variables (e.g., $DATABASE_URL). Package registry credentials
+# referenced by policy.packages.registries[].credential_secret are isolated in
+# the trusted proxy and MUST NOT also appear here. GitHub tokens are handled by
+# the guarded GitHub auth forwarding configuration below. Secrets are never
+# written to disk inside the container.
 secrets:
-  - NPM_TOKEN
   - DATABASE_URL
 
 # ─────────────────────────────────────────────────────────────────────────────

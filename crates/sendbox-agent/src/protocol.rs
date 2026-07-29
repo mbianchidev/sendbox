@@ -2,8 +2,10 @@ use crate::traits::HostTerminalCommand;
 use sendbox_protocol::{
     AGENT_LAUNCH_OPERATION, BootstrapSecret, CapabilitySet, CloseCode, EnvironmentEntryV2, Event,
     EventKind, FrameLimits, GracefulClose, HandshakeConfig, HostHandshake,
-    INTERACTIVE_LAUNCH_OPERATION, INTERACTIVE_OPERATION_SCHEMA_VERSION, InteractiveLaunchRequestV1,
-    LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, Request, ResponseStatus, SecretEnvelopeV2,
+    INTERACTIVE_LAUNCH_OPERATION_V2, INTERACTIVE_OPERATION_SCHEMA_VERSION_V2,
+    InteractiveLaunchRequestV2, LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION,
+    PACKAGE_REPORT_OPERATION, PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1,
+    PackageReportResponseV1, Request, ResponseStatus, SecretEnvelopeV2, TerminalInputCreditV1,
     TerminalResultV2, TerminalSizeV1, TerminalStateV1, VersionRange,
 };
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
@@ -19,10 +21,11 @@ use std::{
 
 use crate::{
     AgentError, BoxFuture, GuestConnectionConfiguration, GuestConnector, GuestEvent,
-    GuestExecution, GuestLaunchRequest, GuestSession, GuestTerminal,
+    GuestExecution, GuestLaunchRequest, GuestPackageReport, GuestSession, GuestTerminal,
 };
 
-const REQUEST_ID: u64 = 1;
+const LAUNCH_REQUEST_ID: u64 = 1;
+const PACKAGE_REPORT_REQUEST_ID: u64 = 2;
 const PROTOCOL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
@@ -145,20 +148,21 @@ impl GuestSession for ProtocolGuestSession {
                     })?,
                 ),
                 Some(terminal) => {
-                    let envelope = InteractiveLaunchRequestV1 {
-                        schema_version: INTERACTIVE_OPERATION_SCHEMA_VERSION,
+                    let envelope = InteractiveLaunchRequestV2 {
+                        schema_version: INTERACTIVE_OPERATION_SCHEMA_VERSION_V2,
                         launch,
                         terminal: TerminalSizeV1 {
                             columns: terminal.columns,
                             rows: terminal.rows,
                         },
                         term: terminal.term.clone(),
+                        separate_stderr: terminal.separate_stderr,
                     };
                     envelope.validate().map_err(|error| {
                         AgentError::Guest(format!("invalid interactive launch request: {error}"))
                     })?;
                     (
-                        INTERACTIVE_LAUNCH_OPERATION,
+                        INTERACTIVE_LAUNCH_OPERATION_V2,
                         serde_json::to_vec(&envelope).map_err(|error| {
                             AgentError::Guest(format!("encode interactive launch request: {error}"))
                         })?,
@@ -173,7 +177,7 @@ impl GuestSession for ProtocolGuestSession {
                 "send guest launch request",
                 cancellation,
                 writer.send(&Message::Request(Request {
-                    request_id: REQUEST_ID,
+                    request_id: LAUNCH_REQUEST_ID,
                     operation: operation.to_owned(),
                     payload,
                 })),
@@ -189,7 +193,9 @@ impl GuestSession for ProtocolGuestSession {
                 terminal: false,
                 cancelled: false,
                 interactive,
-                input_ended: false,
+                flow_controlled: interactive,
+                input: TerminalInputState::default(),
+                report_fetched: false,
             }) as Box<dyn GuestExecution>)
         })
     }
@@ -291,25 +297,62 @@ pub struct ProtocolGuestExecution {
     terminal: bool,
     cancelled: bool,
     interactive: bool,
-    input_ended: bool,
+    flow_controlled: bool,
+    input: TerminalInputState,
+    report_fetched: bool,
+}
+
+#[derive(Debug, Default)]
+struct TerminalInputState {
+    ended: bool,
+    available: u16,
+}
+
+impl TerminalInputState {
+    fn grant(&mut self, credits: u16) -> Result<(), AgentError> {
+        self.available = self
+            .available
+            .checked_add(credits)
+            .filter(|available| *available <= sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS)
+            .ok_or_else(|| {
+                AgentError::Guest("terminal input credit exceeds the negotiated window".to_owned())
+            })?;
+        Ok(())
+    }
+
+    fn require_open(&self) -> Result<(), AgentError> {
+        if self.ended {
+            return Err(AgentError::Guest(
+                "terminal input was already ended".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn consume(&mut self) -> Result<(), AgentError> {
+        self.require_open()?;
+        if self.available == 0 {
+            return Err(AgentError::TerminalInput(
+                "terminal input was produced without launcher credit".to_owned(),
+            ));
+        }
+        self.available -= 1;
+        Ok(())
+    }
+
+    fn end(&mut self) -> Result<(), AgentError> {
+        self.require_open()?;
+        self.ended = true;
+        Ok(())
+    }
 }
 
 /// Queue depth for control frames (cancellation, close). These must never
 /// queue behind bulk terminal input.
 const WRITER_CONTROL_DEPTH: usize = 4;
 
-/// Queue depth for pending terminal input frames.
-const WRITER_INPUT_DEPTH: usize = 256;
-
-/// How long a keystroke may wait for the writer before it is dropped. Dropping
-/// is what keeps the orchestrator reading guest output: a workload that stops
-/// draining its terminal must never be able to stall the screen.
-const INPUT_OFFER_BOUND: Duration = Duration::from_millis(250);
-
-/// How long a one-shot input signal may wait for the writer. Longer than the
-/// droppable bound because losing it hangs the workload, short enough to stay
-/// well inside the protocol timeout.
-const REQUIRED_INPUT_BOUND: Duration = Duration::from_secs(5);
+/// Queue depth for the credited input window plus its FIFO EOF reservation.
+const WRITER_INPUT_DEPTH: usize = sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + 1;
 
 struct WriterMessage {
     message: Message,
@@ -325,6 +368,7 @@ struct WriterMessage {
 struct WriterHandle {
     control: tokio::sync::mpsc::Sender<WriterMessage>,
     input: tokio::sync::mpsc::Sender<WriterMessage>,
+    resize: tokio::sync::watch::Sender<Option<Message>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -335,6 +379,7 @@ impl WriterHandle {
         let (control, mut control_receiver) = tokio::sync::mpsc::channel(WRITER_CONTROL_DEPTH);
         let (input, mut input_receiver) =
             tokio::sync::mpsc::channel::<WriterMessage>(WRITER_INPUT_DEPTH);
+        let (resize, mut resize_receiver) = tokio::sync::watch::channel::<Option<Message>>(None);
         let task = tokio::spawn(async move {
             loop {
                 let queued = tokio::select! {
@@ -342,6 +387,16 @@ impl WriterHandle {
                     control = control_receiver.recv() => match control {
                         Some(queued) => queued,
                         None => return,
+                    },
+                    changed = resize_receiver.changed() => match changed {
+                        Ok(()) => WriterMessage {
+                            message: resize_receiver
+                                .borrow_and_update()
+                                .clone()
+                                .expect("resize notification always carries a message"),
+                            ack: None,
+                        },
+                        Err(_) => continue,
                     },
                     input = input_receiver.recv() => match input {
                         Some(queued) => queued,
@@ -364,6 +419,7 @@ impl WriterHandle {
         Self {
             control,
             input,
+            resize,
             task,
         }
     }
@@ -385,64 +441,25 @@ impl WriterHandle {
             .map_err(AgentError::Protocol)
     }
 
-    /// Queues a keystroke without waiting for the socket. Saturation drops the
-    /// keystroke with a diagnostic rather than blocking the caller.
-    async fn offer_input(&self, message: Message) -> Result<(), AgentError> {
-        match self.queue_input(message, INPUT_OFFER_BOUND).await {
+    /// Queues on the single input channel so terminal ordering is preserved:
+    /// end of file must never overtake the keystrokes that precede it.
+    fn queue_input(&self, message: Message) -> Result<(), AgentError> {
+        match self.input.try_send(WriterMessage { message, ack: None }) {
             Ok(()) => Ok(()),
-            Err(InputQueueError::Saturated) => {
-                eprintln!(
-                    "sendbox: guest stopped accepting terminal input for {}ms; dropping input",
-                    INPUT_OFFER_BOUND.as_millis()
-                );
-                Ok(())
-            }
-            Err(InputQueueError::Stopped) => Err(AgentError::Guest(
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(AgentError::Guest(
+                "terminal input credit invariant failed: guest writer queue is full".to_owned(),
+            )),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(AgentError::Guest(
                 "guest connection writer stopped".to_owned(),
             )),
         }
     }
 
-    /// Queues a one-shot input signal that must not be dropped. End of file
-    /// changes state on both sides — the caller stops sending and the workload
-    /// waits for the terminal's `VEOF` byte — so losing it silently would hang
-    /// the workload until its launch timeout.
-    async fn require_input(&self, message: Message) -> Result<(), AgentError> {
-        self.queue_input(message, REQUIRED_INPUT_BOUND)
-            .await
-            .map_err(|error| match error {
-                InputQueueError::Saturated => AgentError::Guest(format!(
-                    "guest did not accept terminal end of file within {}ms",
-                    REQUIRED_INPUT_BOUND.as_millis()
-                )),
-                InputQueueError::Stopped => {
-                    AgentError::Guest("guest connection writer stopped".to_owned())
-                }
-            })
+    fn queue_resize(&self, message: Message) -> Result<(), AgentError> {
+        self.resize
+            .send(Some(message))
+            .map_err(|_| AgentError::Guest("guest connection writer stopped".to_owned()))
     }
-
-    /// Queues on the single input channel so terminal ordering is preserved:
-    /// end of file must never overtake the keystrokes that precede it.
-    async fn queue_input(&self, message: Message, bound: Duration) -> Result<(), InputQueueError> {
-        match self
-            .input
-            .send_timeout(WriterMessage { message, ack: None }, bound)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
-                Err(InputQueueError::Saturated)
-            }
-            Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => {
-                Err(InputQueueError::Stopped)
-            }
-        }
-    }
-}
-
-enum InputQueueError {
-    Saturated,
-    Stopped,
 }
 
 impl Drop for WriterHandle {
@@ -476,11 +493,30 @@ impl GuestExecution for ProtocolGuestExecution {
                         stream: OutputStream::Stderr,
                         bytes: event.payload,
                     }),
+                    sendbox_protocol::EventKind::TerminalInputCredit => {
+                        if !self.flow_controlled {
+                            return Err(AgentError::Guest(
+                                "terminal input credit arrived without a V2 interactive launch"
+                                    .to_owned(),
+                            ));
+                        }
+                        let credit: TerminalInputCreditV1 = serde_json::from_slice(&event.payload)
+                            .map_err(|error| {
+                                AgentError::Guest(format!("decode terminal input credit: {error}"))
+                            })?;
+                        credit.validate().map_err(|error| {
+                            AgentError::Guest(format!("invalid terminal input credit: {error}"))
+                        })?;
+                        self.input.grant(credit.credits)?;
+                        Ok(GuestEvent::TerminalInputCredit {
+                            credits: credit.credits,
+                        })
+                    }
                     kind => Err(AgentError::Guest(format!(
                         "unexpected guest event kind {kind:?}"
                     ))),
                 },
-                Message::Response(response) if response.request_id == REQUEST_ID => {
+                Message::Response(response) if response.request_id == LAUNCH_REQUEST_ID => {
                     self.terminal = true;
                     if response.status == ResponseStatus::Ok {
                         let terminal: TerminalResultV2 = serde_json::from_slice(&response.payload)
@@ -511,7 +547,7 @@ impl GuestExecution for ProtocolGuestExecution {
     fn send_terminal<'a>(
         &'a mut self,
         command: HostTerminalCommand,
-        cancellation: &'a CancellationToken,
+        _cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
             if !self.interactive {
@@ -524,51 +560,57 @@ impl GuestExecution for ProtocolGuestExecution {
                     "terminal input requested after terminal response".to_owned(),
                 ));
             }
-            if self.input_ended {
-                return Err(AgentError::Guest(
-                    "terminal input was already ended".to_owned(),
-                ));
-            }
-            let event = match command {
-                HostTerminalCommand::Input(bytes) => Event {
-                    stream_id: REQUEST_ID,
-                    kind: sendbox_protocol::EventKind::StandardInput,
-                    payload: bytes,
-                },
+            self.input.require_open()?;
+            match command {
+                HostTerminalCommand::Input(bytes) => {
+                    if bytes.is_empty() || bytes.len() > sendbox_core::TERMINAL_INPUT_CHUNK_BYTES {
+                        return Err(AgentError::TerminalInput(format!(
+                            "one terminal input chunk must contain 1..={} bytes",
+                            sendbox_core::TERMINAL_INPUT_CHUNK_BYTES
+                        )));
+                    }
+                    let event = Event {
+                        stream_id: LAUNCH_REQUEST_ID,
+                        kind: sendbox_protocol::EventKind::StandardInput,
+                        payload: bytes,
+                    };
+                    if self.flow_controlled {
+                        self.input.consume()?;
+                    }
+                    if let Err(error) = self.writer.queue_input(Message::Event(event)) {
+                        if self.flow_controlled {
+                            self.input
+                                .grant(1)
+                                .expect("returning one consumed credit cannot exceed the window");
+                        }
+                        return Err(error);
+                    }
+                    Ok(())
+                }
                 HostTerminalCommand::InputEof => {
                     let event = Event {
-                        stream_id: REQUEST_ID,
+                        stream_id: LAUNCH_REQUEST_ID,
                         kind: sendbox_protocol::EventKind::StandardInputEof,
                         payload: Vec::new(),
                     };
-                    guest_io(
-                        "send guest terminal end of file",
-                        cancellation,
-                        self.writer.require_input(Message::Event(event)),
-                    )
-                    .await?;
-                    self.input_ended = true;
-                    return Ok(());
+                    self.writer.queue_input(Message::Event(event))?;
+                    self.input.end()?;
+                    Ok(())
                 }
                 HostTerminalCommand::Resize { columns, rows } => {
                     let size = TerminalSizeV1::new(columns, rows).map_err(|error| {
                         AgentError::Guest(format!("invalid terminal size: {error}"))
                     })?;
-                    Event {
-                        stream_id: REQUEST_ID,
+                    let event = Event {
+                        stream_id: LAUNCH_REQUEST_ID,
                         kind: sendbox_protocol::EventKind::TerminalResize,
                         payload: serde_json::to_vec(&size).map_err(|error| {
                             AgentError::Guest(format!("encode terminal resize: {error}"))
                         })?,
-                    }
+                    };
+                    self.writer.queue_resize(Message::Event(event))
                 }
-            };
-            guest_io(
-                "send guest terminal input",
-                cancellation,
-                self.writer.offer_input(Message::Event(event)),
-            )
-            .await
+            }
         })
     }
 
@@ -599,13 +641,96 @@ impl GuestExecution for ProtocolGuestExecution {
                 cancellation,
                 self.writer
                     .send_control(Message::Cancellation(sendbox_protocol::Cancellation {
-                        request_id: REQUEST_ID,
+                        request_id: LAUNCH_REQUEST_ID,
                         reason: Some("agent cancellation".to_owned()),
                     })),
             )
             .await?;
             self.cancelled = true;
             Ok(())
+        })
+    }
+
+    fn fetch_package_report<'a>(
+        &'a mut self,
+        maximum_bytes: usize,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<GuestPackageReport, AgentError>> {
+        Box::pin(async move {
+            if !self.terminal {
+                return Err(AgentError::Guest(
+                    "package report requested before terminal response".to_owned(),
+                ));
+            }
+            if self.report_fetched {
+                return Err(AgentError::Guest(
+                    "package report was already requested".to_owned(),
+                ));
+            }
+            let maximum_bytes = u32::try_from(maximum_bytes).map_err(|_| {
+                AgentError::Guest("package report byte limit is out of range".to_owned())
+            })?;
+            let request = PackageReportRequestV1 {
+                schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+                maximum_bytes,
+            };
+            request
+                .validate()
+                .map_err(|error| AgentError::Guest(error.to_owned()))?;
+            let payload = serde_json::to_vec(&request).map_err(|error| {
+                AgentError::Guest(format!("encode package report request: {error}"))
+            })?;
+            guest_io(
+                "send package report request",
+                cancellation,
+                self.writer.send_control(Message::Request(Request {
+                    request_id: PACKAGE_REPORT_REQUEST_ID,
+                    operation: PACKAGE_REPORT_OPERATION.to_owned(),
+                    payload,
+                })),
+            )
+            .await?;
+            self.report_fetched = true;
+            let message = protocol_io(
+                "receive package report response",
+                cancellation,
+                self.reader.receive(),
+            )
+            .await?;
+            let Message::Response(response) = message else {
+                return Err(AgentError::Guest(
+                    "guest returned an unexpected package report message".to_owned(),
+                ));
+            };
+            if response.request_id != PACKAGE_REPORT_REQUEST_ID {
+                return Err(AgentError::Guest(
+                    "guest returned a package report with the wrong request ID".to_owned(),
+                ));
+            }
+            if response.status != ResponseStatus::Ok {
+                return Err(AgentError::Guest(format!(
+                    "guest rejected package report retrieval with status {:?}",
+                    response.status
+                )));
+            }
+            let response: PackageReportResponseV1 = serde_json::from_slice(&response.payload)
+                .map_err(|error| {
+                    AgentError::Guest(format!("decode package report response: {error}"))
+                })?;
+            response
+                .validate(maximum_bytes as usize)
+                .map_err(|error| AgentError::Guest(error.to_owned()))?;
+            let json = response.report_json.into_bytes();
+            let actual_digest = format!("sha256:{}", sendbox_boundary::sha256_hex(&json));
+            if response.sha256 != actual_digest {
+                return Err(AgentError::Guest(
+                    "package report SHA-256 digest mismatch".to_owned(),
+                ));
+            }
+            Ok(GuestPackageReport {
+                json,
+                sha256: actual_digest,
+            })
         })
     }
 }
@@ -690,45 +815,91 @@ mod tests {
 
     fn terminal_event(kind: EventKind) -> Message {
         Message::Event(Event {
-            stream_id: REQUEST_ID,
+            stream_id: LAUNCH_REQUEST_ID,
             kind,
             payload: Vec::new(),
         })
     }
 
-    /// A saturated writer must lose keystrokes rather than the orchestrator's
-    /// ability to keep reading, but end of file changes state on both sides:
-    /// losing it silently leaves the workload waiting for a `VEOF` byte that
-    /// can no longer be produced.
-    #[tokio::test(start_paused = true)]
-    async fn a_saturated_writer_drops_keystrokes_but_never_end_of_file() {
+    #[tokio::test]
+    async fn the_credited_window_reserves_eof_and_coalesces_resizes() {
         let (control, _control) = tokio::sync::mpsc::channel(WRITER_CONTROL_DEPTH);
-        let (input, _input) = tokio::sync::mpsc::channel(1);
-        input
-            .send(WriterMessage {
-                message: terminal_event(EventKind::StandardInput),
-                ack: None,
-            })
-            .await
-            .expect("fill the queue");
+        let (input, mut receiver) = tokio::sync::mpsc::channel(WRITER_INPUT_DEPTH);
+        let (resize, mut resize_receiver) = tokio::sync::watch::channel::<Option<Message>>(None);
         let writer = WriterHandle {
             control,
             input,
+            resize,
             task: tokio::spawn(std::future::pending()),
         };
 
+        for _ in 0..sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS {
+            writer
+                .queue_input(terminal_event(EventKind::StandardInput))
+                .expect("credited input fits");
+        }
         writer
-            .offer_input(terminal_event(EventKind::StandardInput))
+            .queue_input(terminal_event(EventKind::StandardInputEof))
+            .expect("end of file uses reserved capacity");
+
+        for _ in 0..WRITER_INPUT_DEPTH {
+            writer
+                .queue_resize(terminal_event(EventKind::TerminalResize))
+                .expect("coalesce resize");
+        }
+        resize_receiver
+            .changed()
             .await
-            .expect("a dropped keystroke is not a failed run");
+            .expect("resize notification");
+        assert!(matches!(
+            resize_receiver.borrow_and_update().as_ref(),
+            Some(Message::Event(Event {
+                kind: EventKind::TerminalResize,
+                ..
+            }))
+        ));
         let error = writer
-            .require_input(terminal_event(EventKind::StandardInputEof))
-            .await
-            .expect_err("end of file must never be dropped silently");
+            .queue_input(terminal_event(EventKind::StandardInput))
+            .expect_err("full queue must fail without blocking");
         assert!(
-            error.to_string().contains("end of file"),
+            error.to_string().contains("credit invariant"),
             "unexpected error: {error}"
         );
+
+        for _ in 0..sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS {
+            let queued = receiver.recv().await.expect("queued input");
+            assert!(matches!(
+                queued.message,
+                Message::Event(Event {
+                    kind: EventKind::StandardInput,
+                    ..
+                })
+            ));
+        }
+        let eof = receiver.recv().await.expect("queued end of file");
+        assert!(matches!(
+            eof.message,
+            Message::Event(Event {
+                kind: EventKind::StandardInputEof,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_input_state_enforces_credit_end_of_file_and_the_window() {
+        let mut input = TerminalInputState::default();
+        assert!(input.consume().is_err(), "input must wait for credit");
+        input
+            .grant(sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS)
+            .expect("initial window");
+        assert!(input.grant(1).is_err(), "overgrant must fail");
+        for _ in 0..sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS {
+            input.consume().expect("consume credit");
+        }
+        input.end().expect("end of file needs no credit");
+        assert!(input.consume().is_err(), "input after EOF must fail");
+        assert!(input.end().is_err(), "duplicate EOF must fail");
     }
 
     #[test]
