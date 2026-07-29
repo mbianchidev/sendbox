@@ -82,11 +82,10 @@ pub enum Capability {
     Mcp = 7,
     Audit = 8,
     Health = 9,
-    SafeOutputs = 10,
 }
 
 impl Capability {
-    pub(crate) const COUNT: u64 = 10;
+    pub(crate) const COUNT: u64 = 9;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

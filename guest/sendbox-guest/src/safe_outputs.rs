@@ -464,18 +464,29 @@ fn accept_intent(
 }
 
 fn prepare_parent(path: &Path, owner_uid: u32, owner_gid: u32) -> Result<(), GuestError> {
-    if !path.exists() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(ROOT_MODE)
-            .create(path)
-            .map_err(|error| GuestError::io("creating Safe Outputs runtime root", error))?;
+    match path.symlink_metadata() {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(GuestError::Runtime(
+                    "Safe Outputs runtime root must be a real directory".to_owned(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(ROOT_MODE)
+                .create(path)
+                .map_err(|error| GuestError::io("creating Safe Outputs runtime root", error))?;
+        }
+        Err(error) => {
+            return Err(GuestError::io(
+                "inspecting Safe Outputs runtime root",
+                error,
+            ));
+        }
     }
-    std::os::unix::fs::chown(path, Some(owner_uid), Some(owner_gid))
-        .map_err(|error| GuestError::io("assigning Safe Outputs runtime root", error))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(ROOT_MODE))
-        .map_err(|error| GuestError::io("setting Safe Outputs runtime root mode", error))?;
-    validate_directory(
+    prepare_directory(
         path,
         owner_uid,
         owner_gid,
@@ -489,11 +500,7 @@ fn prepare_session_root(path: &Path, owner_uid: u32, workload_gid: u32) -> Resul
         .mode(SESSION_MODE)
         .create(path)
         .map_err(|error| GuestError::io("creating Safe Outputs session root", error))?;
-    std::os::unix::fs::chown(path, Some(owner_uid), Some(workload_gid))
-        .map_err(|error| GuestError::io("assigning Safe Outputs session root", error))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(SESSION_MODE))
-        .map_err(|error| GuestError::io("setting Safe Outputs session root mode", error))?;
-    validate_directory(
+    prepare_directory(
         path,
         owner_uid,
         workload_gid,
@@ -502,18 +509,42 @@ fn prepare_session_root(path: &Path, owner_uid: u32, workload_gid: u32) -> Resul
     )
 }
 
-fn validate_directory(
+fn prepare_directory(
     path: &Path,
     uid: u32,
     gid: u32,
     mode: u32,
     subject: &str,
 ) -> Result<(), GuestError> {
-    let metadata = path
-        .symlink_metadata()
+    let directory = File::from(crate::secure_fs::open_directory_no_symlinks(path)?);
+    rustix::fs::fchown(
+        &directory,
+        Some(rustix::fs::Uid::from_raw(uid)),
+        Some(rustix::fs::Gid::from_raw(gid)),
+    )
+    .map_err(|error| {
+        GuestError::io(
+            "assigning Safe Outputs directory",
+            std::io::Error::from(error),
+        )
+    })?;
+    directory
+        .set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(|error| GuestError::io("setting Safe Outputs directory mode", error))?;
+    validate_directory(&directory, uid, gid, mode, subject)
+}
+
+fn validate_directory(
+    directory: &File,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    subject: &str,
+) -> Result<(), GuestError> {
+    let metadata = directory
+        .metadata()
         .map_err(|error| GuestError::io("inspecting Safe Outputs directory", error))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
+    if !metadata.is_dir()
         || metadata.uid() != uid
         || metadata.gid() != gid
         || metadata.mode() & 0o7777 != mode
@@ -561,7 +592,7 @@ fn safe_outputs_error(error: SafeOutputsError) -> GuestError {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     use sendbox_core::SessionId;
     use sendbox_mcp::safe_outputs::{
@@ -648,6 +679,29 @@ mod tests {
             handle: SafeOutputsHandle { control, live },
             task,
         }
+    }
+
+    #[test]
+    fn runtime_root_symlink_is_rejected_before_target_mutation() {
+        let temporary = crate::secure_fs::secure_tempdir();
+        let target = temporary.path().join("target");
+        fs::create_dir(&target).expect("target directory");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("target mode");
+        let before = target.metadata().expect("target metadata");
+        let runtime_root = temporary.path().join("runtime-root");
+        symlink(&target, &runtime_root).expect("runtime-root symlink");
+
+        let error = prepare_parent(&runtime_root, before.uid(), before.gid())
+            .expect_err("symlink must be rejected");
+        assert!(
+            error.to_string().contains("must be a real directory"),
+            "{error}"
+        );
+
+        let after = target.metadata().expect("target metadata after rejection");
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+        assert_eq!(after.mode() & 0o7777, before.mode() & 0o7777);
     }
 
     fn request(method: &str, params: Value) -> Vec<u8> {

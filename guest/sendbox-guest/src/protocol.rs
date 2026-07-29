@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use sendbox_protocol::{
-    AGENT_LAUNCH_OPERATION, BootstrapSecret, Capability, CloseCode, Event, EventKind, FrameLimits,
+    AGENT_LAUNCH_OPERATION, BootstrapSecret, CloseCode, Event, EventKind, FrameLimits,
     GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, INTERACTIVE_LAUNCH_OPERATION,
     INTERACTIVE_LAUNCH_OPERATION_V2, InteractiveLaunchRequestV1, InteractiveLaunchRequestV2,
     LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, ProtocolErrorCode, ProtocolErrorMessage,
@@ -119,16 +119,6 @@ where
 
     let mut handshake = GuestHandshake::new(config);
     let connection = handshake.establish(stream).await?;
-    if services.safe_outputs.is_some()
-        && !connection
-            .negotiated()
-            .capabilities
-            .contains(Capability::SafeOutputs)
-    {
-        return Err(GuestError::Protocol(
-            "Safe Outputs capability was not negotiated".to_owned(),
-        ));
-    }
     let (mut reader, mut writer) = connection.into_parts();
     if !services.service_readiness.verified_live()
         || services
@@ -182,6 +172,8 @@ where
                 )
                 .await?;
             }
+            // Operation-name negotiation preserves the legacy capability wire
+            // profile while still making unsupported collection fail closed.
             Message::Request(request) if request.operation == SAFE_OUTPUTS_COLLECT_OPERATION => {
                 collect_safe_outputs(request, &mut writer, &services).await?;
             }

@@ -16,6 +16,8 @@ pub const INTERACTIVE_OPERATION_SCHEMA_VERSION: u32 = 1;
 pub const INTERACTIVE_LAUNCH_OPERATION_V2: &str = "agent.launch.interactive.v2";
 pub const INTERACTIVE_OPERATION_SCHEMA_VERSION_V2: u32 = 2;
 pub const HEALTH_OPERATION: &str = "health";
+/// Safe Outputs collection uses a distinct operation so older peers can reject
+/// it without receiving an unknown capability discriminant during handshake.
 pub const SAFE_OUTPUTS_COLLECT_OPERATION: &str = "safe_outputs.collect";
 pub const SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SAFE_OUTPUTS_ARTIFACT_BYTES: usize = 128 * 1024;
@@ -207,7 +209,6 @@ pub fn agent_host_capabilities() -> CapabilitySet {
         Capability::StreamedIo,
         Capability::Signals,
         Capability::Health,
-        Capability::SafeOutputs,
     ])
 }
 
@@ -230,7 +231,6 @@ pub fn agent_guest_capabilities() -> CapabilitySet {
         Capability::Signals,
         Capability::Audit,
         Capability::Health,
-        Capability::SafeOutputs,
     ])
 }
 

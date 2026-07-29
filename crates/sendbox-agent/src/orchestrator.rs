@@ -300,6 +300,7 @@ impl AgentOrchestrator {
                     boundary_plan_digest: plan.boundary_plan_digest(),
                     capabilities: agent_host_capabilities(),
                     required_capabilities: plan.required_guest_capabilities().clone(),
+                    safe_outputs_required: plan.safe_outputs(),
                     bootstrap_secret: bootstrap.as_bytes().to_vec(),
                     policy_digest: plan.policy_digest(),
                 },

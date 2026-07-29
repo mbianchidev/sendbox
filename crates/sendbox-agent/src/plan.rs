@@ -9,7 +9,7 @@ use sendbox_boundary::{
 };
 use sendbox_config::SandboxConfiguration;
 use sendbox_core::{BoundaryPlanDigest, SessionId};
-use sendbox_protocol::{Capability, CapabilitySet, agent_host_required_capabilities};
+use sendbox_protocol::{CapabilitySet, agent_host_required_capabilities};
 use sendbox_runtime::{
     ContainerId, ControlEndpointKind, RuntimeCapabilities, RuntimeCapability, RuntimeResources,
 };
@@ -169,11 +169,7 @@ impl RunPlan {
         .or_else(|_| ContainerId::new(format!("sendbox-{}", boundary.session_id)))
         .map_err(AgentError::Runtime)?;
         let safe_outputs = configuration.github.safe_outputs.enabled;
-        let required_guest_capabilities = CapabilitySet::new(
-            agent_host_required_capabilities()
-                .iter()
-                .chain(safe_outputs.then_some(Capability::SafeOutputs)),
-        );
+        let required_guest_capabilities = agent_host_required_capabilities();
         Ok(Self {
             verified_boundary_plan: request.boundary_plan,
             resolved_runtime: boundary.selection.selected,

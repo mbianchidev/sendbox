@@ -13,7 +13,6 @@ pub enum RuntimeCapability {
     Mcp,
     Audit,
     Health,
-    SafeOutputs,
     /// Runtime-local ability to provision the selected host/guest transport.
     ///
     /// This capability is deliberately not represented in `sendbox-protocol`.
@@ -46,7 +45,6 @@ impl RuntimeCapability {
             Self::Mcp => Some(Capability::Mcp),
             Self::Audit => Some(Capability::Audit),
             Self::Health => Some(Capability::Health),
-            Self::SafeOutputs => Some(Capability::SafeOutputs),
             Self::TransportProvisioning
             | Self::BrokeredExec
             | Self::InteractiveTerminal
@@ -71,7 +69,6 @@ impl From<Capability> for RuntimeCapability {
             Capability::Mcp => Self::Mcp,
             Capability::Audit => Self::Audit,
             Capability::Health => Self::Health,
-            Capability::SafeOutputs => Self::SafeOutputs,
         }
     }
 }

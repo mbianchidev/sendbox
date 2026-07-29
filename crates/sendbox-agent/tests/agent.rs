@@ -1161,6 +1161,7 @@ async fn protocol_connector_authenticates_over_unix_stream() {
                 boundary_plan_digest,
                 capabilities: sendbox_protocol::agent_host_capabilities(),
                 required_capabilities: sendbox_protocol::agent_host_required_capabilities(),
+                safe_outputs_required: false,
                 bootstrap_secret: vec![7; 32],
                 policy_digest: [9; 32],
             },

@@ -48,9 +48,7 @@ impl GuestConnector for ProtocolGuestConnector {
                 EnvelopeCipher::new(&material, configuration.session_id).map_err(|error| {
                     AgentError::Guest(format!("derive secret envelope key: {error}"))
                 })?;
-            let safe_outputs_required = configuration
-                .required_capabilities
-                .contains(sendbox_protocol::Capability::SafeOutputs);
+            let safe_outputs_required = configuration.safe_outputs_required;
             let handshake = HandshakeConfig::new(
                 configuration.session_id,
                 VersionRange::default(),
