@@ -5,9 +5,9 @@ use sendbox_protocol::{
     GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, INTERACTIVE_LAUNCH_OPERATION,
     INTERACTIVE_LAUNCH_OPERATION_V2, InteractiveLaunchRequestV1, InteractiveLaunchRequestV2,
     LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, ProtocolErrorCode, ProtocolErrorMessage,
-    Request, Response, ResponseStatus, TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1,
-    SAFE_OUTPUTS_COLLECT_OPERATION, SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
-    SafeOutputsCollectRequestV1, SafeOutputsCollectionV1, TerminalStateV1, VersionRange,
+    Request, Response, ResponseStatus, SAFE_OUTPUTS_COLLECT_OPERATION,
+    SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION, SafeOutputsCollectRequestV1, SafeOutputsCollectionV1,
+    TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1, TerminalStateV1, VersionRange,
     agent_guest_capabilities, agent_guest_required_capabilities,
 };
 use sendbox_secrets::{
