@@ -1,20 +1,19 @@
 #![forbid(unsafe_code)]
-//! Production-safe MCP framing, policy, stdio brokering, configuration
-//! validation, and observation processing.
-//!
-//! Authorization in this crate applies only to local stdio MCP servers launched
-//! through the broker. HTTP and SSE data can be represented as observations,
-//! but are never treated as an authorization boundary.
+//! Production-safe MCP framing, policy, stdio brokering, trusted Streamable
+//! HTTP gateway enforcement, configuration validation, and observation
+//! processing.
 
 pub mod artifact;
+pub mod audit;
 pub mod broker;
 pub mod config;
 pub mod error;
 pub mod framing;
+pub mod http_gateway;
 pub mod jsonrpc;
 pub mod observation;
 pub mod policy;
 pub mod runtime;
 pub mod safe_outputs;
 
-pub use error::{BrokerError, ConfigError, FrameError, JsonRpcError, ObservationError};
+pub use error::{AuditError, BrokerError, ConfigError, FrameError, JsonRpcError, ObservationError};

@@ -1277,6 +1277,7 @@ mod tests {
             mounts: Vec::new(),
             environment: Vec::<EnvironmentDeclaration>::new(),
             secrets: Vec::new(),
+            gateway_secrets: Vec::new(),
             artifacts: vec![
                 ArtifactIdentity {
                     kind: ArtifactKind::RuntimeExecutable,

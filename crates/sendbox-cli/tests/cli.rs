@@ -976,6 +976,7 @@ fn boundary_inspection_is_structured_and_never_emits_executable_scripts() {
         "sendbox.boundary-plan-inspection"
     );
     assert_eq!(inspection["generated_executables"], false);
+    assert_eq!(inspection["mcp"]["mode"], "disabled");
     assert_eq!(
         inspection["observer"]["artifact_kind"],
         "sendbox.native-mcp-observer-description"

@@ -191,20 +191,21 @@ everything down.
 
 ## Authenticated production composition
 
-The host derives a schema-v1 `RuntimePolicyDocument` from the authenticated
-session ID and the configured `NetworkPolicy`. Apple and Kata bind that exact
-document into guest bootstrap together with the matching execution broker
-cgroup parent. The guest rejects session or cgroup drift before starting any
-service.
+The host derives a schema-v3 `RuntimePolicyDocument` from the authenticated
+session ID, configured `NetworkPolicy`, any remote MCP origins, and any package
+registry isolation. Apple and Kata bind that exact document into guest bootstrap
+together with the matching execution broker cgroup parent. The guest rejects
+session, cgroup, gateway-port, reserved-origin, registry, or direct-IP-policy
+drift before starting any service.
 
 The guest supervisor makes Egress a mandatory service and makes Exec depend on
 it. The egress supervisor:
 
 1. validates and consumes its root-owned configuration;
 2. recovers the original resolver from root-owned state under `/run/sendbox`;
-3. starts gateway children that bind the public DNS/SOCKS listeners and, when
-   package analysis is configured, the registry-only SOCKS listener, but do not
-   serve yet;
+3. starts gateway children that bind the public DNS/SOCKS listeners, the
+   optional trusted MCP HTTP listener, and the optional registry-only SOCKS
+   listener, but do not serve yet;
 4. arms delegated cgroups and nftables, then places only the gateways in the
    broker cgroup;
 5. starts the npm proxy as UID/GID 65532 in the registry cgroup with cleared
@@ -213,8 +214,10 @@ it. The egress supervisor:
    configuration, and only then publishes readiness.
 
 Workloads receive exact upper- and lower-case `ALL_PROXY`/`NO_PROXY` variables.
-The authenticated MCP broker receives the same fixed proxy environment, so MCP
-servers remain descendants of execution leaves and cannot bypass enforcement.
+The authenticated stdio MCP broker receives the same fixed proxy environment,
+so local servers remain descendants of execution leaves and cannot bypass
+enforcement. The remote MCP gateway remains in the broker cgroup and uses
+marked exact-address dials rather than the agent-facing CONNECT cache.
 Package-enabled workloads also receive upper- and lower-case npm registry and
 `ignore-scripts` variables. The public gateway uses a derived policy that denies
 the configured npm upstream; the trusted registry gateway keeps the original
@@ -254,22 +257,51 @@ agent ──(loopback)──▶ DNS broker ──validate name/CNAME/addr, budge
 agent ──(loopback CONNECT)──▶ CONNECT broker ──pin validated ip, re-check policy──▶
                                     dial (SO_MARK) ──▶ upstream
 
+agent ──(loopback /mcp/<server-id>)──▶ MCP gateway
+       ──separate marked DNS, classify, reserve aliases/addresses, exact-IP dial──▶
+       configured upstream
+
 agent ──(loopback HTTP)──▶ npm proxy ──verify/scan/cache──▶ trusted SOCKS broker
                                                       ──(SO_MARK)──▶ npm upstream
 ```
 
 nftables drops any agent packet that is not headed to a loopback broker port,
-or the optional npm proxy port, and any broker external packet that lacks the
-mark or targets metadata. It drops every registry-cgroup packet except TCP to
-the trusted registry SOCKS port.
+the optional MCP gateway port, or the optional npm proxy port, and any broker
+external packet that lacks the mark or targets metadata. It drops every
+registry-cgroup packet except TCP to the trusted registry SOCKS port.
+
+## Remote MCP reservation and bypass protection
+
+Remote MCP is admitted only through the trusted application-layer gateway.
+Primary and redirect origins are normalized into the signed runtime policy.
+The agent-facing CONNECT broker checks those configured names and observed
+aliases before ordinary domain authorization and denies them first.
+
+While any remote MCP server is configured:
+
+- authenticated egress is mandatory even if the ordinary network policy would
+  otherwise be permissive;
+- nftables admits the exact MCP loopback port in addition to DNS and CONNECT;
+- all agent-facing direct-IP CONNECT is denied, preventing literal-IP and
+  shared-address bypasses;
+- gateway DNS uses a separate marked resolver and never grants authorization in
+  the agent cache;
+- every observed address is classified before reservation or dialing, metadata
+  addresses are always rejected, and reservation updates are bounded and
+  atomic;
+- only the broker cgroup can emit marked upstream packets.
+
+There is no direct-origin fallback if the gateway, DNS validation, TLS,
+reservation update, audit sink, or egress control fails.
 
 ## Policy source of truth
 
-`sendbox_policy::NetworkPolicy` remains authoritative. The crate adds only
-`#[serde(default)]` fields (`allowed_networks`, `blocked_networks`,
-`allowed_ports`, and a nested `dns` block), so every previously valid policy
-document still parses unchanged. `allow_dns = false` binds no DNS broker and
-installs no nftables DNS accept rule.
+`sendbox_policy::NetworkPolicy` remains authoritative for ordinary workload
+egress. The signed runtime document additionally carries policy-derived remote
+MCP origins, the trusted gateway port, and direct-IP denial. These fields must
+exactly match the signed MCP policy. `allow_dns = false` binds no agent-facing
+DNS broker and installs no nftables DNS accept rule; the trusted MCP gateway
+still uses its separate marked resolver when remote MCP is configured.
 
 When package analysis is enabled, `sendbox-egress::runtime` derives a
 workload-facing policy that removes direct access to every configured npm

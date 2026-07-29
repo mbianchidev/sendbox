@@ -35,6 +35,7 @@ use crate::connect_proto::{self, ConnectProtocol, ConnectStatus, ConnectTarget};
 use crate::dialer::Dialer;
 use crate::dns_budget::DnsGuard;
 use crate::domain;
+use crate::origin::OriginReservations;
 use crate::policy::PolicyEngine;
 use crate::resolver::UpstreamResolver;
 use crate::socks5;
@@ -86,6 +87,25 @@ impl Default for ConnectBrokerConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct ConnectAuthorizationState {
+    authorizations: Arc<AuthorizationCache>,
+    reservations: Arc<OriginReservations>,
+}
+
+impl ConnectAuthorizationState {
+    #[must_use]
+    pub fn new(
+        authorizations: Arc<AuthorizationCache>,
+        reservations: Arc<OriginReservations>,
+    ) -> Self {
+        Self {
+            authorizations,
+            reservations,
+        }
+    }
+}
+
 pub struct ConnectBroker<R: UpstreamResolver> {
     policy: Arc<PolicyEngine>,
     resolver: Arc<R>,
@@ -95,6 +115,7 @@ pub struct ConnectBroker<R: UpstreamResolver> {
     audit: Arc<dyn AuditSink>,
     config: ConnectBrokerConfig,
     permits: Arc<Semaphore>,
+    reservations: Arc<OriginReservations>,
 }
 
 impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
@@ -108,16 +129,38 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         audit: Arc<dyn AuditSink>,
         config: ConnectBrokerConfig,
     ) -> Arc<Self> {
+        Self::new_with_authorization_state(
+            policy,
+            resolver,
+            ConnectAuthorizationState::new(authorizations, Arc::new(OriginReservations::default())),
+            guard,
+            dialer,
+            audit,
+            config,
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_authorization_state(
+        policy: Arc<PolicyEngine>,
+        resolver: Arc<R>,
+        authorization_state: ConnectAuthorizationState,
+        guard: Arc<DnsGuard>,
+        dialer: Arc<dyn Dialer>,
+        audit: Arc<dyn AuditSink>,
+        config: ConnectBrokerConfig,
+    ) -> Arc<Self> {
         let permits = Arc::new(Semaphore::new(policy.max_concurrent_connections() as usize));
         Arc::new(Self {
             policy,
             resolver,
-            authorizations,
+            authorizations: authorization_state.authorizations,
             guard,
             dialer,
             audit,
             config,
             permits,
+            reservations: authorization_state.reservations,
         })
     }
 
@@ -375,6 +418,14 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         port: u16,
         expected_ip: Option<IpAddr>,
     ) -> Result<AuthorizedDial, ConnectStatus> {
+        let reserved = match target {
+            ConnectTarget::Hostname(host) => self.reservations.denies_hostname(host, port),
+            ConnectTarget::Ip(address) => self.reservations.denies_direct_ip(*address, port),
+        }
+        .map_err(|_| ConnectStatus::Malformed)?;
+        if reserved {
+            return Err(ConnectStatus::PolicyDenied);
+        }
         let (target_ip, hostname_for_decision) = match target {
             ConnectTarget::Hostname(host) => match self.resolve_pinned(host, expected_ip).await {
                 Ok((normalized, ip)) => (ip, Some(normalized)),

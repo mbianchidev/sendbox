@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -8,6 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::GuestError;
 use sendbox_git::TrustedExecutable;
+use sendbox_mcp::audit::{
+    BoundaryAuditEvent, BoundaryAuditSink, FileAuditSink, MAX_AUDIT_EVENT_BYTES, UnixAuditSink,
+};
 use sendbox_mcp::broker::{
     BrokerCancellation, BrokerConfiguration, BrokerDirection, BrokerObserver, StderrPolicy,
     StdioBroker, TokioProcessLauncher,
@@ -18,11 +21,19 @@ use sendbox_mcp::framing::FramingMode;
 use sendbox_mcp::observation::{
     Direction, ObservationEventV1, ObservationMetadata, ObservationParser, Transport,
 };
-use sendbox_mcp::policy::CompiledToolPolicy;
 use sendbox_mcp::runtime::{
-    NATIVE_POLICY_PATH, OBSERVATION_ROOT, RuntimeObservationConfiguration, RuntimePolicyDocument,
+    NATIVE_AUDIT_SOCKET_PATH, NATIVE_POLICY_PATH, OBSERVATION_ROOT,
+    RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
 use sendbox_mcp::safe_outputs::SAFE_OUTPUTS_MCP_PATH;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
+use tokio::time::{Duration, timeout};
+use tokio_util::sync::CancellationToken;
+
+#[cfg(feature = "execution-broker")]
+use crate::service::{HealthCheck, RestartPolicy, ServiceId, ServiceSpec};
 
 const BOUNDARY_ROOT: &str = "/run/sendbox-boundary";
 const EXIT_DENIED: u8 = 126;
@@ -62,6 +73,9 @@ pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
             "MCP server command is not exactly approved".to_owned(),
         ));
     }
+    let resolved = policy.resolve_stdio(&command).map_err(|error| {
+        GuestError::Runtime(format!("MCP server policy resolution failed: {error}"))
+    })?;
 
     let mut environment = policy.fixed_environment.clone();
     environment.extend(
@@ -71,7 +85,7 @@ pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
             .filter_map(|key| std::env::var(key).ok().map(|value| (key.clone(), value))),
     );
     let launcher = TokioProcessLauncher::new(environment, Some(policy.workspace_root.clone()));
-    let compiled = CompiledToolPolicy::compile(&policy.tool_policy);
+    let compiled = resolved.compile();
     let configuration = BrokerConfiguration {
         client_framing: FramingMode::Auto,
         server_framing: FramingMode::Auto,
@@ -80,7 +94,15 @@ pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
         stderr_policy: StderrPolicy::Inherit,
         ..BrokerConfiguration::default()
     };
-    let mut broker = StdioBroker::new(launcher, approved, command.clone(), compiled, configuration);
+    let audit = Arc::new(UnixAuditSink::new(NATIVE_AUDIT_SOCKET_PATH));
+    let mut broker = StdioBroker::new(
+        launcher,
+        approved,
+        command.clone(),
+        compiled,
+        audit,
+        configuration,
+    );
     if let Some(observation) = &policy.observation {
         broker = broker.with_observer(Arc::new(FileObserver::open(
             observation,
@@ -143,6 +165,12 @@ fn install_with_paths(
         .map_err(|error| GuestError::Runtime(format!("invalid MCP runtime policy: {error}")))?;
     validate_layout(policy, paths)?;
     prepare_root(&paths.root, expected_owner, 0o755, "MCP boundary root")?;
+    prepare_root(
+        &paths.observation_root,
+        expected_owner,
+        0o755,
+        "MCP log root",
+    )?;
 
     let guest_binary = TrustedExecutable::verify(&paths.guest_binary)
         .map_err(|error| GuestError::Runtime(error.to_string()))?;
@@ -182,35 +210,173 @@ fn install_with_paths(
         .and_then(|()| file.sync_all())
         .map_err(|error| GuestError::io("writing MCP policy", error))?;
 
+    create_audit_log(&policy.audit_log_path, expected_owner)?;
     if let Some(observation) = &policy.observation {
-        prepare_root(
-            &paths.observation_root,
-            expected_owner,
-            0o755,
-            "MCP observation root",
-        )?;
-        let log = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o620)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&observation.log_path)
-            .map_err(|error| GuestError::io("creating MCP observation log", error))?;
-        std::os::unix::fs::chown(
-            &observation.log_path,
-            Some(expected_owner),
-            Some(policy.workload_gid),
-        )
-        .map_err(|error| GuestError::io("assigning MCP observation log", error))?;
-        fs::set_permissions(&observation.log_path, fs::Permissions::from_mode(0o620))
-            .map_err(|error| GuestError::io("setting MCP observation log mode", error))?;
-        log.sync_all()
-            .map_err(|error| GuestError::io("syncing MCP observation log", error))?;
+        create_log(&observation.log_path, expected_owner, policy.workload_gid)?;
     }
-
     File::open(&paths.root)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| GuestError::io("syncing MCP boundary root", error))
+}
+
+#[must_use]
+#[cfg(feature = "execution-broker")]
+pub fn audit_service() -> ServiceSpec {
+    ServiceSpec {
+        id: ServiceId::Audit,
+        dependencies: Vec::new(),
+        executable: PathBuf::from("bin/sendbox-guest"),
+        args: vec![
+            "mcp-audit".to_owned(),
+            "--policy".to_owned(),
+            NATIVE_POLICY_PATH.to_owned(),
+        ],
+        mandatory: true,
+        restart: RestartPolicy::default(),
+        health: HealthCheck::UnixSocket {
+            path: PathBuf::from(NATIVE_AUDIT_SOCKET_PATH),
+            timeout_ms: 30_000,
+        },
+        graceful_shutdown_ms: 5_000,
+        forced_shutdown_ms: 2_000,
+        max_log_bytes: 256 * 1024,
+    }
+}
+
+pub async fn run_audit_service(policy_path: PathBuf) -> Result<(), GuestError> {
+    let policy = read_policy(&policy_path)?;
+    policy
+        .validate()
+        .map_err(|error| GuestError::Runtime(format!("invalid MCP runtime policy: {error}")))?;
+    validate_regular_file(
+        &policy.audit_log_path,
+        0,
+        Some(0),
+        false,
+        "MCP boundary audit log",
+    )?;
+    let sink = Arc::new(
+        FileAuditSink::open(&policy.audit_log_path)
+            .map_err(|error| GuestError::Runtime(format!("opening MCP audit log: {error}")))?,
+    );
+    let socket_path = Path::new(NATIVE_AUDIT_SOCKET_PATH);
+    remove_socket(socket_path)?;
+    let listener = UnixListener::bind(socket_path)
+        .map_err(|error| GuestError::io("binding MCP audit socket", error))?;
+    std::os::unix::fs::chown(socket_path, Some(0), Some(policy.workload_gid))
+        .map_err(|error| GuestError::io("assigning MCP audit socket", error))?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o620))
+        .map_err(|error| GuestError::io("setting MCP audit socket mode", error))?;
+
+    let fatal = CancellationToken::new();
+    let permits = Arc::new(Semaphore::new(64));
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| GuestError::io("installing MCP audit SIGTERM handler", error))?;
+    loop {
+        tokio::select! {
+            () = fatal.cancelled() => {
+                return Err(GuestError::Runtime(
+                    "MCP audit writer failed closed".to_owned(),
+                ));
+            }
+            _ = terminate.recv() => {
+                remove_socket(socket_path)?;
+                return Ok(());
+            }
+            accepted = listener.accept() => {
+                let (stream, _) =
+                    accepted.map_err(|error| GuestError::io("accepting MCP audit event", error))?;
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    eprintln!("[sendbox-mcp-audit] connection capacity exceeded");
+                    continue;
+                };
+                let sink = Arc::clone(&sink);
+                let fatal = fatal.clone();
+                tokio::spawn(async move {
+                    let result = timeout(
+                        Duration::from_secs(2),
+                        handle_audit_client(stream, sink),
+                    )
+                    .await;
+                    drop(permit);
+                    if let Err(error) = result
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "MCP audit client timed out",
+                            )
+                        })
+                        .and_then(|result| result)
+                    {
+                        eprintln!("[sendbox-mcp-audit] {error}");
+                        if error.kind() == std::io::ErrorKind::Other {
+                            fatal.cancel();
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn handle_audit_client(
+    mut stream: UnixStream,
+    sink: Arc<FileAuditSink>,
+) -> Result<(), std::io::Error> {
+    let mut length = [0_u8; 4];
+    match stream.read_exact(&mut length).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let length = usize::try_from(u32::from_be_bytes(length)).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid audit length")
+    })?;
+    if length == 0 || length > MAX_AUDIT_EVENT_BYTES {
+        stream.write_all(&[0]).await?;
+        return Ok(());
+    }
+    let mut encoded = vec![0_u8; length];
+    stream.read_exact(&mut encoded).await?;
+    let event = match serde_json::from_slice::<BoundaryAuditEvent>(&encoded) {
+        Ok(event) if event.schema_version == 1 => event,
+        Ok(_) | Err(_) => {
+            stream.write_all(&[0]).await?;
+            return Ok(());
+        }
+    };
+    sink.record(&event)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    stream.write_all(&[1]).await
+}
+
+fn remove_socket(path: &Path) -> Result<(), GuestError> {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)
+            .map_err(|error| GuestError::io("removing stale MCP audit socket", error)),
+        Ok(_) => Err(GuestError::Runtime(
+            "MCP audit socket path is occupied by an untrusted file".to_owned(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(GuestError::io("inspecting MCP audit socket", error)),
+    }
+}
+
+fn create_audit_log(path: &Path, expected_owner: u32) -> Result<(), GuestError> {
+    let log = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| GuestError::io("creating MCP boundary audit log", error))?;
+    std::os::unix::fs::chown(path, Some(expected_owner), Some(expected_owner))
+        .map_err(|error| GuestError::io("assigning MCP boundary audit log", error))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| GuestError::io("setting MCP boundary audit log mode", error))?;
+    log.sync_all()
+        .map_err(|error| GuestError::io("syncing MCP boundary audit log", error))
 }
 
 fn validate_layout(policy: &RuntimePolicyDocument, paths: &InstallPaths) -> Result<(), GuestError> {
@@ -223,8 +389,10 @@ fn validate_layout(policy: &RuntimePolicyDocument, paths: &InstallPaths) -> Resu
         || paths.wrapper == paths.safe_outputs_wrapper
         || !paths.guest_binary.is_absolute()
         || !paths.observation_root.is_absolute()
+        || policy.audit_log_path.parent() != Some(paths.observation_root.as_path())
         || policy.observation.as_ref().is_some_and(|observation| {
             observation.log_path.parent() != Some(paths.observation_root.as_path())
+                || observation.log_path == policy.audit_log_path
         })
     {
         return Err(GuestError::Runtime(
@@ -240,6 +408,22 @@ fn validate_layout(policy: &RuntimePolicyDocument, paths: &InstallPaths) -> Resu
         ));
     }
     Ok(())
+}
+
+fn create_log(path: &Path, expected_owner: u32, workload_gid: u32) -> Result<(), GuestError> {
+    let log = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o620)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| GuestError::io("creating MCP boundary log", error))?;
+    std::os::unix::fs::chown(path, Some(expected_owner), Some(workload_gid))
+        .map_err(|error| GuestError::io("assigning MCP boundary log", error))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o620))
+        .map_err(|error| GuestError::io("setting MCP boundary log mode", error))?;
+    log.sync_all()
+        .map_err(|error| GuestError::io("syncing MCP boundary log", error))
 }
 
 fn prepare_root(
@@ -455,7 +639,9 @@ mod tests {
                 max_frame_bytes: 4096,
                 server_command_patterns: Vec::new(),
                 allowed_server_commands: vec![vec!["/bin/echo".to_owned()]],
+                servers: BTreeMap::new(),
             },
+            audit_log_path: PathBuf::from("/var/log/sendbox/boundary.log"),
             fixed_environment: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
             inherited_environment_keys: BTreeSet::new(),
             observation: None,

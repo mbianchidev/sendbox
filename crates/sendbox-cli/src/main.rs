@@ -783,46 +783,56 @@ fn print_policy(policy: &sendbox_policy::PolicyConfiguration) {
     println!("Boundary Policy:");
     println!("  Enabled:        {}", policy.boundaries.enabled);
     println!(
-        "  MCP transport:  {}",
-        match policy.boundaries.tool_calls.transport {
-            sendbox_policy::ToolTransport::Stdio => "stdio",
-        }
-    );
-    println!(
-        "  Tool default:    {}",
-        action_name(policy.boundaries.tool_calls.default_action)
-    );
-    println!(
         "  Max frame bytes: {}",
         policy.boundaries.tool_calls.max_frame_bytes
     );
     println!("  Log path:       {}", policy.boundaries.log_path);
-    print_list(
-        "  Tool allowlist:",
-        "+",
-        &policy.boundaries.tool_calls.allowlist,
-    );
-    print_list(
-        "  Tool denylist:",
-        "-",
-        &policy.boundaries.tool_calls.denylist,
-    );
+    match sendbox_mcp::artifact::McpBoundaryInspection::from_policy(&policy.boundaries.tool_calls) {
+        Ok(inspection) => {
+            println!("  MCP policy mode: {}", inspection.mode);
+            for server in inspection.servers {
+                println!(
+                    "  MCP server {}: {} ({})",
+                    server.server_policy_id,
+                    transport_name(server.transport),
+                    server.fingerprint
+                );
+                if let Some(executable) = server.executable {
+                    println!("    Executable: {executable}");
+                }
+                if let Some(endpoint) = server.normalized_endpoint {
+                    println!("    Endpoint: {endpoint}");
+                }
+                if let Some(gateway) = server.local_gateway_url {
+                    println!("    Local gateway: {gateway}");
+                }
+                if let Some(http) = server.http {
+                    println!(
+                        "    HTTP limits: request={} response={} concurrent={}",
+                        http.max_request_bytes,
+                        http.max_response_bytes,
+                        http.max_concurrent_requests
+                    );
+                    println!(
+                        "    Redirects: {} (max {})",
+                        http.allow_redirects, http.max_redirects
+                    );
+                }
+                println!(
+                    "    Tool default: {}",
+                    action_name(server.tools.default_action)
+                );
+                print_list("    Tool allowlist:", "+", &server.tools.allowlist);
+                print_list("    Tool denylist:", "-", &server.tools.denylist);
+            }
+        }
+        Err(error) => eprintln!("  MCP policy inspection failed: {error}"),
+    }
     print_list(
         "  Additional denied syscalls:",
         "-",
         &policy.boundaries.syscalls.additional_denylist,
     );
-    if !policy
-        .boundaries
-        .tool_calls
-        .allowed_server_commands
-        .is_empty()
-    {
-        println!("  Allowed MCP server commands:");
-        for command in &policy.boundaries.tool_calls.allowed_server_commands {
-            println!("    + {}", command.join(" "));
-        }
-    }
 }
 
 fn print_list(heading: &str, marker: &str, values: &[String]) {
@@ -839,6 +849,14 @@ fn action_name(action: sendbox_policy::Action) -> &'static str {
     match action {
         sendbox_policy::Action::Allow => "allow",
         sendbox_policy::Action::Deny => "deny",
+    }
+}
+
+fn transport_name(transport: sendbox_policy::ToolTransport) -> &'static str {
+    match transport {
+        sendbox_policy::ToolTransport::Stdio => "stdio",
+        sendbox_policy::ToolTransport::StreamableHttp => "streamable-http",
+        sendbox_policy::ToolTransport::StreamableHttp2025 => "streamable-http-2025",
     }
 }
 

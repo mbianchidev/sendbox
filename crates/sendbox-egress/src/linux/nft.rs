@@ -105,6 +105,9 @@ pub struct NftConfig {
     /// the policy disables DNS (`allow_dns = false`), in which case no DNS
     /// accept rule is emitted at all.
     pub dns_broker_port: Option<u16>,
+    /// The loopback HTTP MCP gateway port, or `None` when no remote MCP server
+    /// is configured.
+    pub mcp_gateway_port: Option<u16>,
     /// Workload-facing registry proxy port and registry-only trusted SOCKS port.
     /// Both are configured together or both omitted.
     pub registry_proxy_tcp_port: Option<u16>,
@@ -164,6 +167,9 @@ impl NftConfig {
         if let Some(port) = self.dns_broker_port {
             ports.push(port);
         }
+        if let Some(port) = self.mcp_gateway_port {
+            ports.push(port);
+        }
         if let Some(port) = self.registry_proxy_tcp_port {
             ports.push(port);
         }
@@ -215,6 +221,9 @@ impl NftConfig {
             self.push_loopback_accept(&mut out, "    iif lo", "udp", dns_port);
             self.push_loopback_accept(&mut out, "    iif lo", "tcp", dns_port);
         }
+        if let Some(mcp_port) = self.mcp_gateway_port {
+            self.push_loopback_accept(&mut out, "    iif lo", "tcp", mcp_port);
+        }
         if let Some(proxy_port) = self.registry_proxy_tcp_port {
             self.push_loopback_accept(&mut out, "    iif lo", "tcp", proxy_port);
         }
@@ -241,6 +250,9 @@ impl NftConfig {
         if let Some(dns_port) = self.dns_broker_port {
             self.push_cgroup_loopback_accept(&mut out, &agent, "udp", dns_port);
             self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", dns_port);
+        }
+        if let Some(mcp_port) = self.mcp_gateway_port {
+            self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", mcp_port);
         }
         if let Some(proxy_port) = self.registry_proxy_tcp_port {
             self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", proxy_port);
@@ -487,6 +499,7 @@ mod tests {
             broker_mark: 0x5b0e,
             connect_broker_tcp_port: 15080,
             dns_broker_port: Some(15053),
+            mcp_gateway_port: Some(15082),
             registry_proxy_tcp_port: Some(14873),
             trusted_registry_tcp_port: Some(15081),
             metadata_v4_addresses: crate::address::METADATA_V4_ADDRESSES.to_vec(),
@@ -532,6 +545,12 @@ mod tests {
         ));
         assert!(text.contains(
             "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip daddr 127.0.0.1 udp dport 15053 accept"
+        ));
+        assert!(text.contains(
+            "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip daddr 127.0.0.1 tcp dport 15082 accept"
+        ));
+        assert!(text.contains(
+            "socket cgroupv2 level 3 \"sendbox/inst01/agent\" ip6 daddr ::1 tcp dport 15082 accept"
         ));
         // The agent identity never gets a blanket accept.
         assert!(!text.contains("\"sendbox/inst01/agent\" meta mark"));
@@ -670,6 +689,13 @@ mod tests {
         let mut zero = config();
         zero.broker_mark = 0;
         assert!(matches!(zero.validate(), Err(NftError::ZeroMark)));
+
+        let mut duplicate_port = config();
+        duplicate_port.mcp_gateway_port = Some(duplicate_port.connect_broker_tcp_port);
+        assert!(matches!(
+            duplicate_port.validate(),
+            Err(NftError::InvalidPortConfiguration)
+        ));
 
         let mut iface = config();
         iface.fixture_iface = Some("bad iface".to_owned());

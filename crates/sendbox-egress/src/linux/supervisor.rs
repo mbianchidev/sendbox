@@ -42,6 +42,8 @@ pub struct SupervisorConfig {
     pub connect_port: u16,
     /// Loopback DNS broker port, or `None` when the policy disables DNS.
     pub dns_port: Option<u16>,
+    /// Loopback HTTP MCP gateway port.
+    pub mcp_gateway_port: Option<u16>,
     /// Optional workload-facing package proxy and registry-only trusted SOCKS.
     pub registry_proxy_port: Option<u16>,
     pub trusted_registry_port: Option<u16>,
@@ -70,6 +72,7 @@ impl SupervisorConfig {
             broker_mark,
             connect_port,
             dns_port: None,
+            mcp_gateway_port: None,
             registry_proxy_port: None,
             trusted_registry_port: None,
             metadata_v4: crate::address::METADATA_V4_ADDRESSES.to_vec(),
@@ -83,6 +86,12 @@ impl SupervisorConfig {
     #[must_use]
     pub fn with_dns_port(mut self, port: u16) -> Self {
         self.dns_port = Some(port);
+        self
+    }
+
+    #[must_use]
+    pub fn with_mcp_gateway_port(mut self, port: u16) -> Self {
+        self.mcp_gateway_port = Some(port);
         self
     }
 
@@ -120,6 +129,7 @@ impl SupervisorConfig {
             broker_mark: self.broker_mark,
             connect_broker_tcp_port: self.connect_port,
             dns_broker_port: self.dns_port,
+            mcp_gateway_port: self.mcp_gateway_port,
             registry_proxy_tcp_port: self.registry_proxy_port,
             trusted_registry_tcp_port: self.trusted_registry_port,
             metadata_v4_addresses: self.metadata_v4.clone(),

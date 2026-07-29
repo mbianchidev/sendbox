@@ -9,6 +9,7 @@ use sendbox_config::{
     SAFE_OUTPUTS_MAX_ARTIFACT_BYTES, SafeOutputsConfiguration,
 };
 use sendbox_core::{BoundaryPlanDigest, SessionId, glob_matches};
+use sendbox_policy::{Action, McpServerPolicy, ServerToolPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -19,6 +20,7 @@ use url::Url;
 use crate::jsonrpc::{IdPresence, MessageKind, validate_message};
 
 pub const SAFE_OUTPUTS_SCHEMA_VERSION: u32 = 1;
+pub const SAFE_OUTPUTS_SERVER_ID: &str = "sendbox-safe-outputs";
 pub const SAFE_OUTPUTS_MCP_PATH: &str = "/run/sendbox-boundary/safe-outputs-mcp";
 pub const SAFE_OUTPUTS_RUNTIME_ROOT: &str = "/run/sendbox-safe-outputs";
 pub const MAX_SAFE_OUTPUTS_FRAME_BYTES: usize = 96 * 1024;
@@ -221,6 +223,22 @@ impl SafeOutputsRuntimePolicy {
             SafeOutputTool::ReportIncomplete,
         ]);
         tools
+    }
+
+    #[must_use]
+    pub fn mcp_server_policy(&self) -> McpServerPolicy {
+        McpServerPolicy::Stdio {
+            command: vec![SAFE_OUTPUTS_MCP_PATH.to_owned()],
+            tools: ServerToolPolicy {
+                default_action: Action::Deny,
+                allowlist: self
+                    .enabled_tools()
+                    .into_iter()
+                    .map(|tool| tool.name().to_owned())
+                    .collect(),
+                denylist: Vec::new(),
+            },
+        }
     }
 
     #[must_use]

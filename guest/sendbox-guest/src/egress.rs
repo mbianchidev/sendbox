@@ -13,16 +13,21 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
+use std::str;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", test))]
 use rustix::fs::{Mode, OFlags, open};
-use sendbox_bootstrap::RegistryProxyConfiguration;
+use sendbox_bootstrap::{GatewayCredential, RegistryProxyConfiguration};
 use sendbox_core::SessionId;
 #[cfg(any(target_os = "linux", test))]
 use sendbox_egress::address::{AddressClass, classify};
 use sendbox_egress::runtime::RuntimePolicyDocument;
+use sendbox_mcp::runtime::RuntimePolicyDocument as McpRuntimePolicyDocument;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use zeroize::Zeroizing;
 
 use crate::GuestError;
 use crate::service::{HealthCheck, RestartPolicy, ServiceId, ServiceSpec};
@@ -45,6 +50,8 @@ const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 struct SupervisorProcessConfiguration {
     session_id: SessionId,
     policy: RuntimePolicyDocument,
+    mcp_policy: Option<McpRuntimePolicyDocument>,
+    gateway_credentials: Vec<GatewayCredential>,
     registry: Option<RegistryProxyConfiguration>,
     readiness_socket: PathBuf,
     workload_control_socket: PathBuf,
@@ -58,6 +65,8 @@ struct SupervisorProcessConfiguration {
 struct GatewayProcessConfiguration {
     policy: RuntimePolicyDocument,
     role: GatewayRole,
+    mcp_policy: Option<McpRuntimePolicyDocument>,
+    gateway_credentials: Vec<GatewayCredential>,
     upstream: SocketAddr,
     control_socket: PathBuf,
     control_token: String,
@@ -112,11 +121,15 @@ pub fn prepare(
     session_dir: &Path,
     session_id: SessionId,
     policy: RuntimePolicyDocument,
+    mcp_policy: Option<McpRuntimePolicyDocument>,
+    gateway_credentials: Vec<GatewayCredential>,
     registry: Option<RegistryProxyConfiguration>,
 ) -> Result<ServiceSpec, GuestError> {
     policy
         .validate()
         .map_err(|error| GuestError::Runtime(format!("invalid egress policy: {error}")))?;
+    let mcp_policy = mcp_policy.filter(|policy| policy.tool_policy.has_remote_servers());
+    validate_mcp_gateway_configuration(&policy, mcp_policy.as_ref(), &gateway_credentials)?;
     let readiness_socket = session_dir.join("egress-ready.sock");
     let workload_control_socket = session_dir.join("egress-workload-control.sock");
     let trusted_control_socket = registry
@@ -131,6 +144,8 @@ pub fn prepare(
         &SupervisorProcessConfiguration {
             session_id,
             policy,
+            mcp_policy,
+            gateway_credentials,
             registry,
             readiness_socket: readiness_socket.clone(),
             workload_control_socket,
@@ -189,6 +204,11 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
         .policy
         .validate()
         .map_err(|error| GuestError::Runtime(format!("invalid egress policy: {error}")))?;
+    validate_mcp_gateway_configuration(
+        &config.policy,
+        config.mcp_policy.as_ref(),
+        &config.gateway_credentials,
+    )?;
     validate_runtime_paths(
         &config_path,
         &config.readiness_socket,
@@ -229,6 +249,8 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
         &GatewayProcessConfiguration {
             policy: config.policy.clone(),
             role: GatewayRole::Workload,
+            mcp_policy: config.mcp_policy.clone(),
+            gateway_credentials: config.gateway_credentials.clone(),
             upstream: resolver.upstream,
             control_socket: config.workload_control_socket.clone(),
             control_token: workload_token.clone(),
@@ -253,6 +275,8 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
             &GatewayProcessConfiguration {
                 policy: config.policy.clone(),
                 role: GatewayRole::Registry,
+                mcp_policy: None,
+                gateway_credentials: Vec::new(),
                 upstream: resolver.upstream,
                 control_socket: trusted_control_socket.clone(),
                 control_token: trusted_token.clone(),
@@ -354,6 +378,9 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
         .clone_from(&config.policy.table_name);
     if let Some(port) = config.policy.dns_port {
         supervisor_config = supervisor_config.with_dns_port(port);
+    }
+    if let Some(port) = config.policy.mcp_gateway_port {
+        supervisor_config = supervisor_config.with_mcp_gateway_port(port);
     }
     if let Some(registry) = &config.policy.registry {
         supervisor_config = supervisor_config
@@ -704,8 +731,15 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
     use sendbox_egress::forwarding_resolver::{ForwardingResolver, ForwardingResolverConfig};
     use sendbox_egress::gateway::{Gateway, GatewayConfig, GatewayListeners};
     use sendbox_egress::linux::mark::MarkDialer;
+    use sendbox_egress::origin::OriginReservations;
     use sendbox_egress::policy::PolicyEngine;
-    use tokio::net::UnixListener;
+    use sendbox_mcp::audit::UnixAuditSink;
+    use sendbox_mcp::http_gateway::{
+        ExactUpstreamClient, GatewayCredentialSet, HttpGateway, HttpGatewayError,
+        OriginReservation, OriginResolution,
+    };
+    use sendbox_mcp::runtime::{HttpEndpoint, NATIVE_AUDIT_SOCKET_PATH};
+    use tokio::net::{TcpListener, UnixListener};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
@@ -716,6 +750,20 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
         .policy
         .validate()
         .map_err(|error| GuestError::Runtime(format!("invalid gateway policy: {error}")))?;
+    match config.role {
+        GatewayRole::Workload => validate_mcp_gateway_configuration(
+            &config.policy,
+            config.mcp_policy.as_ref(),
+            &config.gateway_credentials,
+        )?,
+        GatewayRole::Registry => {
+            if config.mcp_policy.is_some() || !config.gateway_credentials.is_empty() {
+                return Err(GuestError::Runtime(
+                    "trusted registry gateway cannot receive MCP policy or credentials".to_owned(),
+                ));
+            }
+        }
+    }
     validate_control_token(&config.control_token)?;
     remove_socket_if_present(&config.control_socket)?;
 
@@ -744,6 +792,15 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
     let listeners = GatewayListeners::bind(dns_addr, connect_addr)
         .await
         .map_err(|error| GuestError::io("binding egress gateway listeners", error))?;
+    let mcp_listener = match (config.role, config.policy.mcp_gateway_port) {
+        (GatewayRole::Registry, _) => None,
+        (GatewayRole::Workload, Some(port)) => Some(
+            TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)))
+                .await
+                .map_err(|error| GuestError::io("binding HTTP MCP gateway listener", error))?,
+        ),
+        (GatewayRole::Workload, None) => None,
+    };
     let control_listener = UnixListener::bind(&config.control_socket)
         .map_err(|error| GuestError::io("binding gateway control socket", error))?;
     fs::set_permissions(&config.control_socket, fs::Permissions::from_mode(0o600))
@@ -781,6 +838,14 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
     let resolver = Arc::new(ForwardingResolver::new(
         ForwardingResolverConfig::new(config.upstream).with_socket_mark(config.policy.broker_mark),
     ));
+    let reserved_origins = match config.role {
+        GatewayRole::Workload => config.policy.reserved_mcp_origins.as_slice(),
+        GatewayRole::Registry => &[],
+    };
+    let reservations = Arc::new(
+        OriginReservations::new(reserved_origins)
+            .map_err(|error| GuestError::Runtime(format!("reserve MCP origins: {error}")))?,
+    );
     let gateway = Gateway::new(
         engine,
         resolver,
@@ -791,19 +856,105 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
                 frontend: ConnectFrontend::Socks5,
                 ..ConnectBrokerConfig::default()
             },
+            origin_reservations: Arc::clone(&reservations),
             ..GatewayConfig::default()
         },
     );
+    let http_gateway = match (config.mcp_policy, mcp_listener) {
+        (Some(policy), Some(listener)) => {
+            struct ReservationAdapter {
+                reservations: Arc<OriginReservations>,
+            }
+
+            #[async_trait::async_trait]
+            impl OriginReservation for ReservationAdapter {
+                async fn reserve(
+                    &self,
+                    _server_id: &str,
+                    endpoint: &HttpEndpoint,
+                    resolution: &OriginResolution,
+                ) -> Result<(), HttpGatewayError> {
+                    self.reservations
+                        .reserve_resolution(
+                            &endpoint.host,
+                            endpoint.port,
+                            &resolution.aliases,
+                            &resolution.addresses,
+                        )
+                        .map_err(|error| HttpGatewayError::Upstream(error.to_string()))
+                }
+            }
+
+            let values = config
+                .gateway_credentials
+                .into_iter()
+                .map(|credential| {
+                    str::from_utf8(credential.expose_secret())
+                        .map(|value| (credential.name.clone(), Zeroizing::new(value.to_owned())))
+                        .map_err(|_| {
+                            GuestError::Runtime(format!(
+                                "gateway credential '{}' is not UTF-8",
+                                credential.name
+                            ))
+                        })
+                })
+                .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+            let gateway_resolver = Arc::new(ForwardingResolver::new(
+                ForwardingResolverConfig::new(config.upstream)
+                    .with_socket_mark(config.policy.broker_mark),
+            ));
+            let upstream = Arc::new(ExactUpstreamClient::new(
+                gateway_resolver,
+                Arc::new(MarkDialer::new(config.policy.broker_mark)),
+                Arc::new(ReservationAdapter {
+                    reservations: Arc::clone(&reservations),
+                }),
+            ));
+            let gateway = Arc::new(
+                HttpGateway::new(
+                    &policy,
+                    GatewayCredentialSet::from_secret_values(values),
+                    upstream,
+                    Arc::new(UnixAuditSink::new(NATIVE_AUDIT_SOCKET_PATH)),
+                )
+                .map_err(|error| {
+                    GuestError::Runtime(format!("configure HTTP MCP gateway: {error}"))
+                })?,
+            );
+            Some((gateway, listener))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(GuestError::Runtime(
+                "HTTP MCP policy and listener configuration drifted".to_owned(),
+            ));
+        }
+    };
     let cancellation = CancellationToken::new();
     let gateway_cancellation = cancellation.clone();
     let mut gateway_task =
         tokio::spawn(async move { gateway.serve(listeners, gateway_cancellation).await });
+    let mut http_task = http_gateway.map(|(gateway, listener)| {
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move { gateway.serve(listener, cancellation).await })
+    });
     tokio::task::yield_now().await;
     if gateway_task.is_finished() {
         return gateway_task
             .await
             .map_err(|error| GuestError::Runtime(format!("gateway task failed: {error}")))?
             .map_err(|error| GuestError::io("serving egress gateway", error));
+    }
+    if http_task
+        .as_ref()
+        .is_some_and(tokio::task::JoinHandle::is_finished)
+    {
+        return http_task
+            .take()
+            .expect("HTTP task exists")
+            .await
+            .map_err(|error| GuestError::Runtime(format!("HTTP MCP task failed: {error}")))?
+            .map_err(|error| GuestError::Runtime(format!("serving HTTP MCP gateway: {error}")));
     }
     write_control(
         &mut control,
@@ -815,20 +966,40 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .map_err(|error| GuestError::io("installing gateway SIGTERM handler", error))?;
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut gateway_task => {
             result
                 .map_err(|error| GuestError::Runtime(format!("gateway task failed: {error}")))?
                 .map_err(|error| GuestError::io("serving egress gateway", error))
         }
+        result = async {
+            match http_task.as_mut() {
+                Some(task) => task.await,
+                None => std::future::pending().await,
+            }
+        } => {
+            result
+                .map_err(|error| GuestError::Runtime(format!("HTTP MCP task failed: {error}")))?
+                .map_err(|error| GuestError::Runtime(format!("serving HTTP MCP gateway: {error}")))
+        }
         _ = terminate.recv() => {
             cancellation.cancel();
-            gateway_task
+            let egress_result = gateway_task
                 .await
                 .map_err(|error| GuestError::Runtime(format!("gateway task failed: {error}")))?
-                .map_err(|error| GuestError::io("stopping egress gateway", error))
+                .map_err(|error| GuestError::io("stopping egress gateway", error));
+            if let Some(task) = http_task {
+                task.await
+                    .map_err(|error| GuestError::Runtime(format!("HTTP MCP task failed: {error}")))?
+                    .map_err(|error| {
+                        GuestError::Runtime(format!("stopping HTTP MCP gateway: {error}"))
+                    })?;
+            }
+            egress_result
         }
-    }
+    };
+    cancellation.cancel();
+    result
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -836,6 +1007,57 @@ pub async fn run_gateway(_config_path: PathBuf) -> Result<(), GuestError> {
     Err(GuestError::Runtime(
         "production egress gateway requires Linux".to_owned(),
     ))
+}
+
+fn validate_mcp_gateway_configuration(
+    egress: &RuntimePolicyDocument,
+    mcp: Option<&McpRuntimePolicyDocument>,
+    credentials: &[GatewayCredential],
+) -> Result<(), GuestError> {
+    let remote = mcp
+        .map(|policy| {
+            policy
+                .validate()
+                .map_err(|error| GuestError::Runtime(format!("invalid MCP policy: {error}")))?;
+            policy
+                .remote_servers()
+                .map_err(|error| GuestError::Runtime(format!("invalid remote MCP policy: {error}")))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let remote_mcp_active = !remote.is_empty();
+    let expected_origins = mcp
+        .map(|policy| policy.tool_policy.remote_origins())
+        .transpose()
+        .map_err(|error| GuestError::Runtime(format!("invalid MCP origins: {error}")))?
+        .unwrap_or_default();
+    let configured_origins = egress
+        .reserved_mcp_origins
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if configured_origins.len() != egress.reserved_mcp_origins.len()
+        || configured_origins != expected_origins
+        || egress.mcp_gateway_port.is_some() != remote_mcp_active
+        || egress.deny_direct_ip != remote_mcp_active
+    {
+        return Err(GuestError::Runtime(
+            "signed egress MCP reservations do not match the MCP policy".to_owned(),
+        ));
+    }
+    let names = credentials
+        .iter()
+        .map(|credential| credential.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_names = mcp
+        .map(|policy| policy.tool_policy.gateway_secret_names())
+        .unwrap_or_default();
+    if names.len() != credentials.len() || names != expected_names {
+        return Err(GuestError::Runtime(
+            "gateway credentials do not exactly match the MCP policy".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1554,6 +1776,84 @@ fn require_root_cgroup_namespace() -> Result<(), GuestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sendbox_core::SessionId;
+    use sendbox_policy::{Action, McpHttpPolicy, McpServerPolicy, NetworkPolicy, ToolCallPolicy};
+
+    fn mcp_gateway_policies() -> (RuntimePolicyDocument, McpRuntimePolicyDocument) {
+        let tool_policy = ToolCallPolicy {
+            servers: std::collections::BTreeMap::from([
+                (
+                    "alpha".to_owned(),
+                    McpServerPolicy::StreamableHttp {
+                        url: "https://alpha.example/mcp".to_owned(),
+                        tools: Default::default(),
+                        http: McpHttpPolicy::default(),
+                    },
+                ),
+                (
+                    "beta".to_owned(),
+                    McpServerPolicy::StreamableHttp {
+                        url: "https://beta.example/mcp".to_owned(),
+                        tools: Default::default(),
+                        http: McpHttpPolicy::default(),
+                    },
+                ),
+            ]),
+            ..ToolCallPolicy::default()
+        };
+        let egress = RuntimePolicyDocument::for_session_with_mcp(
+            SessionId::from_bytes([42; 16]),
+            NetworkPolicy {
+                default_action: Action::Deny,
+                allowed_domains: Vec::new(),
+                blocked_domains: Vec::new(),
+                allow_dns: true,
+                max_connections: None,
+                allowed_networks: Vec::new(),
+                blocked_networks: Vec::new(),
+                allowed_ports: Vec::new(),
+                dns: Default::default(),
+            },
+            Some(&tool_policy),
+        )
+        .expect("egress policy");
+        let mcp = McpRuntimePolicyDocument {
+            schema_version: sendbox_mcp::runtime::RUNTIME_POLICY_SCHEMA_VERSION,
+            workspace_root: PathBuf::from("/workspace"),
+            workload_uid: 1000,
+            workload_gid: 1000,
+            tool_policy,
+            audit_log_path: PathBuf::from(sendbox_mcp::runtime::DEFAULT_AUDIT_LOG_PATH),
+            fixed_environment: Default::default(),
+            inherited_environment_keys: Default::default(),
+            observation: None,
+            safe_outputs: None,
+        };
+        (egress, mcp)
+    }
+
+    #[test]
+    fn mcp_gateway_validation_accepts_reordered_reserved_origins() {
+        let (mut egress, mcp) = mcp_gateway_policies();
+        egress.reserved_mcp_origins.reverse();
+
+        validate_mcp_gateway_configuration(&egress, Some(&mcp), &[])
+            .expect("origin order must not affect policy equivalence");
+    }
+
+    #[test]
+    fn mcp_gateway_validation_rejects_different_reserved_origins() {
+        let (mut egress, mcp) = mcp_gateway_policies();
+        egress.reserved_mcp_origins.pop();
+
+        let error = validate_mcp_gateway_configuration(&egress, Some(&mcp), &[])
+            .expect_err("origin drift must remain fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("signed egress MCP reservations do not match")
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn registry_configuration(root: &Path) -> RegistryProxyConfiguration {

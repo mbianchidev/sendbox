@@ -68,11 +68,13 @@ evidence covers repository/workspace identity, aliases, options, remote
 rewrites, refspecs, timeouts, output limits, environment/config injection,
 trusted binary paths, and native exit preservation.
 
-`mcp.contracts` records native framing, JSON-RPC, policy, exact-command,
-project-validation, authenticated guest delivery, legacy-trace,
-versioned-observation, redaction, backpressure, and cancellation contracts.
-Remote HTTP/SSE authorization remains intentionally unsupported and fails
-closed.
+`mcp.contracts` records native framing, JSON-RPC, hierarchical per-server
+policy, exact-command and exact-gateway project validation, authenticated guest
+delivery, modern Streamable HTTP, explicit 2025 session compatibility, TLS/DNS
+destination checks, redirects, credentials, egress bypass protection,
+legacy-trace, versioned observation, redaction, backpressure, cancellation, and
+fail-closed audit contracts. Legacy 2024 HTTP+SSE remains intentionally
+unsupported.
 
 ## Benchmark gate
 

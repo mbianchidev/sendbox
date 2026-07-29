@@ -1,17 +1,19 @@
 //! Authenticated production runtime policy for guest egress enforcement.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use sendbox_core::SessionId;
-use sendbox_policy::{Action, DnsPolicy, NetworkPolicy};
+use sendbox_policy::{
+    Action, DEFAULT_MCP_HTTP_GATEWAY_PORT, DnsPolicy, McpHttpOrigin, NetworkPolicy, ToolCallPolicy,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::policy::{PolicyEngine, PolicyError};
 
-pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 2;
+pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_CONNECT_PORT: u16 = 15_080;
 pub const DEFAULT_DNS_PORT: u16 = 53;
 pub const DEFAULT_REGISTRY_PROXY_PORT: u16 = 14_873;
@@ -30,6 +32,9 @@ pub struct RuntimePolicyDocument {
     pub broker_mark: u32,
     pub connect_port: u16,
     pub dns_port: Option<u16>,
+    pub mcp_gateway_port: Option<u16>,
+    pub reserved_mcp_origins: Vec<McpHttpOrigin>,
+    pub deny_direct_ip: bool,
     pub network_policy: NetworkPolicy,
     #[serde(default)]
     pub registry: Option<RegistryEgressPolicy>,
@@ -58,8 +63,10 @@ pub enum RuntimePolicyError {
     InvalidConnectPort,
     #[error("DNS-enabled egress requires port 53; DNS-disabled egress must omit the DNS port")]
     InvalidDnsPort,
-    #[error("registry egress ports must be non-zero and distinct from other loopback services")]
-    InvalidRegistryPorts,
+    #[error("remote MCP egress state does not match the signed reserved origins")]
+    InvalidRemoteMcp,
+    #[error("egress loopback service ports must be non-zero and pairwise distinct")]
+    InvalidLoopbackPorts,
     #[error("egress proxy environment does not match the signed endpoints")]
     InvalidProxyEnvironment,
     #[error("invalid network policy: {0}")]
@@ -69,6 +76,15 @@ pub enum RuntimePolicyError {
 impl RuntimePolicyDocument {
     #[must_use]
     pub fn for_session(session_id: SessionId, network_policy: NetworkPolicy) -> Self {
+        Self::for_session_with_mcp(session_id, network_policy, None)
+            .expect("an absent MCP policy is always valid")
+    }
+
+    pub fn for_session_with_mcp(
+        session_id: SessionId,
+        network_policy: NetworkPolicy,
+        tool_policy: Option<&ToolCallPolicy>,
+    ) -> Result<Self, RuntimePolicyError> {
         let digest = Sha256::digest(session_id.as_bytes());
         let instance_id = digest[..INSTANCE_ID_HEX_BYTES]
             .iter()
@@ -82,17 +98,28 @@ impl RuntimePolicyDocument {
         ) | 1;
         let connect_port = DEFAULT_CONNECT_PORT;
         let dns_port = network_policy.allow_dns.then_some(DEFAULT_DNS_PORT);
-        Self {
+        let reserved_mcp_origins = tool_policy
+            .map(ToolCallPolicy::remote_origins)
+            .transpose()
+            .map_err(|_| RuntimePolicyError::InvalidRemoteMcp)?
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let remote_mcp_active = !reserved_mcp_origins.is_empty();
+        Ok(Self {
             schema_version: RUNTIME_POLICY_SCHEMA_VERSION,
             instance_id,
             table_name,
             broker_mark,
             connect_port,
             dns_port,
+            mcp_gateway_port: remote_mcp_active.then_some(DEFAULT_MCP_HTTP_GATEWAY_PORT),
+            reserved_mcp_origins,
+            deny_direct_ip: remote_mcp_active,
             network_policy,
             registry: None,
             proxy_environment: proxy_environment(connect_port, None),
-        }
+        })
     }
 
     #[must_use]
@@ -135,21 +162,50 @@ impl RuntimePolicyDocument {
         if self.dns_port != self.network_policy.allow_dns.then_some(DEFAULT_DNS_PORT) {
             return Err(RuntimePolicyError::InvalidDnsPort);
         }
+        let remote_mcp_active = !self.reserved_mcp_origins.is_empty();
+        if self.mcp_gateway_port != remote_mcp_active.then_some(DEFAULT_MCP_HTTP_GATEWAY_PORT)
+            || self.deny_direct_ip != remote_mcp_active
+        {
+            return Err(RuntimePolicyError::InvalidRemoteMcp);
+        }
+        let origins = self
+            .reserved_mcp_origins
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if origins.len() != self.reserved_mcp_origins.len()
+            || origins.iter().any(|origin| {
+                origin.port == 0
+                    || McpHttpOrigin::from_endpoint(&format!(
+                        "https://{}:{}/",
+                        if origin.host.contains(':') {
+                            format!("[{}]", origin.host)
+                        } else {
+                            origin.host.clone()
+                        },
+                        origin.port
+                    ))
+                    .map(|parsed| parsed != *origin)
+                    .unwrap_or(true)
+            })
+        {
+            return Err(RuntimePolicyError::InvalidRemoteMcp);
+        }
+
+        let mut loopback_ports = vec![self.connect_port];
+        loopback_ports.extend(self.dns_port);
+        loopback_ports.extend(self.mcp_gateway_port);
         if let Some(registry) = &self.registry {
-            let mut ports = vec![
-                self.connect_port,
-                registry.proxy_port,
-                registry.trusted_upstream_port,
-            ];
-            if let Some(port) = self.dns_port {
-                ports.push(port);
-            }
-            ports.sort_unstable();
-            if ports.first() == Some(&0) || ports.windows(2).any(|pair| pair[0] == pair[1]) {
-                return Err(RuntimePolicyError::InvalidRegistryPorts);
-            }
+            loopback_ports.extend([registry.proxy_port, registry.trusted_upstream_port]);
             PolicyEngine::compile(&registry.upstream_network_policy)?;
         }
+        loopback_ports.sort_unstable();
+        if loopback_ports.first() == Some(&0)
+            || loopback_ports.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(RuntimePolicyError::InvalidLoopbackPorts);
+        }
+
         if self.proxy_environment
             != proxy_environment(
                 self.connect_port,
@@ -210,7 +266,9 @@ pub fn proxy_environment(
 
 #[cfg(test)]
 mod tests {
-    use sendbox_policy::{Action, NetworkPolicy};
+    use sendbox_policy::{
+        Action, McpHttpPolicy, McpServerPolicy, NetworkPolicy, ServerToolPolicy, ToolCallPolicy,
+    };
 
     use super::*;
 
@@ -268,6 +326,58 @@ mod tests {
             policy.proxy_environment["NPM_CONFIG_IGNORE_SCRIPTS"],
             "true"
         );
+    }
+
+    #[test]
+    fn remote_mcp_and_registry_use_distinct_fail_closed_ports() {
+        let tool_policy = ToolCallPolicy {
+            servers: BTreeMap::from([(
+                "remote".to_owned(),
+                McpServerPolicy::StreamableHttp {
+                    url: "https://mcp.example.com/mcp".to_owned(),
+                    tools: ServerToolPolicy::default(),
+                    http: McpHttpPolicy::default(),
+                },
+            )]),
+            ..ToolCallPolicy::default()
+        };
+        let original = network_policy();
+        let policy = RuntimePolicyDocument::for_session_with_mcp(
+            SessionId::from_bytes([10; 16]),
+            original.clone(),
+            Some(&tool_policy),
+        )
+        .unwrap()
+        .with_registry(
+            DEFAULT_REGISTRY_PROXY_PORT,
+            DEFAULT_TRUSTED_REGISTRY_PORT,
+            original,
+        );
+
+        policy.validate().unwrap();
+        assert_eq!(policy.mcp_gateway_port, Some(DEFAULT_MCP_HTTP_GATEWAY_PORT));
+        assert_eq!(
+            policy.registry.as_ref().map(|registry| registry.proxy_port),
+            Some(DEFAULT_REGISTRY_PROXY_PORT)
+        );
+        assert_eq!(
+            policy
+                .registry
+                .as_ref()
+                .map(|registry| registry.trusted_upstream_port),
+            Some(DEFAULT_TRUSTED_REGISTRY_PORT)
+        );
+
+        let mut colliding = policy;
+        colliding
+            .registry
+            .as_mut()
+            .expect("registry policy")
+            .trusted_upstream_port = DEFAULT_MCP_HTTP_GATEWAY_PORT;
+        assert!(matches!(
+            colliding.validate(),
+            Err(RuntimePolicyError::InvalidLoopbackPorts)
+        ));
     }
 
     #[test]

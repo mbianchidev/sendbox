@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use sendbox_policy::{
     Action, BoundaryPolicy, CommandPolicy, DnsPolicy, DnsRecordType, EvidenceRequirement,
-    NetworkPolicy, PackageAction, PackageEcosystem, PackageFindingKind, PackageRegistryPolicy,
-    PackageSupplyChainPolicy, PolicyConfiguration, Protocol,
+    McpHttpOrigin, NetworkPolicy, PackageAction, PackageEcosystem, PackageFindingKind,
+    PackageRegistryPolicy, PackageSupplyChainPolicy, PolicyConfiguration, Protocol,
 };
 
 fn workspace_path(relative: &str) -> PathBuf {
@@ -431,4 +431,209 @@ packages:
             .iter()
             .any(|diagnostic| { diagnostic.path == "policy.packages.exceptions[0].action" })
     );
+}
+
+#[test]
+fn hierarchical_servers_parse_with_independent_tool_policies() {
+    let yaml = r#"
+commands:
+  default_action: deny
+  allowlist: []
+  denylist: []
+  log_blocked: true
+network:
+  default_action: deny
+  allowed_domains: []
+  blocked_domains: []
+  allow_dns: true
+boundaries:
+  tool_calls:
+    servers:
+      github:
+        transport: stdio
+        command: ["/usr/bin/github-mcp-server", "stdio"]
+        tools:
+          default_action: deny
+          allowlist: ["search_code"]
+          denylist: ["delete_*"]
+      filesystem:
+        transport: stdio
+        command: ["/usr/bin/node", "/opt/mcp/server-filesystem.js", "/workspace"]
+        tools:
+          default_action: deny
+          allowlist: ["read_file"]
+          denylist: ["write_*"]
+"#;
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(yaml).unwrap();
+    policy.validate().unwrap();
+
+    let servers = &policy.boundaries.tool_calls.servers;
+    assert_eq!(servers.len(), 2);
+    assert_eq!(
+        servers["github"].tools().allowlist,
+        vec!["search_code".to_owned()]
+    );
+    assert_eq!(
+        servers["filesystem"].tools().allowlist,
+        vec!["read_file".to_owned()]
+    );
+}
+
+#[test]
+fn hierarchical_servers_reject_ambiguous_commands_and_legacy_mixing() {
+    let ambiguous = r#"
+commands: { default_action: deny, allowlist: [], denylist: [], log_blocked: true }
+network: { default_action: deny, allowed_domains: [], blocked_domains: [], allow_dns: true }
+boundaries:
+  tool_calls:
+    servers:
+      first:
+        transport: stdio
+        command: ["/usr/bin/mcp-server", "stdio"]
+      second:
+        transport: stdio
+        command: ["/usr/bin/mcp-server", "stdio"]
+"#;
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(ambiguous).unwrap();
+    let diagnostics = policy.validate().unwrap_err().into_diagnostics();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "policy.boundaries.tool_calls.servers.second.command"
+            && diagnostic.message.contains("already mapped")
+    }));
+
+    let mixed = r#"
+commands: { default_action: deny, allowlist: [], denylist: [], log_blocked: true }
+network: { default_action: deny, allowed_domains: [], blocked_domains: [], allow_dns: true }
+boundaries:
+  tool_calls:
+    allowed_server_commands:
+      - ["/usr/bin/mcp-server", "stdio"]
+    servers:
+      first:
+        transport: stdio
+        command: ["/usr/bin/mcp-server", "stdio"]
+"#;
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(mixed).unwrap();
+    let diagnostics = policy.validate().unwrap_err().into_diagnostics();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "policy.boundaries.tool_calls" && diagnostic.message.contains("legacy")
+    }));
+}
+
+#[test]
+fn hierarchical_servers_reject_invalid_ids_commands_and_permissive_empty_tools() {
+    let yaml = r#"
+commands: { default_action: deny, allowlist: [], denylist: [], log_blocked: true }
+network: { default_action: deny, allowed_domains: [], blocked_domains: [], allow_dns: true }
+boundaries:
+  tool_calls:
+    servers:
+      "Bad/Id":
+        transport: stdio
+        command: ["relative-server"]
+        tools:
+          default_action: allow
+"#;
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(yaml).unwrap();
+    let diagnostics = policy.validate().unwrap_err().into_diagnostics();
+    for path in [
+        "policy.boundaries.tool_calls.servers.Bad/Id",
+        "policy.boundaries.tool_calls.servers.Bad/Id.command",
+        "policy.boundaries.tool_calls.servers.Bad/Id.tools",
+    ] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.path == path),
+            "missing diagnostic for {path}"
+        );
+    }
+}
+
+#[test]
+fn remote_server_requires_https_unless_plaintext_is_explicitly_local() {
+    let remote_http = r#"
+commands: { default_action: deny, allowlist: [], denylist: [], log_blocked: true }
+network: { default_action: deny, allowed_domains: [], blocked_domains: [], allow_dns: true }
+boundaries:
+  tool_calls:
+    servers:
+      remote:
+        transport: streamable_http
+        url: "http://mcp.example.com/mcp"
+"#;
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(remote_http).unwrap();
+    let diagnostics = policy.validate().unwrap_err().into_diagnostics();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "policy.boundaries.tool_calls.servers.remote.url"
+            && diagnostic.message.contains("HTTPS")
+    }));
+
+    let local_http = r#"
+commands: { default_action: deny, allowlist: [], denylist: [], log_blocked: true }
+network: { default_action: deny, allowed_domains: [], blocked_domains: [], allow_dns: true }
+boundaries:
+  tool_calls:
+    servers:
+      local:
+        transport: streamable_http
+        url: "http://127.0.0.1:3000/mcp"
+        http:
+          allow_plaintext_local: true
+          allow_private_networks: true
+"#;
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(local_http).unwrap();
+    policy.validate().unwrap();
+}
+
+#[test]
+fn remote_origin_reservations_include_exact_redirect_origins() {
+    let yaml = r#"
+commands: { default_action: deny, allowlist: [], denylist: [], log_blocked: true }
+network: { default_action: deny, allowed_domains: [], blocked_domains: [], allow_dns: true }
+boundaries:
+  tool_calls:
+    servers:
+      remote:
+        transport: streamable_http
+        url: "https://mcp.example.com/mcp"
+        http:
+          allow_redirects: true
+          redirect_allowlist:
+            - "https://mcp.example.com/mcp-v2"
+            - "https://edge.example.net:8443/mcp"
+"#;
+    let policy: PolicyConfiguration = serde_yaml_ng::from_str(yaml).unwrap();
+    policy.validate().unwrap();
+    assert_eq!(
+        policy.boundaries.tool_calls.remote_origins().unwrap(),
+        [
+            McpHttpOrigin {
+                host: "edge.example.net".to_owned(),
+                port: 8443,
+            },
+            McpHttpOrigin {
+                host: "mcp.example.com".to_owned(),
+                port: 443,
+            },
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+#[test]
+fn duplicate_server_ids_are_rejected_while_decoding() {
+    let yaml = r#"
+commands: { default_action: deny, allowlist: [], denylist: [], log_blocked: true }
+network: { default_action: deny, allowed_domains: [], blocked_domains: [], allow_dns: true }
+boundaries:
+  tool_calls:
+    servers:
+      duplicate:
+        transport: stdio
+        command: ["/usr/bin/one"]
+      duplicate:
+        transport: stdio
+        command: ["/usr/bin/two"]
+"#;
+    assert!(serde_yaml_ng::from_str::<PolicyConfiguration>(yaml).is_err());
 }

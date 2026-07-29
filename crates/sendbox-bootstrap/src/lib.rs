@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -15,10 +16,12 @@ use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 3;
-pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
+pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 4;
+pub const MAX_BOOTSTRAP_BYTES: usize = 2 * 1024 * 1024;
+const MAX_GATEWAY_CREDENTIALS: usize = 64;
+const MAX_GATEWAY_CREDENTIAL_BYTES: usize = 64 * 1024;
 pub const MAX_REGISTRY_CREDENTIALS: usize = 16;
 pub const MAX_REGISTRY_CREDENTIAL_BYTES: usize = 16 * 1024;
 pub const MAX_REGISTRY_CREDENTIAL_TOTAL_BYTES: usize = 32 * 1024;
@@ -180,6 +183,45 @@ pub struct ExecutionBrokerBootstrap {
     pub mcp_policy: Option<RuntimePolicyDocument>,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayCredential {
+    pub name: String,
+    value: Vec<u8>,
+}
+
+impl GatewayCredential {
+    pub fn new(name: impl Into<String>, value: Vec<u8>) -> Result<Self, BootstrapError> {
+        let credential = Self {
+            name: name.into(),
+            value,
+        };
+        validate_gateway_credential(&credential)?;
+        Ok(credential)
+    }
+
+    #[must_use]
+    pub fn expose_secret(&self) -> &[u8] {
+        &self.value
+    }
+}
+
+impl fmt::Debug for GatewayCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayCredential")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for GatewayCredential {
+    fn drop(&mut self) {
+        self.value.zeroize();
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct RegistryCredential {
     pub secret_reference: String,
@@ -271,6 +313,7 @@ pub struct BootstrapDocumentConfiguration {
     pub services: Vec<ServiceSpec>,
     pub execution_broker: Option<ExecutionBrokerConfiguration>,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
+    pub gateway_credentials: Vec<GatewayCredential>,
     pub registry_proxy: Option<RegistryProxyConfiguration>,
 }
 
@@ -288,6 +331,7 @@ pub struct BootstrapDocument {
     pub services: Vec<ServiceSpec>,
     pub execution_broker: Option<ExecutionBrokerBootstrap>,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
+    pub gateway_credentials: Vec<GatewayCredential>,
     pub registry_proxy: Option<RegistryProxyConfiguration>,
 }
 
@@ -325,6 +369,8 @@ struct BootstrapWire {
     execution_broker: Option<ExecutionBrokerBootstrap>,
     #[serde(default)]
     egress_policy: Option<EgressRuntimePolicyDocument>,
+    #[serde(default)]
+    gateway_credentials: Vec<GatewayCredential>,
     #[serde(default)]
     registry_proxy: Option<RegistryProxyConfiguration>,
 }
@@ -427,6 +473,7 @@ pub fn encode_bootstrap_document(
         services: configuration.services,
         execution_broker,
         egress_policy: configuration.egress_policy,
+        gateway_credentials: configuration.gateway_credentials,
         registry_proxy: configuration.registry_proxy,
     };
     let encoded = serde_json::to_vec(&wire).map_err(BootstrapError::Encode)?;
@@ -477,8 +524,30 @@ fn validate_configuration(
         configuration
             .execution_broker
             .as_ref()
+            .and_then(|broker| broker.mcp_policy.as_ref()),
+        configuration
+            .execution_broker
+            .as_ref()
             .map(|broker| &broker.cgroup_parent),
     )?;
+    validate_gateway_credentials(
+        &configuration.gateway_credentials,
+        configuration
+            .execution_broker
+            .as_ref()
+            .and_then(|broker| broker.mcp_policy.as_ref()),
+    )?;
+    if configuration
+        .execution_broker
+        .as_ref()
+        .and_then(|broker| broker.mcp_policy.as_ref())
+        .is_some_and(|policy| policy.tool_policy.has_remote_servers())
+        && configuration.egress_policy.is_none()
+    {
+        return Err(BootstrapError::Invalid(
+            "remote MCP requires authenticated egress enforcement".to_owned(),
+        ));
+    }
     validate_registry_proxy(
         configuration.registry_proxy.as_ref(),
         configuration.egress_policy.as_ref(),
@@ -527,8 +596,28 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         wire.egress_policy.as_ref(),
         wire.execution_broker
             .as_ref()
+            .and_then(|broker| broker.mcp_policy.as_ref()),
+        wire.execution_broker
+            .as_ref()
             .map(|broker| &broker.cgroup_parent),
     )?;
+    validate_gateway_credentials(
+        &wire.gateway_credentials,
+        wire.execution_broker
+            .as_ref()
+            .and_then(|broker| broker.mcp_policy.as_ref()),
+    )?;
+    if wire
+        .execution_broker
+        .as_ref()
+        .and_then(|broker| broker.mcp_policy.as_ref())
+        .is_some_and(|policy| policy.tool_policy.has_remote_servers())
+        && wire.egress_policy.is_none()
+    {
+        return Err(BootstrapError::Invalid(
+            "remote MCP requires authenticated egress enforcement".to_owned(),
+        ));
+    }
     validate_registry_proxy(
         wire.registry_proxy.as_ref(),
         wire.egress_policy.as_ref(),
@@ -552,6 +641,7 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         services: wire.services,
         execution_broker: wire.execution_broker,
         egress_policy: wire.egress_policy,
+        gateway_credentials: wire.gateway_credentials,
         registry_proxy: wire.registry_proxy,
     })
 }
@@ -688,6 +778,7 @@ fn validate_registry_credential(credential: &RegistryCredential) -> Result<(), B
 fn validate_egress(
     session_id: SessionId,
     policy: Option<&EgressRuntimePolicyDocument>,
+    mcp_policy: Option<&RuntimePolicyDocument>,
     cgroup_parent: Option<&PathBuf>,
 ) -> Result<(), BootstrapError> {
     let Some(policy) = policy else {
@@ -696,8 +787,12 @@ fn validate_egress(
     policy
         .validate()
         .map_err(|error| BootstrapError::Invalid(error.to_string()))?;
-    let mut expected =
-        EgressRuntimePolicyDocument::for_session(session_id, policy.network_policy.clone());
+    let mut expected = EgressRuntimePolicyDocument::for_session_with_mcp(
+        session_id,
+        policy.network_policy.clone(),
+        mcp_policy.map(|policy| &policy.tool_policy),
+    )
+    .map_err(|error| BootstrapError::Invalid(error.to_string()))?;
     if let Some(registry) = &policy.registry {
         expected = expected.with_registry(
             registry.proxy_port,
@@ -710,11 +805,72 @@ fn validate_egress(
             "egress runtime policy does not match the authenticated session".to_owned(),
         ));
     }
+
     let expected_parent = policy.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
     if cgroup_parent.map(PathBuf::as_path) != Some(expected_parent.as_path()) {
         return Err(BootstrapError::Invalid(
             "execution broker cgroup parent does not match the egress agent hierarchy".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_gateway_credentials(
+    credentials: &[GatewayCredential],
+    mcp_policy: Option<&RuntimePolicyDocument>,
+) -> Result<(), BootstrapError> {
+    if credentials.len() > MAX_GATEWAY_CREDENTIALS {
+        return Err(BootstrapError::Invalid(format!(
+            "gateway credentials may contain at most {MAX_GATEWAY_CREDENTIALS} entries"
+        )));
+    }
+    let mut actual = BTreeSet::new();
+    for credential in credentials {
+        validate_gateway_credential(credential)?;
+        if !actual.insert(credential.name.clone()) {
+            return Err(BootstrapError::Invalid(
+                "gateway credential names must be unique".to_owned(),
+            ));
+        }
+    }
+    let expected = mcp_policy
+        .map(|policy| policy.tool_policy.gateway_secret_names())
+        .unwrap_or_default();
+    if actual != expected {
+        return Err(BootstrapError::Invalid(
+            "gateway credential names do not exactly match the authenticated MCP policy".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gateway_credential(credential: &GatewayCredential) -> Result<(), BootstrapError> {
+    if credential.name.is_empty()
+        || credential.name.len() > 128
+        || credential.name.chars().any(char::is_control)
+    {
+        return Err(BootstrapError::Invalid(
+            "gateway credential names must be printable and between 1 and 128 UTF-8 bytes"
+                .to_owned(),
+        ));
+    }
+    if credential.value.is_empty() || credential.value.len() > MAX_GATEWAY_CREDENTIAL_BYTES {
+        return Err(BootstrapError::Invalid(format!(
+            "gateway credential '{}' must contain between 1 and {MAX_GATEWAY_CREDENTIAL_BYTES} bytes",
+            credential.name
+        )));
+    }
+    let value = std::str::from_utf8(&credential.value).map_err(|_| {
+        BootstrapError::Invalid(format!(
+            "gateway credential '{}' must be UTF-8",
+            credential.name
+        ))
+    })?;
+    if value.chars().any(char::is_control) {
+        return Err(BootstrapError::Invalid(format!(
+            "gateway credential '{}' cannot contain control characters",
+            credential.name
+        )));
     }
     Ok(())
 }
@@ -852,7 +1008,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use sendbox_mcp::runtime::RUNTIME_POLICY_SCHEMA_VERSION;
-    use sendbox_policy::{Action, ToolCallPolicy, ToolTransport};
+    use sendbox_policy::{
+        Action, McpHttpPolicy, McpServerPolicy, ServerToolPolicy, ToolCallPolicy, ToolTransport,
+    };
 
     use super::*;
 
@@ -888,6 +1046,7 @@ mod tests {
                 mcp_policy: None,
             }),
             egress_policy: None,
+            gateway_credentials: Vec::new(),
             registry_proxy: None,
         }
     }
@@ -906,11 +1065,31 @@ mod tests {
                 max_frame_bytes: 4096,
                 server_command_patterns: Vec::new(),
                 allowed_server_commands: vec![vec!["/usr/bin/mcp-server".to_owned()]],
+                servers: BTreeMap::new(),
             },
+            audit_log_path: PathBuf::from("/var/log/sendbox/boundary.log"),
             fixed_environment: BTreeMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]),
             inherited_environment_keys: BTreeSet::from(["TOKEN".to_owned()]),
             observation: None,
             safe_outputs: None,
+        }
+    }
+
+    fn remote_mcp_policy() -> RuntimePolicyDocument {
+        RuntimePolicyDocument {
+            tool_policy: ToolCallPolicy {
+                servers: BTreeMap::from([(
+                    "remote".to_owned(),
+                    McpServerPolicy::StreamableHttp {
+                        url: "https://mcp.example.com/mcp".to_owned(),
+                        tools: ServerToolPolicy::default(),
+                        http: McpHttpPolicy::default(),
+                    },
+                )]),
+                ..ToolCallPolicy::default()
+            },
+            inherited_environment_keys: BTreeSet::new(),
+            ..mcp_policy()
         }
     }
 
@@ -1027,6 +1206,43 @@ mod tests {
     }
 
     #[test]
+    fn remote_mcp_bootstrap_requires_authenticated_egress() {
+        let mut config = configuration();
+        let mcp = remote_mcp_policy();
+        config
+            .execution_broker
+            .as_mut()
+            .expect("execution broker")
+            .mcp_policy = Some(mcp.clone());
+        assert!(encode_bootstrap_document(config.clone(), &[6; 32]).is_err());
+
+        let network = sendbox_policy::NetworkPolicy {
+            default_action: Action::Allow,
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            allow_dns: true,
+            max_connections: None,
+            allowed_networks: Vec::new(),
+            blocked_networks: Vec::new(),
+            allowed_ports: Vec::new(),
+            dns: sendbox_policy::DnsPolicy::default(),
+        };
+        let egress = EgressRuntimePolicyDocument::for_session_with_mcp(
+            config.session_id,
+            network,
+            Some(&mcp.tool_policy),
+        )
+        .unwrap();
+        config
+            .execution_broker
+            .as_mut()
+            .expect("execution broker")
+            .cgroup_parent = egress.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
+        config.egress_policy = Some(egress);
+        assert!(encode_bootstrap_document(config, &[6; 32]).is_ok());
+    }
+
+    #[test]
     fn authenticated_bootstrap_round_trips_redacted_registry_credentials() {
         let mut config = configuration();
         let network = sendbox_policy::NetworkPolicy {
@@ -1041,7 +1257,7 @@ mod tests {
             dns: sendbox_policy::DnsPolicy::default(),
         };
         let egress = EgressRuntimePolicyDocument::for_session(config.session_id, network.clone())
-            .with_registry(15_081, 15_082, network);
+            .with_registry(14_873, 15_081, network);
         config
             .execution_broker
             .as_mut()
@@ -1059,8 +1275,8 @@ mod tests {
         };
         config.registry_proxy = Some(RegistryProxyConfiguration {
             policy,
-            proxy_port: 15_081,
-            trusted_upstream_port: 15_082,
+            proxy_port: 14_873,
+            trusted_upstream_port: 15_081,
             cache_root: PathBuf::from("/var/cache/sendbox/packages"),
             report_path: PathBuf::from("/run/sendbox/package-report.json"),
             proxy_uid: DEFAULT_REGISTRY_UID,
@@ -1099,7 +1315,7 @@ mod tests {
             dns: sendbox_policy::DnsPolicy::default(),
         };
         let egress = EgressRuntimePolicyDocument::for_session(config.session_id, network.clone())
-            .with_registry(15_081, 15_082, network);
+            .with_registry(14_873, 15_081, network);
         config
             .execution_broker
             .as_mut()
@@ -1115,8 +1331,8 @@ mod tests {
                 }],
                 ..sendbox_policy::PackageSupplyChainPolicy::default()
             },
-            proxy_port: 15_081,
-            trusted_upstream_port: 15_082,
+            proxy_port: 14_873,
+            trusted_upstream_port: 15_081,
             cache_root: PathBuf::from("/var/cache/sendbox/packages"),
             report_path: PathBuf::from("/run/sendbox/package-report.json"),
             proxy_uid: DEFAULT_REGISTRY_UID,

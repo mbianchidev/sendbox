@@ -1,14 +1,28 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::{Component, Path};
 
 use sendbox_core::{Diagnostic, DiagnosticCode, ValidationFailure};
 use serde::{Deserialize, Serialize};
-use url::Url;
+use url::{Host, Url};
+
+pub const DEFAULT_MCP_HTTP_GATEWAY_PORT: u16 = 15_082;
 
 const BPFTRACE_STRING_LENGTH: usize = 4096;
 const MAX_SERVER_COMMAND_PARTS: usize = 16;
+pub const MAX_MCP_SERVERS: usize = 64;
+const MAX_MCP_SERVER_ID_BYTES: usize = 64;
+const MAX_HTTP_BODY_BYTES: i64 = 16 * 1024 * 1024;
+const MAX_HTTP_TIMEOUT_SECONDS: u64 = 300;
+const MAX_HTTP_EVENTS: u32 = 65_536;
+const MAX_HTTP_CONCURRENT_REQUESTS: u32 = 1024;
+const MAX_HTTP_SESSIONS: u32 = 4096;
+const MAX_HTTP_SESSION_SECONDS: u64 = 24 * 60 * 60;
+const MAX_TLS_ROOT_BYTES: usize = 1024 * 1024;
+const FORBIDDEN_MCP_EXECUTABLES: [&str; 12] = [
+    "sh", "bash", "zsh", "fish", "env", "npx", "npm", "pnpm", "yarn", "bunx", "pipx", "uvx",
+];
 pub const MAX_PACKAGE_REGISTRIES: usize = 16;
 pub const MAX_PACKAGE_FINDING_RULES: usize = 64;
 pub const MAX_PACKAGE_EXCEPTIONS: usize = 128;
@@ -234,14 +248,186 @@ impl DnsPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ToolTransport {
     Stdio,
+    StreamableHttp,
+    StreamableHttp2025,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerToolPolicy {
+    pub default_action: Action,
+    pub allowlist: Vec<String>,
+    pub denylist: Vec<String>,
+}
+
+impl Default for ServerToolPolicy {
+    fn default() -> Self {
+        Self {
+            default_action: Action::Deny,
+            allowlist: Vec::new(),
+            denylist: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpTlsPolicy {
+    pub trust_roots_pem: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpAuthorizationPolicy {
+    pub bearer_secret: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpHttpOrigin {
+    pub host: String,
+    pub port: u16,
+}
+
+impl McpHttpOrigin {
+    pub fn from_endpoint(value: &str) -> Result<Self, String> {
+        let normalized = normalize_mcp_http_endpoint(value)?;
+        let parsed = Url::parse(&normalized)
+            .map_err(|error| format!("invalid MCP endpoint URL: {error}"))?;
+        let host = match parsed.host() {
+            Some(Host::Domain(domain)) => domain.to_ascii_lowercase(),
+            Some(Host::Ipv4(address)) => address.to_string(),
+            Some(Host::Ipv6(address)) => address.to_string(),
+            None => return Err("MCP endpoint URL must contain a host".to_owned()),
+        };
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| "MCP endpoint URL must have a known port".to_owned())?;
+        Ok(Self { host, port })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpHttpPolicy {
+    pub allow_plaintext_local: bool,
+    pub allow_private_networks: bool,
+    pub allow_redirects: bool,
+    pub redirect_allowlist: Vec<String>,
+    pub max_redirects: u32,
+    pub max_request_bytes: i64,
+    pub max_response_bytes: i64,
+    pub request_timeout_seconds: u64,
+    pub connect_timeout_seconds: u64,
+    pub idle_timeout_seconds: u64,
+    pub max_events: u32,
+    pub max_concurrent_requests: u32,
+    pub max_sessions: u32,
+    pub session_ttl_seconds: u64,
+    pub tls: McpTlsPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<HttpAuthorizationPolicy>,
+}
+
+impl Default for McpHttpPolicy {
+    fn default() -> Self {
+        Self {
+            allow_plaintext_local: false,
+            allow_private_networks: false,
+            allow_redirects: false,
+            redirect_allowlist: Vec::new(),
+            max_redirects: 3,
+            max_request_bytes: 1_048_576,
+            max_response_bytes: 1_048_576,
+            request_timeout_seconds: 30,
+            connect_timeout_seconds: 10,
+            idle_timeout_seconds: 30,
+            max_events: 1024,
+            max_concurrent_requests: 32,
+            max_sessions: 128,
+            session_ttl_seconds: 3600,
+            tls: McpTlsPolicy::default(),
+            authorization: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpServerPolicy {
+    Stdio {
+        command: Vec<String>,
+        #[serde(default)]
+        tools: ServerToolPolicy,
+    },
+    StreamableHttp {
+        url: String,
+        #[serde(default)]
+        tools: ServerToolPolicy,
+        #[serde(default)]
+        http: McpHttpPolicy,
+    },
+    StreamableHttp2025 {
+        url: String,
+        #[serde(default)]
+        tools: ServerToolPolicy,
+        #[serde(default)]
+        http: McpHttpPolicy,
+    },
+}
+
+impl McpServerPolicy {
+    #[must_use]
+    pub const fn transport(&self) -> ToolTransport {
+        match self {
+            Self::Stdio { .. } => ToolTransport::Stdio,
+            Self::StreamableHttp { .. } => ToolTransport::StreamableHttp,
+            Self::StreamableHttp2025 { .. } => ToolTransport::StreamableHttp2025,
+        }
+    }
+
+    #[must_use]
+    pub const fn tools(&self) -> &ServerToolPolicy {
+        match self {
+            Self::Stdio { tools, .. }
+            | Self::StreamableHttp { tools, .. }
+            | Self::StreamableHttp2025 { tools, .. } => tools,
+        }
+    }
+
+    #[must_use]
+    pub fn command(&self) -> Option<&[String]> {
+        match self {
+            Self::Stdio { command, .. } => Some(command),
+            Self::StreamableHttp { .. } | Self::StreamableHttp2025 { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Self::Stdio { .. } => None,
+            Self::StreamableHttp { url, .. } | Self::StreamableHttp2025 { url, .. } => Some(url),
+        }
+    }
+
+    #[must_use]
+    pub const fn http(&self) -> Option<&McpHttpPolicy> {
+        match self {
+            Self::Stdio { .. } => None,
+            Self::StreamableHttp { http, .. } | Self::StreamableHttp2025 { http, .. } => Some(http),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolCallPolicy {
+    /// Deprecated flat stdio compatibility mode. New configurations should use
+    /// [`ToolCallPolicy::servers`].
     pub transport: ToolTransport,
     pub default_action: Action,
     pub allowlist: Vec<String>,
@@ -249,6 +435,8 @@ pub struct ToolCallPolicy {
     pub max_frame_bytes: i64,
     pub server_command_patterns: Vec<String>,
     pub allowed_server_commands: Vec<Vec<String>>,
+    #[serde(deserialize_with = "deserialize_unique_servers")]
+    pub servers: BTreeMap<String, McpServerPolicy>,
 }
 
 impl Default for ToolCallPolicy {
@@ -261,7 +449,57 @@ impl Default for ToolCallPolicy {
             max_frame_bytes: 1_048_576,
             server_command_patterns: default_server_command_patterns(),
             allowed_server_commands: Vec::new(),
+            servers: BTreeMap::new(),
         }
+    }
+}
+
+impl ToolCallPolicy {
+    #[must_use]
+    pub fn uses_hierarchical_servers(&self) -> bool {
+        !self.servers.is_empty()
+    }
+
+    #[must_use]
+    pub fn uses_legacy_fields(&self) -> bool {
+        self.transport != ToolTransport::Stdio
+            || self.default_action != Action::Deny
+            || !self.allowlist.is_empty()
+            || !self.denylist.is_empty()
+            || !self.allowed_server_commands.is_empty()
+    }
+
+    #[must_use]
+    pub fn has_remote_servers(&self) -> bool {
+        self.servers
+            .values()
+            .any(|server| server.transport() != ToolTransport::Stdio)
+    }
+
+    #[must_use]
+    pub fn gateway_secret_names(&self) -> BTreeSet<String> {
+        self.servers
+            .values()
+            .filter_map(McpServerPolicy::http)
+            .filter_map(|http| http.authorization.as_ref())
+            .map(|authorization| authorization.bearer_secret.clone())
+            .collect()
+    }
+
+    pub fn remote_origins(&self) -> Result<BTreeSet<McpHttpOrigin>, String> {
+        let mut origins = BTreeSet::new();
+        for server in self.servers.values() {
+            let Some(url) = server.url() else {
+                continue;
+            };
+            origins.insert(McpHttpOrigin::from_endpoint(url)?);
+            if let Some(http) = server.http() {
+                for redirect in &http.redirect_allowlist {
+                    origins.insert(McpHttpOrigin::from_endpoint(redirect)?);
+                }
+            }
+        }
+        Ok(origins)
     }
 }
 
@@ -574,19 +812,18 @@ impl PolicyConfiguration {
 
 impl BoundaryPolicy {
     fn validate(&self, diagnostics: &mut Vec<Diagnostic>) {
-        if self.tool_calls.max_frame_bytes <= 0 {
-            diagnostics.push(Diagnostic::new(
-                DiagnosticCode::InvalidValue,
-                "policy.boundaries.tool_calls.max_frame_bytes",
-                "must be greater than zero",
-            ));
-        }
-
-        if !Path::new(&self.log_path).is_absolute() {
+        self.tool_calls.validate(diagnostics);
+        let log_path = Path::new(&self.log_path);
+        if !log_path.is_absolute()
+            || log_path
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+            || log_path.parent() != Some(Path::new("/var/log/sendbox"))
+        {
             diagnostics.push(Diagnostic::new(
                 DiagnosticCode::InvalidPath,
                 "policy.boundaries.log_path",
-                "must be an absolute path",
+                "must be a normalized direct child of /var/log/sendbox",
             ));
         }
 
@@ -600,75 +837,481 @@ impl BoundaryPolicy {
                 ));
             }
         }
+    }
+}
 
-        let patterns = if self.tool_calls.server_command_patterns.is_empty() {
+impl ToolCallPolicy {
+    fn validate(&self, diagnostics: &mut Vec<Diagnostic>) {
+        if self.max_frame_bytes <= 0 {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                "policy.boundaries.tool_calls.max_frame_bytes",
+                "must be greater than zero",
+            ));
+        } else if self.max_frame_bytes > MAX_HTTP_BODY_BYTES {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                "policy.boundaries.tool_calls.max_frame_bytes",
+                format!("must be at most {MAX_HTTP_BODY_BYTES}"),
+            ));
+        }
+        let patterns = if self.server_command_patterns.is_empty() {
             default_server_command_patterns()
         } else {
-            self.tool_calls.server_command_patterns.clone()
+            self.server_command_patterns.clone()
         };
         for pattern in &patterns {
-            if pattern.len() >= BPFTRACE_STRING_LENGTH {
+            if pattern.trim().is_empty()
+                || pattern.len() >= BPFTRACE_STRING_LENGTH
+                || pattern.chars().any(char::is_control)
+            {
                 diagnostics.push(Diagnostic::new(
                     DiagnosticCode::InvalidValue,
                     "policy.boundaries.tool_calls.server_command_patterns",
-                    format!("pattern exceeds 4095 UTF-8 bytes: {pattern}"),
+                    "entries must be printable and between 1 and 4095 UTF-8 bytes",
                 ));
             }
         }
 
-        let forbidden = HashSet::from([
-            "sh", "bash", "zsh", "fish", "env", "npx", "npm", "pnpm", "yarn", "bunx", "pipx", "uvx",
-        ]);
-        for (index, command) in self.tool_calls.allowed_server_commands.iter().enumerate() {
+        validate_tool_rules(
+            self.default_action,
+            &self.allowlist,
+            &self.denylist,
+            "policy.boundaries.tool_calls",
+            !self.allowed_server_commands.is_empty(),
+            diagnostics,
+        );
+
+        if self.uses_hierarchical_servers() && self.uses_legacy_fields() {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                "policy.boundaries.tool_calls",
+                "hierarchical servers cannot be combined with legacy transport, allowlist, denylist, default_action, or allowed_server_commands fields",
+            ));
+        }
+        if self.servers.len() > MAX_MCP_SERVERS {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                "policy.boundaries.tool_calls.servers",
+                format!("may contain at most {MAX_MCP_SERVERS} servers"),
+            ));
+        }
+
+        for (index, command) in self.allowed_server_commands.iter().enumerate() {
             let path = format!("policy.boundaries.tool_calls.allowed_server_commands[{index}]");
-            let Some(executable) = command.first() else {
+            validate_mcp_command(command, &path, Some(&patterns), diagnostics);
+        }
+
+        let mut commands = BTreeMap::<Vec<String>, String>::new();
+        let mut endpoints = BTreeMap::<String, String>::new();
+        for (id, server) in &self.servers {
+            let base = format!("policy.boundaries.tool_calls.servers.{id}");
+            if !valid_server_id(id) {
                 diagnostics.push(Diagnostic::new(
                     DiagnosticCode::InvalidValue,
-                    path,
-                    "must contain an executable",
-                ));
-                continue;
-            };
-            let basename = Path::new(executable)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default();
-            if !Path::new(executable).is_absolute() || forbidden.contains(basename) {
-                diagnostics.push(Diagnostic::new(
-                    DiagnosticCode::InvalidPath,
-                    path.clone(),
-                    "executable must be an absolute non-shell, non-package-runner path",
+                    base.clone(),
+                    "server ID must match [a-z][a-z0-9_-]{0,63}",
                 ));
             }
-            if command.len() > MAX_SERVER_COMMAND_PARTS {
-                diagnostics.push(Diagnostic::new(
-                    DiagnosticCode::InvalidValue,
-                    path.clone(),
-                    "may contain at most 16 command parts",
-                ));
-            }
-            if command
-                .iter()
-                .any(|part| part.len() >= BPFTRACE_STRING_LENGTH)
-            {
-                diagnostics.push(Diagnostic::new(
-                    DiagnosticCode::InvalidValue,
-                    path.clone(),
-                    "each command part must be at most 4095 UTF-8 bytes",
-                ));
-            }
-            if !command
-                .iter()
-                .skip(1)
-                .any(|argument| patterns.iter().any(|pattern| argument.contains(pattern)))
-            {
-                diagnostics.push(Diagnostic::new(
-                    DiagnosticCode::InvalidValue,
-                    path,
-                    "an argument must match a configured server_command_patterns entry",
-                ));
+            validate_tool_rules(
+                server.tools().default_action,
+                &server.tools().allowlist,
+                &server.tools().denylist,
+                &format!("{base}.tools"),
+                true,
+                diagnostics,
+            );
+            match server {
+                McpServerPolicy::Stdio { command, .. } => {
+                    let path = format!("{base}.command");
+                    validate_mcp_command(command, &path, None, diagnostics);
+                    if let Some(existing) = commands.insert(command.clone(), id.clone()) {
+                        diagnostics.push(Diagnostic::new(
+                            DiagnosticCode::InvalidValue,
+                            path,
+                            format!("command is already mapped to server policy '{existing}'"),
+                        ));
+                    }
+                }
+                McpServerPolicy::StreamableHttp { url, http, .. }
+                | McpServerPolicy::StreamableHttp2025 { url, http, .. } => {
+                    let path = format!("{base}.url");
+                    if let Some(normalized) = validate_http_endpoint(url, http, &path, diagnostics)
+                        && let Some(existing) = endpoints.insert(normalized, id.clone())
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            DiagnosticCode::InvalidValue,
+                            path,
+                            format!("endpoint is already mapped to server policy '{existing}'"),
+                        ));
+                    }
+                    validate_http_policy(http, &format!("{base}.http"), diagnostics);
+                }
             }
         }
+    }
+}
+
+fn deserialize_unique_servers<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, McpServerPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueServersVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for UniqueServersVisitor {
+        type Value = BTreeMap<String, McpServerPolicy>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map of uniquely named MCP server policies")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut servers = BTreeMap::new();
+            while let Some((id, policy)) = map.next_entry::<String, McpServerPolicy>()? {
+                if servers.insert(id.clone(), policy).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate MCP server policy ID '{id}'"
+                    )));
+                }
+            }
+            Ok(servers)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueServersVisitor)
+}
+
+fn valid_server_id(value: &str) -> bool {
+    value.len() <= MAX_MCP_SERVER_ID_BYTES
+        && matches!(value.as_bytes().first(), Some(byte) if byte.is_ascii_lowercase())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn validate_mcp_command(
+    command: &[String],
+    path: &str,
+    required_patterns: Option<&[String]>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(executable) = command.first() else {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            path,
+            "must contain an executable",
+        ));
+        return;
+    };
+    let basename = Path::new(executable)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !Path::new(executable).is_absolute()
+        || FORBIDDEN_MCP_EXECUTABLES.contains(&basename.as_str())
+    {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidPath,
+            path,
+            "executable must be an absolute non-shell, non-package-runner path",
+        ));
+    }
+    if command.len() > MAX_SERVER_COMMAND_PARTS {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            path,
+            "may contain at most 16 command parts",
+        ));
+    }
+    if command.iter().any(|part| {
+        part.is_empty()
+            || part.len() >= BPFTRACE_STRING_LENGTH
+            || part.as_bytes().contains(&0)
+            || part.chars().any(char::is_control)
+    }) {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            path,
+            "each command part must be printable and between 1 and 4095 UTF-8 bytes",
+        ));
+    }
+    if required_patterns.is_some_and(|patterns| {
+        !command
+            .iter()
+            .skip(1)
+            .any(|argument| patterns.iter().any(|pattern| argument.contains(pattern)))
+    }) {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            path,
+            "an argument must match a configured server_command_patterns entry",
+        ));
+    }
+}
+
+fn validate_tool_rules(
+    default_action: Action,
+    allowlist: &[String],
+    denylist: &[String],
+    path: &str,
+    active: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    validate_glob_patterns(allowlist, &format!("{path}.allowlist"), diagnostics);
+    validate_glob_patterns(denylist, &format!("{path}.denylist"), diagnostics);
+    if active && default_action == Action::Allow && allowlist.is_empty() && denylist.is_empty() {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            path,
+            "an active allow-by-default tool policy must contain at least one explicit rule",
+        ));
+    }
+}
+
+fn validate_glob_patterns(values: &[String], path: &str, diagnostics: &mut Vec<Diagnostic>) {
+    let mut unique = BTreeSet::new();
+    for value in values {
+        if value.trim().is_empty()
+            || value.len() >= BPFTRACE_STRING_LENGTH
+            || value.chars().any(char::is_control)
+        {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                path,
+                "entries must be printable and between 1 and 4095 UTF-8 bytes",
+            ));
+        }
+        if !unique.insert(value) {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                path,
+                format!("duplicate pattern '{value}'"),
+            ));
+        }
+    }
+}
+
+fn validate_http_policy(policy: &McpHttpPolicy, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+    for (field, value) in [
+        ("max_request_bytes", policy.max_request_bytes),
+        ("max_response_bytes", policy.max_response_bytes),
+    ] {
+        if !(1..=MAX_HTTP_BODY_BYTES).contains(&value) {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                format!("{path}.{field}"),
+                format!("must be between 1 and {MAX_HTTP_BODY_BYTES}"),
+            ));
+        }
+    }
+    for (field, value) in [
+        ("request_timeout_seconds", policy.request_timeout_seconds),
+        ("connect_timeout_seconds", policy.connect_timeout_seconds),
+        ("idle_timeout_seconds", policy.idle_timeout_seconds),
+    ] {
+        if !(1..=MAX_HTTP_TIMEOUT_SECONDS).contains(&value) {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                format!("{path}.{field}"),
+                format!("must be between 1 and {MAX_HTTP_TIMEOUT_SECONDS}"),
+            ));
+        }
+    }
+    for (field, value, maximum) in [
+        ("max_redirects", policy.max_redirects, 10),
+        ("max_events", policy.max_events, MAX_HTTP_EVENTS),
+        (
+            "max_concurrent_requests",
+            policy.max_concurrent_requests,
+            MAX_HTTP_CONCURRENT_REQUESTS,
+        ),
+        ("max_sessions", policy.max_sessions, MAX_HTTP_SESSIONS),
+    ] {
+        if value == 0 || value > maximum {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                format!("{path}.{field}"),
+                format!("must be between 1 and {maximum}"),
+            ));
+        }
+    }
+    if policy.session_ttl_seconds == 0 || policy.session_ttl_seconds > MAX_HTTP_SESSION_SECONDS {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            format!("{path}.session_ttl_seconds"),
+            format!("must be between 1 and {MAX_HTTP_SESSION_SECONDS}"),
+        ));
+    }
+    if !policy.allow_redirects && !policy.redirect_allowlist.is_empty() {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            format!("{path}.redirect_allowlist"),
+            "redirect targets require allow_redirects: true",
+        ));
+    }
+    if !policy.allow_redirects && policy.max_redirects != McpHttpPolicy::default().max_redirects {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            format!("{path}.max_redirects"),
+            "custom redirect limits require allow_redirects: true",
+        ));
+    }
+    if policy.allow_redirects && policy.redirect_allowlist.is_empty() {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            format!("{path}.redirect_allowlist"),
+            "enabled redirects require at least one exact target",
+        ));
+    }
+    let mut redirects = BTreeSet::new();
+    for (index, value) in policy.redirect_allowlist.iter().enumerate() {
+        let redirect_path = format!("{path}.redirect_allowlist[{index}]");
+        if let Some(normalized) = validate_http_endpoint(value, policy, &redirect_path, diagnostics)
+            && !redirects.insert(normalized)
+        {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                redirect_path,
+                "duplicate normalized redirect target",
+            ));
+        }
+    }
+    let root_bytes = policy
+        .tls
+        .trust_roots_pem
+        .iter()
+        .map(String::len)
+        .sum::<usize>();
+    if root_bytes > MAX_TLS_ROOT_BYTES
+        || policy
+            .tls
+            .trust_roots_pem
+            .iter()
+            .any(|root| root.trim().is_empty())
+    {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            format!("{path}.tls.trust_roots_pem"),
+            format!("roots must be non-empty and total at most {MAX_TLS_ROOT_BYTES} bytes"),
+        ));
+    }
+    if let Some(authorization) = &policy.authorization
+        && (authorization.bearer_secret.trim().is_empty()
+            || authorization.bearer_secret.len() > 128
+            || authorization.bearer_secret.chars().any(char::is_control))
+    {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            format!("{path}.authorization.bearer_secret"),
+            "secret name must be printable and between 1 and 128 UTF-8 bytes",
+        ));
+    }
+}
+
+fn validate_http_endpoint(
+    value: &str,
+    policy: &McpHttpPolicy,
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<String> {
+    let parsed = match Url::parse(value) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            diagnostics.push(Diagnostic::new(
+                DiagnosticCode::InvalidValue,
+                path,
+                format!("invalid MCP endpoint URL: {error}"),
+            ));
+            return None;
+        }
+    };
+    let normalized = match normalize_parsed_http_endpoint(&parsed) {
+        Ok(normalized) => normalized,
+        Err(message) => {
+            diagnostics.push(Diagnostic::new(DiagnosticCode::InvalidValue, path, message));
+            return None;
+        }
+    };
+    let local = endpoint_is_local(&parsed);
+    match parsed.scheme() {
+        "https" => {}
+        "http" if policy.allow_plaintext_local && local => {}
+        "http" => diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            path,
+            "remote MCP endpoints require HTTPS; plaintext HTTP is limited to explicitly enabled local development endpoints",
+        )),
+        _ => unreachable!("normalization accepts only HTTP schemes"),
+    }
+    if endpoint_is_restricted_literal(&parsed) && !policy.allow_private_networks {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            path,
+            "restricted literal addresses require allow_private_networks: true",
+        ));
+    }
+    Some(normalized)
+}
+
+pub fn normalize_mcp_http_endpoint(value: &str) -> Result<String, String> {
+    let parsed = Url::parse(value).map_err(|error| format!("invalid MCP endpoint URL: {error}"))?;
+    normalize_parsed_http_endpoint(&parsed)
+}
+
+fn normalize_parsed_http_endpoint(url: &Url) -> Result<String, String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("MCP endpoint scheme must be http or https".to_owned());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("MCP endpoint URL cannot contain user information".to_owned());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("MCP endpoint URL cannot contain a query or fragment".to_owned());
+    }
+    let host = match url.host() {
+        Some(Host::Domain(domain)) => domain.to_ascii_lowercase(),
+        Some(Host::Ipv4(address)) => address.to_string(),
+        Some(Host::Ipv6(address)) => format!("[{address}]"),
+        None => return Err("MCP endpoint URL must contain a host".to_owned()),
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "MCP endpoint URL must have a known port".to_owned())?;
+    Ok(format!("{}://{host}:{port}{}", url.scheme(), url.path()))
+}
+
+fn endpoint_is_local(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn endpoint_is_restricted_literal(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(address)) => {
+            address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_multicast()
+                || address.is_unspecified()
+        }
+        Some(Host::Ipv6(address)) => {
+            address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || (address.segments()[0] & 0xffc0) == 0xfe80
+                || (address.segments()[0] & 0xfe00) == 0xfc00
+        }
+        Some(Host::Domain(_)) | None => false,
     }
 }
 

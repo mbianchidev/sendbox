@@ -54,6 +54,7 @@ enum Commands {
     #[command(hide = true)]
     EgressGateway(EgressProcessArgs),
     #[command(hide = true)]
+    McpAudit(McpAuditArgs),
     RegistryProxy(EgressProcessArgs),
     #[command(hide = true)]
     Tunnel(TunnelArgs),
@@ -125,6 +126,12 @@ struct ExecBrokerArgs {
 struct EgressProcessArgs {
     #[arg(long)]
     config: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct McpAuditArgs {
+    #[arg(long)]
+    policy: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -297,6 +304,7 @@ async fn execute(cli: Cli) -> Result<(), GuestError> {
             sendbox_guest::egress::run_supervisor(args.config).await
         }
         Commands::EgressGateway(args) => sendbox_guest::egress::run_gateway(args.config).await,
+        Commands::McpAudit(args) => sendbox_guest::mcp_broker::run_audit_service(args.policy).await,
         Commands::RegistryProxy(args) => {
             sendbox_guest::egress::run_registry_proxy(args.config).await
         }

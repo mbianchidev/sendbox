@@ -94,6 +94,45 @@ The current BPF programs are cgroup-scoped observation only. They cannot permit
 or deny exec, syscall, network, or MCP actions and are not part of the semantic
 execution enforcement boundary.
 
+### Production MCP authorization
+
+Apple and Kata guests enforce MCP policy in trusted application-layer services.
+One signed hierarchical policy maps stable server IDs to exact stdio argv or
+normalized HTTP endpoints and gives each server an independent tool policy.
+Project aliases and caller-supplied policy IDs are never trusted. Unknown
+servers, changed identities, malformed JSON-RPC, ambiguous mappings, audit
+failure, and transport failure deny.
+
+The stdio path uses the installed root-owned broker. Exact ordered argv selects
+the policy, server discovery is filtered, and every `tools/call` is checked
+again before forwarding. Server children receive a scrubbed signed environment
+and fixed working directory.
+
+The remote path uses a mandatory loopback Streamable HTTP gateway. Project
+configuration contains only
+`http://127.0.0.1:15082/mcp/<server-id>` and an exact supported transport type;
+it cannot contain the upstream URL, headers, or credentials. The gateway
+validates JSON-RPC and protocol metadata, bounds request/SSE/session state,
+verifies TLS and hostnames, resolves each connection independently, rejects
+restricted addresses, pins the exact dial address, and revalidates every
+allowlisted redirect. Modern Streamable HTTP is the default. Stateful 2025
+behavior is an explicit compatibility mode; legacy 2024 HTTP+SSE is rejected.
+
+Remote MCP forces authenticated egress. Configured upstream and redirect origins
+are deny-first reservations in the normal CONNECT broker, direct-IP CONNECT is
+disabled, and nftables admits only the exact loopback gateway port from the
+agent cgroup. Gateway DNS and marked dials run in the broker cgroup and never
+authorize the agent-facing cache. There is no direct fallback.
+
+Gateway credential names form a separate signed secret partition that must be
+disjoint from workload `secrets`. Values are resolved from the host vault,
+delivered only in authenticated root-owned bootstrap material, and injected
+only into the selected upstream request. Stdio and HTTP decisions share a
+mandatory redacted audit path; audit write failure is terminal.
+
+TLS uprobes and MCP BPF records remain observation-only. SendBox does not treat
+plaintext recovery from uprobes as an authorization mechanism.
+
 ---
 
 ## SandboxEscapeBench Coverage — Apple Provider
@@ -346,27 +385,43 @@ program and, when supported by the kernel, the seccomp audit log.
 
 ### Layer 5: MCP Tool Boundary
 
-The native `sendbox-mcp` library and authenticated guest bootstrap define the
-framing-aware stdio authorization boundary for Apple and Kata runs:
+The native `sendbox-mcp` library and authenticated guest bootstrap define one
+application-layer authorization boundary for stdio and remote Streamable HTTP:
 
 - Complete bounded newline or `Content-Length` JSON-RPC messages are parsed
   before forwarding.
-- `tools/call` names use denylist-first glob matching, then allowlist/default action.
+- Exact argv derives one stable server policy; caller-supplied IDs and
+  project-local aliases do not select permissions.
+- Each server has an independent tool namespace. `tools/list` is correlated and
+  filtered, while every `tools/call` uses denylist-first glob matching, then
+  allowlist/default action.
 - Denied requests receive JSON-RPC error `-32001`; denied notifications are dropped.
 - An injected launcher receives only an exact approved absolute executable and
   argv vector; shells, package runners, inherited environment variables, and
   project-defined `env`/`cwd` overrides are rejected.
 - Child death, malformed frames, output saturation, cancellation, and cleanup
   failure are fail-closed outcomes.
+- Authorization records containing the server ID, command fingerprint, tool,
+  matching rule, and outcome are appended before forwarding. Audit failure is a
+  denial and does not expose command or tool arguments.
+- Remote definitions select only an exact loopback gateway route. The gateway
+  resolves the configured endpoint itself, verifies TLS and hostnames, pins the
+  validated address, revalidates allowlisted redirects, and applies the same
+  tool policy and audit schema.
+- Remote MCP forces authenticated egress, reserves configured origins from the
+  normal CONNECT broker, disables direct-IP CONNECT, and permits no direct
+  fallback.
+- Modern Streamable HTTP is the default; bounded stateful 2025 behavior is an
+  explicit compatibility mode. Legacy 2024 HTTP+SSE is rejected.
 - Legacy bpftrace records remain readable, while the guest broker emits the
   versioned native observation format.
-- Remote HTTP/SSE MCP remains observation-only and is never presented as
-  authorization.
+- TLS uprobes remain observation-only and never authorize a remote MCP request.
 
 Project MCP configuration must route each approved local server through the
-trusted guest broker with an exact allowlisted executable and argv. Unbrokered,
-remote, shell, package-runner, environment, and working-directory overrides fail
-closed.
+trusted guest broker and each remote server through its deterministic loopback
+gateway URL. Unbrokered commands, direct upstream URLs, custom credentials,
+shells, package runners, environment overrides, and working-directory overrides
+fail closed.
 
 #### Credential-free Safe Outputs
 
@@ -510,7 +565,7 @@ These are threats SendBox is designed to defend against:
 | Agent attempts cloud metadata access | `route_localnet` disabled and metadata endpoints must remain outside the network allowlist |
 | Agent attempts to intercept network traffic | `CAP_NET_RAW` dropped; separate virtual NIC |
 | Agent attempts to load malicious kernel modules | `kernel.modules_disabled=1`; `CAP_SYS_MODULE` dropped; seccomp blocks `init_module` |
-| Agent attempts a disallowed MCP tool call | When runtime wiring routes stdio through `sendbox-mcp`, the broker returns `-32001` or drops a denied notification before server delivery |
+| Agent attempts a disallowed MCP tool call | The stdio broker or HTTP gateway filters discovery and denies the call before upstream delivery; denied stdio requests receive `-32001` and denied notifications are dropped |
 | Agent attempts to push or pull a protected selected-repository branch | Root-installed git policy validates current and remote refs; eBPF terminates direct real-git execution |
 | Agent reads back host keystrokes it was never sent | Terminal input is host→guest only; direction binding on the control channel rejects a guest-originated `StandardInput` event |
 | Interactive workload escapes its terminal to reach the launcher | The pseudoterminal secondary is the child's controlling terminal after `setsid`; the launcher keeps the primary and applies the same seccomp, capability and uid drops as a headless launch |
@@ -531,8 +586,7 @@ These threats are not addressed by SendBox:
 | Supply chain attacks on the base VM image | Image provenance and signing are the user's responsibility |
 | Proving arbitrary package source code is safe | Static package findings are policy signals, not a complete malware detector |
 | Zero-day hypervisor escapes | No software sandbox can eliminate hypervisor zero-day risk |
-| Remote HTTP/SSE MCP authorization | Boundary mode intentionally supports stdio MCP only; HTTP/SSE remains audit-only |
-| Preventing direct MCP server launch before runtime integration | `sendbox-mcp` provides the broker and validator library; guest/runtime mediation is separate work |
+| Semantic authorization of separately launched local MCP binaries or alternate local clients | Protocol authorization applies to traffic through the installed stdio broker or HTTP gateway; command policy and image minimization remain defense in depth |
 | Direct GitHub API/GraphQL ref mutation or alternate Git clients | The bundled-git guard cannot constrain arbitrary bearer-token API calls or independently installed clients; use GitHub server-side rulesets |
 
 ---

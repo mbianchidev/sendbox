@@ -1,15 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use sendbox_policy::ToolCallPolicy;
+use sendbox_policy::{
+    DEFAULT_MCP_HTTP_GATEWAY_PORT, McpHttpPolicy, McpServerPolicy, ServerToolPolicy,
+    ToolCallPolicy, ToolTransport, normalize_mcp_http_endpoint,
+};
 use serde::{Deserialize, Serialize};
+use url::{Host, Url};
 
 use crate::config::{ApprovedCommand, ProjectConfigValidator};
-use crate::safe_outputs::{SAFE_OUTPUTS_MCP_PATH, SafeOutputsRuntimePolicy};
+use crate::policy::{ResolvedServerPolicy, http_fingerprint, resolve_stdio_server};
+use crate::safe_outputs::{
+    SAFE_OUTPUTS_MCP_PATH, SAFE_OUTPUTS_SERVER_ID, SafeOutputsRuntimePolicy,
+};
 
-pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const NATIVE_POLICY_PATH: &str = "/run/sendbox-boundary/mcp-policy.json";
+pub const NATIVE_AUDIT_SOCKET_PATH: &str = "/run/sendbox-boundary/audit.sock";
 pub const OBSERVATION_ROOT: &str = "/var/log/sendbox";
+pub const DEFAULT_AUDIT_LOG_PATH: &str = "/var/log/sendbox/boundary.log";
+pub const DEFAULT_HTTP_GATEWAY_PORT: u16 = DEFAULT_MCP_HTTP_GATEWAY_PORT;
+pub const HTTP_GATEWAY_ROUTE_PREFIX: &str = "/mcp/";
 const MAX_FRAME_BYTES: i64 = 16 * 1024 * 1024;
 const MAX_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;
 const MAX_ENVIRONMENT_BYTES: usize = 16 * 1024;
@@ -30,12 +41,66 @@ pub struct RuntimePolicyDocument {
     pub workload_uid: u32,
     pub workload_gid: u32,
     pub tool_policy: ToolCallPolicy,
+    pub audit_log_path: PathBuf,
     pub fixed_environment: BTreeMap<String, String>,
     pub inherited_environment_keys: BTreeSet<String>,
     #[serde(default)]
     pub observation: Option<RuntimeObservationConfiguration>,
     #[serde(default)]
     pub safe_outputs: Option<SafeOutputsRuntimePolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteServerRuntime {
+    pub id: String,
+    pub transport: ToolTransport,
+    pub fingerprint: String,
+    pub endpoint: HttpEndpoint,
+    pub gateway_url: String,
+    pub tools: ServerToolPolicy,
+    pub http: McpHttpPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpEndpoint {
+    pub normalized: String,
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+}
+
+impl HttpEndpoint {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let normalized = normalize_mcp_http_endpoint(value)?;
+        let parsed = Url::parse(&normalized)
+            .map_err(|error| format!("invalid MCP endpoint URL: {error}"))?;
+        let host = match parsed.host() {
+            Some(Host::Domain(domain)) => domain.to_owned(),
+            Some(Host::Ipv4(address)) => address.to_string(),
+            Some(Host::Ipv6(address)) => address.to_string(),
+            None => return Err("MCP endpoint URL must contain a host".to_owned()),
+        };
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| "MCP endpoint URL must have a known port".to_owned())?;
+        Ok(Self {
+            normalized,
+            scheme: parsed.scheme().to_owned(),
+            host,
+            port,
+            path: parsed.path().to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
 }
 
 impl RuntimePolicyDocument {
@@ -50,10 +115,22 @@ impl RuntimePolicyDocument {
             return Err("MCP workloads must use a non-root uid and gid".to_owned());
         }
         validate_absolute_normalized(&self.workspace_root, "MCP workspace")?;
+        if self.tool_policy.uses_hierarchical_servers() && self.tool_policy.uses_legacy_fields() {
+            return Err(
+                "hierarchical MCP servers cannot be combined with legacy global policy fields"
+                    .to_owned(),
+            );
+        }
         let _ = self.approved_commands()?;
         if !(1..=MAX_FRAME_BYTES).contains(&self.tool_policy.max_frame_bytes) {
             return Err(format!(
                 "MCP maximum frame size must be between 1 and {MAX_FRAME_BYTES} bytes"
+            ));
+        }
+        validate_absolute_normalized(&self.audit_log_path, "MCP audit log")?;
+        if self.audit_log_path.parent() != Some(Path::new(OBSERVATION_ROOT)) {
+            return Err(format!(
+                "MCP audit log must be a direct child of {OBSERVATION_ROOT}"
             ));
         }
         if self
@@ -110,58 +187,147 @@ impl RuntimePolicyDocument {
                     "MCP observation log must be a direct child of {OBSERVATION_ROOT}"
                 ));
             }
+            if observation.log_path == self.audit_log_path {
+                return Err("MCP audit and observation logs must be different files".to_owned());
+            }
         }
         if let Some(safe_outputs) = &self.safe_outputs {
             safe_outputs.validate().map_err(|error| error.to_string())?;
-            let command = vec![SAFE_OUTPUTS_MCP_PATH.to_owned()];
-            if !self.tool_policy.allowed_server_commands.contains(&command) {
-                return Err(
-                    "Safe Outputs MCP command is not in the exact server command allowlist"
-                        .to_owned(),
-                );
-            }
-            for tool in safe_outputs.enabled_tools() {
-                if !self
-                    .tool_policy
-                    .allowlist
-                    .iter()
-                    .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
-                {
-                    return Err(format!(
-                        "Safe Outputs tool `{}` is not admitted by the MCP tool policy",
-                        tool.name()
-                    ));
+            if self.tool_policy.uses_hierarchical_servers() {
+                let expected = safe_outputs.mcp_server_policy();
+                match self.tool_policy.servers.get(SAFE_OUTPUTS_SERVER_ID) {
+                    Some(actual) if actual == &expected => {}
+                    Some(_) => {
+                        return Err(
+                            "Safe Outputs MCP server policy does not match the authenticated Safe Outputs configuration"
+                                .to_owned(),
+                        );
+                    }
+                    None => {
+                        return Err(
+                            "Safe Outputs MCP server policy is missing from the hierarchical policy"
+                                .to_owned(),
+                        );
+                    }
                 }
-                if self
-                    .tool_policy
-                    .denylist
-                    .iter()
-                    .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
-                {
-                    return Err(format!(
-                        "Safe Outputs tool `{}` is denied by the MCP tool policy",
-                        tool.name()
-                    ));
+            } else {
+                let command = vec![SAFE_OUTPUTS_MCP_PATH.to_owned()];
+                if !self.tool_policy.allowed_server_commands.contains(&command) {
+                    return Err(
+                        "Safe Outputs MCP command is not in the exact server command allowlist"
+                            .to_owned(),
+                    );
+                }
+                for tool in safe_outputs.enabled_tools() {
+                    if !self
+                        .tool_policy
+                        .allowlist
+                        .iter()
+                        .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
+                    {
+                        return Err(format!(
+                            "Safe Outputs tool `{}` is not admitted by the MCP tool policy",
+                            tool.name()
+                        ));
+                    }
+                    if self
+                        .tool_policy
+                        .denylist
+                        .iter()
+                        .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
+                    {
+                        return Err(format!(
+                            "Safe Outputs tool `{}` is denied by the MCP tool policy",
+                            tool.name()
+                        ));
+                    }
                 }
             }
+        } else if self
+            .tool_policy
+            .servers
+            .contains_key(SAFE_OUTPUTS_SERVER_ID)
+        {
+            return Err("reserved Safe Outputs MCP server policy is not enabled".to_owned());
         }
         Ok(())
     }
 
     pub fn approved_commands(&self) -> Result<Vec<ApprovedCommand>, String> {
-        self.tool_policy
-            .allowed_server_commands
-            .iter()
-            .map(|command| ApprovedCommand::from_argv(command))
-            .collect()
+        if self.tool_policy.uses_hierarchical_servers() {
+            self.tool_policy
+                .servers
+                .values()
+                .filter_map(|server| match server {
+                    McpServerPolicy::Stdio { command, .. } => Some(command),
+                    McpServerPolicy::StreamableHttp { .. }
+                    | McpServerPolicy::StreamableHttp2025 { .. } => None,
+                })
+                .map(|command| ApprovedCommand::from_argv(command))
+                .collect()
+        } else {
+            self.tool_policy
+                .allowed_server_commands
+                .iter()
+                .map(|command| ApprovedCommand::from_argv(command))
+                .collect()
+        }
+    }
+
+    pub fn resolve_stdio(&self, command: &ApprovedCommand) -> Result<ResolvedServerPolicy, String> {
+        resolve_stdio_server(&self.tool_policy, &command.argv())
     }
 
     pub fn project_validator(&self) -> Result<ProjectConfigValidator, String> {
-        Ok(ProjectConfigValidator::new(
-            [vec![crate::config::NATIVE_BROKER_PATH.to_owned()]],
-            self.approved_commands()?,
-        ))
+        ProjectConfigValidator::from_policy(&self.tool_policy)
     }
+
+    pub fn remote_servers(&self) -> Result<BTreeMap<String, RemoteServerRuntime>, String> {
+        self.tool_policy
+            .servers
+            .iter()
+            .filter_map(|(id, server)| {
+                let (transport, url, tools, http) = match server {
+                    McpServerPolicy::Stdio { .. } => return None,
+                    McpServerPolicy::StreamableHttp { url, tools, http } => {
+                        (ToolTransport::StreamableHttp, url, tools, http)
+                    }
+                    McpServerPolicy::StreamableHttp2025 { url, tools, http } => {
+                        (ToolTransport::StreamableHttp2025, url, tools, http)
+                    }
+                };
+                Some((id, transport, url, tools, http))
+            })
+            .map(|(id, transport, url, tools, http)| {
+                let endpoint = HttpEndpoint::parse(url)?;
+                Ok((
+                    id.clone(),
+                    RemoteServerRuntime {
+                        id: id.clone(),
+                        transport,
+                        fingerprint: http_fingerprint(transport, &endpoint.normalized),
+                        endpoint,
+                        gateway_url: gateway_url(id),
+                        tools: tools.clone(),
+                        http: http.clone(),
+                    },
+                ))
+            })
+            .collect()
+    }
+}
+
+#[must_use]
+pub fn gateway_route(server_id: &str) -> String {
+    format!("{HTTP_GATEWAY_ROUTE_PREFIX}{server_id}")
+}
+
+#[must_use]
+pub fn gateway_url(server_id: &str) -> String {
+    format!(
+        "http://127.0.0.1:{DEFAULT_HTTP_GATEWAY_PORT}{}",
+        gateway_route(server_id)
+    )
 }
 
 fn validate_absolute_normalized(path: &Path, name: &str) -> Result<(), String> {
@@ -205,7 +371,9 @@ mod tests {
                     "/usr/bin/server".to_owned(),
                     "--stdio".to_owned(),
                 ]],
+                servers: BTreeMap::new(),
             },
+            audit_log_path: PathBuf::from(DEFAULT_AUDIT_LOG_PATH),
             fixed_environment: BTreeMap::from([
                 ("HOME".to_owned(), "/workspace".to_owned()),
                 ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
@@ -242,6 +410,69 @@ mod tests {
 
         let mut policy = policy();
         policy.observation.as_mut().expect("observation").log_path = PathBuf::from("/tmp/mcp.log");
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn remote_servers_share_one_normalized_runtime_derivation() {
+        let mut policy = policy();
+        policy.tool_policy = ToolCallPolicy {
+            servers: BTreeMap::from([(
+                "remote-github".to_owned(),
+                McpServerPolicy::StreamableHttp {
+                    url: "https://MCP.Example.com/mcp".to_owned(),
+                    tools: ServerToolPolicy::default(),
+                    http: McpHttpPolicy::default(),
+                },
+            )]),
+            ..ToolCallPolicy::default()
+        };
+        let remote = policy.remote_servers().expect("remote runtime");
+        let server = remote.get("remote-github").expect("server");
+        assert_eq!(
+            server.endpoint.normalized,
+            "https://mcp.example.com:443/mcp"
+        );
+        assert_eq!(
+            server.gateway_url,
+            "http://127.0.0.1:15082/mcp/remote-github"
+        );
+        assert_eq!(server.endpoint.authority(), "mcp.example.com:443");
+        assert_eq!(server.transport, ToolTransport::StreamableHttp);
+    }
+
+    #[test]
+    fn hierarchical_safe_outputs_policy_must_match_the_runtime_configuration() {
+        let configuration = sendbox_config::SafeOutputsConfiguration {
+            enabled: true,
+            ..sendbox_config::SafeOutputsConfiguration::default()
+        };
+        let safe_outputs = SafeOutputsRuntimePolicy::from_configuration(
+            sendbox_core::SessionId::from_bytes([7; 16]),
+            &configuration,
+        )
+        .expect("Safe Outputs policy");
+
+        let mut policy = policy();
+        policy.tool_policy = ToolCallPolicy {
+            servers: BTreeMap::from([(
+                SAFE_OUTPUTS_SERVER_ID.to_owned(),
+                safe_outputs.mcp_server_policy(),
+            )]),
+            ..ToolCallPolicy::default()
+        };
+        policy.safe_outputs = Some(safe_outputs);
+        policy.validate().expect("matching policy");
+
+        let McpServerPolicy::Stdio { tools, .. } = policy
+            .tool_policy
+            .servers
+            .get_mut(SAFE_OUTPUTS_SERVER_ID)
+            .expect("Safe Outputs server")
+        else {
+            panic!("Safe Outputs must use stdio");
+        };
+        tools.allowlist.pop();
         assert!(policy.validate().is_err());
     }
 }

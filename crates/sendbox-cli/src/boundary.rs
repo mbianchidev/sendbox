@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Args, Subcommand};
 use sendbox_config::SandboxConfiguration;
 use sendbox_core::CONFIG_SCHEMA_VERSION;
-use sendbox_mcp::artifact::NativeObserverArtifact;
+use sendbox_mcp::artifact::{McpBoundaryInspection, NativeObserverArtifact};
 use serde::Serialize;
 
 #[derive(Debug, Args)]
@@ -34,6 +34,7 @@ struct BoundaryInspection<'a> {
     generated_executables: bool,
     config_source: String,
     configuration: &'a SandboxConfiguration,
+    mcp: McpBoundaryInspection,
     observer: NativeObserverArtifact,
 }
 
@@ -52,12 +53,18 @@ fn inspect(arguments: InspectArgs) -> ExitCode {
         return emit_error(arguments.json, &arguments.config, &error.to_string());
     }
 
+    let mcp = match McpBoundaryInspection::from_policy(&configuration.policy.boundaries.tool_calls)
+    {
+        Ok(mcp) => mcp,
+        Err(error) => return emit_error(arguments.json, &arguments.config, &error),
+    };
     let inspection = BoundaryInspection {
         schema_version: CONFIG_SCHEMA_VERSION,
         artifact_kind: "sendbox.boundary-plan-inspection",
         generated_executables: false,
         config_source: arguments.config.display().to_string(),
         configuration: &configuration,
+        mcp,
         observer: configuration.observability.as_ref().map_or_else(
             || {
                 NativeObserverArtifact::from_config(
@@ -80,6 +87,32 @@ fn inspect(arguments: InspectArgs) -> ExitCode {
         );
         println!("boundary artifact: {}", inspection.artifact_kind);
         println!("generated executables: no");
+        println!("MCP policy mode: {}", inspection.mcp.mode);
+        for server in &inspection.mcp.servers {
+            println!(
+                "MCP server: {} ({:?}, {})",
+                server.server_policy_id, server.transport, server.fingerprint
+            );
+            if let Some(endpoint) = &server.normalized_endpoint {
+                println!("  upstream endpoint: {endpoint}");
+            }
+            if let Some(gateway) = &server.local_gateway_url {
+                println!("  local gateway: {gateway}");
+            }
+            if let Some(http) = &server.http {
+                println!(
+                    "  HTTP limits: request={} response={} concurrent={} redirects={}",
+                    http.max_request_bytes,
+                    http.max_response_bytes,
+                    http.max_concurrent_requests,
+                    if http.allow_redirects {
+                        http.max_redirects
+                    } else {
+                        0
+                    }
+                );
+            }
+        }
         println!("observer artifact: {}", inspection.observer.artifact_kind);
     }
     ExitCode::SUCCESS

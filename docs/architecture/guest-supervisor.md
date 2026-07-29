@@ -4,9 +4,10 @@ Status: **production runtime integration**. This document defines the trust, boo
 readiness, service, and fail-closed semantics implemented by
 `guest/sendbox-guest`. Apple and Kata integrate the production execution broker,
 mandatory DNS/SOCKS5 egress service, and authenticated MCP policy. The host
-session lifecycle owns audit and snapshot persistence. When enabled, the
-supervisor also owns the Safe Outputs recorder and its seal key; BPF activation
-remains explicit guest policy.
+session lifecycle owns audit and snapshot persistence. The guest also starts the
+mandatory MCP audit service and, for remote MCP, a trusted HTTP gateway inside
+the egress broker. When enabled, the supervisor also owns the Safe Outputs
+recorder and its seal key. BPF activation remains explicit guest policy.
 
 ## Process and command model
 
@@ -21,6 +22,11 @@ remains explicit guest policy.
   qualification.
 - `inject-bootstrap` and `tunnel` are hidden runtime-only Kata controls.
 - `exec-broker` is the mandatory one-session production broker service.
+- `egress-supervisor` and `egress-gateway` are hidden production services for
+  cgroup/nftables ownership and loopback DNS, CONNECT, and MCP listeners.
+- `mcp-audit` is the mandatory root-owned MCP audit sink.
+- invocation as the installed `mcp-broker` path runs the exact-command stdio
+  broker selected by project MCP configuration.
 - `safe-outputs-mcp` is a root-installed stdio bridge to the authenticated
   session recorder. The bridge never validates or persists operations itself.
 
@@ -28,7 +34,9 @@ Typed service identifiers reserve `exec`, `mcp`, `dns`, `egress`, `audit`,
 `bpf`, and `safe_outputs`. Reserving an identifier does not claim that its
 service is implemented. The Safe Outputs identity represents the mandatory
 in-process recorder rather than a separate child, so the bootstrap secret never
-crosses a process boundary.
+crosses a process boundary. Exec depends on configured mandatory egress and
+audit services; readiness is not published until the complete dependency graph
+is healthy.
 
 ## Trust and immutable bootstrap
 
@@ -160,8 +168,10 @@ The launcher drops brokered workloads to the non-root project uid/gid and applie
 the production capability, rlimit, cgroup, pidfd, and command seccomp controls.
 Tests retain a deterministic unprivileged adapter.
 
-Egress/nftables, BPF attachment, secrets, MCP, and audit integration remain
-unimplemented for this slice and cannot be requested as completed features.
+Production egress/nftables, authenticated secret delivery, hierarchical stdio
+MCP policy, the Streamable HTTP MCP gateway, and mandatory MCP audit integration
+are wired into this lifecycle. BPF attachment remains an explicit policy-driven
+observation feature and is never an MCP authorization mechanism.
 
 ## Static delivery
 

@@ -19,10 +19,15 @@ guest role, secret name, sequence, expiry, and policy digest.
 Long-lived trust roots, release signing, policy signing, and rollback floors are
 separate versioned trust domains rather than protocol-session keys.
 
-Apple and Kata bootstrap also carry the session-derived egress runtime policy
-and the exact delegated execution cgroup parent. The guest validates both before
-starting mandatory services, starts Egress before Exec, and exposes readiness
-only after the DNS/SOCKS5 gateway and kernel rules are armed.
+Apple and Kata bootstrap also carry the schema-v3 signed boundary plan, the
+session-derived schema-v3 egress runtime policy, the exact hierarchical MCP
+runtime policy, the delegated execution cgroup parent, and gateway-only
+credential material. The guest validates policy equivalence before starting
+mandatory services. Gateway credential names must exactly match the signed MCP
+policy and remain disjoint from workload secret names; values are zeroized after
+delivery to the trusted gateway. Egress and MCP audit become ready before Exec,
+and remote MCP readiness additionally requires the loopback HTTP gateway,
+reserved-origin policy, marked dialing path, and kernel rules to be armed.
 
 When package analysis is enabled, the encrypted bootstrap additionally carries
 the strict package policy, workload-facing and registry-only ports, private

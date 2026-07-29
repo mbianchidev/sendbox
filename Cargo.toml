@@ -41,6 +41,7 @@ repository = "https://github.com/mbianchidev/sendbox"
 async-trait = "0.1.89"
 axum = "0.8.9"
 base64 = "0.22.1"
+bytes = "1.12.1"
 cap-std = "4.0.2"
 caps = "0.5.6"
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
@@ -53,8 +54,11 @@ futures-util = "0.3.33"
 getrandom = "0.4.3"
 hickory-proto = "0.26.1"
 http = "1.4.0"
+http-body-util = "0.1.4"
 hkdf = "0.13.0"
 hmac = { version = "0.13.0", features = ["zeroize"] }
+hyper = { version = "1.11.0", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 ipnet = "2.11.0"
 jiff = "0.2.35"
 jsonc-parser = { version = "0.33.0", features = ["serde"] }
@@ -64,11 +68,15 @@ libseccomp = "0.4.0"
 minicbor = { version = "2.2.2", features = ["std"] }
 p256 = "0.14.0"
 proptest = "1.11.0"
+rcgen = "0.14.8"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "socks", "stream"] }
 rpassword = "7.5.4"
 rustix = { version = "1.1.4", features = ["fs", "process", "std"] }
 rlimit = "0.11.0"
 roxmltree = "0.21.1"
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.4"
+rustls-pki-types = "1.15.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["raw_value"] }
 serde_json_canonicalizer = "0.3.2"
@@ -84,6 +92,7 @@ thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["formatting", "parsing", "serde"] }
 tokio = { version = "1.53.0", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = { version = "0.7.16", features = ["io", "rt"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
 toml = "1.1.3"
 unicode-normalization = "0.1.25"
 url = "2.5.8"

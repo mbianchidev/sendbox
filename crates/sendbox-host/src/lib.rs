@@ -19,8 +19,8 @@ use sendbox_agent::{
     SecretEnvelope, SecretReference, SecretResolver, SignalSource, TerminalSource,
 };
 use sendbox_bootstrap::{
-    DEFAULT_REGISTRY_CACHE_ROOT, DEFAULT_REGISTRY_GID, DEFAULT_REGISTRY_UID, RegistryCredential,
-    RegistryProxyConfiguration,
+    DEFAULT_REGISTRY_CACHE_ROOT, DEFAULT_REGISTRY_GID, DEFAULT_REGISTRY_UID, GatewayCredential,
+    RegistryCredential, RegistryProxyConfiguration,
 };
 use sendbox_boundary::{
     Architecture, ArtifactIdentity, ArtifactKind, BOUNDARY_PLAN_FORMAT, BOUNDARY_PLAN_VERSION,
@@ -53,7 +53,10 @@ use sendbox_mcp::config::{NATIVE_BROKER_PATH, PROJECT_CONFIG_PATHS};
 use sendbox_mcp::runtime::{
     RUNTIME_POLICY_SCHEMA_VERSION, RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
-use sendbox_mcp::safe_outputs::{SAFE_OUTPUTS_MCP_PATH, SafeOutputsRuntimePolicy};
+use sendbox_mcp::safe_outputs::{
+    SAFE_OUTPUTS_MCP_PATH, SAFE_OUTPUTS_SERVER_ID, SafeOutputsRuntimePolicy,
+};
+use sendbox_policy::MAX_MCP_SERVERS;
 use sendbox_runtime::{
     BootstrapMaterial, CancellationToken, CommandArgument, CommandSpec, ContainerId, CreateRequest,
     InitializeRequest, OutputStream, ProcessOptions, ProcessOutcome, Program, RuntimeError,
@@ -415,6 +418,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .configuration
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
+    validate_reserved_secret_names(&request.configuration)?;
     let workspace_destination = PathBuf::from("/workspace");
     let workload_identity = match selected_runtime {
         ResolvedRuntime::Apple | ResolvedRuntime::Kata => {
@@ -492,6 +496,15 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let resources = runtime_resources(&request.configuration)?;
     let bootstrap_reference =
         SecretReference::new(format!("bootstrap-{session_id}")).map_err(HostError::AgentPlan)?;
+    let gateway_secret_names = request
+        .configuration
+        .policy
+        .boundaries
+        .tool_calls
+        .gateway_secret_names()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let gateway_credentials = resolve_gateway_credentials(&gateway_secret_names)?;
     let secrets = Arc::new(HostSecretResolver::open(
         bootstrap_reference.clone(),
         random_bootstrap_secret()?,
@@ -510,6 +523,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         git_guard_policy.as_ref(),
         mcp_policy.as_ref(),
         egress_policy.as_ref(),
+        &gateway_credentials,
         registry_proxy.as_ref(),
     )?;
     let registry_mounts = registry_proxy
@@ -567,6 +581,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
             })
             .collect(),
         secrets: request.configuration.secrets.clone(),
+        gateway_secrets: gateway_secret_names,
         resources: ResourceDeclaration {
             cpus: resources.cpus,
             memory_bytes: resources.memory_bytes,
@@ -810,6 +825,7 @@ fn build_runtime(
     git_guard_policy: Option<&GuardPolicyDocument>,
     mcp_policy: Option<&RuntimePolicyDocument>,
     egress_policy: Option<&EgressRuntimePolicyDocument>,
+    gateway_credentials: &[GatewayCredential],
     registry_proxy: Option<&PreparedRegistryProxy>,
 ) -> Result<RuntimeBuild, HostError> {
     let manifest_path = bundle_root.join("manifest.json");
@@ -848,6 +864,7 @@ fn build_runtime(
             configuration.git_guard_policy = git_guard_policy.cloned();
             configuration.mcp_policy = mcp_policy.cloned();
             configuration.egress_policy = egress_policy.cloned();
+            configuration.gateway_credentials = gateway_credentials.to_vec();
             configuration.registry_proxy =
                 registry_proxy.map(|prepared| prepared.bootstrap.clone());
             configuration.workload_uid = workload_uid;
@@ -914,6 +931,7 @@ fn build_runtime(
                 git_guard_policy: git_guard_policy.cloned(),
                 mcp_policy: mcp_policy.cloned(),
                 egress_policy: egress_policy.cloned(),
+                gateway_credentials: gateway_credentials.to_vec(),
                 registry_proxy: registry_proxy.map(|prepared| prepared.bootstrap.clone()),
                 workload_uid,
                 workload_gid,
@@ -1289,6 +1307,11 @@ fn validate_runtime_features(
     }
     if selected_runtime == ResolvedRuntime::Hyperlight
         && (requires_enforcement(&configuration.policy.network)
+            || configuration
+                .policy
+                .boundaries
+                .tool_calls
+                .has_remote_servers()
             || configuration.policy.packages.enabled)
     {
         return Err(HostError::Invalid(
@@ -1303,7 +1326,9 @@ fn make_egress_policy(
     configuration: &SandboxConfiguration,
     session_id: SessionId,
 ) -> Result<Option<EgressRuntimePolicyDocument>, HostError> {
+    let tool_policy = &configuration.policy.boundaries.tool_calls;
     if !requires_enforcement(&configuration.policy.network)
+        && !tool_policy.has_remote_servers()
         && !configuration.policy.packages.enabled
     {
         return Ok(None);
@@ -1328,7 +1353,11 @@ fn make_egress_policy(
         workload.blocked_domains.sort();
         workload.blocked_domains.dedup();
     }
-    let mut policy = EgressRuntimePolicyDocument::for_session(session_id, workload);
+    let mut policy =
+        EgressRuntimePolicyDocument::for_session_with_mcp(session_id, workload, Some(tool_policy))
+            .map_err(|error| {
+                HostError::Invalid(format!("invalid egress runtime policy: {error}"))
+            })?;
     if configuration.policy.packages.enabled {
         policy = policy.with_registry(
             DEFAULT_REGISTRY_PROXY_PORT,
@@ -1517,6 +1546,12 @@ fn make_mcp_policy(
             .tool_calls
             .allowed_server_commands
             .is_empty()
+        && configuration
+            .policy
+            .boundaries
+            .tool_calls
+            .servers
+            .is_empty()
         && inspection.is_none()
         && !safe_outputs_enabled
     {
@@ -1538,10 +1573,16 @@ fn make_mcp_policy(
         .tool_calls
         .allowed_server_commands
         .is_empty()
+        && configuration
+            .policy
+            .boundaries
+            .tool_calls
+            .servers
+            .is_empty()
         && !safe_outputs_enabled
     {
         return Err(HostError::Invalid(
-            "MCP composition requires at least one exactly approved server command".to_owned(),
+            "MCP composition requires at least one allowed server policy".to_owned(),
         ));
     }
     let (workload_uid, workload_gid) = workload_identity
@@ -1604,19 +1645,54 @@ fn make_mcp_policy(
         .transpose()
         .map_err(|error| HostError::Invalid(format!("invalid Safe Outputs policy: {error}")))?;
     let mut tool_policy = configuration.policy.boundaries.tool_calls.clone();
+    if tool_policy.servers.contains_key(SAFE_OUTPUTS_SERVER_ID) {
+        return Err(HostError::Invalid(format!(
+            "MCP server policy ID `{SAFE_OUTPUTS_SERVER_ID}` is reserved for Safe Outputs"
+        )));
+    }
     if let Some(safe_outputs) = &safe_outputs {
-        let command = vec![SAFE_OUTPUTS_MCP_PATH.to_owned()];
-        if !tool_policy.allowed_server_commands.contains(&command) {
-            tool_policy.allowed_server_commands.push(command);
-        }
-        for tool in safe_outputs.enabled_tools() {
-            if !tool_policy
-                .allowlist
-                .iter()
-                .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
-            {
-                tool_policy.allowlist.push(tool.name().to_owned());
+        if !tool_policy.allowed_server_commands.is_empty() {
+            let command = vec![SAFE_OUTPUTS_MCP_PATH.to_owned()];
+            if !tool_policy.allowed_server_commands.contains(&command) {
+                tool_policy.allowed_server_commands.push(command);
             }
+            for tool in safe_outputs.enabled_tools() {
+                if !tool_policy
+                    .allowlist
+                    .iter()
+                    .any(|pattern| sendbox_core::glob_matches(tool.name(), pattern))
+                {
+                    tool_policy.allowlist.push(tool.name().to_owned());
+                }
+            }
+        } else {
+            if tool_policy.servers.is_empty() {
+                tool_policy.transport = sendbox_policy::ToolTransport::Stdio;
+                tool_policy.default_action = sendbox_policy::Action::Deny;
+                tool_policy.allowlist.clear();
+                tool_policy.denylist.clear();
+            }
+            if tool_policy.servers.len() >= MAX_MCP_SERVERS {
+                return Err(HostError::Invalid(format!(
+                    "Safe Outputs requires one free hierarchical MCP server slot; at most {MAX_MCP_SERVERS} servers are supported"
+                )));
+            }
+            let safe_outputs_policy = safe_outputs.mcp_server_policy();
+            let safe_outputs_command = safe_outputs_policy
+                .command()
+                .expect("Safe Outputs policy must use stdio");
+            if let Some((id, _)) = tool_policy.servers.iter().find(|(_, server)| {
+                server
+                    .command()
+                    .is_some_and(|command| command == safe_outputs_command)
+            }) {
+                return Err(HostError::Invalid(format!(
+                    "Safe Outputs MCP command is already assigned to server policy `{id}`"
+                )));
+            }
+            tool_policy
+                .servers
+                .insert(SAFE_OUTPUTS_SERVER_ID.to_owned(), safe_outputs_policy);
         }
     }
     let policy = RuntimePolicyDocument {
@@ -1625,6 +1701,7 @@ fn make_mcp_policy(
         workload_uid,
         workload_gid,
         tool_policy,
+        audit_log_path: configuration.policy.boundaries.log_path.clone().into(),
         fixed_environment,
         inherited_environment_keys,
         observation,
@@ -1729,6 +1806,18 @@ fn boundary_features(
                 FeatureAdmission {
                     decision: FeatureDecision::Enforced,
                     mechanism,
+                },
+            );
+        }
+        if policy.tool_policy.has_remote_servers() {
+            features.insert(
+                "mcp_http_gateway".to_owned(),
+                FeatureAdmission {
+                    decision: FeatureDecision::Enforced,
+                    mechanism: format!(
+                        "trusted_streamable_http_gateway_v1:sha256={}",
+                        sha256_hex(&encoded)
+                    ),
                 },
             );
         }
@@ -1901,6 +1990,11 @@ fn collect_credential_values(
 }
 
 fn validate_reserved_secret_names(configuration: &SandboxConfiguration) -> Result<(), HostError> {
+    let gateway_names = configuration
+        .policy
+        .boundaries
+        .tool_calls
+        .gateway_secret_names();
     for value in &configuration.secrets {
         let name = SecretName::new(value.clone())?;
         if requires_guarded_github_forwarding(&name) {
@@ -1908,8 +2002,29 @@ fn validate_reserved_secret_names(configuration: &SandboxConfiguration) -> Resul
                 "configured secret `{value}` requires guarded credential forwarding"
             )));
         }
+        if gateway_names.contains(value) {
+            return Err(HostError::Invalid(format!(
+                "configured secret `{value}` cannot also be an HTTP MCP gateway credential"
+            )));
+        }
     }
     Ok(())
+}
+
+fn resolve_gateway_credentials(names: &[String]) -> Result<Vec<GatewayCredential>, HostError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = native_secret_store()?;
+    names
+        .iter()
+        .map(|name| {
+            let secret_name = SecretName::new(name.clone())?;
+            let secret = store.retrieve(&secret_name)?;
+            GatewayCredential::new(name.clone(), secret.value.expose_secret().to_vec())
+                .map_err(|error| HostError::Invalid(error.to_string()))
+        })
+        .collect()
 }
 
 struct SecurityComposition<'a> {
@@ -2601,7 +2716,7 @@ fn current_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use sendbox_config::{PolicyPreset, RuntimeProvider as ConfigRuntimeProvider};
-    use sendbox_policy::Action;
+    use sendbox_policy::{Action, McpServerPolicy, ServerToolPolicy};
     use tempfile::TempDir;
 
     use super::*;
@@ -2692,12 +2807,18 @@ mod tests {
         )
         .expect("MCP configuration");
         let mut configuration = supported_configuration(temp.path().to_path_buf());
-        configuration
-            .policy
-            .boundaries
-            .tool_calls
-            .allowed_server_commands =
-            vec![vec!["/usr/bin/mcp-server".to_owned(), "--stdio".to_owned()]];
+        configuration.policy.boundaries.tool_calls.default_action = Action::Deny;
+        configuration.policy.boundaries.tool_calls.servers.insert(
+            "fixture-policy".to_owned(),
+            McpServerPolicy::Stdio {
+                command: vec!["/usr/bin/mcp-server".to_owned(), "--stdio".to_owned()],
+                tools: ServerToolPolicy {
+                    default_action: Action::Deny,
+                    allowlist: vec!["read_*".to_owned()],
+                    denylist: vec!["delete_*".to_owned()],
+                },
+            },
+        );
         let inspection = &mut configuration
             .observability
             .as_mut()
@@ -2718,6 +2839,19 @@ mod tests {
         .expect("MCP policy")
         .expect("MCP composition");
         assert_eq!(policy.workspace_root, Path::new("/workspace"));
+        let command = sendbox_mcp::config::ApprovedCommand::from_argv(&[
+            "/usr/bin/mcp-server".to_owned(),
+            "--stdio".to_owned(),
+        ])
+        .expect("approved command");
+        assert_eq!(
+            policy
+                .resolve_stdio(&command)
+                .expect("resolved policy")
+                .identity
+                .id,
+            "fixture-policy"
+        );
         assert_eq!(
             runtime_environment(Some(&policy), None)[0].value,
             NATIVE_BROKER_PATH
@@ -2796,18 +2930,12 @@ mod tests {
         )
         .expect("MCP policy")
         .expect("Safe Outputs policy");
-        assert!(
-            policy
-                .tool_policy
-                .allowed_server_commands
-                .contains(&vec![SAFE_OUTPUTS_MCP_PATH.to_owned()])
+        let safe_outputs = policy.safe_outputs.as_ref().expect("Safe Outputs runtime");
+        assert_eq!(
+            policy.tool_policy.servers.get(SAFE_OUTPUTS_SERVER_ID),
+            Some(&safe_outputs.mcp_server_policy())
         );
-        assert!(
-            policy
-                .tool_policy
-                .allowlist
-                .contains(&"create_issue".to_owned())
-        );
+        assert!(!policy.tool_policy.uses_legacy_fields());
         assert!(
             !policy
                 .fixed_environment
@@ -2834,6 +2962,112 @@ mod tests {
         let features = boundary_features(&configuration, None, Some(&policy), None, &credentials)
             .expect("features");
         assert!(features.contains_key("github_safe_outputs"));
+    }
+
+    #[test]
+    fn safe_outputs_policy_coexists_with_hierarchical_servers() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.policy.boundaries.tool_calls.default_action = Action::Deny;
+        configuration.policy.boundaries.tool_calls.servers.insert(
+            "fixture".to_owned(),
+            McpServerPolicy::Stdio {
+                command: vec!["/usr/bin/mcp-server".to_owned()],
+                tools: ServerToolPolicy::default(),
+            },
+        );
+        configuration.github.safe_outputs.enabled = true;
+        configuration.validate().expect("configuration");
+
+        let policy = make_mcp_policy(
+            ResolvedRuntime::Kata,
+            test_session(),
+            &configuration,
+            temp.path(),
+            Path::new("/workspace"),
+            Some((1000, 1000)),
+            None,
+        )
+        .expect("MCP policy")
+        .expect("Safe Outputs policy");
+
+        assert!(policy.tool_policy.servers.contains_key("fixture"));
+        let safe_outputs = policy.safe_outputs.as_ref().expect("Safe Outputs runtime");
+        assert_eq!(
+            policy.tool_policy.servers.get(SAFE_OUTPUTS_SERVER_ID),
+            Some(&safe_outputs.mcp_server_policy())
+        );
+    }
+
+    #[test]
+    fn safe_outputs_policy_preserves_legacy_compatibility() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration
+            .policy
+            .boundaries
+            .tool_calls
+            .allowed_server_commands
+            .push(vec![
+                "/usr/bin/node".to_owned(),
+                "/usr/lib/mcp-server.js".to_owned(),
+            ]);
+        configuration.policy.boundaries.tool_calls.default_action = Action::Deny;
+        configuration.github.safe_outputs.enabled = true;
+        configuration.validate().expect("configuration");
+
+        let policy = make_mcp_policy(
+            ResolvedRuntime::Kata,
+            test_session(),
+            &configuration,
+            temp.path(),
+            Path::new("/workspace"),
+            Some((1000, 1000)),
+            None,
+        )
+        .expect("MCP policy")
+        .expect("Safe Outputs policy");
+
+        assert!(policy.tool_policy.servers.is_empty());
+        assert!(
+            policy
+                .tool_policy
+                .allowed_server_commands
+                .contains(&vec![SAFE_OUTPUTS_MCP_PATH.to_owned()])
+        );
+        assert!(policy.tool_policy.allowlist.contains(&"noop".to_owned()));
+    }
+
+    #[test]
+    fn safe_outputs_policy_rejects_reserved_server_id_collisions() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.policy.boundaries.tool_calls.default_action = Action::Deny;
+        configuration.policy.boundaries.tool_calls.servers.insert(
+            SAFE_OUTPUTS_SERVER_ID.to_owned(),
+            McpServerPolicy::Stdio {
+                command: vec!["/usr/bin/mcp-server".to_owned()],
+                tools: ServerToolPolicy::default(),
+            },
+        );
+        configuration.github.safe_outputs.enabled = true;
+        configuration.validate().expect("configuration");
+
+        let error = make_mcp_policy(
+            ResolvedRuntime::Kata,
+            test_session(),
+            &configuration,
+            temp.path(),
+            Path::new("/workspace"),
+            Some((1000, 1000)),
+            None,
+        )
+        .expect_err("reserved server ID must fail closed");
+        assert!(matches!(
+            error,
+            HostError::Invalid(message)
+                if message.contains("is reserved for Safe Outputs")
+        ));
     }
 
     #[test]

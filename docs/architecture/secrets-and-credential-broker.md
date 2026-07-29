@@ -81,6 +81,21 @@ guard before returning a zeroizing value. Replay state is intentionally
 session-scoped: session bootstrap material and IDs must never be reused after a
 process restart. Guest plaintext persistence is not provided by this crate.
 
+## MCP gateway credential partition
+
+Remote MCP bearer credentials reuse the host `SecretStore`, but they do not
+enter the ordinary workload secret set or environment. Each
+`http.authorization.bearer_secret` name is derived from the hierarchical MCP
+policy and signed as a separate boundary-plan partition. Configuration rejects
+missing, unexpected, duplicate, or overlapping workload/gateway names.
+
+The host resolves exactly those names before runtime startup. Values are carried
+only in the authenticated root-owned bootstrap payload, validated against the
+signed MCP policy, moved into zeroizing gateway storage, and injected only as
+the configured upstream `Authorization: Bearer` header after route, policy,
+destination, and TLS validation. Values are redacted from debug output, audit,
+inspection, and errors and are never accepted from project MCP files.
+
 ## Credential broker policy and listener
 
 Policies require an exact canonical target host, absolute path prefix, explicit

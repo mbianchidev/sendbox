@@ -125,24 +125,66 @@ policy:
     enabled: true
 
     tool_calls:
-      # Secure enforcement currently supports newline-framed stdio MCP only.
-      # Prefix each configured server command with:
+      # Each server policy binds one exact transport identity to its own tool
+      # rules. Prefix project-local stdio definitions with:
       #   /run/sendbox-boundary/mcp-broker --
-      transport: stdio
-      default_action: deny
-      allowlist:
-        - read_file
-        - list_directory
-        - search_code
-      denylist:
-        - "*delete*"
-        - "*shell*"
       max_frame_bytes: 1048576
-      server_command_patterns:
-        - mcp-server
-        - "@modelcontextprotocol"
-      allowed_server_commands:
-        - ["/usr/local/bin/node", "/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/workspaces/my-project"]
+      servers:
+        filesystem:
+          transport: stdio
+          command:
+            - /usr/local/bin/node
+            - /usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js
+            - /workspaces/my-project
+          tools:
+            default_action: deny
+            allowlist:
+              - read_file
+              - list_directory
+            denylist:
+              - "write_*"
+              - "move_*"
+              - "delete_*"
+        github:
+          transport: stdio
+          command: ["/usr/local/bin/github-mcp-server", "stdio"]
+          tools:
+            default_action: deny
+            allowlist:
+              - search_code
+              - get_file_contents
+            denylist:
+              - "create_*"
+              - "update_*"
+              - "delete_*"
+        remote-docs:
+          # Project MCP files must use:
+          #   type: streamable-http
+          #   url: http://127.0.0.1:15082/mcp/remote-docs
+          transport: streamable_http
+          url: https://mcp.example.com/mcp
+          tools:
+            default_action: deny
+            allowlist:
+              - search_docs
+              - get_document
+            denylist:
+              - "create_*"
+              - "update_*"
+              - "delete_*"
+          http:
+            allow_redirects: false
+            max_request_bytes: 1048576
+            max_response_bytes: 1048576
+            request_timeout_seconds: 30
+            connect_timeout_seconds: 10
+            idle_timeout_seconds: 30
+            max_events: 1024
+            max_concurrent_requests: 32
+            authorization:
+              # Stored in the SendBox vault, delivered only to the trusted
+              # gateway, and intentionally absent from top-level secrets.
+              bearer_secret: REMOTE_MCP_TOKEN
 
     syscalls:
       # These extend the built-in ContainerHardening seccomp denylist.

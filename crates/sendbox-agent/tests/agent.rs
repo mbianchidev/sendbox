@@ -200,6 +200,13 @@ fn verified_boundary_plan(
             })
             .collect(),
         secrets: configuration.secrets.clone(),
+        gateway_secrets: configuration
+            .policy
+            .boundaries
+            .tool_calls
+            .gateway_secret_names()
+            .into_iter()
+            .collect(),
         artifacts: vec![
             ArtifactIdentity {
                 kind: ArtifactKind::RuntimeExecutable,
