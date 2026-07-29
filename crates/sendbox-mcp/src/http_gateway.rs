@@ -92,12 +92,17 @@ impl fmt::Debug for GatewayCredentialSet {
 impl GatewayCredentialSet {
     #[must_use]
     pub fn new(values: BTreeMap<String, String>) -> Self {
-        Self {
-            values: values
+        Self::from_secret_values(
+            values
                 .into_iter()
                 .map(|(name, value)| (name, Zeroizing::new(value)))
                 .collect(),
-        }
+        )
+    }
+
+    #[must_use]
+    pub fn from_secret_values(values: BTreeMap<String, Zeroizing<String>>) -> Self {
+        Self { values }
     }
 
     fn names(&self) -> BTreeSet<String> {

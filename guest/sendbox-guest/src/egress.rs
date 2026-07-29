@@ -13,6 +13,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
+use std::str;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", test))]
@@ -23,6 +25,8 @@ use sendbox_egress::address::{AddressClass, classify};
 use sendbox_egress::runtime::RuntimePolicyDocument;
 use sendbox_mcp::runtime::RuntimePolicyDocument as McpRuntimePolicyDocument;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use zeroize::Zeroizing;
 
 use crate::GuestError;
 use crate::service::{HealthCheck, RestartPolicy, ServiceId, ServiceSpec};
@@ -604,8 +608,8 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
                 .gateway_credentials
                 .into_iter()
                 .map(|credential| {
-                    String::from_utf8(credential.expose_secret().to_vec())
-                        .map(|value| (credential.name.clone(), value))
+                    str::from_utf8(credential.expose_secret())
+                        .map(|value| (credential.name.clone(), Zeroizing::new(value.to_owned())))
                         .map_err(|_| {
                             GuestError::Runtime(format!(
                                 "gateway credential '{}' is not UTF-8",
@@ -628,7 +632,7 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
             let gateway = Arc::new(
                 HttpGateway::new(
                     &policy,
-                    GatewayCredentialSet::new(values),
+                    GatewayCredentialSet::from_secret_values(values),
                     upstream,
                     Arc::new(UnixAuditSink::new(NATIVE_AUDIT_SOCKET_PATH)),
                 )
@@ -745,10 +749,14 @@ fn validate_mcp_gateway_configuration(
         .map(|policy| policy.tool_policy.remote_origins())
         .transpose()
         .map_err(|error| GuestError::Runtime(format!("invalid MCP origins: {error}")))?
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if egress.reserved_mcp_origins != expected_origins
+        .unwrap_or_default();
+    let configured_origins = egress
+        .reserved_mcp_origins
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if configured_origins.len() != egress.reserved_mcp_origins.len()
+        || configured_origins != expected_origins
         || egress.mcp_gateway_port.is_some() != remote_mcp_active
         || egress.deny_direct_ip != remote_mcp_active
     {
@@ -1225,6 +1233,83 @@ fn require_root_cgroup_namespace() -> Result<(), GuestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sendbox_core::SessionId;
+    use sendbox_policy::{Action, McpHttpPolicy, McpServerPolicy, NetworkPolicy, ToolCallPolicy};
+
+    fn mcp_gateway_policies() -> (RuntimePolicyDocument, McpRuntimePolicyDocument) {
+        let tool_policy = ToolCallPolicy {
+            servers: std::collections::BTreeMap::from([
+                (
+                    "alpha".to_owned(),
+                    McpServerPolicy::StreamableHttp {
+                        url: "https://alpha.example/mcp".to_owned(),
+                        tools: Default::default(),
+                        http: McpHttpPolicy::default(),
+                    },
+                ),
+                (
+                    "beta".to_owned(),
+                    McpServerPolicy::StreamableHttp {
+                        url: "https://beta.example/mcp".to_owned(),
+                        tools: Default::default(),
+                        http: McpHttpPolicy::default(),
+                    },
+                ),
+            ]),
+            ..ToolCallPolicy::default()
+        };
+        let egress = RuntimePolicyDocument::for_session_with_mcp(
+            SessionId::from_bytes([42; 16]),
+            NetworkPolicy {
+                default_action: Action::Deny,
+                allowed_domains: Vec::new(),
+                blocked_domains: Vec::new(),
+                allow_dns: true,
+                max_connections: None,
+                allowed_networks: Vec::new(),
+                blocked_networks: Vec::new(),
+                allowed_ports: Vec::new(),
+                dns: Default::default(),
+            },
+            Some(&tool_policy),
+        )
+        .expect("egress policy");
+        let mcp = McpRuntimePolicyDocument {
+            schema_version: sendbox_mcp::runtime::RUNTIME_POLICY_SCHEMA_VERSION,
+            workspace_root: PathBuf::from("/workspace"),
+            workload_uid: 1000,
+            workload_gid: 1000,
+            tool_policy,
+            audit_log_path: PathBuf::from(sendbox_mcp::runtime::DEFAULT_AUDIT_LOG_PATH),
+            fixed_environment: Default::default(),
+            inherited_environment_keys: Default::default(),
+            observation: None,
+        };
+        (egress, mcp)
+    }
+
+    #[test]
+    fn mcp_gateway_validation_accepts_reordered_reserved_origins() {
+        let (mut egress, mcp) = mcp_gateway_policies();
+        egress.reserved_mcp_origins.reverse();
+
+        validate_mcp_gateway_configuration(&egress, Some(&mcp), &[])
+            .expect("origin order must not affect policy equivalence");
+    }
+
+    #[test]
+    fn mcp_gateway_validation_rejects_different_reserved_origins() {
+        let (mut egress, mcp) = mcp_gateway_policies();
+        egress.reserved_mcp_origins.pop();
+
+        let error = validate_mcp_gateway_configuration(&egress, Some(&mcp), &[])
+            .expect_err("origin drift must remain fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("signed egress MCP reservations do not match")
+        );
+    }
 
     #[test]
     fn resolver_rewrite_preserves_non_nameserver_configuration() {
