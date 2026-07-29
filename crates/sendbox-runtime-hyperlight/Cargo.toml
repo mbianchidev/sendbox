@@ -13,7 +13,7 @@ ipnet.workspace = true
 sendbox-bundle = { path = "../sendbox-bundle" }
 sendbox-core = { path = "../sendbox-core" }
 sendbox-egress = { path = "../sendbox-egress" }
-sendbox-guest = { path = "../../guest/sendbox-guest" }
+sendbox-guest = { path = "../../guest/sendbox-guest", default-features = false }
 sendbox-runtime = { path = "../sendbox-runtime" }
 sha2.workspace = true
 tokio.workspace = true

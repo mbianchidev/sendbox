@@ -20,6 +20,9 @@ provider with a narrower capability set.
 - **Network Firewall** — Apple and Kata sessions route DNS and TCP CONNECT
   through loopback brokers backed by cgroup-v2 identity, `SO_MARK`, and atomic
   nftables rules. UDP/QUIC and direct external agent traffic are denied.
+- **Package Supply-chain Proxy** — npm metadata and artifacts traverse an
+  isolated trusted proxy that verifies, scans, caches, and reports verdicts
+  before any package bytes reach the workload.
 - **Runtime Providers** — `auto` selects Apple on macOS arm64 and Kata on Linux.
   Explicit Apple, Kata, and Hyperlight requests never fall back silently.
 - **Hyperlight Execution** — Verified one-shot commands run in
@@ -338,6 +341,22 @@ policy:
       - registry.npmjs.org
     blocked_domains: []
 
+  packages:
+    enabled: true
+    registries:
+      - ecosystem: npm
+        url: https://registry.npmjs.org/
+        allow_insecure_http: false
+        signature: if_present
+        provenance: if_present
+    default_finding_action: deny
+    finding_actions:
+      - finding: lifecycle_script
+        action: deny
+    exceptions: []
+    limits:
+      max_report_bytes: 98304
+
   boundaries:
     # Set to false when using Hyperlight.
     enabled: true
@@ -363,7 +382,7 @@ policy:
     log_path: /var/log/sendbox/boundary.log
 
 secrets:
-  - NPM_TOKEN
+  - DATABASE_URL
 
 devcontainer:
   auto_generate: true
@@ -437,6 +456,21 @@ Whichever host variable supplied the value, the guest receives it as
 wrapper script or duplicated GitHub token is required. Errors name the supported variables
 and never print a credential value.
 
+### Package registry credentials
+
+`policy.packages.enabled: true` activates the npm-first proxy on Apple and Kata
+persistent guests. The current implementation requires exactly one npm
+registry. For private registries, set
+`registries[].credential_secret` to a SendBox vault reference. That reference
+must not also appear in top-level `secrets`: registry tokens are delivered only
+to the isolated trusted proxy and are never exposed to the workload.
+
+The proxy forces npm to its loopback endpoint, disables lifecycle scripts,
+denies direct workload access to the configured upstream, and withholds
+tarballs until verification and inspection allow them. See
+[Package supply-chain proxy](docs/package-supply-chain.md) for setup, policy,
+false-positive handling, reports, and future ecosystem adapter contracts.
+
 ### Configuration Reference
 
 | Section | Key | Description |
@@ -454,6 +488,9 @@ and never print a credential value.
 | `resources.disk_size_mb` | int | Requested writable-layer size |
 | `policy.commands` | object | Command allowlist/denylist policy |
 | `policy.network` | object | Outbound network policy |
+| `policy.packages` | object | npm proxy, verification, finding actions, limits, exceptions, and cache policy |
+| `policy.packages.registries[].credential_secret` | string | Vault reference isolated from workload secrets |
+| `policy.packages.limits.max_report_bytes` | int | Bounded package report size, up to 98304 bytes |
 | `policy.boundaries.enabled` | bool | Install fail-closed MCP and syscall boundaries |
 | `policy.boundaries.tool_calls` | object | Framed stdio MCP tool allow/deny rules |
 | `policy.boundaries.syscalls.additional_denylist` | list | Extra syscall names blocked by seccomp |
@@ -510,7 +547,8 @@ See the architecture documents for
 [session security](docs/architecture/session-security-lifecycle.md),
 [execution brokerage](docs/architecture/execution-broker.md),
 [interactive terminals](docs/architecture/interactive-terminal.md), plus
-[egress enforcement](docs/architecture/egress-enforcement.md).
+[egress enforcement](docs/architecture/egress-enforcement.md) and the
+[package registry proxy](docs/architecture/package-registry-proxy.md).
 
 See [docs/hyperlight.md](docs/hyperlight.md) for Hyperlight setup and limitations.
 The production Apple adapter, qualification command, transport design, and
@@ -525,9 +563,11 @@ SendBox follows a **deny-by-default** security posture:
 1. **Filesystem** — Only explicitly configured host paths are mounted into the guest. State and workspace roots cannot overlap.
 2. **Commands** — Deny rules win over allow rules for the brokered top-level argv. Descendants are constrained by the guest execution boundary, not recursively reinterpreted as shell text.
 3. **Network** — Persistent workloads can reach only the loopback DNS and SOCKS5 brokers. Kernel rules deny direct external agent traffic and unmarked broker traffic.
-4. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when repository scope matches policy. Secret values use authenticated envelopes and temporary owner-only guest files where a child process requires a file.5. **Isolation** — Apple and Kata provide persistent Linux VMs; Hyperlight provides explicit Linux/KVM one-shot isolation. Missing host or runtime capabilities are errors, never silent fallbacks.
-6. **Boundaries** — Signed guest services must become ready before execution. Local stdio MCP calls must traverse the installed broker; HTTP/SSE, direct project-server configuration, and unsupported transports fail closed.
-7. **Branches** — Trusted Git wrappers restrict selected-repository push and pull operations. Alternate clients and direct hosting-provider APIs remain outside this local guard, so server-side rules stay required.
+4. **Packages** — Configured npm artifacts are quarantined, verified, and inspected before release. Workloads cannot reach their configured npm upstream directly.
+5. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when repository scope matches policy. Package registry credentials remain proxy-only. Other secret values use authenticated envelopes and temporary owner-only guest files where a child process requires a file.
+6. **Isolation** — Apple and Kata provide persistent Linux VMs; Hyperlight provides explicit Linux/KVM one-shot isolation. Missing host or runtime capabilities are errors, never silent fallbacks.
+7. **Boundaries** — Signed guest services must become ready before execution. Local stdio MCP calls must traverse the installed broker; HTTP/SSE, direct project-server configuration, and unsupported transports fail closed.
+8. **Branches** — Trusted Git wrappers restrict selected-repository push and pull operations. Alternate clients and direct hosting-provider APIs remain outside this local guard, so server-side rules stay required.
 
 ## CLI Reference
 
@@ -543,6 +583,7 @@ SUBCOMMANDS:
   secrets       Add, remove, or list stored secrets
   policy        Show or validate policies
   mcp           Parse and summarize native or legacy MCP observations
+  package       Show package verdict status or a complete security report
   boundary      Inspect the structured native boundary plan
   completions   Install or print shell completions
   help          Show help for any subcommand
@@ -570,6 +611,10 @@ sendbox policy validate --config sendbox.yaml
 # Show the effective policy as deterministic JSON
 sendbox policy show --config sendbox.yaml --json
 
+# Show the latest package-enabled run and its complete report
+sendbox package status
+sendbox package report --json
+
 # Print or install generated shell completions
 sendbox completions print --shell zsh
 sendbox completions install --shell fish
@@ -594,8 +639,9 @@ Contributions are welcome! Please:
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-change`)
-3. Make sure tests pass (`make test`)
-4. Lint your code (`make lint`)
+3. Run `make lint` (this also compiles every standalone fuzz workspace with
+   its committed lockfile)
+4. Run `make test`, `make release`, and `make audit`
 5. Open a pull request
 
 For larger changes, please open an issue first to discuss the approach.

@@ -1,10 +1,21 @@
-.PHONY: all build release test clean install install-completions lint audit help
+.PHONY: all build release test clean install install-completions lint fuzz-check audit help
 
 CARGO ?= cargo
 PREFIX ?= /usr/local
 DESTDIR ?=
 BINDIR := $(DESTDIR)$(PREFIX)/bin
 SENDBOX := target/release/sendbox
+FUZZ_MANIFESTS := \
+	fuzz/security/Cargo.toml \
+	fuzz/git/Cargo.toml \
+	fuzz/secrets/Cargo.toml \
+	fuzz/credentials/Cargo.toml \
+	fuzz/mcp/Cargo.toml \
+	fuzz/bpf/Cargo.toml \
+	fuzz/project/Cargo.toml \
+	fuzz/config/Cargo.toml \
+	fuzz/protocol/Cargo.toml \
+	fuzz/registry/Cargo.toml
 
 all: release
 
@@ -34,9 +45,14 @@ install: release
 install-completions: release
 	@"$(SENDBOX)" completions install
 
-lint:
+lint: fuzz-check
 	$(CARGO) fmt --all -- --check
 	$(CARGO) clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+fuzz-check:
+	@set -e; for manifest in $(FUZZ_MANIFESTS); do \
+		$(CARGO) check --locked --manifest-path "$$manifest" --bins; \
+	done
 
 audit:
 	$(CARGO) audit
@@ -50,6 +66,7 @@ help:
 	@echo "  clean               Remove Cargo build artifacts"
 	@echo "  install             Install the sendbox binary and user completions"
 	@echo "  install-completions Install user shell completions"
-	@echo "  lint                Check rustfmt and Clippy"
+	@echo "  lint                Check fuzz locks, rustfmt, and Clippy"
+	@echo "  fuzz-check          Compile every standalone fuzz workspace with its lockfile"
 	@echo "  audit               Audit Cargo.lock with cargo-audit"
 	@echo "  help                Show this help message"

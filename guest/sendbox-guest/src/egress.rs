@@ -17,6 +17,8 @@ use std::time::Duration;
 
 #[cfg(any(target_os = "linux", test))]
 use rustix::fs::{Mode, OFlags, open};
+use sendbox_bootstrap::RegistryProxyConfiguration;
+use sendbox_core::SessionId;
 #[cfg(any(target_os = "linux", test))]
 use sendbox_egress::address::{AddressClass, classify};
 use sendbox_egress::runtime::RuntimePolicyDocument;
@@ -41,9 +43,13 @@ const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SupervisorProcessConfiguration {
+    session_id: SessionId,
     policy: RuntimePolicyDocument,
+    registry: Option<RegistryProxyConfiguration>,
     readiness_socket: PathBuf,
-    gateway_control_socket: PathBuf,
+    workload_control_socket: PathBuf,
+    trusted_control_socket: Option<PathBuf>,
+    registry_control_socket: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -51,7 +57,26 @@ struct SupervisorProcessConfiguration {
 #[serde(deny_unknown_fields)]
 struct GatewayProcessConfiguration {
     policy: RuntimePolicyDocument,
+    role: GatewayRole,
     upstream: SocketAddr,
+    control_socket: PathBuf,
+    control_token: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GatewayRole {
+    Workload,
+    Registry,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryProcessConfiguration {
+    session_id: SessionId,
+    registry: RegistryProxyConfiguration,
     control_socket: PathBuf,
     control_token: String,
 }
@@ -85,20 +110,32 @@ struct ResolverPlan {
 
 pub fn prepare(
     session_dir: &Path,
+    session_id: SessionId,
     policy: RuntimePolicyDocument,
+    registry: Option<RegistryProxyConfiguration>,
 ) -> Result<ServiceSpec, GuestError> {
     policy
         .validate()
         .map_err(|error| GuestError::Runtime(format!("invalid egress policy: {error}")))?;
     let readiness_socket = session_dir.join("egress-ready.sock");
-    let gateway_control_socket = session_dir.join("egress-gateway-control.sock");
+    let workload_control_socket = session_dir.join("egress-workload-control.sock");
+    let trusted_control_socket = registry
+        .as_ref()
+        .map(|_| session_dir.join("egress-trusted-control.sock"));
+    let registry_control_socket = registry
+        .as_ref()
+        .map(|_| session_dir.join("registry-proxy-control.sock"));
     let config_path = session_dir.join("egress-supervisor.json");
     write_root_config(
         &config_path,
         &SupervisorProcessConfiguration {
+            session_id,
             policy,
+            registry,
             readiness_socket: readiness_socket.clone(),
-            gateway_control_socket,
+            workload_control_socket,
+            trusted_control_socket,
+            registry_control_socket,
         },
     )?;
     Ok(ServiceSpec {
@@ -123,12 +160,26 @@ pub fn prepare(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+enum ChildPlacement {
+    Broker,
+    Registry,
+}
+
+#[cfg(target_os = "linux")]
+struct ControlledChild {
+    role: &'static str,
+    placement: ChildPlacement,
+    child: tokio::process::Child,
+    control: tokio::net::UnixStream,
+    token: String,
+    control_socket: PathBuf,
+    reaped: bool,
+}
+
+#[cfg(target_os = "linux")]
 pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
-    use rustix::process::{Pid, Signal, kill_process};
     use sendbox_egress::linux::supervisor::{ArmedEgress, SupervisorConfig};
-    use tokio::net::{UnixListener, UnixStream};
-    use tokio::process::{Child, Command};
-    use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
 
     let config: SupervisorProcessConfiguration = read_root_config(&config_path)?;
@@ -141,8 +192,18 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
     validate_runtime_paths(
         &config_path,
         &config.readiness_socket,
-        &config.gateway_control_socket,
+        &config.workload_control_socket,
+        config.trusted_control_socket.as_deref(),
+        config.registry_control_socket.as_deref(),
     )?;
+    if config.registry.is_some() != config.policy.registry.is_some()
+        || config.registry.is_some() != config.trusted_control_socket.is_some()
+        || config.registry.is_some() != config.registry_control_socket.is_some()
+    {
+        return Err(GuestError::Runtime(
+            "registry proxy and egress isolation configuration must be present together".to_owned(),
+        ));
+    }
     require_root_cgroup_namespace()?;
 
     let runtime_root = config_path
@@ -154,58 +215,133 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
         Path::new(RESOLV_CONF_PATH),
         &runtime_root.join(RESOLVER_STATE_FILE),
     )?;
-    let token = random_token()?;
-    let gateway_config_path = config_path
+    if let Some(registry) = &config.registry {
+        prepare_registry_directories(registry)?;
+    }
+
+    let workload_token = random_token()?;
+    let workload_config_path = config_path
         .parent()
         .expect("validated configuration has a parent")
-        .join("egress-gateway.json");
+        .join("egress-workload-gateway.json");
     write_root_config(
-        &gateway_config_path,
+        &workload_config_path,
         &GatewayProcessConfiguration {
             policy: config.policy.clone(),
+            role: GatewayRole::Workload,
             upstream: resolver.upstream,
-            control_socket: config.gateway_control_socket.clone(),
-            control_token: token.clone(),
+            control_socket: config.workload_control_socket.clone(),
+            control_token: workload_token.clone(),
         },
     )?;
-    remove_socket_if_present(&config.gateway_control_socket)?;
+    remove_socket_if_present(&config.workload_control_socket)?;
+
+    let mut trusted_process = None;
+    let mut registry_process = None;
+    if let Some(registry) = &config.registry {
+        let trusted_token = random_token()?;
+        let trusted_config_path = config_path
+            .parent()
+            .expect("validated configuration has a parent")
+            .join("egress-trusted-gateway.json");
+        let trusted_control_socket = config
+            .trusted_control_socket
+            .clone()
+            .expect("validated trusted control socket");
+        write_root_config(
+            &trusted_config_path,
+            &GatewayProcessConfiguration {
+                policy: config.policy.clone(),
+                role: GatewayRole::Registry,
+                upstream: resolver.upstream,
+                control_socket: trusted_control_socket.clone(),
+                control_token: trusted_token.clone(),
+            },
+        )?;
+        remove_socket_if_present(&trusted_control_socket)?;
+        trusted_process = Some((trusted_config_path, trusted_control_socket, trusted_token));
+
+        let registry_token = random_token()?;
+        let registry_config_path = config_path
+            .parent()
+            .expect("validated configuration has a parent")
+            .join("registry-proxy.json");
+        let registry_control_socket = config
+            .registry_control_socket
+            .clone()
+            .expect("validated registry control socket");
+        write_root_config(
+            &registry_config_path,
+            &RegistryProcessConfiguration {
+                session_id: config.session_id,
+                registry: registry.clone(),
+                control_socket: registry_control_socket.clone(),
+                control_token: registry_token.clone(),
+            },
+        )?;
+        remove_socket_if_present(&registry_control_socket)?;
+        registry_process = Some((
+            registry_config_path,
+            registry_control_socket,
+            registry_token,
+        ));
+    }
+
     let executable = std::env::current_exe()
         .map_err(|error| GuestError::io("resolving guest executable", error))?;
-    let mut child = Command::new(executable)
-        .arg("egress-gateway")
-        .arg("--config")
-        .arg(&gateway_config_path)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| GuestError::io("spawning egress gateway", error))?;
-
-    let mut control = match connect_control(
-        &config.gateway_control_socket,
-        &mut child,
-        GATEWAY_START_TIMEOUT,
+    let mut children = Vec::new();
+    match spawn_controlled(
+        &executable,
+        "egress-gateway",
+        &workload_config_path,
+        config.workload_control_socket.clone(),
+        workload_token,
+        "workload egress gateway",
+        ChildPlacement::Broker,
     )
     .await
     {
-        Ok(stream) => stream,
-        Err(error) => {
-            let _ = stop_gateway(&mut child, false).await;
-            return Err(error);
+        Ok(child) => children.push(child),
+        Err(error) => return Err(error),
+    }
+    if let Some((path, socket, token)) = trusted_process {
+        match spawn_controlled(
+            &executable,
+            "egress-gateway",
+            &path,
+            socket,
+            token,
+            "trusted registry gateway",
+            ChildPlacement::Broker,
+        )
+        .await
+        {
+            Ok(child) => children.push(child),
+            Err(error) => {
+                let _ = stop_children(&mut children).await;
+                return Err(error);
+            }
         }
-    };
-    write_control(
-        &mut control,
-        &ControlMessage::Hello {
-            token: token.clone(),
-        },
-    )
-    .await?;
-    expect_control(
-        &mut control,
-        ControlMessage::Bound {
-            token: token.clone(),
-        },
-    )
-    .await?;
+    }
+    if let Some((path, socket, token)) = registry_process {
+        match spawn_controlled(
+            &executable,
+            "registry-proxy",
+            &path,
+            socket,
+            token,
+            "registry proxy",
+            ChildPlacement::Registry,
+        )
+        .await
+        {
+            Ok(child) => children.push(child),
+            Err(error) => {
+                let _ = stop_children(&mut children).await;
+                return Err(error);
+            }
+        }
+    }
 
     let mut supervisor_config = SupervisorConfig::new(
         config.policy.instance_id.clone(),
@@ -219,30 +355,44 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
     if let Some(port) = config.policy.dns_port {
         supervisor_config = supervisor_config.with_dns_port(port);
     }
+    if let Some(registry) = &config.policy.registry {
+        supervisor_config = supervisor_config
+            .with_registry_proxy(registry.proxy_port, registry.trusted_upstream_port);
+    }
     let mut armed = match ArmedEgress::arm(supervisor_config) {
         Ok(armed) => armed,
         Err(error) => {
-            let _ = stop_gateway(&mut child, false).await;
+            let _ = stop_children(&mut children).await;
             return Err(GuestError::Runtime(format!(
                 "arming production egress: {error}"
             )));
         }
     };
-    let child_pid = child
-        .id()
-        .ok_or_else(|| GuestError::Runtime("egress gateway has no process ID".to_owned()))?;
-    if let Err(error) = armed.place_broker(child_pid) {
-        let _ = stop_gateway(&mut child, false).await;
-        let teardown = armed.teardown();
-        return Err(GuestError::Runtime(format!(
-            "placing egress gateway in broker cgroup: {error}; teardown: {teardown:?}"
-        )));
+    for index in 0..children.len() {
+        let role = children[index].role;
+        let placement = children[index].placement;
+        let child_pid = children[index]
+            .child
+            .id()
+            .ok_or_else(|| GuestError::Runtime(format!("{role} has no process ID")))?;
+        let placement = match placement {
+            ChildPlacement::Broker => armed.place_broker(child_pid),
+            ChildPlacement::Registry => armed.place_registry(child_pid),
+        };
+        if let Err(error) = placement {
+            let _ = stop_children(&mut children).await;
+            let teardown = armed.teardown();
+            return Err(GuestError::Runtime(format!(
+                "placing {} in its egress cgroup: {error}; teardown: {teardown:?}",
+                role
+            )));
+        }
     }
     let expected_parent = config
         .policy
         .execution_cgroup_parent(Path::new(sendbox_egress::runtime::DEFAULT_CGROUP_ROOT));
     if armed.execution_cgroup_parent() != expected_parent {
-        let _ = stop_gateway(&mut child, false).await;
+        let _ = stop_children(&mut children).await;
         let teardown = armed.teardown();
         return Err(GuestError::Runtime(format!(
             "armed execution cgroup parent drifted from signed policy; teardown: {teardown:?}"
@@ -251,33 +401,33 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
 
     async fn run_armed(
         config: &SupervisorProcessConfiguration,
-        token: String,
-        mut control: UnixStream,
-        mut child: Child,
+        mut children: Vec<ControlledChild>,
         mut armed: ArmedEgress,
         resolver: ResolverPlan,
     ) -> Result<(), GuestError> {
         let mut failures = Vec::new();
         let mut resolver_installed = false;
-        let mut child_reaped = false;
         let readiness_cancel = CancellationToken::new();
         let mut readiness_task = None;
 
         let startup = async {
-            write_control(
-                &mut control,
-                &ControlMessage::Start {
-                    token: token.clone(),
-                },
-            )
-            .await?;
-            expect_control(
-                &mut control,
-                ControlMessage::Serving {
-                    token: token.clone(),
-                },
-            )
-            .await
+            for child in &mut children {
+                write_control(
+                    &mut child.control,
+                    &ControlMessage::Start {
+                        token: child.token.clone(),
+                    },
+                )
+                .await?;
+                expect_control(
+                    &mut child.control,
+                    ControlMessage::Serving {
+                        token: child.token.clone(),
+                    },
+                )
+                .await?;
+            }
+            Ok::<(), GuestError>(())
         }
         .await;
         if let Err(error) = startup {
@@ -302,22 +452,41 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .map_err(|error| GuestError::io("installing egress SIGTERM handler", error))?;
             let readiness = readiness_task.as_mut().expect("readiness task started");
-            tokio::select! {
-                status = child.wait() => {
-                    child_reaped = true;
-                    failures.push(match status {
-                        Ok(status) => format!("egress gateway exited unexpectedly: {status}"),
-                        Err(error) => format!("waiting for egress gateway: {error}"),
-                    });
+            let mut health = tokio::time::interval(Duration::from_millis(100));
+            'monitor: loop {
+                tokio::select! {
+                    _ = health.tick() => {
+                        for child in &mut children {
+                            match child.child.try_wait() {
+                                Ok(Some(status)) => {
+                                    child.reaped = true;
+                                    failures.push(format!(
+                                        "{} exited unexpectedly: {status}",
+                                        child.role
+                                    ));
+                                    break 'monitor;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    failures.push(format!(
+                                        "checking {} status: {error}",
+                                        child.role
+                                    ));
+                                    break 'monitor;
+                                }
+                            }
+                        }
+                    }
+                    result = &mut *readiness => {
+                        failures.push(match result {
+                            Ok(Ok(())) => "egress readiness listener stopped unexpectedly".to_owned(),
+                            Ok(Err(error)) => format!("egress readiness listener failed: {error}"),
+                            Err(error) => format!("egress readiness task failed: {error}"),
+                        });
+                        break;
+                    }
+                    _ = terminate.recv() => break,
                 }
-                result = readiness => {
-                    failures.push(match result {
-                        Ok(Ok(())) => "egress readiness listener stopped unexpectedly".to_owned(),
-                        Ok(Err(error)) => format!("egress readiness listener failed: {error}"),
-                        Err(error) => format!("egress readiness task failed: {error}"),
-                    });
-                }
-                _ = terminate.recv() => {}
             }
         }
 
@@ -328,9 +497,7 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
         if let Err(error) = remove_socket_if_present(&config.readiness_socket) {
             failures.push(error.to_string());
         }
-        if let Err(error) = stop_gateway(&mut child, child_reaped).await {
-            failures.push(error.to_string());
-        }
+        failures.extend(stop_children(&mut children).await);
         if resolver_installed && let Err(error) = resolver.restore() {
             failures.push(error.to_string());
         }
@@ -340,8 +507,10 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
                 .into_iter()
                 .map(|error| format!("tearing down egress: {error}")),
         );
-        if let Err(error) = remove_socket_if_present(&config.gateway_control_socket) {
-            failures.push(error.to_string());
+        for child in &children {
+            if let Err(error) = remove_socket_if_present(&child.control_socket) {
+                failures.push(error.to_string());
+            }
         }
         if failures.is_empty() {
             Ok(())
@@ -350,89 +519,172 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
         }
     }
 
-    async fn connect_control(
-        path: &Path,
-        child: &mut Child,
-        bound: Duration,
-    ) -> Result<UnixStream, GuestError> {
-        let deadline = tokio::time::Instant::now() + bound;
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|error| GuestError::io("checking egress gateway startup", error))?
-            {
-                return Err(GuestError::Runtime(format!(
-                    "egress gateway exited before binding listeners: {status}"
-                )));
+    run_armed(&config, children, armed, resolver).await
+}
+
+#[cfg(target_os = "linux")]
+async fn spawn_controlled(
+    executable: &Path,
+    subcommand: &'static str,
+    config_path: &Path,
+    control_socket: PathBuf,
+    token: String,
+    role: &'static str,
+    placement: ChildPlacement,
+) -> Result<ControlledChild, GuestError> {
+    let mut child = tokio::process::Command::new(executable)
+        .arg(subcommand)
+        .arg("--config")
+        .arg(config_path)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| GuestError::io(format!("spawning {role}"), error))?;
+    let mut control =
+        match connect_control(&control_socket, &mut child, role, GATEWAY_START_TIMEOUT).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = stop_process(role, &mut child, false).await;
+                return Err(error);
             }
-            match UnixStream::connect(path).await {
-                Ok(stream) => return Ok(stream),
-                Err(error) if tokio::time::Instant::now() < deadline => {
-                    let _ = error;
-                    sleep(Duration::from_millis(10)).await;
-                }
-                Err(error) => {
-                    return Err(GuestError::io(
-                        "connecting egress gateway control socket",
-                        error,
-                    ));
-                }
+        };
+    if let Err(error) = write_control(
+        &mut control,
+        &ControlMessage::Hello {
+            token: token.clone(),
+        },
+    )
+    .await
+    {
+        let _ = stop_process(role, &mut child, false).await;
+        return Err(error);
+    }
+    if let Err(error) = expect_control(
+        &mut control,
+        ControlMessage::Bound {
+            token: token.clone(),
+        },
+    )
+    .await
+    {
+        let _ = stop_process(role, &mut child, false).await;
+        return Err(error);
+    }
+    Ok(ControlledChild {
+        role,
+        placement,
+        child,
+        control,
+        token,
+        control_socket,
+        reaped: false,
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_control(
+    path: &Path,
+    child: &mut tokio::process::Child,
+    role: &str,
+    bound: Duration,
+) -> Result<tokio::net::UnixStream, GuestError> {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| GuestError::io(format!("checking {role} startup"), error))?
+        {
+            return Err(GuestError::Runtime(format!(
+                "{role} exited before binding listeners: {status}"
+            )));
+        }
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                let _ = error;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => {
+                return Err(GuestError::io(
+                    format!("connecting {role} control socket"),
+                    error,
+                ));
             }
         }
     }
+}
 
-    async fn stop_gateway(child: &mut Child, already_reaped: bool) -> Result<(), GuestError> {
-        if already_reaped {
-            return Ok(());
-        }
-        if let Some(raw_pid) = child.id().and_then(|value| Pid::from_raw(value as i32)) {
-            match kill_process(raw_pid, Signal::TERM) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-                Err(error) => {
-                    return Err(GuestError::io(
-                        "signalling egress gateway",
-                        io::Error::from(error),
-                    ));
-                }
-            }
-        }
-        match timeout(GATEWAY_STOP_TIMEOUT, child.wait()).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => Err(GuestError::io("reaping egress gateway", error)),
-            Err(_) => {
-                child
-                    .start_kill()
-                    .map_err(|error| GuestError::io("killing egress gateway", error))?;
-                child
-                    .wait()
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| GuestError::io("reaping killed egress gateway", error))
-            }
+#[cfg(target_os = "linux")]
+async fn stop_children(children: &mut [ControlledChild]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for child in children.iter_mut().rev() {
+        if let Err(error) = stop_process(child.role, &mut child.child, child.reaped).await {
+            failures.push(error.to_string());
         }
     }
+    failures
+}
 
-    fn bind_readiness(path: &Path) -> Result<UnixListener, GuestError> {
-        remove_socket_if_present(path)?;
-        let listener = UnixListener::bind(path)
-            .map_err(|error| GuestError::io("binding egress readiness socket", error))?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|error| GuestError::io("setting egress readiness socket mode", error))?;
-        Ok(listener)
+#[cfg(target_os = "linux")]
+async fn stop_process(
+    role: &str,
+    child: &mut tokio::process::Child,
+    already_reaped: bool,
+) -> Result<(), GuestError> {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    if already_reaped {
+        return Ok(());
     }
-
-    async fn readiness_loop(listener: UnixListener, cancel: CancellationToken) -> io::Result<()> {
-        loop {
-            tokio::select! {
-                () = cancel.cancelled() => return Ok(()),
-                accepted = listener.accept() => {
-                    let (_stream, _) = accepted?;
-                }
+    if let Some(raw_pid) = child.id().and_then(|value| Pid::from_raw(value as i32)) {
+        match kill_process(raw_pid, Signal::TERM) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            Err(error) => {
+                return Err(GuestError::io(
+                    format!("signalling {role}"),
+                    io::Error::from(error),
+                ));
             }
         }
     }
+    match tokio::time::timeout(GATEWAY_STOP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(GuestError::io(format!("reaping {role}"), error)),
+        Err(_) => {
+            child
+                .start_kill()
+                .map_err(|error| GuestError::io(format!("killing {role}"), error))?;
+            child
+                .wait()
+                .await
+                .map(|_| ())
+                .map_err(|error| GuestError::io(format!("reaping killed {role}"), error))
+        }
+    }
+}
 
-    run_armed(&config, token, control, child, armed, resolver).await
+#[cfg(target_os = "linux")]
+fn bind_readiness(path: &Path) -> Result<tokio::net::UnixListener, GuestError> {
+    remove_socket_if_present(path)?;
+    let listener = tokio::net::UnixListener::bind(path)
+        .map_err(|error| GuestError::io("binding egress readiness socket", error))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| GuestError::io("setting egress readiness socket mode", error))?;
+    Ok(listener)
+}
+
+#[cfg(target_os = "linux")]
+async fn readiness_loop(
+    listener: tokio::net::UnixListener,
+    cancel: tokio_util::sync::CancellationToken,
+) -> io::Result<()> {
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return Ok(()),
+            accepted = listener.accept() => {
+                let (_stream, _) = accepted?;
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -467,14 +719,28 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
     validate_control_token(&config.control_token)?;
     remove_socket_if_present(&config.control_socket)?;
 
-    let dns_addr = config
-        .policy
-        .dns_port
-        .map(|port| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
-    let connect_addr = SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::LOCALHOST,
-        config.policy.connect_port,
-    ));
+    let (network_policy, connect_port, dns_port) = match config.role {
+        GatewayRole::Workload => (
+            &config.policy.network_policy,
+            config.policy.connect_port,
+            config.policy.dns_port,
+        ),
+        GatewayRole::Registry => {
+            let registry = config.policy.registry.as_ref().ok_or_else(|| {
+                GuestError::Runtime(
+                    "trusted registry gateway requires registry egress policy".to_owned(),
+                )
+            })?;
+            (
+                &registry.upstream_network_policy,
+                registry.trusted_upstream_port,
+                None,
+            )
+        }
+    };
+    let dns_addr =
+        dns_port.map(|port| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
+    let connect_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, connect_port));
     let listeners = GatewayListeners::bind(dns_addr, connect_addr)
         .await
         .map_err(|error| GuestError::io("binding egress gateway listeners", error))?;
@@ -509,7 +775,7 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
     .await?;
 
     let engine = Arc::new(
-        PolicyEngine::compile(&config.policy.network_policy)
+        PolicyEngine::compile(network_policy)
             .map_err(|error| GuestError::Runtime(format!("compile egress policy: {error}")))?,
     );
     let resolver = Arc::new(ForwardingResolver::new(
@@ -570,6 +836,254 @@ pub async fn run_gateway(_config_path: PathBuf) -> Result<(), GuestError> {
     Err(GuestError::Runtime(
         "production egress gateway requires Linux".to_owned(),
     ))
+}
+
+#[cfg(target_os = "linux")]
+pub async fn run_registry_proxy(config_path: PathBuf) -> Result<(), GuestError> {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
+
+    use sendbox_exec::ResourceLimits;
+    use sendbox_exec::platform::linux::{capabilities, rlimits, seccomp};
+    use sendbox_policy::PackageEcosystem;
+    use sendbox_registry::{
+        NpmAdapter, NpmPackageProvenanceVerifier, RegistryProxy,
+        RegistryProxyConfiguration as RuntimeRegistryConfiguration, ReqwestUpstreamClient,
+    };
+    use tokio::net::{TcpListener, UnixListener};
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
+
+    let config: RegistryProcessConfiguration = read_root_config(&config_path)?;
+    fs::remove_file(&config_path)
+        .map_err(|error| GuestError::io("removing consumed registry configuration", error))?;
+    validate_control_token(&config.control_token)?;
+    config
+        .registry
+        .policy
+        .validate()
+        .map_err(|error| GuestError::Runtime(format!("invalid package policy: {error}")))?;
+    let registry_policy = config
+        .registry
+        .policy
+        .registries
+        .iter()
+        .find(|registry| registry.ecosystem == PackageEcosystem::Npm)
+        .cloned()
+        .ok_or_else(|| {
+            GuestError::Runtime("registry proxy requires an npm registry policy".to_owned())
+        })?;
+    if config
+        .registry
+        .policy
+        .registries
+        .iter()
+        .any(|registry| registry.ecosystem != PackageEcosystem::Npm)
+    {
+        return Err(GuestError::Runtime(
+            "registry proxy received an unsupported non-npm registry".to_owned(),
+        ));
+    }
+    let token = registry_policy
+        .credential_secret
+        .as_deref()
+        .map(|reference| {
+            config
+                .registry
+                .credentials
+                .iter()
+                .find(|credential| credential.secret_reference == reference)
+                .map(|credential| credential.expose_to_registry_proxy().to_vec())
+                .ok_or_else(|| {
+                    GuestError::Runtime(
+                        "registry credential is missing from authenticated bootstrap".to_owned(),
+                    )
+                })
+        })
+        .transpose()?;
+
+    remove_socket_if_present(&config.control_socket)?;
+    let listener = TcpListener::bind(SocketAddrV4::new(
+        Ipv4Addr::LOCALHOST,
+        config.registry.proxy_port,
+    ))
+    .await
+    .map_err(|error| GuestError::io("binding registry proxy listener", error))?;
+    let control_listener = UnixListener::bind(&config.control_socket)
+        .map_err(|error| GuestError::io("binding registry proxy control socket", error))?;
+    fs::set_permissions(&config.control_socket, fs::Permissions::from_mode(0o600))
+        .map_err(|error| GuestError::io("setting registry control socket mode", error))?;
+
+    rlimits::apply(&ResourceLimits {
+        open_files: 256,
+        processes: 64,
+        core_bytes: 0,
+        file_bytes: config.registry.policy.limits.max_download_bytes,
+        address_space_bytes: 2 * 1024 * 1024 * 1024,
+    })
+    .map_err(|error| GuestError::Runtime(format!("applying registry resource limits: {error}")))?;
+    capabilities::drop_to_user(config.registry.proxy_uid, config.registry.proxy_gid)
+        .map_err(|error| GuestError::Runtime(format!("dropping registry privileges: {error}")))?;
+    let denied_syscalls = ["execve", "execveat", "fork", "vfork"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    seccomp::install(seccomp::Profile::Command {
+        additional_denied_syscalls: &denied_syscalls,
+    })
+    .map_err(|error| {
+        GuestError::Runtime(format!("installing registry seccomp profile: {error}"))
+    })?;
+
+    let adapter = Arc::new(
+        NpmAdapter::new(registry_policy, config.registry.policy.clone(), token)
+            .map_err(|error| GuestError::Runtime(format!("configuring npm adapter: {error}")))?,
+    );
+    let socks_proxy = format!(
+        "socks5h://127.0.0.1:{}",
+        config.registry.trusted_upstream_port
+    );
+    let upstream = Arc::new(
+        ReqwestUpstreamClient::new(
+            &socks_proxy,
+            Duration::from_secs(u64::from(
+                config.registry.policy.limits.request_timeout_secs,
+            )),
+        )
+        .map_err(|error| GuestError::Runtime(format!("configuring registry upstream: {error}")))?,
+    );
+    let proxy = RegistryProxy::new(
+        RuntimeRegistryConfiguration {
+            base_url: format!("http://127.0.0.1:{}/", config.registry.proxy_port),
+            cache_root: config.registry.cache_root.clone(),
+            report_path: config.registry.report_path.clone(),
+            session_id: config.session_id.to_string(),
+            policy: config.registry.policy,
+        },
+        adapter,
+        upstream,
+        Arc::new(NpmPackageProvenanceVerifier),
+    )
+    .map_err(|error| GuestError::Runtime(format!("preparing registry proxy: {error}")))?;
+
+    let (mut control, _) = timeout(GATEWAY_START_TIMEOUT, control_listener.accept())
+        .await
+        .map_err(|_| GuestError::Runtime("registry control handshake timed out".to_owned()))?
+        .map_err(|error| GuestError::io("accepting registry control connection", error))?;
+    expect_control(
+        &mut control,
+        ControlMessage::Hello {
+            token: config.control_token.clone(),
+        },
+    )
+    .await?;
+    write_control(
+        &mut control,
+        &ControlMessage::Bound {
+            token: config.control_token.clone(),
+        },
+    )
+    .await?;
+    expect_control(
+        &mut control,
+        ControlMessage::Start {
+            token: config.control_token.clone(),
+        },
+    )
+    .await?;
+
+    let cancellation = CancellationToken::new();
+    let serving_cancellation = cancellation.clone();
+    let mut proxy_task =
+        tokio::spawn(async move { proxy.serve(listener, serving_cancellation).await });
+    tokio::task::yield_now().await;
+    if proxy_task.is_finished() {
+        return proxy_task
+            .await
+            .map_err(|error| GuestError::Runtime(format!("registry task failed: {error}")))?
+            .map_err(|error| GuestError::Runtime(format!("serving registry proxy: {error}")));
+    }
+    write_control(
+        &mut control,
+        &ControlMessage::Serving {
+            token: config.control_token,
+        },
+    )
+    .await?;
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| GuestError::io("installing registry SIGTERM handler", error))?;
+    tokio::select! {
+        result = &mut proxy_task => {
+            result
+                .map_err(|error| GuestError::Runtime(format!("registry task failed: {error}")))?
+                .map_err(|error| GuestError::Runtime(format!("serving registry proxy: {error}")))
+        }
+        _ = terminate.recv() => {
+            cancellation.cancel();
+            proxy_task
+                .await
+                .map_err(|error| GuestError::Runtime(format!("registry task failed: {error}")))?
+                .map_err(|error| GuestError::Runtime(format!("stopping registry proxy: {error}")))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn run_registry_proxy(_config_path: PathBuf) -> Result<(), GuestError> {
+    Err(GuestError::Runtime(
+        "production registry proxy requires Linux".to_owned(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_registry_directories(
+    configuration: &RegistryProxyConfiguration,
+) -> Result<(), GuestError> {
+    let report_parent = configuration
+        .report_path
+        .parent()
+        .ok_or_else(|| GuestError::Runtime("registry report path has no parent".to_owned()))?;
+    if !configuration.cache_root.exists() {
+        return Err(GuestError::Runtime(format!(
+            "package cache mount is missing: {}",
+            configuration.cache_root.display()
+        )));
+    }
+    if !report_parent.exists() {
+        let parent = report_parent.parent().ok_or_else(|| {
+            GuestError::Runtime("registry report directory has no parent".to_owned())
+        })?;
+        crate::secure_fs::open_directory_no_symlinks(parent)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(report_parent)
+            .map_err(|error| GuestError::io("creating package report directory", error))?;
+    }
+    for (name, path) in [
+        ("package cache", configuration.cache_root.as_path()),
+        ("package report", report_parent),
+    ] {
+        crate::secure_fs::open_directory_no_symlinks(path)?;
+        let metadata = path
+            .symlink_metadata()
+            .map_err(|error| GuestError::io(format!("inspecting {name} directory"), error))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(GuestError::Runtime(format!(
+                "{} is not a trusted registry directory",
+                path.display()
+            )));
+        }
+        std::os::unix::fs::chown(
+            path,
+            Some(configuration.proxy_uid),
+            Some(configuration.proxy_gid),
+        )
+        .map_err(|error| GuestError::io(format!("owning {name} directory"), error))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| GuestError::io(format!("securing {name} directory"), error))?;
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -867,16 +1381,30 @@ fn validate_owned_file(
 fn validate_runtime_paths(
     config_path: &Path,
     readiness: &Path,
-    control: &Path,
+    workload_control: &Path,
+    trusted_control: Option<&Path>,
+    registry_control: Option<&Path>,
 ) -> Result<(), GuestError> {
     let parent = config_path
         .parent()
         .ok_or_else(|| GuestError::Runtime("egress configuration has no parent".to_owned()))?;
     if !config_path.is_absolute()
         || readiness.parent() != Some(parent)
-        || control.parent() != Some(parent)
+        || workload_control.parent() != Some(parent)
         || readiness.file_name().and_then(|name| name.to_str()) != Some("egress-ready.sock")
-        || control.file_name().and_then(|name| name.to_str()) != Some("egress-gateway-control.sock")
+        || workload_control.file_name().and_then(|name| name.to_str())
+            != Some("egress-workload-control.sock")
+        || trusted_control.is_some_and(|path| {
+            path.parent() != Some(parent)
+                || path.file_name().and_then(|name| name.to_str())
+                    != Some("egress-trusted-control.sock")
+        })
+        || registry_control.is_some_and(|path| {
+            path.parent() != Some(parent)
+                || path.file_name().and_then(|name| name.to_str())
+                    != Some("registry-proxy-control.sock")
+        })
+        || trusted_control.is_some() != registry_control.is_some()
     {
         return Err(GuestError::Runtime(
             "egress runtime paths must be fixed files beneath the authenticated session directory"
@@ -1026,6 +1554,75 @@ fn require_root_cgroup_namespace() -> Result<(), GuestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn registry_configuration(root: &Path) -> RegistryProxyConfiguration {
+        let metadata = fs::metadata(root).expect("root metadata");
+        RegistryProxyConfiguration {
+            policy: sendbox_policy::PackageSupplyChainPolicy::default(),
+            proxy_port: 14_873,
+            trusted_upstream_port: 15_081,
+            cache_root: root.join("cache"),
+            report_path: root.join("runtime/registry/report.json"),
+            proxy_uid: metadata.uid(),
+            proxy_gid: metadata.gid(),
+            credentials: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registry_directory_preparation_requires_the_cache_mount() {
+        let root = tempfile::tempdir().expect("root");
+        fs::create_dir(root.path().join("runtime")).expect("runtime");
+        let configuration = registry_configuration(root.path());
+
+        let error = prepare_registry_directories(&configuration).expect_err("missing cache");
+
+        assert!(error.to_string().contains("package cache mount is missing"));
+        assert!(!root.path().join("runtime/registry").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registry_directory_preparation_creates_only_the_report_leaf() {
+        let root = tempfile::tempdir().expect("root");
+        fs::create_dir(root.path().join("cache")).expect("cache");
+        fs::create_dir(root.path().join("runtime")).expect("runtime");
+        let configuration = registry_configuration(root.path());
+
+        prepare_registry_directories(&configuration).expect("prepare directories");
+
+        let report =
+            fs::symlink_metadata(root.path().join("runtime/registry")).expect("report directory");
+        assert!(report.is_dir());
+        assert_eq!(report.permissions().mode() & 0o7777, 0o700);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registry_directory_preparation_rejects_a_report_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        fs::create_dir(root.path().join("cache")).expect("cache");
+        fs::create_dir(root.path().join("runtime")).expect("runtime");
+        fs::create_dir(root.path().join("attacker")).expect("attacker");
+        symlink(
+            root.path().join("attacker"),
+            root.path().join("runtime/registry"),
+        )
+        .expect("report symlink");
+        let configuration = registry_configuration(root.path());
+
+        let error = prepare_registry_directories(&configuration).expect_err("reject symlink");
+
+        assert!(
+            error
+                .to_string()
+                .contains("opening secure directory component")
+        );
+    }
 
     #[test]
     fn resolver_rewrite_preserves_non_nameserver_configuration() {
