@@ -317,10 +317,10 @@ pub async fn run<P: PlatformControls>(
                         Arc::clone(&runtime),
                         readiness,
                         broker_client.as_ref().map(|(client, _)| client.clone()),
-                        package_report,
                         secret_decryptor,
-                        safe_outputs.clone(),
-                    ),
+                    )
+                    .with_package_report(package_report)
+                    .with_safe_outputs(safe_outputs.clone()),
                 ) => protocol,
                 failure = services.wait_for_mandatory_failure() => Err(failure),
                 failure = wait_for_safe_outputs_failure(safe_outputs.as_ref()), if safe_outputs.is_some() => Err(failure),

@@ -122,9 +122,7 @@ impl ProtocolServices {
         runtime: Arc<RuntimeSession>,
         readiness: ReadinessSnapshot,
         broker: Option<BrokerClientConfiguration>,
-        package_report: Option<PackageReportSource>,
         secret_decryptor: GuestSecretDecryptor,
-        safe_outputs: Option<SafeOutputsHandle>,
     ) -> Self {
         Self {
             state,
@@ -132,10 +130,25 @@ impl ProtocolServices {
             runtime,
             readiness,
             broker,
-            package_report,
+            package_report: None,
             secret_decryptor,
-            safe_outputs,
+            safe_outputs: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_package_report(
+        mut self,
+        package_report: Option<PackageReportSource>,
+    ) -> Self {
+        self.package_report = package_report;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_safe_outputs(mut self, safe_outputs: Option<SafeOutputsHandle>) -> Self {
+        self.safe_outputs = safe_outputs;
+        self
     }
 }
 
@@ -1350,14 +1363,12 @@ mod tests {
                     audit_events: Vec::new(),
                 },
                 None,
-                None,
                 GuestSecretDecryptor::new(
                     SessionId::from_bytes([3; 16]),
                     &[9; 32],
                     BoundaryPlanDigest::from_bytes([0x91; 32]),
                 )
                 .expect("secret decryptor"),
-                None,
             ),
         )
         .await;
@@ -1416,10 +1427,8 @@ mod tests {
                 runtime,
                 readiness,
                 None,
-                None,
                 GuestSecretDecryptor::new(session_id, &[8; 32], boundary_plan_digest)
                     .expect("secret decryptor"),
-                None,
             ),
         ));
         let mut host_handshake = HostHandshake::new(
