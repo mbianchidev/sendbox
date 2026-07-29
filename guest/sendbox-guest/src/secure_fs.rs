@@ -141,10 +141,17 @@ pub fn read_bounded_named(
 
 fn read_up_to_limit(file: &mut File, limit: usize) -> Result<Zeroizing<Vec<u8>>, GuestError> {
     let mut bytes = Zeroizing::new(Vec::new());
-    file.take(u64::try_from(limit + 1).expect("bounded size fits u64"))
+    file.take(bounded_read_length(limit)?)
         .read_to_end(&mut bytes)
         .map_err(|error| GuestError::io("reading bounded file", error))?;
     Ok(bytes)
+}
+
+fn bounded_read_length(limit: usize) -> Result<u64, GuestError> {
+    u64::try_from(limit)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| GuestError::Runtime("bounded file limit is out of range".to_owned()))
 }
 
 pub fn validate_regular_metadata(
@@ -228,4 +235,23 @@ pub(crate) fn secure_tempdir() -> tempfile::TempDir {
         .expect("canonical test base");
     open_directory_no_symlinks(&base).expect("test base must not traverse symlinks");
     tempfile::tempdir_in(base).expect("secure temporary directory")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_read_reserves_a_sentinel_byte() {
+        assert_eq!(bounded_read_length(0).expect("zero limit"), 1);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn bounded_read_rejects_an_unrepresentable_sentinel() {
+        assert!(matches!(
+            bounded_read_length(usize::MAX),
+            Err(GuestError::Runtime(detail)) if detail == "bounded file limit is out of range"
+        ));
+    }
 }

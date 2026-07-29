@@ -30,7 +30,7 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["io-std", "rt", "signal", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["event", "pipe", "process", "stdio", "std", "termios"] }
+rustix = { workspace = true, features = ["event", "pipe", "stdio", "termios"] }
 
 [dev-dependencies]
 tempfile.workspace = true

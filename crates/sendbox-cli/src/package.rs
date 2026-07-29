@@ -219,10 +219,11 @@ fn require_directory(path: &Path, subject: &str) -> Result<(), String> {
 }
 
 fn read_secure_report(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata = path
-        .symlink_metadata()
-        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let file = open_secure_report(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect open {}: {error}", path.display()))?;
+    if !metadata.is_file() {
         return Err(format!("{} is not a regular report file", path.display()));
     }
     #[cfg(unix)]
@@ -242,9 +243,12 @@ fn read_secure_report(path: &Path) -> Result<Vec<u8>, String> {
     }
     let limit = usize::try_from(MAX_PACKAGE_REPORT_BYTES)
         .map_err(|_| "package report byte limit is out of range".to_owned())?;
-    let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let read_limit = u64::try_from(limit)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| "package report byte limit is out of range".to_owned())?;
     let mut bytes = Vec::new();
-    file.take(u64::try_from(limit + 1).expect("bounded package report length"))
+    file.take(read_limit)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     if bytes.len() > limit {
@@ -254,6 +258,30 @@ fn read_secure_report(path: &Path) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_secure_report(path: &Path) -> Result<File, String> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("open {}: {}", path.display(), std::io::Error::from(error)))?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_secure_report(path: &Path) -> Result<File, String> {
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a regular report file", path.display()));
+    }
+    File::open(path).map_err(|error| format!("open {}: {error}", path.display()))
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), String> {
@@ -336,5 +364,20 @@ mod tests {
             .expect("replace report");
         assert!(load_report(temporary.path(), Some(&session_id)).is_err());
         assert!(load_report(temporary.path(), Some("../escape")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_report_open_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().expect("temporary directory");
+        let target = temporary.path().join("report.json");
+        let link = temporary.path().join("report-link.json");
+        fs::write(&target, b"{}").expect("write target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("target mode");
+        symlink(&target, &link).expect("create symlink");
+
+        assert!(read_secure_report(&link).is_err());
     }
 }
