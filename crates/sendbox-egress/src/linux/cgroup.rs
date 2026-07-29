@@ -375,10 +375,17 @@ impl CgroupHierarchy {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             // A sibling sandbox instance still owns the shared top-level dir.
-            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(()),
+            Err(e) if shared_top_level_is_still_owned(&e) => Ok(()),
             Err(source) => Err(self.io_error(SENDBOX_CGROUP_PREFIX, source)),
         }
     }
+}
+
+fn shared_top_level_is_still_owned(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::ResourceBusy
+    )
 }
 
 fn is_valid_instance_id(id: &str) -> bool {
@@ -579,6 +586,16 @@ tmpfs /run tmpfs rw 0 0
         let errors = one.teardown();
         assert!(errors.is_empty(), "teardown errors: {errors:?}");
         assert!(root.path().join("sendbox/inst02").is_dir());
+    }
+
+    #[test]
+    fn teardown_tolerates_cgroupfs_busy_shared_top_level() {
+        let busy = io::Error::from_raw_os_error(libc::EBUSY);
+        assert!(shared_top_level_is_still_owned(&busy));
+        assert!(!shared_top_level_is_still_owned(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "denied",
+        )));
     }
 
     #[test]
