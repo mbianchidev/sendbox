@@ -24,8 +24,9 @@ use sendbox_runtime::{
     ControlChannelRequest, ControlEndpointKind, CreateRequest, ExecPurpose, ExecRequest,
     InitializeRequest, LifecycleState, OutputSubscription, PreflightReport, PreflightRequest,
     ProcessOptions, ProcessOutcome, ProcessRunner, ProgramResolver, ProvisionedControlChannel,
-    RunningProcess, RuntimeCapabilities, RuntimeCapability, RuntimeError, RuntimeHealth, RuntimeId,
-    RuntimeProvider, RuntimeSignal, RuntimeStatus, StartRequest, StopRequest, TerminationReason,
+    RUNTIME_INJECTED_BOOTSTRAP_TARGET, RunningProcess, RuntimeCapabilities, RuntimeCapability,
+    RuntimeError, RuntimeHealth, RuntimeId, RuntimeProvider, RuntimeSignal, RuntimeStatus,
+    StartRequest, StopRequest, TerminationReason,
 };
 use serde::Deserialize;
 use tokio::{
@@ -43,7 +44,7 @@ use crate::{
 
 pub const APPLE_RUNTIME_ID: &str = "apple-container";
 const SUPPORTED_VERSION: &str = "0.10.0";
-const BOOTSTRAP_TARGET: &str = "/run/sendbox-bootstrap/bootstrap.json";
+const BOOTSTRAP_TARGET: &str = RUNTIME_INJECTED_BOOTSTRAP_TARGET;
 const BUNDLE_LAUNCHER: &str = "bin/sendbox-exec-launcher";
 const GUEST_BUNDLE_ROOT: &str = "/opt/sendbox";
 const GUEST_BROKER_RUNTIME: &str = "/run/sendbox-broker";
@@ -163,6 +164,7 @@ struct ContainerRecord {
     lifecycle: LifecycleState,
     request: CreateRequest,
     host_state_directory: PathBuf,
+    staged_public_key: PathBuf,
     log_process: Option<RunningProcess>,
     channel_provisioned: bool,
 }
@@ -634,12 +636,40 @@ impl RuntimeProvider for AppleRuntime {
                 .ok_or_else(|| provider_error("Apple runtime is not initialized"))?;
             self.verify_launch_artifacts()?;
             self.ensure_image(&request.image, cancellation).await?;
+            let launch = self.configuration.launch.merge_create_request(&request)?;
+            if self
+                .containers
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains_key(&request.container_id)
+            {
+                return Err(provider_error(format!(
+                    "Apple container `{}` already exists",
+                    request.container_id
+                )));
+            }
             let container_state = state_root.join("apple").join(request.container_id.as_str());
             prepare_state_directory(&container_state)?;
+            let staged_public_key =
+                stage_public_key(&self.configuration.public_key, &container_state)?;
+            let command = match self.commands.create(
+                &request.container_id,
+                &request.image,
+                &launch,
+                &self.configuration.bundle_root,
+                &staged_public_key,
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&container_state);
+                    return Err(error);
+                }
+            };
             let record = Arc::new(tokio::sync::Mutex::new(ContainerRecord {
                 lifecycle: LifecycleState::Initialized,
                 request: request.clone(),
                 host_state_directory: container_state.clone(),
+                staged_public_key: staged_public_key.clone(),
                 log_process: None,
                 channel_provisioned: false,
             }));
@@ -656,14 +686,6 @@ impl RuntimeProvider for AppleRuntime {
                 }
                 containers.insert(request.container_id.clone(), Arc::clone(&record));
             }
-            let launch = self.configuration.launch.merge_create_request(&request)?;
-            let command = self.commands.create(
-                &request.container_id,
-                &request.image,
-                &launch,
-                &self.configuration.bundle_root,
-                &self.configuration.public_key,
-            )?;
             if let Err(error) = self.run_checked(command, cancellation).await {
                 if !error
                     .to_string()
@@ -757,7 +779,8 @@ impl RuntimeProvider for AppleRuntime {
             self.inject_bootstrap(&request.container_id, bootstrap.as_ref(), cancellation)
                 .await?;
             self.run_checked(
-                self.commands.supervisor(&request.container_id),
+                self.commands
+                    .supervisor(&request.container_id, &record.staged_public_key)?,
                 cancellation,
             )
             .await?;
@@ -1163,6 +1186,74 @@ fn prepare_state_directory(path: &Path) -> Result<(), RuntimeError> {
     })
 }
 
+fn stage_public_key(source: &Path, state_directory: &Path) -> Result<PathBuf, RuntimeError> {
+    let trust_root_directory = state_directory.join("trust-root");
+    fs::create_dir(&trust_root_directory).map_err(|error| {
+        provider_error(format!(
+            "creating private Apple trust-root directory {}: {error}",
+            trust_root_directory.display()
+        ))
+    })?;
+    fs::set_permissions(&trust_root_directory, fs::Permissions::from_mode(0o700)).map_err(
+        |error| {
+            let _ = fs::remove_dir(&trust_root_directory);
+            provider_error(format!(
+                "securing private Apple trust-root directory {}: {error}",
+                trust_root_directory.display()
+            ))
+        },
+    )?;
+    let destination = trust_root_directory.join("release-public.key");
+    let stage = || -> Result<(), RuntimeError> {
+        let mut source_file = fs::File::open(source).map_err(|error| {
+            provider_error(format!(
+                "opening Apple trust root {} for staging: {error}",
+                source.display()
+            ))
+        })?;
+        let mut destination_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .map_err(|error| {
+                provider_error(format!(
+                    "creating staged Apple trust root {}: {error}",
+                    destination.display()
+                ))
+            })?;
+        io::copy(&mut source_file, &mut destination_file).map_err(|error| {
+            provider_error(format!(
+                "copying Apple trust root to {}: {error}",
+                destination.display()
+            ))
+        })?;
+        destination_file
+            .set_permissions(fs::Permissions::from_mode(0o444))
+            .map_err(|error| {
+                provider_error(format!(
+                    "securing staged Apple trust root {}: {error}",
+                    destination.display()
+                ))
+            })?;
+        destination_file.sync_all().map_err(|error| {
+            provider_error(format!(
+                "syncing staged Apple trust root {}: {error}",
+                destination.display()
+            ))
+        })
+    };
+    if let Err(error) = stage() {
+        if let Err(cleanup_error) = fs::remove_dir_all(&trust_root_directory) {
+            return Err(provider_error(format!(
+                "{error}; removing incomplete Apple trust-root directory {}: {cleanup_error}",
+                trust_root_directory.display()
+            )));
+        }
+        return Err(error);
+    }
+    Ok(destination)
+}
+
 fn checked_outcome(outcome: ProcessOutcome) -> Result<ProcessOutcome, RuntimeError> {
     match outcome.termination {
         TerminationReason::Cancelled => Err(RuntimeError::Cancelled),
@@ -1466,6 +1557,33 @@ esac
         );
     }
 
+    #[test]
+    fn trust_root_staging_rejects_existing_directories_and_rolls_back_failures() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let state = temporary.path().join("state");
+        prepare_state_directory(&state).expect("state directory");
+        let source = temporary.path().join("root.pub");
+
+        let error = stage_public_key(&source, &state).expect_err("missing source must fail");
+        assert!(error.to_string().contains("opening Apple trust root"));
+        assert!(!state.join("trust-root").exists());
+
+        fs::write(&source, b"public key").expect("public key");
+        let trust_root = state.join("trust-root");
+        fs::create_dir(&trust_root).expect("existing trust root");
+        fs::write(trust_root.join("unrelated"), b"private").expect("unrelated file");
+        let error = stage_public_key(&source, &state).expect_err("existing directory must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("creating private Apple trust-root directory")
+        );
+        assert_eq!(
+            fs::read(trust_root.join("unrelated")).expect("unrelated file remains"),
+            b"private"
+        );
+    }
+
     #[tokio::test]
     async fn fake_cli_passes_shared_runtime_conformance() {
         let (temporary, runtime) = fixture_runtime();
@@ -1494,6 +1612,8 @@ esac
     async fn create_applies_dynamic_request_configuration() {
         let (temporary, runtime) = fixture_runtime();
         let cancellation = CancellationToken::new();
+        let source_public_key = runtime.configuration.public_key.clone();
+        let source_public_key_parent = source_public_key.parent().expect("public key parent");
         runtime
             .initialize(
                 InitializeRequest {
@@ -1556,6 +1676,30 @@ esac
             "--mount type=bind,source={},target=/workspace",
             project.display()
         )));
+        let staged_trust_root = temporary
+            .path()
+            .join("state/apple/apple-dynamic/trust-root");
+        assert!(create.contains(&format!(
+            "--mount type=bind,source={},target=/opt/sendbox-trust-root,readonly",
+            staged_trust_root.display()
+        )));
+        assert!(!create.contains(&format!(
+            "--mount type=bind,source={},target=/opt/sendbox-trust-root,readonly",
+            source_public_key_parent.display()
+        )));
+        let staged_public_key = staged_trust_root.join("release-public.key");
+        assert_eq!(
+            fs::read(&staged_public_key).expect("staged public key"),
+            fs::read(source_public_key).expect("source public key")
+        );
+        assert_eq!(
+            fs::metadata(staged_public_key)
+                .expect("staged public key metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
     }
 
     #[tokio::test]

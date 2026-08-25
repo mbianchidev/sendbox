@@ -12,7 +12,8 @@ use sendbox_protocol::{
 use sendbox_runtime::{
     BootstrapDelivery, BootstrapMaterial, CancellationToken, ChannelLifetime, ChannelOwnership,
     ContainerId, ControlChannelRequest, ControlEndpointKind, CreateRequest, InitializeRequest,
-    PreflightRequest, RuntimeMount, RuntimeProvider, StartRequest, StopRequest,
+    PreflightRequest, RUNTIME_INJECTED_BOOTSTRAP_TARGET, RuntimeMount, RuntimeProvider,
+    StartRequest, StopRequest,
 };
 use sendbox_runtime_apple::{AppleRuntime, AppleRuntimeConfiguration};
 
@@ -121,7 +122,7 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
                     lifetime: ChannelLifetime::UntilRuntimeCleanup,
                     readiness_timeout: Duration::from_secs(30),
                     bootstrap_delivery: BootstrapDelivery::RuntimeInjection {
-                        target: "/run/sendbox-bootstrap/bootstrap.json".to_owned(),
+                        target: RUNTIME_INJECTED_BOOTSTRAP_TARGET.to_owned(),
                     },
                     bootstrap_material: BootstrapMaterial::new(secret.to_vec())?,
                 },

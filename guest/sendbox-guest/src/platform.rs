@@ -82,19 +82,34 @@ impl LinuxPlatformControls {
         }
         let controllers = std::fs::read_to_string(root.join("cgroup.controllers"))
             .map_err(|error| GuestError::io("reading cgroup controllers", error))?;
-        let requested = ["cpu", "memory", "pids"]
-            .into_iter()
-            .filter(|controller| {
-                controllers
-                    .split_whitespace()
-                    .any(|value| value == *controller)
-            })
-            .map(|controller| format!("+{controller}"))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let delegated = std::fs::read_to_string(root.join("cgroup.subtree_control"))
+            .map_err(|error| GuestError::io("reading delegated cgroup controllers", error))?;
+        let requested = Self::controllers_to_delegate(&controllers, &delegated);
         if !requested.is_empty() {
+            self.move_root_processes_to_runtime_cgroup(root)?;
             std::fs::write(root.join("cgroup.subtree_control"), requested)
                 .map_err(|error| GuestError::io("delegating cgroup controllers", error))?;
+        }
+        Ok(())
+    }
+
+    fn move_root_processes_to_runtime_cgroup(
+        &self,
+        hierarchy_root: &std::path::Path,
+    ) -> Result<(), GuestError> {
+        let processes = std::fs::read_to_string(hierarchy_root.join("cgroup.procs"))
+            .map_err(|error| GuestError::io("reading root cgroup processes", error))?;
+        if processes.trim().is_empty() {
+            return Ok(());
+        }
+        let runtime_cgroup = hierarchy_root.join("sendbox-runtime");
+        if !runtime_cgroup.exists() {
+            std::fs::create_dir(&runtime_cgroup)
+                .map_err(|error| GuestError::io("creating runtime cgroup", error))?;
+        }
+        for process in processes.lines().filter(|value| !value.is_empty()) {
+            std::fs::write(runtime_cgroup.join("cgroup.procs"), process)
+                .map_err(|error| GuestError::io("moving process into runtime cgroup", error))?;
         }
         Ok(())
     }
@@ -113,6 +128,23 @@ impl LinuxPlatformControls {
             .open(&kill)
             .map_err(|error| GuestError::io("opening delegated cgroup.kill", error))?;
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn controllers_to_delegate(available: &str, delegated: &str) -> String {
+        ["cpu", "memory", "pids"]
+            .into_iter()
+            .filter(|controller| {
+                available
+                    .split_whitespace()
+                    .any(|value| value == *controller)
+                    && !delegated
+                        .split_whitespace()
+                        .any(|value| value == *controller)
+            })
+            .map(|controller| format!("+{controller}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn status(
