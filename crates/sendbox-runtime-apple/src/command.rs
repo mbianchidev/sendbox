@@ -2,11 +2,11 @@ use std::path::{Component, Path, PathBuf};
 
 use sendbox_runtime::{
     CommandArgument, CommandSpec, ContainerId, CreateRequest, EnvironmentVariable, ExecRequest,
-    Program, RuntimeError, RuntimeSignal,
+    Program, RUNTIME_INJECTED_BOOTSTRAP_TARGET, RuntimeError, RuntimeSignal,
 };
 
 const GUEST_ARTIFACT_ROOT: &str = "/opt/sendbox";
-const GUEST_TRUST_ROOT: &str = "/sendbox-trust-root.pub";
+const GUEST_TRUST_ROOT_DIRECTORY: &str = "/opt/sendbox-trust-root";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ImagePullPolicy {
@@ -272,6 +272,10 @@ impl AppleContainerCommands {
         launch.validate()?;
         validate_mapping_path(bundle_root, "bundle root")?;
         validate_mapping_path(public_key, "public key")?;
+        let public_key_parent = public_key
+            .parent()
+            .ok_or_else(|| invalid("public key must have a parent directory"))?;
+        validate_mapping_path(public_key_parent, "public key parent")?;
 
         let mut arguments = vec![
             plain("create"),
@@ -281,6 +285,8 @@ impl AppleContainerCommands {
             plain("linux/arm64"),
             plain("--entrypoint"),
             plain("/opt/sendbox/bin/sendbox-guest"),
+            plain("--user"),
+            plain("0:0"),
             plain("--mount"),
             plain(format!(
                 "type=bind,source={},target={GUEST_ARTIFACT_ROOT},readonly",
@@ -288,8 +294,8 @@ impl AppleContainerCommands {
             )),
             plain("--mount"),
             plain(format!(
-                "type=bind,source={},target={GUEST_TRUST_ROOT},readonly",
-                display_path(public_key)
+                "type=bind,source={},target={GUEST_TRUST_ROOT_DIRECTORY},readonly",
+                display_path(public_key_parent)
             )),
         ];
         append_environment(&mut arguments, &launch.environment);
@@ -388,27 +394,31 @@ impl AppleContainerCommands {
         self.spec(["delete", id.as_str()])
     }
 
-    #[must_use]
-    pub fn supervisor(&self, id: &ContainerId) -> CommandSpec {
-        self.spec([
-            "exec",
-            "--detach",
-            "--user",
-            "0:0",
-            id.as_str(),
-            "/opt/sendbox/bin/sendbox-guest",
-            "supervisor",
-            "--bootstrap-file",
-            "/run/sendbox-bootstrap/bootstrap.json",
-            "--trust-root-file",
-            GUEST_TRUST_ROOT,
-            "--artifact-root",
-            GUEST_ARTIFACT_ROOT,
-            "--runtime-root",
-            "/run/sendbox",
-            "--replay-root",
-            "/var/lib/sendbox/replay",
-        ])
+    pub fn supervisor(
+        &self,
+        id: &ContainerId,
+        public_key: &Path,
+    ) -> Result<CommandSpec, RuntimeError> {
+        let guest_trust_root = guest_trust_root(public_key)?;
+        Ok(self.command(vec![
+            plain("exec"),
+            plain("--detach"),
+            plain("--user"),
+            plain("0:0"),
+            plain(id.as_str()),
+            plain("/opt/sendbox/bin/sendbox-guest"),
+            plain("supervisor"),
+            plain("--bootstrap-file"),
+            plain(RUNTIME_INJECTED_BOOTSTRAP_TARGET),
+            plain("--trust-root-file"),
+            plain(display_path(&guest_trust_root)),
+            plain("--artifact-root"),
+            plain(GUEST_ARTIFACT_ROOT),
+            plain("--runtime-root"),
+            plain("/run/sendbox"),
+            plain("--replay-root"),
+            plain("/var/lib/sendbox/replay"),
+        ]))
     }
 
     #[must_use]
@@ -422,7 +432,7 @@ impl AppleContainerCommands {
             "/opt/sendbox/bin/sendbox-guest",
             "bootstrap-install",
             "--target",
-            "/run/sendbox-bootstrap/bootstrap.json",
+            RUNTIME_INJECTED_BOOTSTRAP_TARGET,
         ]
         .into_iter()
         .map(str::to_owned)
@@ -685,6 +695,13 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn guest_trust_root(public_key: &Path) -> Result<PathBuf, RuntimeError> {
+    let filename = public_key
+        .file_name()
+        .ok_or_else(|| invalid("public key must have a file name"))?;
+    Ok(Path::new(GUEST_TRUST_ROOT_DIRECTORY).join(filename))
+}
+
 fn invalid(reason: impl Into<String>) -> RuntimeError {
     RuntimeError::InvalidCommand {
         reason: reason.into(),
@@ -762,10 +779,12 @@ mod tests {
                 "linux/arm64",
                 "--entrypoint",
                 "/opt/sendbox/bin/sendbox-guest",
+                "--user",
+                "0:0",
                 "--mount",
                 "type=bind,source=/opt/host/sendbox-bundle,target=/opt/sendbox,readonly",
                 "--mount",
-                "type=bind,source=/opt/host/root.pub,target=/sendbox-trust-root.pub,readonly",
+                "type=bind,source=/opt/host,target=/opt/sendbox-trust-root,readonly",
                 "--env",
                 "PUBLIC=yes",
                 "--env",
@@ -811,6 +830,32 @@ mod tests {
         assert_eq!(
             values(&commands.signal(&id, RuntimeSignal::User1)),
             ["kill", "--signal", "SIGUSR1", "apple-test"]
+        );
+        assert_eq!(
+            values(
+                &commands
+                    .supervisor(&id, Path::new("/opt/host/root.pub"))
+                    .expect("supervisor")
+            ),
+            [
+                "exec",
+                "--detach",
+                "--user",
+                "0:0",
+                "apple-test",
+                "/opt/sendbox/bin/sendbox-guest",
+                "supervisor",
+                "--bootstrap-file",
+                "/run/sendbox-bootstrap/bootstrap.json",
+                "--trust-root-file",
+                "/opt/sendbox-trust-root/root.pub",
+                "--artifact-root",
+                "/opt/sendbox",
+                "--runtime-root",
+                "/run/sendbox",
+                "--replay-root",
+                "/var/lib/sendbox/replay",
+            ]
         );
         assert_eq!(
             commands

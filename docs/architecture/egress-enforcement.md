@@ -118,7 +118,7 @@ bytes, which would be ambiguous and attacker-influenceable):
   forwarding, with matching authority/Host validation and strict body framing.
   Proxy credentials and ambiguous framing are rejected.
 
-Both front ends funnel through the *same* `authorize_and_dial` path: resolve and
+All front ends funnel through the *same* `authorize_and_dial` path: resolve and
 pin a hostname (or validate a direct IP), re-check the full port-aware policy
 decision, and dial the exact validated `SocketAddr` through the `Dialer`. Only
 the wire framing and the reply-code mapping differ. A runtime selects the SOCKS5

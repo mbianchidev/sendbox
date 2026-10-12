@@ -411,7 +411,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .configuration
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
-    validate_reserved_secret_names(&request.configuration)?;
+    validate_reserved_secret_names(&request.configuration, None)?;
     let command = validate_command(&request.command)?;
     validate_command_policy(&request.configuration.policy.commands, &request.command)?;
     let host = current_host()?;
@@ -457,7 +457,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .configuration
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
-    validate_reserved_secret_names(&request.configuration)?;
+    validate_reserved_secret_names(&request.configuration, Some(&credentials))?;
     let workspace_destination = PathBuf::from("/workspace");
     let workload_identity = match selected_runtime {
         ResolvedRuntime::Apple | ResolvedRuntime::Kata => Some(project_identity(&project_source)?),
@@ -2069,7 +2069,10 @@ fn collect_credential_values(
     })
 }
 
-fn validate_reserved_secret_names(configuration: &SandboxConfiguration) -> Result<(), HostError> {
+fn validate_reserved_secret_names(
+    configuration: &SandboxConfiguration,
+    trusted_credentials: Option<&EffectiveCredentialSet>,
+) -> Result<(), HostError> {
     let gateway_names = configuration
         .policy
         .boundaries
@@ -2077,7 +2080,9 @@ fn validate_reserved_secret_names(configuration: &SandboxConfiguration) -> Resul
         .gateway_secret_names();
     for value in &configuration.secrets {
         let name = SecretName::new(value.clone())?;
-        if requires_guarded_github_forwarding(&name) {
+        if requires_guarded_github_forwarding(&name)
+            && trusted_credentials.is_none_or(|credentials| !credentials.values.contains_key(value))
+        {
             return Err(HostError::Invalid(format!(
                 "configured secret `{value}` requires guarded credential forwarding"
             )));
@@ -3602,7 +3607,7 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let mut configuration = supported_configuration(temp.path().to_path_buf());
         configuration.secrets.push("github_token".to_owned());
-        let error = validate_reserved_secret_names(&configuration)
+        let error = validate_reserved_secret_names(&configuration, None)
             .expect_err("reserved credential must fail");
         assert!(matches!(
             error,
@@ -3610,6 +3615,29 @@ mod tests {
                 if message
                     == "configured secret `github_token` requires guarded credential forwarding"
         ));
+    }
+
+    #[test]
+    fn prepared_copilot_credentials_are_valid_trusted_secrets() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.github.forward_auth = false;
+        configuration.github.forward_copilot_auth = true;
+        let credentials = EffectiveCredentialSet {
+            values: BTreeMap::from([(
+                COPILOT_GUEST_TOKEN_ENVIRONMENT.to_owned(),
+                SecretValue::try_from("token").expect("token"),
+            )]),
+            github_https_auth: false,
+            copilot_auth: true,
+            git_ssh_auth: false,
+        };
+
+        validate_reserved_secret_names(&configuration, None)
+            .expect("user configuration has no reserved secrets");
+        credentials.apply_to(&mut configuration);
+        validate_reserved_secret_names(&configuration, Some(&credentials))
+            .expect("prepared credentials are trusted");
     }
 
     #[test]
