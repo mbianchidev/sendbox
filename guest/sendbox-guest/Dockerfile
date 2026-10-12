@@ -66,7 +66,7 @@ ENV LIBSECCOMP_STATIC=1
 ENV PKG_CONFIG_ALL_STATIC=1
 ENV PKG_CONFIG_PATH=/opt/libseccomp/lib/pkgconfig
 ENV SOURCE_DATE_EPOCH=0
-ENV RUSTFLAGS="-Dwarnings --remap-path-prefix=/workspace=. -Lnative=/usr/lib -Clink-arg=-lzstd -Clink-arg=-latomic -Clink-arg=-lgcc"
+ENV RUSTFLAGS="-Dwarnings --remap-path-prefix=/workspace=. -Lnative=/usr/lib -Clink-arg=-Wl,-Bstatic -Clink-arg=-lzstd -Clink-arg=-latomic -Clink-arg=-lgcc -Clink-arg=-static"
 
 FROM source AS quality
 COPY --from=audit-tool /usr/local/cargo/bin/cargo-audit /usr/local/cargo/bin/cargo-audit
