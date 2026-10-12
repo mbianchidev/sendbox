@@ -133,6 +133,12 @@ struct ScanArgs {
 struct InitArgs {
     #[arg(long, value_name = "PATH", default_value = ".")]
     project: PathBuf,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Share this workspace root instead of only the selected repository"
+    )]
+    workspace: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = PolicyPresetArg::Default)]
     policy: PolicyPresetArg,
     #[arg(long, value_enum, default_value_t = RuntimeArg::Auto)]
@@ -572,7 +578,15 @@ async fn run(arguments: RunArgs) -> ExitCode {
                         "denied": package.denied(),
                         "quarantined": package.quarantined(),
                     })),
+                    "syscall_report": report.syscall_report(),
                 }));
+            } else if let Some(trace) = report.syscall_report() {
+                eprintln!("syscall report: {}", trace.path().display());
+                if trace.incomplete_capture() {
+                    eprintln!(
+                        "sendbox: syscall capture reported loss or reached its guest log limit"
+                    );
+                }
             }
             exit_code(code)
         }
@@ -611,6 +625,25 @@ fn init(arguments: InitArgs) -> ExitCode {
     );
     if let Some(agent) = arguments.agent {
         agent.configure(&mut configuration);
+    }
+    if let Some(workspace) = arguments.workspace.as_ref() {
+        configuration.workspace_path = match canonical_project(workspace) {
+            Ok(root) => Some(root),
+            Err(diagnostic) => {
+                return emit_diagnostics(
+                    arguments.json,
+                    INVALID_CONFIGURATION_EXIT,
+                    vec![diagnostic],
+                );
+            }
+        };
+    }
+    if let Err(error) = configuration.validate() {
+        return emit_diagnostics(
+            arguments.json,
+            INVALID_CONFIGURATION_EXIT,
+            error.into_diagnostics(),
+        );
     }
 
     if let Err(error) =

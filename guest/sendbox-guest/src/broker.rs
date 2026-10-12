@@ -2,7 +2,8 @@
 
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -51,6 +52,22 @@ struct BrokerProcessConfiguration {
     fixed_environment: std::collections::BTreeMap<String, String>,
 }
 
+#[must_use]
+pub fn workload_environment(session_id: SessionId) -> std::collections::BTreeMap<String, String> {
+    let home = format!("/run/sendbox-workload/{session_id}");
+    std::collections::BTreeMap::from([
+        ("HOME".to_owned(), home.clone()),
+        ("XDG_CONFIG_HOME".to_owned(), format!("{home}/.config")),
+        ("XDG_DATA_HOME".to_owned(), format!("{home}/.local/share")),
+        ("XDG_CACHE_HOME".to_owned(), format!("{home}/.cache")),
+        ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
+        ("LANG".to_owned(), "C.UTF-8".to_owned()),
+        ("USER".to_owned(), "sendbox".to_owned()),
+        ("LOGNAME".to_owned(), "sendbox".to_owned()),
+        ("TMPDIR".to_owned(), "/tmp".to_owned()),
+    ])
+}
+
 pub fn prepare(
     session_id: SessionId,
     session_dir: &Path,
@@ -62,6 +79,29 @@ pub fn prepare(
             "brokered workloads must use a non-root uid and gid".to_owned(),
         ));
     }
+    let home_root = Path::new("/run/sendbox-workload");
+    sendbox_config::ensure_directory(home_root, 0o755)
+        .map_err(|error| GuestError::io("preparing ephemeral workload home root", error))?;
+    let metadata = fs::metadata(home_root)
+        .map_err(|error| GuestError::io("checking workload home root", error))?;
+    if metadata.uid() != 0 || metadata.gid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(GuestError::Runtime(
+            "workload home root must be owned by the trusted supervisor".to_owned(),
+        ));
+    }
+    let home = home_root.join(session_id.to_string());
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&home)
+        .map_err(|error| GuestError::io("creating fresh ephemeral workload home", error))?;
+    std::os::unix::fs::chown(
+        &home,
+        Some(bootstrap.workload_uid),
+        Some(bootstrap.workload_gid),
+    )
+    .map_err(|error| GuestError::io("assigning ephemeral workload home", error))?;
+    let mut environment = workload_environment(session_id);
+    environment.extend(fixed_environment);
     prepare_runtime_parent(&bootstrap.runtime_parent)?;
     let expected_socket = bootstrap
         .runtime_parent
@@ -107,7 +147,7 @@ pub fn prepare(
         workspace_root: bootstrap.workspace_root,
         system_root: bootstrap.system_root,
         command_policy: bootstrap.command_policy,
-        fixed_environment,
+        fixed_environment: environment,
     })
     .map_err(|error| GuestError::Runtime(format!("encode broker configuration: {error}")))?;
     use std::os::unix::fs::OpenOptionsExt;
@@ -193,14 +233,7 @@ pub async fn run(config_path: PathBuf) -> Result<(), GuestError> {
         session,
         sendbox_exec::CompiledCommandPolicy::compile(&config.command_policy)
             .map_err(|error| GuestError::Runtime(format!("compile command policy: {error}")))?,
-        sendbox_exec::environment::EnvironmentPolicy::new(
-            [
-                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-                ("LANG".to_owned(), "C.UTF-8".to_owned()),
-            ]
-            .into_iter()
-            .chain(config.fixed_environment),
-        ),
+        sendbox_exec::environment::EnvironmentPolicy::new(config.fixed_environment),
         RequestLimits::default(),
         backend,
     ));

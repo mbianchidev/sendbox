@@ -75,6 +75,7 @@ pub struct AgentReport {
     pub states: Vec<AgentState>,
     pub safe_outputs: Option<crate::CollectedSafeOutputs>,
     pub package_report: Option<GuestPackageReport>,
+    pub syscall_report: Option<crate::GuestSyscallReport>,
 }
 
 enum WorkloadStep {
@@ -162,6 +163,7 @@ impl AgentOrchestrator {
                     states: context.states,
                     safe_outputs,
                     package_report: context.package_report,
+                    syscall_report: context.syscall_report,
                 })
             }
             Ok(_) => Err(RunFailure {
@@ -303,6 +305,7 @@ impl AgentOrchestrator {
                     capabilities: agent_host_capabilities(),
                     required_capabilities: plan.required_guest_capabilities().clone(),
                     safe_outputs_required: plan.safe_outputs(),
+                    syscall_tracing_required: plan.syscall_tracing(),
                     bootstrap_secret: bootstrap.as_bytes().to_vec(),
                     policy_digest: plan.policy_digest(),
                 },
@@ -353,6 +356,16 @@ impl AgentOrchestrator {
         let terminal = self
             .monitor(plan.package_report_maximum_bytes(), cancellation, context)
             .await?;
+        if plan.syscall_tracing() {
+            context.syscall_report = Some(
+                context
+                    .execution
+                    .as_mut()
+                    .expect("execution was stored")
+                    .fetch_syscall_report(sendbox_protocol::MAX_SYSCALL_REPORT_BYTES, cancellation)
+                    .await?,
+            );
+        }
         let safe_outputs = if plan.safe_outputs() {
             Some(
                 context
@@ -526,6 +539,7 @@ struct RunContext {
     guest: Option<Box<dyn GuestSession>>,
     execution: Option<Box<dyn GuestExecution>>,
     package_report: Option<GuestPackageReport>,
+    syscall_report: Option<crate::GuestSyscallReport>,
 }
 
 impl RunContext {
@@ -540,6 +554,7 @@ impl RunContext {
             guest: None,
             execution: None,
             package_report: None,
+            syscall_report: None,
         }
     }
 

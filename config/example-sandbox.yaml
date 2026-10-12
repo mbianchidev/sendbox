@@ -21,6 +21,9 @@ name: my-project-sandbox
 # This directory is mounted read/write into the sandbox container.
 # The agent can read, modify, and create files within this tree.
 project_path: /Users/developer/my-project
+# Optional enclosing multi-repository root. The selected project must be inside
+# it; only this root is shared, with the project remaining the initial cwd.
+# workspace_path: /Users/developer/team-workspace
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime Provider
@@ -41,7 +44,8 @@ runtime:
     # configuration_path: /etc/kata-containers/configuration.toml
 
   # Used only when provider is "hyperlight". The kernel and initrd must contain
-  # a shell and every command or MCP server that the guest will execute.
+  # a shell and every one-shot command. Persistent CLI/MCP composition and
+  # guest syscall tracing are unsupported and fail closed.
   hyperlight:
     executable: /usr/local/bin/hyperlight-unikraft
     kernel_path: /opt/hyperlight/shell-kernel
@@ -119,9 +123,9 @@ policy:
 
   # ── Kernel and MCP boundaries ─────────────────────────────────────────────
   boundaries:
-    # Fail closed if eBPF, Python, the compiler, or libseccomp is unavailable.
-    # Hyperlight users must set this to false because the Unikraft guest cannot
-    # run the eBPF/seccomp boundary bootstrap.
+    # Require the authenticated native guest broker and seccomp controls.
+    # Optional eBPF observation is configured separately under observability.
+    # Hyperlight cannot provide these persistent guest controls.
     enabled: true
 
     tool_calls:
@@ -173,6 +177,7 @@ policy:
               - "update_*"
               - "delete_*"
           http:
+            allowed_auth_methods: [bearer]
             allow_redirects: false
             max_request_bytes: 1048576
             max_response_bytes: 1048576
@@ -346,8 +351,8 @@ github:
   allow_private_repository_access: false
 
   # Protect push and pull operations for the repository mounted at project_path.
-  # Requires policy.boundaries.enabled so direct execution of the hidden git
-  # binary is terminated by the eBPF boundary.
+  # Requires policy.boundaries.enabled for the trusted Git wrapper and guest
+  # execution containment. eBPF observation does not enforce Git authorization.
   branch_protection:
     # Default: true
     enabled: true
@@ -385,3 +390,8 @@ github:
   # The key is mounted at ~/.ssh/ inside the container.
   # Default: not set (SSH auth disabled; use HTTPS via `gh auth`)
   # ssh_key_path: ~/.ssh/id_ed25519
+
+# Optional observation inside the Linux guest, never on the host. Missing BTF,
+# tracepoints, privileges or tracer readiness fails a requested session.
+observability:
+  syscall_tracing: false

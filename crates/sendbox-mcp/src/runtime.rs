@@ -126,6 +126,20 @@ impl RuntimePolicyDocument {
             if let Some(http) = server.http() {
                 http.validate_authentication()?;
             }
+            if let McpServerPolicy::Stdio {
+                authorization: Some(authorization),
+                ..
+            } = server
+                && (authorization.secret_names().is_empty()
+                    || !authorization
+                        .secret_names()
+                        .is_subset(&self.inherited_environment_keys))
+            {
+                return Err(
+                    "stdio MCP authentication references secrets not admitted for delivery"
+                        .to_owned(),
+                );
+            }
         }
         if !(1..=MAX_FRAME_BYTES).contains(&self.tool_policy.max_frame_bytes) {
             return Err(format!(
@@ -283,6 +297,23 @@ impl RuntimePolicyDocument {
         resolve_stdio_server(&self.tool_policy, &command.argv())
     }
 
+    pub fn inherited_environment_for(
+        &self,
+        command: &ApprovedCommand,
+    ) -> Result<BTreeSet<String>, String> {
+        let resolved = self.resolve_stdio(command)?;
+        if !self.tool_policy.uses_hierarchical_servers() {
+            return Ok(self.inherited_environment_keys.clone());
+        }
+        match self.tool_policy.servers.get(&resolved.identity.id) {
+            Some(McpServerPolicy::Stdio { authorization, .. }) => Ok(authorization
+                .as_ref()
+                .map(|authorization| authorization.secret_names().clone())
+                .unwrap_or_default()),
+            _ => Err("resolved MCP server is not an admitted stdio identity".to_owned()),
+        }
+    }
+
     pub fn project_validator(&self) -> Result<ProjectConfigValidator, String> {
         ProjectConfigValidator::from_policy(&self.tool_policy)
     }
@@ -402,6 +433,38 @@ mod tests {
             policy.approved_commands().expect("commands")[0].argv(),
             ["/usr/bin/server", "--stdio"]
         );
+    }
+
+    #[test]
+    fn stdio_servers_receive_only_their_own_admitted_authentication_secrets() {
+        let mut runtime = policy();
+        runtime.tool_policy = serde_json::from_value(serde_json::json!({
+            "servers": {
+                "authenticated": {
+                    "transport": "stdio",
+                    "command": ["/usr/bin/server", "--stdio"],
+                    "authorization": {"method": "environment", "secrets": ["TOKEN"]}
+                },
+                "public": {"transport": "stdio", "command": ["/usr/bin/public-server"]}
+            }
+        }))
+        .unwrap();
+        runtime.validate().expect("runtime policy");
+        let authenticated =
+            ApprovedCommand::new("/usr/bin/server", ["--stdio".to_owned()]).unwrap();
+        let public = ApprovedCommand::new("/usr/bin/public-server", []).unwrap();
+        assert_eq!(
+            runtime.inherited_environment_for(&authenticated).unwrap(),
+            BTreeSet::from(["TOKEN".to_owned()])
+        );
+        assert!(
+            runtime
+                .inherited_environment_for(&public)
+                .unwrap()
+                .is_empty()
+        );
+        runtime.inherited_environment_keys.clear();
+        assert!(runtime.validate().is_err());
     }
 
     #[test]

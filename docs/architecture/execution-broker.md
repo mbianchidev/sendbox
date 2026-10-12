@@ -35,8 +35,10 @@ The host agent reaches this broker through the runtime-owned authenticated guest
 control channel. `sendbox-agent` validates `BrokeredExec` and guest `Exec`
 capabilities before launch and sends the workload over that channel.
 `RuntimeProvider::exec` is reserved for trusted bootstrap and control operations;
-it is not an alternate workload path. Concrete guest wiring and runtime adapter
-mappings remain pending.
+it is not an alternate workload path. Apple and Kata wire this through their
+authenticated supervisor transport. Third-party CLI agents are brokered
+top-level workloads; their spawned tools inherit kernel/VM containment, not
+recursive semantic argv authorization.
 
 ## Typed contract
 

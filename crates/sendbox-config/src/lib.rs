@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use sendbox_core::{Diagnostic, DiagnosticCode, ValidationFailure};
@@ -25,6 +26,19 @@ pub enum RuntimeProvider {
     Apple,
     Kata,
     Hyperlight,
+}
+
+#[must_use]
+pub fn is_kata_runtime_handler(handler: &str) -> bool {
+    matches!(
+        handler,
+        "io.containerd.kata.v2"
+            | "io.containerd.kata-qemu.v2"
+            | "io.containerd.kata-clh.v2"
+            | "io.containerd.kata-fc.v2"
+            | "io.containerd.kata-dragonball.v2"
+            | "io.containerd.kata-qemu-coco.v2"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +377,12 @@ impl Default for McpInspectionConfiguration {
 #[serde(default, deny_unknown_fields)]
 pub struct ObservabilityConfiguration {
     pub mcp_inspection: McpInspectionConfiguration,
+    #[serde(skip_serializing_if = "is_false")]
+    pub syscall_tracing: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +410,11 @@ fn normalized_scope_path(path: &Path) -> bool {
         && !path
             .components()
             .any(|component| matches!(component, Component::ParentDir))
+        && !path
+            .as_os_str()
+            .as_bytes()
+            .split(|byte| *byte == b'/')
+            .any(|component| component == b".")
 }
 
 impl SandboxConfiguration {
@@ -553,6 +578,13 @@ impl SandboxConfiguration {
         self.workspace_path.as_deref().unwrap_or(&self.project_path)
     }
 
+    #[must_use]
+    pub fn syscall_tracing_enabled(&self) -> bool {
+        self.observability
+            .as_ref()
+            .is_some_and(|configuration| configuration.syscall_tracing)
+    }
+
     pub fn to_canonical_yaml(&self) -> Result<String, ConfigurationError> {
         self.validate().map_err(ConfigurationError::Validation)?;
         persistence::serialize(self)
@@ -577,6 +609,13 @@ impl SandboxConfiguration {
         let Some(runtime) = &self.runtime else {
             return;
         };
+        if !is_kata_runtime_handler(&runtime.kata.runtime_handler) {
+            invalid_value(
+                diagnostics,
+                "runtime.kata.runtime_handler",
+                "must select a supported io.containerd.kata runtime v2 handler; shared-kernel and unverified handlers are rejected",
+            );
+        }
         if let Some(path) = &runtime.kata.configuration_path
             && !path.is_absolute()
         {
@@ -901,6 +940,19 @@ impl SandboxConfiguration {
         let Some(observability) = &self.observability else {
             return;
         };
+        if observability.syscall_tracing
+            && (!self.policy.boundaries.enabled
+                || self
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.provider == RuntimeProvider::Hyperlight))
+        {
+            incompatible(
+                diagnostics,
+                "observability.syscall_tracing",
+                "syscall tracing requires an Apple or Kata guest with policy.boundaries.enabled",
+            );
+        }
         let inspection = &observability.mcp_inspection;
         if inspection.max_payload_bytes <= 0 {
             invalid_value(

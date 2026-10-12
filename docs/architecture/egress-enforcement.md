@@ -114,6 +114,9 @@ bytes, which would be ambiguous and attacker-influenceable):
 - `ConnectFrontend::Socks5` — standard SOCKS5 (RFC 1928), no-authentication
   negotiation, `CONNECT` only. `BIND` and `UDP ASSOCIATE` are refused with
   `Command not supported`, which is how UDP/QUIC is denied at the SOCKS layer.
+- `ConnectFrontend::Http` — bounded HTTP/1.x CONNECT plus absolute-form HTTP
+  forwarding, with matching authority/Host validation and strict body framing.
+  Proxy credentials and ambiguous framing are rejected.
 
 Both front ends funnel through the *same* `authorize_and_dial` path: resolve and
 pin a hostname (or validate a direct IP), re-check the full port-aware policy
@@ -191,7 +194,7 @@ everything down.
 
 ## Authenticated production composition
 
-The host derives a schema-v3 `RuntimePolicyDocument` from the authenticated
+The host derives a schema-v4 `RuntimePolicyDocument` from the authenticated
 session ID, configured `NetworkPolicy`, any remote MCP origins, and any package
 registry isolation. Apple and Kata bind that exact document into guest bootstrap
 together with the matching execution broker cgroup parent. The guest rejects
@@ -213,7 +216,11 @@ it. The egress supervisor:
 6. authorizes the gateways and proxy to serve, installs loopback resolver
    configuration, and only then publishes readiness.
 
-Workloads receive exact upper- and lower-case `ALL_PROXY`/`NO_PROXY` variables.
+Workloads receive exact upper- and lower-case `ALL_PROXY`/`NO_PROXY` and
+`HTTP_PROXY`/`HTTPS_PROXY` variables, plus fixed `NODE_USE_ENV_PROXY=1`.
+The HTTP listener on port 15083 and SOCKS listener on 15080 share the same
+authorization cache, DNS guard, semaphore, and marked dialer. Both ports are
+signed and pairwise distinct from DNS, MCP, and package ports.
 The authenticated stdio MCP broker receives the same fixed proxy environment,
 so local servers remain descendants of execution leaves and cannot bypass
 enforcement. The remote MCP gateway remains in the broker cgroup and uses

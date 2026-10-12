@@ -78,12 +78,19 @@ pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
     })?;
 
     let mut environment = policy.fixed_environment.clone();
-    environment.extend(
-        policy
-            .inherited_environment_keys
-            .iter()
-            .filter_map(|key| std::env::var(key).ok().map(|value| (key.clone(), value))),
-    );
+    let inherited = policy
+        .inherited_environment_for(&command)
+        .map_err(|error| {
+            GuestError::Runtime(format!("MCP authentication admission failed: {error}"))
+        })?;
+    for key in inherited {
+        let value = std::env::var(&key).map_err(|_| {
+            GuestError::Runtime(format!(
+                "MCP authentication secret '{key}' was not delivered"
+            ))
+        })?;
+        environment.insert(key, value);
+    }
     let launcher = TokioProcessLauncher::new(environment, Some(policy.workspace_root.clone()));
     let compiled = resolved.compile();
     let configuration = BrokerConfiguration {

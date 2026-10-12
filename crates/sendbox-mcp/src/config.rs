@@ -281,6 +281,14 @@ impl ProjectConfigValidator {
         name: &str,
         server: &Map<String, Value>,
     ) -> Result<Map<String, Value>, ConfigError> {
+        if server.contains_key("type") && server.contains_key("transport") {
+            return invalid_server(path, name, "MCP transport must have one unambiguous field");
+        }
+        for field in ["type", "transport"] {
+            if server.get(field).is_some_and(|value| !value.is_string()) {
+                return invalid_server(path, name, "MCP transport must be a string");
+            }
+        }
         let mut server = server.clone();
         let opencode_remote =
             is_opencode(path) && server.get("type").and_then(Value::as_str) == Some("remote");
@@ -584,9 +592,8 @@ fn parse_configuration(path: &Path, bytes: &[u8]) -> Result<Value, ConfigError> 
                 toml::from_str(source).map_err(|error| invalid(error.to_string()))?;
             serde_json::to_value(value).map_err(|error| invalid(error.to_string()))
         }
-        Some("jsonc") => jsonc_parser::parse_to_serde_value(source, &Default::default())
-            .map_err(|error| invalid(error.to_string())),
-        _ => serde_json::from_str(source).map_err(|error| invalid(error.to_string())),
+        Some("jsonc") => crate::jsonrpc::parse_strict_value(source, true).map_err(invalid),
+        _ => crate::jsonrpc::parse_strict_value(source, false).map_err(invalid),
     }
 }
 
@@ -815,6 +822,14 @@ mod tests {
                 r#"{"mcpServers":{"files":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/node","/opt/mcp-server-filesystem.js"],"unrecognized_launch_override":true}}}"#,
             ),
             (".mcp.json", r#"{"mcpServers":[]}"#),
+            (
+                ".mcp.json",
+                r#"{"servers":{"x":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/node","/opt/mcp-server-filesystem.js"],"type":"stdio","transport":"http"}}}"#,
+            ),
+            (
+                ".mcp.json",
+                r#"{"servers":{"x":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/node","/opt/mcp-server-filesystem.js"],"type":false}}}"#,
+            ),
             (".codex/config.toml", "mcp_servers = 'not-a-table'\n"),
         ] {
             let temp = TempDir::new().unwrap();
@@ -823,6 +838,27 @@ mod tests {
                 validator().validate_project(temp.path()).is_err(),
                 "{path}: unsafe metadata was accepted"
             );
+        }
+    }
+
+    #[test]
+    fn json_and_jsonc_configs_reject_duplicate_server_and_launcher_keys() {
+        for path in [".mcp.json", "opencode.jsonc"] {
+            let temp = TempDir::new().unwrap();
+            write_config(
+                &temp,
+                path,
+                r#"{
+                "mcpServers": {
+                    "files": {
+                        "command": "/usr/bin/unapproved",
+                        "command": "/run/sendbox-boundary/mcp-broker",
+                        "args": ["--", "/usr/bin/node", "/opt/mcp-server-filesystem.js"]
+                    }
+                }
+            }"#,
+            );
+            assert!(validator().validate_project(temp.path()).is_err(), "{path}");
         }
     }
 
@@ -882,6 +918,7 @@ mod tests {
                 "trusted-github".to_owned(),
                 McpServerPolicy::Stdio {
                     command: vec!["/usr/bin/github-mcp".to_owned(), "stdio".to_owned()],
+                    authorization: None,
                     tools: ServerToolPolicy {
                         default_action: Action::Deny,
                         allowlist: vec!["search_code".to_owned()],

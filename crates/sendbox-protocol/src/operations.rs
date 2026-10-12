@@ -24,6 +24,10 @@ pub const MAX_SAFE_OUTPUTS_ARTIFACT_BYTES: usize = 128 * 1024;
 pub const MAX_SAFE_OUTPUTS_SEAL_BYTES: usize = 4 * 1024;
 pub const PACKAGE_REPORT_OPERATION: &str = "package.report";
 pub const PACKAGE_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const SYSCALL_REPORT_OPERATION: &str = "syscall.report";
+pub const MAX_SYSCALL_REPORT_BYTES: usize = 96 * 1024;
+pub type SyscallReportRequestV1 = PackageReportRequestV1;
+pub type SyscallReportResponseV1 = PackageReportResponseV1;
 
 /// Longest accepted `TERM` value; real terminfo names are far shorter.
 const MAX_TERM_BYTES: usize = 64;

@@ -64,7 +64,12 @@ fields.
 ## Bind project MCP definitions
 
 SendBox validates `.mcp.json`, `.vscode/mcp.json`,
-`.github/copilot/mcp.json`, `.cursor/mcp.json`, and `.claude/mcp.json`.
+`.github/copilot/mcp.json`, `.cursor/mcp.json`, `.claude/mcp.json`,
+`opencode.json`, `opencode.jsonc`, `.codex/config.toml`, and
+`.gemini/settings.json`. Native OpenCode `local`/`remote`, Codex TOML, and
+Gemini `httpUrl` definitions are normalized into the same policy. OpenCode
+remote definitions require `oauth: false`; client-side credentials, environment
+overrides, and header helpers remain forbidden. See [CLI agents](cli-agents.md).
 Project aliases do not affect policy selection and project files cannot select a
 SendBox policy ID.
 
@@ -159,6 +164,17 @@ normal CONNECT broker, and direct-IP CONNECT is disabled while remote MCP is
 active. TLS uprobes remain observation-only and never authorize traffic.
 
 ## Gateway credentials
+
+`http.allowed_auth_methods` admits `none` and/or `bearer`; the selected
+configuration must match the allowlist. Unsupported methods, empty lists, and
+duplicates are rejected. Existing HTTP policies default to those two supported
+methods for compatibility.
+
+Hierarchical stdio policies expose no workload credentials unless they declare
+`authorization: {method: environment, secrets: [MCP_TOKEN]}`. References must
+already be admitted for workload delivery, and only that server receives those
+values. Unknown methods and missing references fail closed. Legacy flat
+policies retain their global environment compatibility.
 
 `http.authorization.bearer_secret` names a value in the SendBox vault. Store it
 with the normal secret CLI:

@@ -439,6 +439,40 @@ fn init_selects_cli_agents_without_unrelated_copilot_credentials() {
 }
 
 #[test]
+fn init_can_explicitly_scope_a_multi_repository_workspace() {
+    let workspace = tempdir().unwrap();
+    let project = workspace.path().join("repo-one");
+    std::fs::create_dir(&project).unwrap();
+    let output = run(&[
+        "init",
+        "--project",
+        project.to_str().unwrap(),
+        "--workspace",
+        workspace.path().to_str().unwrap(),
+        "--agent",
+        "opencode",
+        "--json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let configuration = SandboxConfiguration::load(project.join(".sendbox.yaml")).unwrap();
+    assert_eq!(
+        configuration.workspace_path,
+        Some(workspace.path().canonicalize().unwrap())
+    );
+    let outside = tempdir().unwrap();
+    let output = run(&[
+        "init",
+        "--project",
+        outside.path().to_str().unwrap(),
+        "--workspace",
+        workspace.path().to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!outside.path().join(".sendbox.yaml").exists());
+}
+
+#[test]
 fn init_refuses_to_overwrite_an_existing_configuration() {
     let project = tempdir().unwrap();
     let path = project.path().join(".sendbox.yaml");

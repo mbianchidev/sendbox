@@ -229,6 +229,7 @@ impl SafeOutputsRuntimePolicy {
     pub fn mcp_server_policy(&self) -> McpServerPolicy {
         McpServerPolicy::Stdio {
             command: vec![SAFE_OUTPUTS_MCP_PATH.to_owned()],
+            authorization: None,
             tools: ServerToolPolicy {
                 default_action: Action::Deny,
                 allowlist: self

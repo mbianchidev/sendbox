@@ -131,6 +131,8 @@ pub struct GuestPackageReport {
     pub sha256: String,
 }
 
+pub type GuestSyscallReport = GuestPackageReport;
+
 impl fmt::Debug for GuestPackageReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -156,6 +158,7 @@ pub struct GuestConnectionConfiguration {
     pub capabilities: CapabilitySet,
     pub required_capabilities: CapabilitySet,
     pub safe_outputs_required: bool,
+    pub syscall_tracing_required: bool,
     pub bootstrap_secret: Vec<u8>,
     pub policy_digest: [u8; 32],
 }
@@ -169,6 +172,7 @@ impl fmt::Debug for GuestConnectionConfiguration {
             .field("capabilities", &self.capabilities)
             .field("required_capabilities", &self.required_capabilities)
             .field("safe_outputs_required", &self.safe_outputs_required)
+            .field("syscall_tracing_required", &self.syscall_tracing_required)
             .field("bootstrap_secret", &"[REDACTED]")
             .field("policy_digest", &self.policy_digest)
             .finish()
@@ -222,6 +226,19 @@ pub trait GuestExecution: Send {
         Box::pin(async {
             Err(AgentError::Guest(
                 "this execution does not support package report retrieval".to_owned(),
+            ))
+        })
+    }
+
+    fn fetch_syscall_report<'a>(
+        &'a mut self,
+        maximum_bytes: usize,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<GuestSyscallReport, AgentError>> {
+        let _ = (maximum_bytes, cancellation);
+        Box::pin(async {
+            Err(AgentError::Guest(
+                "this execution does not support syscall report retrieval".to_owned(),
             ))
         })
     }

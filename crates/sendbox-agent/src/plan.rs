@@ -107,6 +107,7 @@ pub struct RunPlan {
     policy_digest: [u8; 32],
     interactive: bool,
     safe_outputs: bool,
+    syscall_tracing: bool,
 }
 
 impl RunPlan {
@@ -179,7 +180,8 @@ impl RunPlan {
         let mut required_guest_capabilities = agent_host_required_capabilities()
             .iter()
             .collect::<Vec<_>>();
-        if package_report_maximum_bytes.is_some() {
+        let syscall_tracing = configuration.syscall_tracing_enabled();
+        if package_report_maximum_bytes.is_some() || syscall_tracing {
             required_guest_capabilities.push(Capability::Audit);
         }
         let container_id = ContainerId::new(format!(
@@ -231,6 +233,7 @@ impl RunPlan {
             policy_digest,
             interactive: request.interactive,
             safe_outputs,
+            syscall_tracing,
         })
     }
 
@@ -243,6 +246,11 @@ impl RunPlan {
     #[must_use]
     pub const fn safe_outputs(&self) -> bool {
         self.safe_outputs
+    }
+
+    #[must_use]
+    pub const fn syscall_tracing(&self) -> bool {
+        self.syscall_tracing
     }
 
     #[must_use]

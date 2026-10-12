@@ -58,6 +58,22 @@ fn mcp_authentication_requires_an_explicitly_admitted_method() {
     }
 }
 
+#[test]
+fn stdio_authentication_explicitly_selects_environment_secret_references() {
+    let server: sendbox_policy::McpServerPolicy = serde_yaml_ng::from_str(
+        "transport: stdio\ncommand: ['/usr/bin/mcp-server']\nauthorization:\n  method: environment\n  secrets: [MCP_TOKEN]\n",
+    ).expect("stdio authentication policy");
+    let mut policy = sendbox_config_fixture();
+    policy
+        .boundaries
+        .tool_calls
+        .servers
+        .insert("docs".to_owned(), server);
+    policy.validate().expect("valid environment authentication");
+    let unsupported = "transport: stdio\ncommand: ['/usr/bin/mcp-server']\nauthorization:\n  method: oauth\n  secrets: [MCP_TOKEN]\n";
+    assert!(serde_yaml_ng::from_str::<sendbox_policy::McpServerPolicy>(unsupported).is_err());
+}
+
 fn sendbox_config_fixture() -> PolicyConfiguration {
     serde_yaml_ng::from_str(
         &fs::read_to_string(workspace_path("config/default-policy.yaml")).unwrap(),

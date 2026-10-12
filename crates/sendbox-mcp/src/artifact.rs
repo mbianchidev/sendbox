@@ -1,6 +1,7 @@
 use sendbox_config::{InspectionTransport, McpInspectionConfiguration};
 use sendbox_policy::{
-    McpHttpPolicy, McpServerPolicy, ServerToolPolicy, ToolCallPolicy, ToolTransport,
+    McpHttpPolicy, McpServerPolicy, McpStdioAuthorizationPolicy, ServerToolPolicy, ToolCallPolicy,
+    ToolTransport,
 };
 use serde::Serialize;
 
@@ -27,6 +28,8 @@ pub struct McpServerInspection {
     pub local_gateway_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http: Option<McpHttpPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdio_authorization: Option<McpStdioAuthorizationPolicy>,
     pub tools: ServerToolPolicy,
 }
 
@@ -44,7 +47,11 @@ impl McpBoundaryInspection {
                 .servers
                 .iter()
                 .map(|(id, server)| match server {
-                    McpServerPolicy::Stdio { command, .. } => {
+                    McpServerPolicy::Stdio {
+                        command,
+                        authorization,
+                        ..
+                    } => {
                         let resolved = resolve_stdio_server(policy, command)?;
                         Ok(McpServerInspection {
                             server_policy_id: id.clone(),
@@ -54,6 +61,7 @@ impl McpBoundaryInspection {
                             normalized_endpoint: None,
                             local_gateway_url: None,
                             http: None,
+                            stdio_authorization: authorization.clone(),
                             tools: resolved.tools,
                         })
                     }
@@ -68,6 +76,7 @@ impl McpBoundaryInspection {
                             normalized_endpoint: resolved.identity.endpoint,
                             local_gateway_url: Some(gateway_url(id)),
                             http: Some(http.clone()),
+                            stdio_authorization: None,
                             tools: resolved.tools,
                         })
                     }
@@ -87,6 +96,7 @@ impl McpBoundaryInspection {
                         normalized_endpoint: None,
                         local_gateway_url: None,
                         http: None,
+                        stdio_authorization: None,
                         tools: resolved.tools,
                     })
                 })
@@ -180,6 +190,7 @@ mod tests {
                 "github".to_owned(),
                 McpServerPolicy::Stdio {
                     command: vec!["/usr/bin/github-mcp".to_owned(), "stdio".to_owned()],
+                    authorization: None,
                     tools: ServerToolPolicy {
                         default_action: Action::Deny,
                         allowlist: vec!["search_code".to_owned()],

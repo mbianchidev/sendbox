@@ -69,13 +69,30 @@ struct RawFields {
 
 pub fn validate_message(payload: &[u8]) -> Result<ValidatedMessage, JsonRpcError> {
     let text = std::str::from_utf8(payload).map_err(|_| JsonRpcError::InvalidUtf8)?;
-    let value = serde_json::from_str::<StrictValue>(text)
-        .map_err(|error| JsonRpcError::InvalidJson(error.to_string()))?
-        .0;
+    let value = parse_strict_value(text, false).map_err(JsonRpcError::InvalidJson)?;
     if value.is_array() {
         return Err(JsonRpcError::BatchUnsupported);
     }
 
+    let object = value.as_object().ok_or(JsonRpcError::NotObject)?;
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(JsonRpcError::InvalidVersion);
+    }
+
+    let raw_fields: RawFields =
+        serde_json::from_str(text).map_err(|error| JsonRpcError::InvalidJson(error.to_string()))?;
+    let id = match raw_fields.id {
+        Presence::Missing => IdPresence::Missing,
+        Presence::Present(raw) => {
+            validate_raw_id(raw.get())?;
+            IdPresence::Present(raw.get().to_owned())
+        }
+    };
+
+    validate_object(object, id)
+}
+
+pub(crate) fn parse_strict_value(text: &str, jsonc: bool) -> Result<Value, String> {
     struct StrictValue(Value);
 
     impl<'de> Deserialize<'de> for StrictValue {
@@ -162,21 +179,21 @@ pub fn validate_message(payload: &[u8]) -> Result<ValidatedMessage, JsonRpcError
             Ok(StrictValue(Value::Object(values)))
         }
     }
-    let object = value.as_object().ok_or(JsonRpcError::NotObject)?;
-    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(JsonRpcError::InvalidVersion);
+    if jsonc {
+        jsonc_parser::parse_to_serde_value::<StrictValue>(text, &Default::default())
+            .map(|value| value.0)
+            .map_err(|error| error.to_string())
+    } else {
+        serde_json::from_str::<StrictValue>(text)
+            .map(|value| value.0)
+            .map_err(|error| error.to_string())
     }
+}
 
-    let raw_fields: RawFields =
-        serde_json::from_str(text).map_err(|error| JsonRpcError::InvalidJson(error.to_string()))?;
-    let id = match raw_fields.id {
-        Presence::Missing => IdPresence::Missing,
-        Presence::Present(raw) => {
-            validate_raw_id(raw.get())?;
-            IdPresence::Present(raw.get().to_owned())
-        }
-    };
-
+fn validate_object(
+    object: &serde_json::Map<String, Value>,
+    id: IdPresence,
+) -> Result<ValidatedMessage, JsonRpcError> {
     let method = match object.get("method") {
         Some(Value::String(method)) if !method.is_empty() => Some(method.clone()),
         Some(_) => {

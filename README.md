@@ -12,6 +12,10 @@ provider with a narrower capability set.
 
 ## Features
 
+- **CLI Agent Compatibility** — OpenCode, Claude Code, Codex, Copilot, Gemini,
+  and custom CLI programs share the same guest controls. Agent profiles admit
+  explicit commands/inference endpoints without requiring unrelated Copilot
+  credentials. See [CLI agents](docs/cli-agents.md).
 - **File Isolation** — Host visibility is limited to explicitly configured
   runtime mounts; state and workspace roots must be disjoint.
 - **Command Filtering** — Deny-first semantic policy applies to the brokered
@@ -84,10 +88,10 @@ signed manifests, inventory, SBOM metadata, deterministic rootfs tarballs, and
 minimal scratch OCI images for Linux x86_64 and arm64. The image contains no
 Python, Node.js, compiler, bpftrace, or development headers.
 
-The production BPF programs are cgroup-scoped observation only. The Apple
-adapter can mount their signed bundle, but activation remains guest-policy
-driven and these programs do not claim exec, syscall, network, or MCP
-enforcement.
+The production BPF programs are cgroup-scoped observation only. Set
+`observability.syscall_tracing: true` to require a signed guest tracer on Apple
+or Kata and retain a bounded, redacted host report. The programs do not enforce
+exec, syscall, network, or MCP policy.
 
 ## Quick Start
 
@@ -209,6 +213,9 @@ Generate `.sendbox.yaml` in the project root, then edit it as needed using the
 ```bash
 sendbox init --project .
 sendbox init --project . --runtime kata
+sendbox init --project /projects/my-repo --agent opencode
+# Explicit multi-repository scope:
+sendbox init --project /projects/team/repo-one --workspace /projects/team --agent codex
 ```
 
 ### Run
@@ -232,7 +239,7 @@ trust it only after verifying the host or standalone guest archive attestation.
 
 `--interactive` runs the workload on a pseudoterminal inside the sandbox and forwards this
 terminal's keystrokes and window size to it, which is what terminal agents such as GitHub
-Copilot CLI, Claude Code, Codex and Gemini need in order to render and accept input.
+Copilot CLI, OpenCode, Claude Code, Codex and Gemini need in order to render and accept input.
 
 ```bash
 sendbox run --interactive \
@@ -516,9 +523,10 @@ false-positive handling, reports, and future ecosystem adapter contracts.
 | Section | Key | Description |
 |---|---|---|
 | `name` | string | Human-readable sandbox name |
-| `project_path` | string | Host project directory mounted into the guest |
+| `project_path` | string | Selected host project and initial guest working directory |
+| `workspace_path` | optional string | Explicit enclosing multi-repo mount root; otherwise only the project is shared |
 | `runtime.provider` | enum | `auto`, `apple`, `kata`, or `hyperlight` |
-| `runtime.kata.runtime_handler` | string | Kata containerd runtime v2 handler |
+| `runtime.kata.runtime_handler` | string | Kata v2 handler or supported qemu/clh/fc/dragonball/qemu-coco variant; shared-kernel/unverified handlers are rejected |
 | `runtime.kata.namespace` | string | containerd namespace |
 | `runtime.kata.configuration_path` | string | Absolute Kata config path on the containerd host |
 | `runtime.hyperlight.kernel_path` | string | Hyperlight-compatible Unikraft shell kernel |
@@ -533,6 +541,8 @@ false-positive handling, reports, and future ecosystem adapter contracts.
 | `policy.packages.limits.max_report_bytes` | int | Bounded package report size, up to 98304 bytes |
 | `policy.boundaries.enabled` | bool | Install fail-closed MCP and syscall boundaries |
 | `policy.boundaries.tool_calls` | object | Exact stdio/HTTP MCP servers with independent tool and transport policy |
+| `policy.boundaries.tool_calls.servers.*.authorization` | object | Explicit stdio environment-auth method and per-server secret references |
+| `policy.boundaries.tool_calls.servers.*.http.allowed_auth_methods` | list | Admitted HTTP auth methods: `none`, `bearer` |
 | `policy.boundaries.syscalls.additional_denylist` | list | Extra syscall names blocked by seccomp |
 | `secrets` | list | Secret names injected at runtime |
 | `devcontainer.auto_generate` | bool | Generate a devcontainer spec |
@@ -549,6 +559,7 @@ false-positive handling, reports, and future ecosystem adapter contracts.
 | `github.safe_outputs.write_token_env` | string | Host-only environment variable read after runtime teardown |
 | `github.safe_outputs.allowed_repositories` | list | Exact `owner/repository` write targets |
 | `observability.mcp_inspection.enabled` | bool | Enable authenticated local stdio MCP observation on Apple or Kata |
+| `observability.syscall_tracing` | bool | Require cgroup-subtree guest syscall observation and a verified redacted report |
 
 ### Run flags
 
@@ -606,7 +617,7 @@ SendBox follows a **deny-by-default** security posture:
 
 1. **Filesystem** — Only explicitly configured host paths are mounted into the guest. State and workspace roots cannot overlap.
 2. **Commands** — Deny rules win over allow rules for the brokered top-level argv. Descendants are constrained by the guest execution boundary, not recursively reinterpreted as shell text.
-3. **Network** — Persistent workloads can reach only the loopback DNS and SOCKS5 brokers. Kernel rules deny direct external agent traffic and unmarked broker traffic.
+3. **Network** — Persistent workloads use loopback DNS, SOCKS5, and HTTP CONNECT/forward brokers with one policy and connection budget. Kernel rules deny direct external agent traffic and unmarked broker traffic.
 4. **Packages** — Configured npm artifacts are quarantined, verified, and inspected before release. Workloads cannot reach their configured npm upstream directly.
 5. **Secrets** — Copilot authentication is independent; GitHub credentials are forwarded only when repository scope matches policy. MCP gateway names form a separate signed credential partition, package registry credentials remain proxy-only, and neither value set enters the agent environment.
 6. **Isolation** — Apple and Kata provide persistent Linux VMs; Hyperlight provides explicit Linux/KVM one-shot isolation. Missing host or runtime capabilities are errors, never silent fallbacks.

@@ -249,10 +249,56 @@ where
             if let Err(error) = persist_package_report(&mut report, &context) {
                 return finalize_runtime_error(session, &clock, error);
             }
+            if let Err(error) = persist_syscall_report(&mut report, &context) {
+                return finalize_runtime_error(session, &clock, error);
+            }
             finalize_report(session, &clock, report)
         }
         Err(runtime_error) => finalize_runtime_error(session, &clock, runtime_error),
     }
+}
+
+fn persist_syscall_report(
+    report: &mut HostRunReport,
+    context: &HostSecurityContext,
+) -> Result<(), HostError> {
+    let plan = context.verified_plan.plan();
+    let requested = plan
+        .features
+        .get("syscall_tracing")
+        .is_some_and(|feature| feature.decision == sendbox_boundary::FeatureDecision::Enforced);
+    let raw = match report {
+        HostRunReport::Persistent(report) => report.agent.syscall_report.take(),
+        HostRunReport::OneShot(_) => None,
+    };
+    if !requested {
+        if raw.is_some() {
+            return Err(HostError::Invalid(
+                "guest returned an unexpected syscall report".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let raw = raw.ok_or_else(|| {
+        HostError::Invalid("guest omitted the required syscall report".to_owned())
+    })?;
+    let architecture = match plan.selection.host.architecture {
+        sendbox_boundary::Architecture::Aarch64 => sendbox_bpf::report::TraceArchitecture::Aarch64,
+        sendbox_boundary::Architecture::X86_64 => sendbox_bpf::report::TraceArchitecture::X86_64,
+    };
+    let persisted = super::persist_syscall_artifact(
+        &raw,
+        &context.state_directory,
+        plan.session_id,
+        architecture,
+    )?;
+    let HostRunReport::Persistent(report) = report else {
+        return Err(HostError::Invalid(
+            "one-shot runs cannot return syscall reports".to_owned(),
+        ));
+    };
+    report.syscall_report = Some(persisted);
+    Ok(())
 }
 
 fn persist_package_report(
@@ -346,6 +392,30 @@ fn finalize_report(
     clock: &dyn LifecycleClock,
     report: HostRunReport,
 ) -> Result<HostRunReport, HostError> {
+    if let Some(trace) = report.syscall_report() {
+        record_or_abort(
+            &mut session,
+            clock,
+            AuditCategory::Provenance,
+            "syscall_trace_report_persisted",
+            trace.sha256.clone(),
+            AuditResult::Success,
+            BTreeMap::from([
+                (
+                    "file".to_owned(),
+                    super::SYSCALL_TRACE_REPORT_FILE.to_owned(),
+                ),
+                (
+                    "observed_events".to_owned(),
+                    trace.observed_events.to_string(),
+                ),
+                (
+                    "incomplete_capture".to_owned(),
+                    trace.incomplete_capture().to_string(),
+                ),
+            ]),
+        )?;
+    }
     if let Some(package) = report.package_report() {
         record_or_abort(
             &mut session,
@@ -1135,9 +1205,11 @@ mod tests {
                 terminal: GuestTerminal::Exited { code: 0 },
                 states: Vec::new(),
                 package_report: Some(GuestPackageReport { json, sha256 }),
+                syscall_report: None,
                 safe_outputs: None,
             },
             package_report: None,
+            syscall_report: None,
         })
     }
 

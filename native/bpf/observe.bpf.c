@@ -77,12 +77,21 @@ struct {
     __type(value, __u64);
 } scope SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_CGROUP_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} scope_tree SEC(".maps");
+
 static __always_inline bool in_scope(void)
 {
     __u32 key = 0;
     __u64 *target = bpf_map_lookup_elem(&scope, &key);
 
-    return target != 0 && *target != 0 && bpf_get_current_cgroup_id() == *target;
+    return target != 0 && *target != 0 &&
+        (bpf_get_current_cgroup_id() == *target ||
+         bpf_current_task_under_cgroup(&scope_tree, 0) == 1);
 }
 
 static __always_inline void account_reserve_failure(void)

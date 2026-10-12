@@ -94,6 +94,7 @@ const MCP_PROXY_ENVIRONMENT: &str = "SENDBOX_MCP_PROXY";
 const MAX_EXECUTION_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;
 const MAX_EXECUTION_ENVIRONMENT_BYTES: usize = 16 * 1024;
 pub const PACKAGE_SECURITY_REPORT_FILE: &str = "package-security-report.json";
+pub const SYSCALL_TRACE_REPORT_FILE: &str = "syscall-trace-report.json";
 #[cfg(target_os = "linux")]
 const SECRET_SERVICE: &str = "sendbox";
 
@@ -132,6 +133,7 @@ pub struct PersistentHostRunReport {
     session_id: SessionId,
     agent: AgentReport,
     package_report: Option<PersistedPackageReport>,
+    syscall_report: Option<PersistedSyscallReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -143,6 +145,29 @@ pub struct PersistedPackageReport {
     allowed: u32,
     denied: u32,
     quarantined: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersistedSyscallReport {
+    path: PathBuf,
+    sha256: String,
+    observed_events: u64,
+    sampled_events: usize,
+    sampled_out: u64,
+    log_limit_reached: bool,
+    losses: sendbox_bpf::LossSnapshot,
+}
+
+impl PersistedSyscallReport {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn incomplete_capture(&self) -> bool {
+        self.log_limit_reached || self.losses != sendbox_bpf::LossSnapshot::default()
+    }
 }
 
 impl PersistedPackageReport {
@@ -227,6 +252,14 @@ impl HostRunReport {
     pub fn package_report(&self) -> Option<&PersistedPackageReport> {
         match self {
             Self::Persistent(report) => report.package_report.as_ref(),
+            Self::OneShot(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn syscall_report(&self) -> Option<&PersistedSyscallReport> {
+        match self {
+            Self::Persistent(report) => report.syscall_report.as_ref(),
             Self::OneShot(_) => None,
         }
     }
@@ -790,6 +823,7 @@ async fn execute_runtime(
                 session_id,
                 agent,
                 package_report: None,
+                syscall_report: None,
             }))
         }
         HostExecution::Hyperlight(execution) => {
@@ -867,6 +901,7 @@ fn build_runtime(
             configuration.command_policy = request.configuration.policy.commands.clone();
             configuration.git_guard_policy = git_guard_policy.cloned();
             configuration.mcp_policy = mcp_policy.cloned();
+            configuration.syscall_tracing = request.configuration.syscall_tracing_enabled();
             configuration.egress_policy = egress_policy.cloned();
             configuration.gateway_credentials = gateway_credentials.to_vec();
             configuration.registry_proxy =
@@ -934,6 +969,7 @@ fn build_runtime(
                 command_policy: request.configuration.policy.commands.clone(),
                 git_guard_policy: git_guard_policy.cloned(),
                 mcp_policy: mcp_policy.cloned(),
+                syscall_tracing: request.configuration.syscall_tracing_enabled(),
                 egress_policy: egress_policy.cloned(),
                 gateway_credentials: gateway_credentials.to_vec(),
                 registry_proxy: registry_proxy.map(|prepared| prepared.bootstrap.clone()),
@@ -1294,6 +1330,11 @@ fn validate_runtime_features(
     selected_runtime: ResolvedRuntime,
     configuration: &SandboxConfiguration,
 ) -> Result<(), HostError> {
+    if selected_runtime == ResolvedRuntime::Hyperlight && configuration.syscall_tracing_enabled() {
+        return Err(HostError::Invalid(
+            "Hyperlight has no Linux guest kernel for cgroup-scoped syscall tracing".to_owned(),
+        ));
+    }
     if selected_runtime == ResolvedRuntime::Hyperlight && !configuration.secrets.is_empty() {
         return Err(HostError::Invalid(
             "Hyperlight does not support authenticated configured-secret delivery".to_owned(),
@@ -1624,14 +1665,17 @@ fn make_mcp_policy(
         })
         .transpose()?;
     let mut fixed_environment = BTreeMap::from([
-        ("HOME".to_owned(), guest_workspace.display().to_string()),
+        (
+            "HOME".to_owned(),
+            format!("/run/sendbox-workload/{session_id}"),
+        ),
         ("LANG".to_owned(), "C.UTF-8".to_owned()),
         ("LOGNAME".to_owned(), "sendbox".to_owned()),
         (
             MCP_PROXY_ENVIRONMENT.to_owned(),
             NATIVE_BROKER_PATH.to_owned(),
         ),
-        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
         ("TMPDIR".to_owned(), "/tmp".to_owned()),
         ("USER".to_owned(), "sendbox".to_owned()),
     ]);
@@ -1779,6 +1823,16 @@ fn boundary_features(
     credentials: &EffectiveCredentialSet,
 ) -> Result<BTreeMap<String, FeatureAdmission>, HostError> {
     let mut features = BTreeMap::new();
+    if configuration.syscall_tracing_enabled() {
+        features.insert(
+            "syscall_tracing".to_owned(),
+            FeatureAdmission {
+                decision: FeatureDecision::Enforced,
+                mechanism: "guest_cgroup_v2_bpf_observation_v1_with_bounded_redacted_report"
+                    .to_owned(),
+            },
+        );
+    }
     if let Some(policy) = git_guard_policy {
         let encoded =
             serde_json::to_vec(policy).map_err(|error| HostError::Invalid(error.to_string()))?;
@@ -2751,6 +2805,48 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), HostError> {
     result
 }
 
+fn persist_syscall_artifact(
+    raw: &sendbox_agent::GuestSyscallReport,
+    state_directory: &Path,
+    session_id: SessionId,
+    architecture: sendbox_bpf::report::TraceArchitecture,
+) -> Result<PersistedSyscallReport, HostError> {
+    use sendbox_bpf::report::{MAX_TRACE_REPORT_BYTES, TraceReport};
+    if raw.json.len() > MAX_TRACE_REPORT_BYTES
+        || raw.sha256 != format!("sha256:{}", sha256_hex(&raw.json))
+    {
+        return Err(HostError::Invalid(
+            "syscall report size or digest does not match".to_owned(),
+        ));
+    }
+    let parsed: TraceReport = serde_json::from_slice(&raw.json)
+        .map_err(|error| HostError::Invalid(format!("decode syscall report: {error}")))?;
+    parsed.validate(session_id).map_err(HostError::Invalid)?;
+    if parsed.architecture != architecture {
+        return Err(HostError::Invalid(
+            "syscall report architecture does not match its guest".to_owned(),
+        ));
+    }
+    let canonical = serde_json::to_vec(&parsed)
+        .map_err(|error| HostError::Invalid(format!("encode syscall report: {error}")))?;
+    if canonical != raw.json {
+        return Err(HostError::Invalid(
+            "syscall report is not in canonical transport form".to_owned(),
+        ));
+    }
+    let path = state_directory.join(SYSCALL_TRACE_REPORT_FILE);
+    atomic_write(&path, &canonical, 0o600)?;
+    Ok(PersistedSyscallReport {
+        path,
+        sha256: raw.sha256.clone(),
+        observed_events: parsed.observed_events,
+        sampled_events: parsed.samples.len(),
+        sampled_out: parsed.sampled_out,
+        log_limit_reached: parsed.log_limit_reached,
+        losses: parsed.losses,
+    })
+}
+
 fn random_session_id() -> Result<SessionId, HostError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes)
@@ -2832,6 +2928,73 @@ mod tests {
     }
 
     #[test]
+    fn syscall_tracing_is_signed_and_never_admitted_on_hyperlight() {
+        let mut configuration = supported_configuration(PathBuf::from("/projects/example"));
+        configuration
+            .observability
+            .as_mut()
+            .unwrap()
+            .syscall_tracing = true;
+        let credentials = EffectiveCredentialSet {
+            values: BTreeMap::new(),
+            github_https_auth: false,
+            copilot_auth: false,
+            git_ssh_auth: false,
+        };
+        let features = boundary_features(&configuration, None, None, None, &credentials).unwrap();
+        assert_eq!(
+            features["syscall_tracing"].decision,
+            FeatureDecision::Enforced
+        );
+        assert!(
+            features["syscall_tracing"]
+                .mechanism
+                .contains("observation")
+        );
+        assert!(validate_runtime_features(ResolvedRuntime::Kata, &configuration).is_ok());
+        assert!(validate_runtime_features(ResolvedRuntime::Hyperlight, &configuration).is_err());
+    }
+
+    #[test]
+    fn syscall_reports_are_verified_before_private_host_persistence() {
+        use sendbox_bpf::report::{TraceArchitecture, TraceReport};
+        let directory = secure_tempdir();
+        let session = test_session();
+        let json =
+            serde_json::to_vec(&TraceReport::new(session, TraceArchitecture::Aarch64)).unwrap();
+        let mut raw = sendbox_agent::GuestSyscallReport {
+            sha256: format!("sha256:{}", sha256_hex(&json)),
+            json,
+        };
+        let persisted =
+            persist_syscall_artifact(&raw, directory.path(), session, TraceArchitecture::Aarch64)
+                .expect("persistent report");
+        assert_eq!(fs::read(persisted.path()).unwrap(), raw.json);
+        assert_eq!(
+            fs::metadata(persisted.path()).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            persist_syscall_artifact(
+                &raw,
+                directory.path(),
+                SessionId::from_bytes([3; 16]),
+                TraceArchitecture::Aarch64
+            )
+            .is_err()
+        );
+        assert!(
+            persist_syscall_artifact(&raw, directory.path(), session, TraceArchitecture::X86_64)
+                .is_err()
+        );
+        raw.sha256 = "sha256:".to_owned() + &"00".repeat(32);
+        assert!(
+            persist_syscall_artifact(&raw, directory.path(), session, TraceArchitecture::Aarch64)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn host_security_policies_fail_closed_or_compose() {
         let temp = TempDir::new().expect("temp dir");
 
@@ -2893,6 +3056,7 @@ mod tests {
             "fixture-policy".to_owned(),
             McpServerPolicy::Stdio {
                 command: vec!["/usr/bin/mcp-server".to_owned(), "--stdio".to_owned()],
+                authorization: None,
                 tools: ServerToolPolicy {
                     default_action: Action::Deny,
                     allowlist: vec!["read_*".to_owned()],
@@ -3054,6 +3218,7 @@ mod tests {
             "fixture".to_owned(),
             McpServerPolicy::Stdio {
                 command: vec!["/usr/bin/mcp-server".to_owned()],
+                authorization: None,
                 tools: ServerToolPolicy::default(),
             },
         );
@@ -3128,6 +3293,7 @@ mod tests {
             SAFE_OUTPUTS_SERVER_ID.to_owned(),
             McpServerPolicy::Stdio {
                 command: vec!["/usr/bin/mcp-server".to_owned()],
+                authorization: None,
                 tools: ServerToolPolicy::default(),
             },
         );

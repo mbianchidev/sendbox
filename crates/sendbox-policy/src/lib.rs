@@ -292,6 +292,21 @@ pub enum McpAuthenticationMethod {
     Bearer,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpStdioAuthorizationPolicy {
+    Environment { secrets: BTreeSet<String> },
+}
+
+impl McpStdioAuthorizationPolicy {
+    #[must_use]
+    pub fn secret_names(&self) -> &BTreeSet<String> {
+        match self {
+            Self::Environment { secrets } => secrets,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpHttpOrigin {
@@ -402,6 +417,8 @@ pub enum McpServerPolicy {
         command: Vec<String>,
         #[serde(default)]
         tools: ServerToolPolicy,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authorization: Option<McpStdioAuthorizationPolicy>,
     },
     StreamableHttp {
         url: String,
@@ -962,7 +979,24 @@ impl ToolCallPolicy {
                 diagnostics,
             );
             match server {
-                McpServerPolicy::Stdio { command, .. } => {
+                McpServerPolicy::Stdio {
+                    command,
+                    authorization,
+                    ..
+                } => {
+                    if let Some(authorization) = authorization
+                        && (authorization.secret_names().is_empty()
+                            || authorization
+                                .secret_names()
+                                .iter()
+                                .any(|name| !valid_secret_reference(name)))
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            DiagnosticCode::InvalidValue,
+                            format!("{base}.authorization.secrets"),
+                            "environment authentication requires explicit valid secret references",
+                        ));
+                    }
                     let path = format!("{base}.command");
                     validate_mcp_command(command, &path, None, diagnostics);
                     if let Some(existing) = commands.insert(command.clone(), id.clone()) {

@@ -134,6 +134,7 @@ fn workspace_scope_is_explicit_normalized_and_contains_the_selected_project() {
         ("/projects/sample", "/projects/sample", true),
         ("/projects", "/elsewhere/sample", false),
         ("/projects/../projects", "/projects/sample", false),
+        ("/projects/./sample", "/projects/sample", false),
         ("/", "/projects/sample", false),
         ("projects", "/projects/sample", false),
     ] {
@@ -151,6 +152,29 @@ fn workspace_scope_is_explicit_normalized_and_contains_the_selected_project() {
             valid,
             "{workspace}: {project}"
         );
+    }
+}
+
+#[test]
+fn syscall_tracing_requires_the_persistent_guest_boundary() {
+    for (runtime, boundaries, valid) in [
+        (RuntimeProvider::Auto, true, true),
+        (RuntimeProvider::Kata, true, true),
+        (RuntimeProvider::Auto, false, false),
+        (RuntimeProvider::Hyperlight, false, false),
+    ] {
+        let mut configuration = SandboxConfiguration::for_project(
+            PathBuf::from("/projects/sample"),
+            PolicyPreset::Default,
+            runtime,
+        );
+        configuration.policy.boundaries.enabled = boundaries;
+        configuration.github.branch_protection.enabled = false;
+        let mut document = serde_json::to_value(configuration).unwrap();
+        document["observability"]["syscall_tracing"] = serde_json::Value::Bool(true);
+        let configuration: SandboxConfiguration =
+            serde_json::from_value(document).expect("tracing configuration");
+        assert_eq!(configuration.validate().is_ok(), valid);
     }
 }
 

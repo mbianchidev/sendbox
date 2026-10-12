@@ -8,7 +8,7 @@ session-security lifecycle.
 ## Lifecycle and trust
 
 1. Host preflight requires Linux, `/dev/kvm`, a root-owned non-writable nerdctl
-   executable, containerd connectivity, the configured Kata handler, and an
+   executable, containerd connectivity, a supported Kata v2 handler, and an
    independently supplied trust root.
 2. `sendbox-bundle::verify_bundle` validates signature, trust-root ID, host and
    guest versions, architecture, release rollback floor, metadata, artifact
@@ -25,6 +25,12 @@ session-security lifecycle.
 The bundle verifier proves the mounted artifacts, not the Kata kernel, initrd,
 hypervisor, containerd daemon, or workload image signature. Those remain host
 operator trust inputs.
+
+The handler allowlist includes `io.containerd.kata.v2` and the
+`kata-qemu`, `kata-clh`, `kata-fc`, `kata-dragonball`, and `kata-qemu-coco` v2
+variants. This preserves explicit Kata hypervisor selection while rejecting
+shared-kernel or unrelated handler names. Operators must verify the installed
+handler-to-shim/hypervisor mapping; its label alone is not an attestation.
 
 ## VM-crossing control channel
 
@@ -62,13 +68,15 @@ workload exec remains rejected with `WorkloadExecRequiresGuestBroker`.
 
 ## Explicit exclusions
 
-- no egress or DNS-policy enforcement;
-- no secret forwarding;
-- no MCP inspection;
-- no BPF/audit service integration;
-- no interactive stdin;
+- no shared-kernel runtime handler or silent runtime downgrade;
 - no Apple or Hyperlight fallback;
 - no claim that hosted GitHub runners boot Kata;
 - no global stdout/stderr chronology beyond broker event sequence.
 
 The live proof must run on a dedicated self-hosted Linux/KVM runner.
+
+Persistent sessions compose authenticated secret delivery, MCP stdio/HTTP
+policy, DNS/SOCKS/HTTP egress, interactive terminals, and optional mandatory
+cgroup-subtree BPF observation. `NET_ADMIN` is added only for trusted egress;
+`BPF`, `PERFMON`, and `SYS_RESOURCE` are added only when tracing is requested.
+The non-root workload launcher still clears all capability sets.
