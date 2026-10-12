@@ -179,7 +179,7 @@ fn verified_boundary_plan(
             working_directory: command.working_directory.clone(),
         },
         workspace: MountDeclaration {
-            source: configuration.project_path.clone(),
+            source: configuration.workspace_root().to_path_buf(),
             destination: guest_workspace.to_path_buf(),
             writable: true,
         },
@@ -252,6 +252,43 @@ fn plan(
         plan_time(),
     )
     .expect("run plan")
+}
+
+#[test]
+fn native_cli_agents_preserve_signed_workspace_scope_and_project_cwd() {
+    let resources = TempResource::new().expect("resources");
+    let mut configuration = configuration(resources.path().join("repo-one"));
+    configuration.workspace_path = Some(resources.path().to_path_buf());
+    for agent in ["opencode", "claude", "codex", "copilot", "custom-agent"] {
+        let session_id = SessionId::from_bytes([14; 16]);
+        let mut request = request_for_configuration(&resources, session_id, &configuration);
+        request.command.program = format!("/usr/local/bin/{agent}");
+        request.command.arguments = vec![
+            "--synthetic-option".to_owned(),
+            "one argument with spaces".to_owned(),
+        ];
+        request.command.working_directory = "/workspace/repo-one".to_owned();
+        request.boundary_plan = verified_boundary_plan(
+            &configuration,
+            session_id,
+            &request.image,
+            &request.guest_workspace,
+            &request.command,
+            &request.environment,
+            &request.mounts,
+        );
+        let plan = RunPlan::compile(
+            &configuration,
+            request,
+            &runtime_capabilities(),
+            plan_time(),
+        )
+        .expect("agent-neutral workspace plan");
+        assert_eq!(plan.workspace().host_path, resources.path());
+        assert_eq!(plan.command().working_directory, "/workspace/repo-one");
+        assert_eq!(plan.command().program, format!("/usr/local/bin/{agent}"));
+        assert_eq!(plan.command().arguments[1], "one argument with spaces");
+    }
 }
 
 fn safe_outputs_plan(

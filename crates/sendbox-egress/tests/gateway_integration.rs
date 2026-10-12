@@ -497,3 +497,124 @@ async fn socks5_gateway_refuses_udp_associate() {
     stream.read_exact(&mut reply).await.unwrap();
     assert_eq!(reply[1], socks5::Socks5Reply::CommandNotSupported as u8);
 }
+
+#[tokio::test]
+async fn http_proxy_connect_uses_the_same_allowlist_and_pinned_dial() {
+    let echo = spawn_echo("127.0.0.1:0").await;
+    let resolver = Arc::new(StaticResolver::new());
+    resolver.set(
+        Name::from_str("allowed.test.").unwrap(),
+        chain_to("allowed.test", echo.ip()),
+    );
+    let gw = start_gateway_with(
+        base_policy(),
+        resolver,
+        GatewayConfig {
+            connect: ConnectBrokerConfig {
+                frontend: ConnectFrontend::Http,
+                ..ConnectBrokerConfig::default()
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let mut stream = TcpStream::connect(gw.connect_addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "CONNECT allowed.test:{} HTTP/1.1\r\nHost: allowed.test:{}\r\n\r\nhttp-ping",
+                echo.port(),
+                echo.port(),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        read_http_head(&mut stream)
+            .await
+            .starts_with("HTTP/1.1 200 ")
+    );
+    let mut echoed = [0; 9];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"http-ping");
+
+    let mut denied = TcpStream::connect(gw.connect_addr).await.unwrap();
+    denied
+        .write_all(b"CONNECT forbidden.test:443 HTTP/1.1\r\nHost: forbidden.test:443\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(
+        read_http_head(&mut denied)
+            .await
+            .starts_with("HTTP/1.1 403 ")
+    );
+}
+
+#[tokio::test]
+async fn http_forward_proxy_rewrites_authority_before_sending_bytes() {
+    let fixture = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = fixture.local_addr().unwrap();
+    let fixture_task = tokio::spawn(async move {
+        let (mut stream, _) = fixture.accept().await.unwrap();
+        let request = read_http_head(&mut stream).await;
+        assert!(request.starts_with("GET /documents?limit=1 HTTP/1.1\r\n"));
+        assert!(!request.to_ascii_lowercase().contains("proxy-connection:"));
+        assert!(request.contains("Connection: close\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong")
+            .await
+            .unwrap();
+    });
+    let resolver = Arc::new(StaticResolver::new());
+    resolver.set(
+        Name::from_str("allowed.test.").unwrap(),
+        chain_to("allowed.test", upstream.ip()),
+    );
+    let gw = start_gateway_with(
+        base_policy(),
+        resolver,
+        GatewayConfig {
+            connect: ConnectBrokerConfig {
+                frontend: ConnectFrontend::Http,
+                ..ConnectBrokerConfig::default()
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let mut stream = TcpStream::connect(gw.connect_addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET http://allowed.test:{}/documents?limit=1 HTTP/1.1\r\nHost: allowed.test:{}\r\nProxy-Connection: keep-alive\r\n\r\n",
+                upstream.port(),
+                upstream.port(),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        read_http_head(&mut stream)
+            .await
+            .starts_with("HTTP/1.1 200 ")
+    );
+    let mut response = [0; 4];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"pong");
+    fixture_task.await.unwrap();
+}
+
+async fn read_http_head(stream: &mut TcpStream) -> String {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            assert!(bytes.len() < 16 * 1024, "oversized HTTP response");
+            bytes.push(stream.read_u8().await.unwrap());
+        }
+        String::from_utf8(bytes).unwrap()
+    })
+    .await
+    .expect("HTTP response deadline")
+}

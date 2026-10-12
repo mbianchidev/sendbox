@@ -63,7 +63,7 @@ pub fn safe_outputs_writer_socket() -> Result<PathBuf, GuestError> {
 
 pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
     let policy = read_policy(Path::new(NATIVE_POLICY_PATH))?;
-    let command = ApprovedCommand::from_argv(arguments)
+    let command = ApprovedCommand::from_broker_argv(arguments)
         .map_err(|error| GuestError::Runtime(format!("invalid MCP server command: {error}")))?;
     let approved = policy
         .approved_commands()

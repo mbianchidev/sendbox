@@ -285,6 +285,13 @@ pub struct HttpAuthorizationPolicy {
     pub bearer_secret: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuthenticationMethod {
+    None,
+    Bearer,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpHttpOrigin {
@@ -328,6 +335,7 @@ pub struct McpHttpPolicy {
     pub max_sessions: u32,
     pub session_ttl_seconds: u64,
     pub tls: McpTlsPolicy,
+    pub allowed_auth_methods: Vec<McpAuthenticationMethod>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization: Option<HttpAuthorizationPolicy>,
 }
@@ -350,8 +358,40 @@ impl Default for McpHttpPolicy {
             max_sessions: 128,
             session_ttl_seconds: 3600,
             tls: McpTlsPolicy::default(),
+            allowed_auth_methods: vec![
+                McpAuthenticationMethod::None,
+                McpAuthenticationMethod::Bearer,
+            ],
             authorization: None,
         }
+    }
+}
+
+impl McpHttpPolicy {
+    #[must_use]
+    pub const fn authentication_method(&self) -> McpAuthenticationMethod {
+        if self.authorization.is_some() {
+            McpAuthenticationMethod::Bearer
+        } else {
+            McpAuthenticationMethod::None
+        }
+    }
+
+    pub fn validate_authentication(&self) -> Result<(), String> {
+        let methods = self
+            .allowed_auth_methods
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if methods.is_empty() || methods.len() != self.allowed_auth_methods.len() {
+            return Err("authentication method allowlist must be non-empty and unique".to_owned());
+        }
+        if !methods.contains(&self.authentication_method()) {
+            return Err(
+                "configured authentication method is not allowlisted for this server".to_owned(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1098,6 +1138,13 @@ fn validate_glob_patterns(values: &[String], path: &str, diagnostics: &mut Vec<D
 }
 
 fn validate_http_policy(policy: &McpHttpPolicy, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+    if let Err(message) = policy.validate_authentication() {
+        diagnostics.push(Diagnostic::new(
+            DiagnosticCode::InvalidValue,
+            format!("{path}.allowed_auth_methods"),
+            message,
+        ));
+    }
     for (field, value) in [
         ("max_request_bytes", policy.max_request_bytes),
         ("max_response_bytes", policy.max_response_bytes),

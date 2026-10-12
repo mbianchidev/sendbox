@@ -911,9 +911,14 @@ fn validate_broker(
         policy
             .validate()
             .map_err(|error| BootstrapError::Invalid(error.to_string()))?;
-        if policy.selected_workspace != workspace_root {
+        if !policy.selected_workspace.starts_with(workspace_root)
+            || policy
+                .selected_workspace
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
             return Err(BootstrapError::Invalid(
-                "Git guard workspace must match the execution broker workspace".to_owned(),
+                "Git guard repository must remain within the execution broker workspace".to_owned(),
             ));
         }
     }
@@ -1153,6 +1158,43 @@ mod tests {
                 .mcp_policy,
             Some(mcp_policy())
         );
+    }
+
+    #[test]
+    fn git_guard_selected_repository_can_be_a_workspace_descendant() {
+        for (workspace, valid) in [
+            ("/workspace/repo-one", true),
+            ("/outside/repo-one", false),
+            ("/workspace/../outside", false),
+        ] {
+            let mut config = configuration();
+            config.execution_broker.as_mut().unwrap().git_guard_policy =
+                Some(GuardPolicyDocument {
+                    schema_version: sendbox_git::PolicySchemaVersion::V1,
+                    selected_repository: sendbox_git::RepositoryIdentity::new(
+                        "github.com",
+                        "test-org",
+                        "test-repo",
+                    )
+                    .unwrap(),
+                    selected_workspace: PathBuf::from(workspace),
+                    branch_protection: sendbox_git::BranchPolicyConfiguration {
+                        enabled: false,
+                        username: None,
+                        protected_branches: Vec::new(),
+                        allowed_branch_patterns: Vec::new(),
+                    },
+                    environment: sendbox_git::EnvironmentPolicy::default(),
+                    github_https_auth: false,
+                    git_ssh_auth: false,
+                    limits: sendbox_git::GuardLimits::default(),
+                });
+            assert_eq!(
+                encode_bootstrap_document(config, &[7; 32]).is_ok(),
+                valid,
+                "{workspace}"
+            );
+        }
     }
 
     #[test]

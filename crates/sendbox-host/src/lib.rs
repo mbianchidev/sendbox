@@ -49,7 +49,7 @@ use sendbox_git::{
     RepositoryIdentity, SSH_KEY_ENVIRONMENT, SystemGitProcessRunner, TrustedGitBinary,
     discover_repository_identity,
 };
-use sendbox_mcp::config::{NATIVE_BROKER_PATH, PROJECT_CONFIG_PATHS};
+use sendbox_mcp::config::{NATIVE_BROKER_PATH, has_project_configuration};
 use sendbox_mcp::runtime::{
     RUNTIME_POLICY_SCHEMA_VERSION, RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
@@ -393,8 +393,14 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let selection = select_runtime(runtime_request, host)?;
     let selected_runtime = selection.selected;
     validate_runtime_features(selected_runtime, &request.configuration)?;
-    let workspace_source =
-        canonical_file_or_directory(&request.configuration.project_path, "project root")?;
+    let workspace = resolve_workspace(&request.configuration)?;
+    let project_source = workspace.host_project;
+    let workspace_source = workspace.host_root;
+    let project_destination = workspace.guest_project;
+    request.configuration.project_path = project_source.clone();
+    if let Some(root) = &mut request.configuration.workspace_path {
+        root.clone_from(&workspace_source);
+    }
     let bundle_root = canonical_file_or_directory(&request.bundle_root, "bundle root")?;
     let trust_root = canonical_file_or_directory(&request.trust_root, "bundle trust root")?;
     let bundle = verify_bundle(&VerifyOptions {
@@ -410,7 +416,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let manifest_sha256 = hash_file(&bundle_root.join("manifest.json"))?;
     let bundle_id = format!("{}:{}", request.trust_root_id, bundle.release_sequence);
     let selected_repository =
-        discover_selected_repository(&request.configuration, &workspace_source)?;
+        discover_selected_repository(&request.configuration, &project_source)?;
     let credentials =
         prepare_effective_credentials(&request.configuration, selected_repository.as_ref()).await?;
     credentials.apply_to(&mut request.configuration);
@@ -421,9 +427,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     validate_reserved_secret_names(&request.configuration)?;
     let workspace_destination = PathBuf::from("/workspace");
     let workload_identity = match selected_runtime {
-        ResolvedRuntime::Apple | ResolvedRuntime::Kata => {
-            Some(project_identity(&workspace_source)?)
-        }
+        ResolvedRuntime::Apple | ResolvedRuntime::Kata => Some(project_identity(&project_source)?),
         ResolvedRuntime::Hyperlight => None,
     };
     let session_id = random_session_id()?;
@@ -441,8 +445,8 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         selected_runtime,
         &request.configuration,
         selected_repository.as_ref(),
-        &workspace_source,
-        &workspace_destination,
+        &project_source,
+        &project_destination,
         &credentials,
     )?;
     let mcp_policy = make_mcp_policy(
@@ -569,7 +573,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         command: CommandDeclaration {
             program: command.0.clone(),
             arguments: command.1.clone(),
-            working_directory: workspace_destination.display().to_string(),
+            working_directory: project_destination.display().to_string(),
         },
         mounts: registry_mounts.clone(),
         environment: environment
@@ -621,7 +625,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                 command: GuestCommand {
                     program: command.0,
                     arguments: command.1,
-                    working_directory: "/workspace".to_owned(),
+                    working_directory: project_destination.display().to_string(),
                 },
                 environment,
                 mounts: registry_mounts
@@ -670,13 +674,13 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                     writable: true,
                 }],
                 environment: Vec::new(),
-                working_directory: PathBuf::from("/workspace"),
+                working_directory: project_destination.clone(),
                 dns_servers: Vec::new(),
                 labels: Vec::new(),
             };
             let command = CommandSpec {
                 arguments: command.1.into_iter().map(CommandArgument::plain).collect(),
-                current_directory: Some(PathBuf::from("/workspace")),
+                current_directory: Some(project_destination),
                 environment: Vec::new(),
                 clear_environment: true,
                 ..CommandSpec::new(Program::Absolute(PathBuf::from(command.0)))
@@ -701,7 +705,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                 boundary_plan_digest: security_plan.digest(),
                 seal_key: secrets.safe_outputs_seal_key(session_id)?,
                 state_directory: state_directory.clone(),
-                workspace: workspace_source.clone(),
+                workspace: project_source,
             })
         })
         .transpose()?;
@@ -1530,16 +1534,20 @@ fn make_mcp_policy(
     workload_identity: Option<(u32, u32)>,
     egress_policy: Option<&EgressRuntimePolicyDocument>,
 ) -> Result<Option<RuntimePolicyDocument>, HostError> {
-    let has_project_configuration = PROJECT_CONFIG_PATHS
-        .iter()
-        .any(|relative| host_workspace.join(relative).symlink_metadata().is_ok());
+    let configuration_roots = mcp_configuration_roots(configuration, host_workspace)?;
+    let mut has_configuration = false;
+    for root in &configuration_roots {
+        has_configuration |= has_project_configuration(root).map_err(|error| {
+            HostError::Invalid(format!("unsafe MCP project configuration: {error}"))
+        })?;
+    }
     let inspection = configuration
         .observability
         .as_ref()
         .map(|observability| &observability.mcp_inspection)
         .filter(|inspection| inspection.enabled);
     let safe_outputs_enabled = configuration.github.safe_outputs.enabled;
-    if !has_project_configuration
+    if !has_configuration
         && configuration
             .policy
             .boundaries
@@ -1710,14 +1718,32 @@ fn make_mcp_policy(
     policy
         .validate()
         .map_err(|error| HostError::Invalid(format!("invalid MCP runtime policy: {error}")))?;
-    policy
+    let validator = policy
         .project_validator()
-        .map_err(|error| HostError::Invalid(format!("invalid MCP project policy: {error}")))?
-        .validate_project(host_workspace)
-        .map_err(|error| {
+        .map_err(|error| HostError::Invalid(format!("invalid MCP project policy: {error}")))?;
+    for root in configuration_roots {
+        validator.validate_project(root).map_err(|error| {
             HostError::Invalid(format!("unsafe MCP project configuration: {error}"))
         })?;
+    }
     Ok(Some(policy))
+}
+
+fn mcp_configuration_roots<'a>(
+    configuration: &'a SandboxConfiguration,
+    host_workspace: &Path,
+) -> Result<Vec<&'a Path>, HostError> {
+    let roots = configuration
+        .project_path
+        .ancestors()
+        .take_while(|path| path.starts_with(host_workspace))
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Err(HostError::Invalid(
+            "MCP project must be inside the mounted workspace".to_owned(),
+        ));
+    }
+    Ok(roots)
 }
 
 fn runtime_environment(
@@ -2073,9 +2099,17 @@ fn validate_security_composition(composition: SecurityComposition<'_>) -> Result
             "authenticated Git guard composition is inconsistent".to_owned(),
         ));
     }
+    let relative_project = configuration
+        .project_path
+        .strip_prefix(host_workspace)
+        .map_err(|_| {
+            HostError::Invalid("selected project is outside the signed workspace".to_owned())
+        })?;
+    let expected_guest_project = guest_workspace.join(relative_project);
     if let Some(policy) = git_guard_policy
         && (selected_runtime == ResolvedRuntime::Hyperlight
             || Some(&policy.selected_repository) != selected_repository
+            || policy.selected_workspace != expected_guest_project
             || policy.branch_protection.enabled != configuration.github.branch_protection.enabled
             || policy.github_https_auth != credentials.github_https_auth
             || policy.git_ssh_auth != credentials.git_ssh_auth)
@@ -2401,6 +2435,35 @@ fn megabytes(value: i64, description: &str) -> Result<u64, HostError> {
         .ok()
         .and_then(|value| value.checked_mul(1024 * 1024))
         .ok_or_else(|| HostError::Invalid(format!("{description} is out of range")))
+}
+
+struct ResolvedWorkspace {
+    host_root: PathBuf,
+    host_project: PathBuf,
+    guest_project: PathBuf,
+}
+
+fn resolve_workspace(configuration: &SandboxConfiguration) -> Result<ResolvedWorkspace, HostError> {
+    let host_project = canonical_file_or_directory(&configuration.project_path, "project root")?;
+    let host_root = if configuration.workspace_path.is_some() {
+        canonical_file_or_directory(configuration.workspace_root(), "workspace root")?
+    } else {
+        host_project.clone()
+    };
+    if !host_project.is_dir() || !host_root.is_dir() {
+        return Err(HostError::Invalid(
+            "project and workspace roots must be directories".to_owned(),
+        ));
+    }
+    let relative = host_project.strip_prefix(&host_root).map_err(|_| {
+        HostError::Invalid("project root must be inside the mounted workspace".to_owned())
+    })?;
+    let guest_project = Path::new("/workspace").join(relative);
+    Ok(ResolvedWorkspace {
+        host_root,
+        host_project,
+        guest_project,
+    })
 }
 
 fn project_identity(path: &Path) -> Result<(u32, u32), HostError> {
@@ -2748,6 +2811,24 @@ mod tests {
             .canonicalize()
             .expect("canonical test base");
         tempfile::tempdir_in(base).expect("secure temporary directory")
+    }
+
+    #[test]
+    fn workspace_scope_maps_only_the_selected_root_and_preserves_project_cwd() {
+        let temporary = secure_tempdir();
+        let root = temporary.path().join("workspace");
+        let project = root.join("repo-one");
+        fs::create_dir_all(&project).unwrap();
+        let mut configuration = supported_configuration(project.clone());
+        configuration.workspace_path = Some(root.clone());
+        let resolved = resolve_workspace(&configuration).expect("workspace scope");
+        assert_eq!(resolved.host_root, root);
+        assert_eq!(resolved.host_project, project);
+        assert_eq!(resolved.guest_project, Path::new("/workspace/repo-one"));
+        configuration.workspace_path = None;
+        let resolved = resolve_workspace(&configuration).expect("repository scope");
+        assert_eq!(resolved.host_root, project);
+        assert_eq!(resolved.guest_project, Path::new("/workspace"));
     }
 
     #[test]

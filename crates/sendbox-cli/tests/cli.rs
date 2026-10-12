@@ -390,6 +390,55 @@ fn init_writes_a_private_valid_config_and_json_result() {
 }
 
 #[test]
+fn init_selects_cli_agents_without_unrelated_copilot_credentials() {
+    for (agent, executable, endpoint) in [
+        ("opencode", "opencode", "opencode.ai"),
+        ("open-code", "opencode", "opencode.ai"),
+        ("claude", "claude", "api.anthropic.com"),
+        ("codex", "codex", "api.openai.com"),
+        ("gemini", "gemini", "generativelanguage.googleapis.com"),
+        ("copilot", "copilot", "api.githubcopilot.com"),
+    ] {
+        let project = tempdir().unwrap();
+        let output = run_in(
+            &[
+                "init",
+                "--project",
+                project.path().to_str().unwrap(),
+                "--agent",
+                agent,
+                "--json",
+            ],
+            project.path(),
+        );
+        assert!(output.status.success(), "{agent}: {output:?}");
+        let configuration =
+            SandboxConfiguration::load(project.path().join(".sendbox.yaml")).unwrap();
+        configuration.validate().unwrap();
+        assert_eq!(
+            configuration.github.forward_copilot_auth,
+            agent == "copilot"
+        );
+        assert!(
+            configuration
+                .policy
+                .commands
+                .allowlist
+                .contains(&executable.to_owned())
+        );
+        assert!(
+            configuration
+                .policy
+                .network
+                .allowed_domains
+                .contains(&endpoint.to_owned())
+        );
+        assert!(configuration.policy.boundaries.enabled);
+        assert!(configuration.github.branch_protection.enabled);
+    }
+}
+
+#[test]
 fn init_refuses_to_overwrite_an_existing_configuration() {
     let project = tempdir().unwrap();
     let path = project.path().join(".sendbox.yaml");

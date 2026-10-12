@@ -101,6 +101,11 @@ fn inspect(arguments: InspectArgs) -> ExitCode {
             }
             if let Some(http) = &server.http {
                 println!(
+                    "  authentication: {:?}; allowed methods: {:?}",
+                    http.authentication_method(),
+                    http.allowed_auth_methods,
+                );
+                println!(
                     "  HTTP limits: request={} response={} concurrent={} redirects={}",
                     http.max_request_bytes,
                     http.max_response_bytes,

@@ -48,12 +48,14 @@ struct BrokerProcessConfiguration {
     workspace_root: PathBuf,
     system_root: PathBuf,
     command_policy: CommandPolicy,
+    fixed_environment: std::collections::BTreeMap<String, String>,
 }
 
 pub fn prepare(
     session_id: SessionId,
     session_dir: &Path,
     bootstrap: ExecutionBrokerBootstrap,
+    fixed_environment: std::collections::BTreeMap<String, String>,
 ) -> Result<(BrokerClientConfiguration, ServiceSpec), GuestError> {
     if bootstrap.workload_uid == 0 || bootstrap.workload_gid == 0 {
         return Err(GuestError::Runtime(
@@ -105,6 +107,7 @@ pub fn prepare(
         workspace_root: bootstrap.workspace_root,
         system_root: bootstrap.system_root,
         command_policy: bootstrap.command_policy,
+        fixed_environment,
     })
     .map_err(|error| GuestError::Runtime(format!("encode broker configuration: {error}")))?;
     use std::os::unix::fs::OpenOptionsExt;
@@ -190,7 +193,14 @@ pub async fn run(config_path: PathBuf) -> Result<(), GuestError> {
         session,
         sendbox_exec::CompiledCommandPolicy::compile(&config.command_policy)
             .map_err(|error| GuestError::Runtime(format!("compile command policy: {error}")))?,
-        sendbox_exec::environment::EnvironmentPolicy::default(),
+        sendbox_exec::environment::EnvironmentPolicy::new(
+            [
+                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+                ("LANG".to_owned(), "C.UTF-8".to_owned()),
+            ]
+            .into_iter()
+            .chain(config.fixed_environment),
+        ),
         RequestLimits::default(),
         backend,
     ));

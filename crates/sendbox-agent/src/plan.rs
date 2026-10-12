@@ -392,7 +392,7 @@ fn validate_request(
             "mount paths must be absolute".to_owned(),
         ));
     }
-    if configuration.project_path == request.guest_workspace {
+    if configuration.workspace_root() == request.guest_workspace {
         return Err(AgentError::InvalidPlan(
             "host and guest workspace paths must be distinct".to_owned(),
         ));
@@ -428,8 +428,8 @@ fn validate_boundary_equivalence(
     require_equal("image reference", reference, &request.image)?;
     require_equal(
         "workspace source",
-        &boundary.workspace.source,
-        &configuration.project_path,
+        boundary.workspace.source.as_path(),
+        configuration.workspace_root(),
     )?;
     require_equal(
         "workspace destination",

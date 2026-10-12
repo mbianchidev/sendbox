@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audit::AuditSink;
 use crate::authorization::AuthorizationCache;
-use crate::connect_broker::{ConnectAuthorizationState, ConnectBroker, ConnectBrokerConfig};
+use crate::connect_broker::{
+    ConnectAuthorizationState, ConnectBroker, ConnectBrokerConfig, ConnectFrontend,
+};
 use crate::dialer::Dialer;
 use crate::dns_broker::{DnsBroker, DnsBrokerConfig};
 use crate::dns_budget::DnsGuard;
@@ -32,8 +34,10 @@ pub struct GatewayListeners {
     dns_udp: Option<UdpSocket>,
     dns_tcp: Option<TcpListener>,
     connect: TcpListener,
+    http_proxy: Option<TcpListener>,
     dns_addr: Option<SocketAddr>,
     connect_addr: SocketAddr,
+    http_proxy_addr: Option<SocketAddr>,
 }
 
 impl GatewayListeners {
@@ -46,6 +50,14 @@ impl GatewayListeners {
         dns_listen: Option<SocketAddr>,
         connect_listen: SocketAddr,
     ) -> io::Result<Self> {
+        Self::bind_with_http_proxy(dns_listen, connect_listen, None).await
+    }
+
+    pub async fn bind_with_http_proxy(
+        dns_listen: Option<SocketAddr>,
+        connect_listen: SocketAddr,
+        http_proxy_listen: Option<SocketAddr>,
+    ) -> io::Result<Self> {
         let (dns_udp, dns_tcp, dns_addr) = match dns_listen {
             Some(addr) => {
                 let (udp, tcp, resolved) = Self::bind_dns_pair(addr).await?;
@@ -55,12 +67,22 @@ impl GatewayListeners {
         };
         let connect = TcpListener::bind(connect_listen).await?;
         let connect_addr = connect.local_addr()?;
+        let http_proxy = match http_proxy_listen {
+            Some(address) => Some(TcpListener::bind(address).await?),
+            None => None,
+        };
+        let http_proxy_addr = http_proxy
+            .as_ref()
+            .map(TcpListener::local_addr)
+            .transpose()?;
         Ok(Self {
             dns_udp,
             dns_tcp,
             connect,
             dns_addr,
             connect_addr,
+            http_proxy,
+            http_proxy_addr,
         })
     }
 
@@ -100,6 +122,11 @@ impl GatewayListeners {
     #[must_use]
     pub fn connect_addr(&self) -> SocketAddr {
         self.connect_addr
+    }
+
+    #[must_use]
+    pub fn http_proxy_addr(&self) -> Option<SocketAddr> {
+        self.http_proxy_addr
     }
 }
 
@@ -184,8 +211,15 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
 
         let mut tasks = Vec::new();
         tasks.push(tokio::spawn(
-            connect_broker.run(listeners.connect, cancel.clone()),
+            Arc::clone(&connect_broker).run(listeners.connect, cancel.clone()),
         ));
+        if let Some(http_proxy) = listeners.http_proxy {
+            tasks.push(tokio::spawn(connect_broker.run_with_frontend(
+                http_proxy,
+                cancel.clone(),
+                ConnectFrontend::Http,
+            )));
+        }
 
         if self.engine.allow_dns()
             && let (Some(udp), Some(tcp)) = (listeners.dns_udp, listeners.dns_tcp)

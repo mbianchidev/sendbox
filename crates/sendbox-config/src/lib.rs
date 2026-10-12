@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use sendbox_core::{Diagnostic, DiagnosticCode, ValidationFailure};
 use sendbox_git::normalize_branch;
@@ -370,6 +370,8 @@ pub struct ObservabilityConfiguration {
 pub struct SandboxConfiguration {
     pub name: String,
     pub project_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeConfiguration>,
     pub resources: ResourceConfiguration,
@@ -380,6 +382,14 @@ pub struct SandboxConfiguration {
     pub github: GitHubConfiguration,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observability: Option<ObservabilityConfiguration>,
+}
+
+fn normalized_scope_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path != Path::new("/")
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
 }
 
 impl SandboxConfiguration {
@@ -437,6 +447,7 @@ impl SandboxConfiguration {
         Self {
             name,
             project_path,
+            workspace_path: None,
             runtime: Some(runtime),
             resources: ResourceConfiguration::default(),
             policy,
@@ -463,8 +474,28 @@ impl SandboxConfiguration {
         if self.name.trim().is_empty() {
             invalid_value(&mut diagnostics, "name", "cannot be empty");
         }
-        if !self.project_path.is_absolute() {
-            invalid_path(&mut diagnostics, "project_path", "must be an absolute path");
+        if !normalized_scope_path(&self.project_path) {
+            invalid_path(
+                &mut diagnostics,
+                "project_path",
+                "must be an absolute, normalized directory below the filesystem root",
+            );
+        }
+        if let Some(workspace) = &self.workspace_path {
+            if !normalized_scope_path(workspace) {
+                invalid_path(
+                    &mut diagnostics,
+                    "workspace_path",
+                    "must be an absolute, normalized directory below the filesystem root",
+                );
+            }
+            if !self.project_path.starts_with(workspace) {
+                invalid_path(
+                    &mut diagnostics,
+                    "project_path",
+                    "must be inside workspace_path",
+                );
+            }
         }
         if self.resources.cpus <= 0 {
             invalid_value(
@@ -515,6 +546,11 @@ impl SandboxConfiguration {
 
     pub fn to_canonical_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace_path.as_deref().unwrap_or(&self.project_path)
     }
 
     pub fn to_canonical_yaml(&self) -> Result<String, ConfigurationError> {

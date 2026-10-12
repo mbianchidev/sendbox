@@ -122,6 +122,11 @@ impl RuntimePolicyDocument {
             );
         }
         let _ = self.approved_commands()?;
+        for server in self.tool_policy.servers.values() {
+            if let Some(http) = server.http() {
+                http.validate_authentication()?;
+            }
+        }
         if !(1..=MAX_FRAME_BYTES).contains(&self.tool_policy.max_frame_bytes) {
             return Err(format!(
                 "MCP maximum frame size must be between 1 and {MAX_FRAME_BYTES} bytes"
@@ -299,6 +304,7 @@ impl RuntimePolicyDocument {
                 Some((id, transport, url, tools, http))
             })
             .map(|(id, transport, url, tools, http)| {
+                http.validate_authentication()?;
                 let endpoint = HttpEndpoint::parse(url)?;
                 Ok((
                     id.clone(),

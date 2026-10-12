@@ -122,6 +122,11 @@ pub async fn run<P: PlatformControls>(
             .map(|policy| (policy, broker.workload_uid, broker.workload_gid))
     });
     let egress_configured = bootstrap.egress_policy.is_some();
+    let fixed_environment = bootstrap
+        .egress_policy
+        .as_ref()
+        .map(|policy| policy.proxy_environment.clone())
+        .unwrap_or_default();
     let registry_proxy = bootstrap.registry_proxy.take();
     let package_report = registry_proxy
         .as_ref()
@@ -175,7 +180,12 @@ pub async fn run<P: PlatformControls>(
         .execution_broker
         .take()
         .map(|configuration| {
-            broker::prepare(bootstrap.session_id, runtime.session_dir(), configuration)
+            broker::prepare(
+                bootstrap.session_id,
+                runtime.session_dir(),
+                configuration,
+                fixed_environment,
+            )
         })
         .transpose()?;
     if let Some((_, service)) = &mut broker_client {

@@ -372,6 +372,7 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
         config.policy.broker_mark,
         config.policy.connect_port,
     )
+    .with_http_proxy_port(config.policy.http_proxy_port)
     .with_execution_delegation();
     supervisor_config
         .table_name
@@ -789,7 +790,13 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
     let dns_addr =
         dns_port.map(|port| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
     let connect_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, connect_port));
-    let listeners = GatewayListeners::bind(dns_addr, connect_addr)
+    let http_proxy_addr = (config.role == GatewayRole::Workload).then(|| {
+        SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            config.policy.http_proxy_port,
+        ))
+    });
+    let listeners = GatewayListeners::bind_with_http_proxy(dns_addr, connect_addr, http_proxy_addr)
         .await
         .map_err(|error| GuestError::io("binding egress gateway listeners", error))?;
     let mcp_listener = match (config.role, config.policy.mcp_gateway_port) {

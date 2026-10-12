@@ -1,20 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
+use rustix::fs::{Mode, OFlags, open, openat};
 use sendbox_policy::{McpServerPolicy, ToolCallPolicy, ToolTransport};
 use serde_json::{Map, Value};
 
 use crate::error::ConfigError;
 
-pub const PROJECT_CONFIG_PATHS: [&str; 5] = [
+pub const PROJECT_CONFIG_PATHS: [&str; 9] = [
     ".mcp.json",
     ".vscode/mcp.json",
     ".github/copilot/mcp.json",
     ".cursor/mcp.json",
     ".claude/mcp.json",
+    "opencode.json",
+    "opencode.jsonc",
+    ".codex/config.toml",
+    ".gemini/settings.json",
 ];
 pub const NATIVE_BROKER_PATH: &str = "/run/sendbox-boundary/mcp-broker";
 pub const LEGACY_PROXY_PATH: &str = "/run/sendbox-boundary/mcp-proxy";
@@ -26,6 +32,22 @@ const FORBIDDEN_EXECUTABLES: [&str; 13] = [
 const MAX_COMMAND_PARTS: usize = 16;
 const MAX_COMMAND_PART_BYTES: usize = 4095;
 const MAX_PROJECT_CONFIG_BYTES: u64 = 1024 * 1024;
+const CLIENT_METADATA_FIELDS: &[&str] = &[
+    "enabled",
+    "timeout",
+    "startup_timeout_sec",
+    "startup_timeout_ms",
+    "tool_timeout_sec",
+    "required",
+    "enabled_tools",
+    "disabled_tools",
+    "includeTools",
+    "excludeTools",
+    "trust",
+    "description",
+    "tools",
+    "default_tools_approval_mode",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ApprovedCommand {
@@ -81,6 +103,16 @@ impl ApprovedCommand {
             return Err("command must contain an executable".into());
         };
         Self::new(executable.clone(), arguments.to_vec())
+    }
+
+    pub fn from_broker_argv(argv: &[String]) -> Result<Self, String> {
+        let Some((separator, command)) = argv.split_first() else {
+            return Err("MCP broker requires -- followed by an exact server command".to_owned());
+        };
+        if separator != "--" {
+            return Err("MCP broker requires -- followed by an exact server command".to_owned());
+        }
+        Self::from_argv(command)
     }
 
     #[must_use]
@@ -172,10 +204,11 @@ impl ProjectConfigValidator {
 
     pub fn validate_project(&self, project: impl AsRef<Path>) -> Result<(), ConfigError> {
         let project = project.as_ref();
+        let root = open_project_root(project)?;
         for relative in PROJECT_CONFIG_PATHS {
             let path = project.join(relative);
-            if path.symlink_metadata().is_ok() {
-                self.validate_file(&path)?;
+            if let Some(file) = open_project_file(&root, Path::new(relative), &path)? {
+                self.validate_open_file(&path, file)?;
             }
         }
         Ok(())
@@ -183,14 +216,18 @@ impl ProjectConfigValidator {
 
     pub fn validate_file(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         let path = path.as_ref();
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|source| ConfigError::Io {
                 path: path.to_path_buf(),
                 source,
             })?;
+        self.validate_open_file(path, file)
+    }
+
+    fn validate_open_file(&self, path: &Path, mut file: File) -> Result<(), ConfigError> {
         let metadata = file.metadata().map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
@@ -203,22 +240,26 @@ impl ProjectConfigValidator {
                 ),
             });
         }
-        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-        file.read_to_end(&mut bytes)
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(MAX_PROJECT_CONFIG_BYTES + 1)
+            .read_to_end(&mut bytes)
             .map_err(|source| ConfigError::Io {
                 path: path.to_path_buf(),
                 source,
             })?;
-        let root: Value =
-            serde_json::from_slice(&bytes).map_err(|error| ConfigError::InvalidJson {
+        if bytes.len() as u64 > MAX_PROJECT_CONFIG_BYTES {
+            return Err(ConfigError::InvalidJson {
                 path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
+                message: "configuration grew beyond the byte limit while reading".to_owned(),
+            });
+        }
+        let root = parse_configuration(path, &bytes)?;
         let root = root.as_object().ok_or_else(|| ConfigError::InvalidJson {
             path: path.to_path_buf(),
             message: "root must be an object".into(),
         })?;
-        for servers in server_containers(root) {
+        for servers in server_containers(path, root)? {
             for (name, server) in servers {
                 let server = server
                     .as_object()
@@ -227,10 +268,54 @@ impl ProjectConfigValidator {
                         server: name.clone(),
                         message: "server definition must be an object".into(),
                     })?;
-                self.validate_server(path, name, server)?;
+                let server = self.normalize_server(path, name, server)?;
+                self.validate_server(path, name, &server)?;
             }
         }
         Ok(())
+    }
+
+    fn normalize_server(
+        &self,
+        path: &Path,
+        name: &str,
+        server: &Map<String, Value>,
+    ) -> Result<Map<String, Value>, ConfigError> {
+        let mut server = server.clone();
+        let opencode_remote =
+            is_opencode(path) && server.get("type").and_then(Value::as_str) == Some("remote");
+        if opencode_remote {
+            if server.get("oauth") != Some(&Value::Bool(false)) {
+                return invalid_server(
+                    path,
+                    name,
+                    "OpenCode remote MCP requires oauth: false; authentication belongs to the trusted gateway",
+                );
+            }
+            server.remove("oauth");
+        }
+        let codex_remote = path.ends_with(".codex/config.toml") && server.contains_key("url");
+        let gemini_remote =
+            path.ends_with(".gemini/settings.json") && server.contains_key("httpUrl");
+        if gemini_remote {
+            if server.contains_key("url") {
+                return invalid_server(path, name, "HTTP and legacy SSE URLs cannot be combined");
+            }
+            let url = server.remove("httpUrl").expect("checked HTTP URL");
+            server.insert("url".to_owned(), url);
+        }
+        if opencode_remote || codex_remote || gemini_remote {
+            let transport = server
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|url| self.http_servers.get(url));
+            let transport = match transport {
+                Some(ToolTransport::StreamableHttp2025) => "streamable-http-2025",
+                _ => "streamable-http",
+            };
+            server.insert("type".to_owned(), Value::String(transport.to_owned()));
+        }
+        Ok(server)
     }
 
     fn validate_server(
@@ -244,6 +329,13 @@ impl ProjectConfigValidator {
             .or_else(|| server.get("transport"))
             .and_then(Value::as_str)
             .map(str::to_ascii_lowercase);
+        let transport = transport.map(|transport| {
+            if is_opencode(path) && transport == "local" {
+                "stdio".to_owned()
+            } else {
+                transport
+            }
+        });
         let remote = [
             "http",
             "https",
@@ -258,35 +350,21 @@ impl ProjectConfigValidator {
                 .as_deref()
                 .is_some_and(|transport| remote.contains(&transport))
         {
+            validate_fields(path, name, server, &["type", "transport", "url"])?;
             return self.validate_http_server(path, name, server, transport.as_deref());
         }
+        validate_fields(
+            path,
+            name,
+            server,
+            &["type", "transport", "command", "args"],
+        )?;
         if transport
             .as_deref()
             .is_some_and(|transport| transport != "stdio")
         {
             return invalid_server(path, name, "only stdio MCP transport is supported");
         }
-        if ["env", "envFile", "cwd", "workingDirectory"]
-            .iter()
-            .any(|field| server.contains_key(*field))
-        {
-            return invalid_server(
-                path,
-                name,
-                "server env/cwd overrides are rejected; the broker uses a scrubbed environment and fixed working directory",
-            );
-        }
-        if ["policy", "policyId", "serverId", "sendboxPolicy"]
-            .iter()
-            .any(|field| server.contains_key(*field))
-        {
-            return invalid_server(
-                path,
-                name,
-                "project MCP definitions cannot select a SendBox server policy ID",
-            );
-        }
-
         let command = parse_command(path, name, server)?;
         let separator = command
             .iter()
@@ -333,39 +411,6 @@ impl ProjectConfigValidator {
         server: &Map<String, Value>,
         transport: Option<&str>,
     ) -> Result<(), ConfigError> {
-        if [
-            "command",
-            "args",
-            "env",
-            "envFile",
-            "cwd",
-            "workingDirectory",
-            "headers",
-            "header",
-            "authorization",
-            "auth",
-            "token",
-            "cookies",
-        ]
-        .iter()
-        .any(|field| server.contains_key(*field))
-        {
-            return invalid_server(
-                path,
-                name,
-                "HTTP MCP definitions may only select an exact trusted local gateway URL and transport",
-            );
-        }
-        if ["policy", "policyId", "serverId", "sendboxPolicy"]
-            .iter()
-            .any(|field| server.contains_key(*field))
-        {
-            return invalid_server(
-                path,
-                name,
-                "project MCP definitions cannot select a SendBox server policy ID",
-            );
-        }
         let url = server.get("url").and_then(Value::as_str).ok_or_else(|| {
             ConfigError::InvalidServer {
                 path: path.to_path_buf(),
@@ -410,6 +455,60 @@ impl ProjectConfigValidator {
         }
         Ok(())
     }
+}
+
+pub fn has_project_configuration(project: &Path) -> Result<bool, ConfigError> {
+    let root = open_project_root(project)?;
+    let mut present = false;
+    for relative in PROJECT_CONFIG_PATHS {
+        present |=
+            open_project_file(&root, Path::new(relative), &project.join(relative))?.is_some();
+    }
+    Ok(present)
+}
+
+fn open_project_root(project: &Path) -> Result<OwnedFd, ConfigError> {
+    open(
+        project,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| ConfigError::Io {
+        path: project.to_path_buf(),
+        source: source.into(),
+    })
+}
+
+fn open_project_file(
+    root: &OwnedFd,
+    relative: &Path,
+    path: &Path,
+) -> Result<Option<File>, ConfigError> {
+    let mut directory = None::<OwnedFd>;
+    let mut components = relative.components().peekable();
+    while let Some(Component::Normal(name)) = components.next() {
+        let parent = directory.as_ref().map_or(root.as_fd(), AsFd::as_fd);
+        let leaf = components.peek().is_none();
+        let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        if !leaf {
+            flags |= OFlags::DIRECTORY;
+        }
+        match openat(parent, name, flags, Mode::empty()) {
+            Ok(file) if leaf => return Ok(Some(File::from(file))),
+            Ok(next) => directory = Some(next),
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    path: path.to_path_buf(),
+                    source: source.into(),
+                });
+            }
+        }
+    }
+    Err(ConfigError::InvalidJson {
+        path: path.to_path_buf(),
+        message: "configuration path must contain only normal relative components".to_owned(),
+    })
 }
 
 fn parse_command(
@@ -466,21 +565,81 @@ fn parse_command(
     }
 }
 
-fn server_containers(root: &Map<String, Value>) -> Vec<&Map<String, Value>> {
-    let mut containers = Vec::new();
-    for key in ["mcpServers", "servers"] {
-        if let Some(servers) = root.get(key).and_then(Value::as_object) {
-            containers.push(servers);
+fn is_opencode(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("opencode.json" | "opencode.jsonc")
+    )
+}
+
+fn parse_configuration(path: &Path, bytes: &[u8]) -> Result<Value, ConfigError> {
+    let invalid = |message: String| ConfigError::InvalidJson {
+        path: path.to_path_buf(),
+        message,
+    };
+    let source = std::str::from_utf8(bytes).map_err(|error| invalid(error.to_string()))?;
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("toml") => {
+            let value: toml::Value =
+                toml::from_str(source).map_err(|error| invalid(error.to_string()))?;
+            serde_json::to_value(value).map_err(|error| invalid(error.to_string()))
+        }
+        Some("jsonc") => jsonc_parser::parse_to_serde_value(source, &Default::default())
+            .map_err(|error| invalid(error.to_string())),
+        _ => serde_json::from_str(source).map_err(|error| invalid(error.to_string())),
+    }
+}
+
+fn validate_fields(
+    path: &Path,
+    name: &str,
+    server: &Map<String, Value>,
+    structural_fields: &[&str],
+) -> Result<(), ConfigError> {
+    for field in server.keys() {
+        if !structural_fields.contains(&field.as_str())
+            && !CLIENT_METADATA_FIELDS.contains(&field.as_str())
+        {
+            return invalid_server(
+                path,
+                name,
+                &format!(
+                    "unapproved MCP client field '{field}'; server identity, environment and authentication are controlled by signed policy"
+                ),
+            );
         }
     }
-    if let Some(mcp) = root.get("mcp").and_then(Value::as_object) {
+    Ok(())
+}
+
+fn server_containers<'a>(
+    path: &Path,
+    root: &'a Map<String, Value>,
+) -> Result<Vec<&'a Map<String, Value>>, ConfigError> {
+    let object = |value: &'a Value, key: &str| {
+        value.as_object().ok_or_else(|| ConfigError::InvalidJson {
+            path: path.to_path_buf(),
+            message: format!("{key} must be an object"),
+        })
+    };
+    let mut containers = Vec::new();
+    for key in ["mcpServers", "servers", "mcp_servers"] {
+        if let Some(servers) = root.get(key) {
+            containers.push(object(servers, key)?);
+        }
+    }
+    if let Some(mcp) = root.get("mcp") {
+        let mcp = object(mcp, "mcp")?;
         for key in ["mcpServers", "servers"] {
-            if let Some(servers) = mcp.get(key).and_then(Value::as_object) {
-                containers.push(servers);
+            if let Some(servers) = mcp.get(key) {
+                containers.push(object(servers, key)?);
+            }
+            if !mcp.contains_key("mcpServers") && !mcp.contains_key("servers") {
+                containers.push(mcp);
             }
         }
     }
-    containers
+    Ok(containers)
 }
 
 fn invalid_server<T>(path: &Path, server: &str, message: &str) -> Result<T, ConfigError> {
@@ -517,9 +676,32 @@ mod tests {
     }
 
     #[test]
+    fn native_broker_invocation_consumes_the_required_argv_separator() {
+        let arguments = vec![
+            "--".to_owned(),
+            "/usr/bin/node".to_owned(),
+            "/opt/mcp-server-filesystem.js".to_owned(),
+        ];
+        let command = ApprovedCommand::from_broker_argv(&arguments).expect("broker argv");
+        assert_eq!(command.executable(), "/usr/bin/node");
+        assert_eq!(command.arguments(), ["/opt/mcp-server-filesystem.js"]);
+        assert!(ApprovedCommand::from_broker_argv(&arguments[1..]).is_err());
+        assert!(ApprovedCommand::from_broker_argv(&arguments[..1]).is_err());
+    }
+
+    #[test]
     fn validates_every_supported_path_and_nested_shape() {
         for (index, path) in PROJECT_CONFIG_PATHS.into_iter().enumerate() {
             let temp = TempDir::new().unwrap();
+            if path.ends_with(".toml") {
+                write_config(
+                    &temp,
+                    path,
+                    "[mcp_servers.files]\ncommand = '/run/sendbox-boundary/mcp-broker'\nargs = ['--', '/usr/bin/node', '/opt/mcp-server-filesystem.js']\n",
+                );
+                validator().validate_project(temp.path()).unwrap();
+                continue;
+            }
             let container = if index % 2 == 0 {
                 "mcpServers"
             } else {
@@ -533,6 +715,114 @@ mod tests {
                 ),
             );
             validator().validate_project(temp.path()).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_unbrokered_opencode_servers() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            &temp,
+            "opencode.json",
+            r#"{"mcp":{"files":{"type":"local","command":["/usr/bin/node","/opt/mcp-server-filesystem.js"]}}}"#,
+        );
+        assert!(validator().validate_project(temp.path()).is_err());
+    }
+
+    #[test]
+    fn validates_native_cli_agent_formats_through_one_policy() {
+        for (path, source) in [
+            (
+                "opencode.json",
+                r#"{"mcp":{"files":{"type":"local","command":["/run/sendbox-boundary/mcp-broker","--","/usr/bin/node","/opt/mcp-server-filesystem.js"]}}}"#,
+            ),
+            (
+                "opencode.jsonc",
+                r#"{
+                    // OpenCode accepts comments and trailing commas.
+                    "mcp": {"files": {
+                        "type": "local",
+                        "command": ["/run/sendbox-boundary/mcp-broker", "--", "/usr/bin/node", "/opt/mcp-server-filesystem.js"],
+                    }},
+                }"#,
+            ),
+            (
+                ".codex/config.toml",
+                "[mcp_servers.files]\ncommand = '/run/sendbox-boundary/mcp-broker'\nargs = ['--', '/usr/bin/node', '/opt/mcp-server-filesystem.js']\n",
+            ),
+            (
+                ".gemini/settings.json",
+                r#"{"mcpServers":{"files":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/node","/opt/mcp-server-filesystem.js"]}}}"#,
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            write_config(&temp, path, source);
+            validator()
+                .validate_file(temp.path().join(path))
+                .unwrap_or_else(|error| panic!("{path}: {error}"));
+        }
+    }
+
+    #[test]
+    fn native_remote_definitions_use_the_trusted_gateway() {
+        let policy = ToolCallPolicy {
+            servers: BTreeMap::from([(
+                "docs".to_owned(),
+                McpServerPolicy::StreamableHttp {
+                    url: "https://mcp.example.com/mcp".to_owned(),
+                    tools: ServerToolPolicy::default(),
+                    http: Default::default(),
+                },
+            )]),
+            ..ToolCallPolicy::default()
+        };
+        let validator = ProjectConfigValidator::from_policy(&policy).unwrap();
+        for (path, source) in [
+            (
+                "opencode.json",
+                r#"{"mcp":{"docs":{"type":"remote","url":"http://127.0.0.1:15082/mcp/docs","oauth":false}}}"#,
+            ),
+            (
+                ".codex/config.toml",
+                "[mcp_servers.docs]\nurl = 'http://127.0.0.1:15082/mcp/docs'\n",
+            ),
+            (
+                ".gemini/settings.json",
+                r#"{"mcpServers":{"docs":{"httpUrl":"http://127.0.0.1:15082/mcp/docs"}}}"#,
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            write_config(&temp, path, source);
+            validator
+                .validate_project(temp.path())
+                .unwrap_or_else(|error| panic!("{path}: {error}"));
+        }
+    }
+
+    #[test]
+    fn native_client_metadata_cannot_expand_broker_authority() {
+        for (path, source) in [
+            (
+                "opencode.json",
+                r#"{"mcp":{"files":{"type":"local","command":["/run/sendbox-boundary/mcp-broker","--","/usr/bin/node","/opt/mcp-server-filesystem.js"],"environment":{"NODE_OPTIONS":"--require=/tmp/untrusted.js"}}}}"#,
+            ),
+            (
+                ".codex/config.toml",
+                "[mcp_servers.files]\ncommand = '/run/sendbox-boundary/mcp-broker'\nargs = ['--', '/usr/bin/node', '/opt/mcp-server-filesystem.js']\nenv_vars = ['UNAPPROVED_TOKEN']\n",
+            ),
+            (
+                ".gemini/settings.json",
+                r#"{"mcpServers":{"files":{"command":"/run/sendbox-boundary/mcp-broker","args":["--","/usr/bin/node","/opt/mcp-server-filesystem.js"],"unrecognized_launch_override":true}}}"#,
+            ),
+            (".mcp.json", r#"{"mcpServers":[]}"#),
+            (".codex/config.toml", "mcp_servers = 'not-a-table'\n"),
+        ] {
+            let temp = TempDir::new().unwrap();
+            write_config(&temp, path, source);
+            assert!(
+                validator().validate_project(temp.path()).is_err(),
+                "{path}: unsafe metadata was accepted"
+            );
         }
     }
 
@@ -568,6 +858,21 @@ mod tests {
         .unwrap();
         symlink(&target, temp.path().join(".mcp.json")).unwrap();
         assert!(validator().validate_project(temp.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_symlinked_configuration_parents() {
+        use std::os::unix::fs::symlink;
+
+        let project = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(
+            outside.path().join("config.toml"),
+            "[mcp_servers.files]\ncommand = '/run/sendbox-boundary/mcp-broker'\nargs = ['--', '/usr/bin/node', '/opt/mcp-server-filesystem.js']\n",
+        )
+        .unwrap();
+        symlink(outside.path(), project.path().join(".codex")).unwrap();
+        assert!(validator().validate_project(project.path()).is_err());
     }
 
     #[test]

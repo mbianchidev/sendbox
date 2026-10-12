@@ -137,8 +137,86 @@ struct InitArgs {
     policy: PolicyPresetArg,
     #[arg(long, value_enum, default_value_t = RuntimeArg::Auto)]
     runtime: RuntimeArg,
+    #[arg(
+        long,
+        value_enum,
+        help = "Configure command and inference access for a CLI agent"
+    )]
+    agent: Option<InitAgent>,
     #[arg(long, help = "Emit a deterministic JSON result")]
     json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum InitAgent {
+    Copilot,
+    #[value(name = "opencode", alias = "open-code")]
+    OpenCode,
+    Claude,
+    Codex,
+    Gemini,
+    Custom,
+}
+
+impl InitAgent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Copilot => "copilot",
+            Self::OpenCode => "opencode",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::Custom => "custom",
+        }
+    }
+
+    fn configure(self, configuration: &mut SandboxConfiguration) {
+        configuration.github.forward_copilot_auth = self == Self::Copilot;
+        if self != Self::Custom
+            && configuration.policy.commands.default_action == sendbox_policy::Action::Deny
+            && !configuration
+                .policy
+                .commands
+                .allowlist
+                .iter()
+                .any(|rule| rule == self.as_str())
+        {
+            configuration
+                .policy
+                .commands
+                .allowlist
+                .push(self.as_str().to_owned());
+        }
+        let domains: &[&str] = match self {
+            Self::Copilot => &["api.githubcopilot.com", "*.githubcopilot.com"],
+            Self::OpenCode => &["opencode.ai", "models.dev"],
+            Self::Claude => &["api.anthropic.com"],
+            Self::Codex => &["api.openai.com", "chatgpt.com", "auth.openai.com"],
+            Self::Gemini => &[
+                "generativelanguage.googleapis.com",
+                "oauth2.googleapis.com",
+                "cloudcode-pa.googleapis.com",
+            ],
+            Self::Custom => &[],
+        };
+        if configuration.policy.network.default_action == sendbox_policy::Action::Deny {
+            for domain in domains {
+                if !configuration
+                    .policy
+                    .network
+                    .allowed_domains
+                    .iter()
+                    .any(|rule| rule == domain)
+                {
+                    configuration
+                        .policy
+                        .network
+                        .allowed_domains
+                        .push((*domain).to_owned());
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -319,6 +397,8 @@ struct InitResult<'a> {
     sandbox: &'a str,
     policy: &'a str,
     runtime: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -524,11 +604,14 @@ fn init(arguments: InitArgs) -> ExitCode {
         }
     };
     let config_path = project.join(".sendbox.yaml");
-    let configuration = SandboxConfiguration::for_project(
+    let mut configuration = SandboxConfiguration::for_project(
         project.clone(),
         arguments.policy.value(),
         arguments.runtime.value(),
     );
+    if let Some(agent) = arguments.agent {
+        agent.configure(&mut configuration);
+    }
 
     if let Err(error) =
         configuration.write(&config_path, sendbox_config::AtomicWriteMode::CreateNew)
@@ -560,12 +643,16 @@ fn init(arguments: InitArgs) -> ExitCode {
             sandbox: &configuration.name,
             policy: &arguments.policy.to_string(),
             runtime: &arguments.runtime.to_string(),
+            agent: arguments.agent.map(InitAgent::as_str),
         });
     } else {
         println!("created configuration: {config}");
         println!("project: {project}");
         println!("policy: {}", arguments.policy);
         println!("runtime: {}", arguments.runtime);
+        if let Some(agent) = arguments.agent {
+            println!("agent: {}", agent.as_str());
+        }
     }
     ExitCode::SUCCESS
 }
