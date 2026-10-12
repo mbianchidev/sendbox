@@ -3,16 +3,28 @@ FROM rust:1.93.1-alpine3.23@sha256:4fec02de605563c297c78a31064c8335bc004fa2b0bf4
 
 ARG TARGETARCH
 
+ENV CARGO_BUILD_JOBS=1
+
 RUN apk add --no-cache \
         binutils=2.45.1-r0 \
-        curl=8.20.0-r0 \
+        curl=8.22.0-r0 \
+        elfutils-dev=0.194-r0 \
         file=5.46-r2 \
         g++=15.2.0-r2 \
         gperf=3.3-r0 \
         linux-headers=6.16.12-r0 \
         make=4.4.1-r3 \
         pkgconf=2.5.1-r0 \
-        musl-dev=1.2.5-r23
+        musl-dev=1.2.5-r23 \
+        zlib=1.3.2-r1 \
+        zlib-dev=1.3.2-r1 \
+        zlib-static=1.3.2-r1 \
+        zstd-dev=1.5.7-r2 \
+        zstd-static=1.5.7-r2
+
+RUN ar d /usr/lib/libelf.a crc32.o \
+    && ranlib /usr/lib/libelf.a \
+    && ! nm -g /usr/lib/libelf.a | grep -q ' T crc32$'
 
 RUN case "$TARGETARCH" in \
         amd64) target="x86_64-unknown-linux-musl" ;; \

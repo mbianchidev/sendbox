@@ -1,3 +1,5 @@
+#![cfg(feature = "execution-broker")]
+
 use sendbox_core::SessionId;
 use sendbox_guest::broker::workload_environment;
 

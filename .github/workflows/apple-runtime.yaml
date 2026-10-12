@@ -47,7 +47,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libseccomp-dev
+          sudo apt-get install --yes --no-install-recommends \
+            clang libelf-dev libseccomp-dev libzstd-dev make pkg-config zlib1g-dev
       - name: Install pinned Rust
         run: rustup toolchain install 1.93.1 --profile minimal --component clippy,rustfmt
       - name: Format

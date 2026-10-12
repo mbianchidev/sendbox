@@ -10,6 +10,7 @@ publish = false
 [features]
 default = ["execution-broker"]
 execution-broker = [
+    "dep:sendbox-bpf",
     "dep:sendbox-egress",
     "dep:sendbox-exec",
     "dep:sendbox-policy",
@@ -23,7 +24,7 @@ ed25519-dalek.workspace = true
 getrandom = "0.3.4"
 libc.workspace = true
 rustix = { workspace = true, features = ["mount"] }
-sendbox-bpf = { path = "../../crates/sendbox-bpf" }
+sendbox-bpf = { path = "../../crates/sendbox-bpf", optional = true }
 sendbox-config = { path = "../../crates/sendbox-config" }
 sendbox-bootstrap = { path = "../../crates/sendbox-bootstrap" }
 sendbox-core = { path = "../../crates/sendbox-core" }

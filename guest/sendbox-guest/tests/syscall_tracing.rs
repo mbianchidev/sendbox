@@ -1,3 +1,5 @@
+#![cfg(feature = "execution-broker")]
+
 use std::path::Path;
 
 use sendbox_guest::service::{HealthCheck, ServiceId};
