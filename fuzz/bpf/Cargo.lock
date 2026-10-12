@@ -1519,7 +1519,6 @@ dependencies = [
  "libc",
  "rustix",
  "sendbox-bootstrap",
- "sendbox-bpf",
  "sendbox-config",
  "sendbox-core",
  "sendbox-git",
