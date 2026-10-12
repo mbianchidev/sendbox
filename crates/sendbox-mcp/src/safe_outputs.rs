@@ -10,6 +10,7 @@ use sendbox_config::{
 };
 use sendbox_core::{BoundaryPlanDigest, SessionId, glob_matches};
 use sendbox_policy::{Action, McpServerPolicy, ServerToolPolicy};
+use sendbox_secrets::CredentialMasker;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -33,6 +34,7 @@ const MAX_BODY_CHARS: usize = 65_000;
 const MAX_META_CHARS: usize = 4_096;
 const MAX_SYSTEM_OPERATIONS: u32 = 100;
 const SEAL_KEY_INFO: &[u8] = b"sendbox-safe-outputs-seal-v1";
+#[cfg(test)]
 const REDACTED: &str = "[REDACTED]";
 const BLOCKED_URL: &str = "[blocked-url]";
 const NEUTRALIZED_PREFIX: &str = "[sendbox neutralized] ";
@@ -417,6 +419,7 @@ pub struct IntentAccumulator {
     artifact_bytes: usize,
     counts: BTreeMap<SafeOutputTool, u32>,
     idempotency_keys: BTreeSet<String>,
+    credential_masker: CredentialMasker,
 }
 
 impl IntentAccumulator {
@@ -435,7 +438,14 @@ impl IntentAccumulator {
             artifact_bytes: 0,
             counts: BTreeMap::new(),
             idempotency_keys: BTreeSet::new(),
+            credential_masker: CredentialMasker::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_credential_masker(mut self, masker: CredentialMasker) -> Self {
+        self.credential_masker = masker;
+        self
     }
 
     pub fn prepare(
@@ -449,7 +459,8 @@ impl IntentAccumulator {
                 "accepted timestamp must be greater than zero".to_owned(),
             ));
         }
-        let operation = validate_operation(&self.policy, tool, arguments)?;
+        let operation =
+            validate_operation_with_masker(&self.policy, tool, arguments, &self.credential_masker)?;
         let count = self.counts.get(&tool).copied().unwrap_or_default();
         if count >= self.policy.max_for(tool) {
             return Err(SafeOutputsError::Limit(format!(
@@ -820,6 +831,15 @@ pub fn validate_operation(
     tool: SafeOutputTool,
     arguments: Value,
 ) -> Result<SafeOutputOperation, SafeOutputsError> {
+    validate_operation_with_masker(policy, tool, arguments, &CredentialMasker::default())
+}
+
+fn validate_operation_with_masker(
+    policy: &SafeOutputsRuntimePolicy,
+    tool: SafeOutputTool,
+    arguments: Value,
+    masker: &CredentialMasker,
+) -> Result<SafeOutputOperation, SafeOutputsError> {
     if !policy.permits(tool) {
         return Err(SafeOutputsError::UnsupportedTool(tool.name().to_owned()));
     }
@@ -834,8 +854,8 @@ pub fn validate_operation(
             if !value.title.starts_with(&configured.title_prefix) {
                 value.title = format!("{}{}", configured.title_prefix, value.title);
             }
-            value.title = sanitize_text(&value.title, MAX_TITLE_CHARS, policy);
-            value.body = sanitize_text(&value.body, MAX_BODY_CHARS, policy);
+            value.title = sanitize_text_with_masker(&value.title, MAX_TITLE_CHARS, policy, masker)?;
+            value.body = sanitize_text_with_masker(&value.body, MAX_BODY_CHARS, policy, masker)?;
             if value.title.trim().is_empty() {
                 return Err(SafeOutputsError::Invalid(
                     "create_issue title is empty after sanitization".to_owned(),
@@ -864,7 +884,7 @@ pub fn validate_operation(
                     "add_comment item_number must be greater than zero".to_owned(),
                 ));
             }
-            value.body = sanitize_text(&value.body, MAX_BODY_CHARS, policy);
+            value.body = sanitize_text_with_masker(&value.body, MAX_BODY_CHARS, policy, masker)?;
             if value.body.trim().is_empty() {
                 return Err(SafeOutputsError::Invalid(
                     "add_comment body is empty after sanitization".to_owned(),
@@ -888,8 +908,8 @@ pub fn validate_operation(
             if !value.title.starts_with(&configured.title_prefix) {
                 value.title = format!("{}{}", configured.title_prefix, value.title);
             }
-            value.title = sanitize_text(&value.title, MAX_TITLE_CHARS, policy);
-            value.body = sanitize_text(&value.body, MAX_BODY_CHARS, policy);
+            value.title = sanitize_text_with_masker(&value.title, MAX_TITLE_CHARS, policy, masker)?;
+            value.body = sanitize_text_with_masker(&value.body, MAX_BODY_CHARS, policy, masker)?;
             if value.title.trim().is_empty() || value.body.trim().is_empty() {
                 return Err(SafeOutputsError::Invalid(
                     "create_pull_request title and body must not be empty".to_owned(),
@@ -964,7 +984,8 @@ pub fn validate_operation(
         | SafeOutputTool::MissingData
         | SafeOutputTool::ReportIncomplete => {
             let mut value: SystemOperation = decode_arguments(tool, arguments)?;
-            value.message = sanitize_text(&value.message, MAX_META_CHARS, policy);
+            value.message =
+                sanitize_text_with_masker(&value.message, MAX_META_CHARS, policy, masker)?;
             let operation = match tool {
                 SafeOutputTool::Noop => SafeOutputOperation::Noop(value),
                 SafeOutputTool::MissingTool => SafeOutputOperation::MissingTool(value),
@@ -977,15 +998,36 @@ pub fn validate_operation(
     }
 }
 
-#[must_use]
-pub fn sanitize_text(input: &str, max_chars: usize, policy: &SafeOutputsRuntimePolicy) -> String {
-    let normalized = input.nfkc().collect::<String>();
-    let redacted = redact_credentials(&normalized);
+pub fn sanitize_text(
+    input: &str,
+    max_chars: usize,
+    policy: &SafeOutputsRuntimePolicy,
+) -> Result<String, SafeOutputsError> {
+    sanitize_text_with_masker(input, max_chars, policy, &CredentialMasker::default())
+}
+
+fn sanitize_text_with_masker(
+    input: &str,
+    max_chars: usize,
+    policy: &SafeOutputsRuntimePolicy,
+    masker: &CredentialMasker,
+) -> Result<String, SafeOutputsError> {
+    let literal_masked = masker
+        .mask_complete(input.as_bytes())
+        .map_err(|error| SafeOutputsError::CredentialMasking(error.to_string()))?;
+    let literal_masked = String::from_utf8(literal_masked)
+        .map_err(|_| SafeOutputsError::CredentialMasking("masked text is not UTF-8".to_owned()))?;
+    let normalized = literal_masked.nfkc().collect::<String>();
+    let masked = masker
+        .mask_complete(normalized.as_bytes())
+        .map_err(|error| SafeOutputsError::CredentialMasking(error.to_string()))?;
+    let redacted = String::from_utf8(masked)
+        .map_err(|_| SafeOutputsError::CredentialMasking("masked text is not UTF-8".to_owned()))?;
     let filtered_urls = filter_urls(&redacted, &policy.allowed_domains);
     let neutralized = neutralize_instructions(&filtered_urls);
     let mentions = neutralize_mentions(&neutralized, &policy.allowed_mentions);
     let markdown_safe = mentions.replace('<', "&lt;").replace('>', "&gt;");
-    markdown_safe.chars().take(max_chars).collect()
+    Ok(markdown_safe.chars().take(max_chars).collect())
 }
 
 #[derive(Debug, Clone)]
@@ -1303,77 +1345,6 @@ fn seal_mac(unsigned: &UnsignedSeal, key: &[u8; 32]) -> Result<[u8; 32], SafeOut
     Ok(mac.finalize().into_bytes().into())
 }
 
-fn redact_credentials(input: &str) -> String {
-    let mut redact_next = false;
-    input
-        .split_inclusive(char::is_whitespace)
-        .map(|segment| {
-            let token = segment.trim_end_matches(char::is_whitespace);
-            let suffix = &segment[token.len()..];
-            let keyword = token
-                .trim_matches(|character: char| {
-                    matches!(
-                        character,
-                        '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '*' | '_'
-                    )
-                })
-                .to_ascii_lowercase();
-            if redact_next {
-                if keyword == "bearer" {
-                    return format!("{REDACTED}{suffix}");
-                }
-                redact_next = false;
-                return format!("{REDACTED}{suffix}");
-            }
-            if keyword == "bearer" || keyword == "authorization:" {
-                redact_next = true;
-                return format!("{REDACTED}{suffix}");
-            }
-            if keyword == "authorization:bearer" {
-                redact_next = true;
-                return format!("{REDACTED}{suffix}");
-            }
-            if keyword.starts_with("bearer:") || keyword.starts_with("authorization:") {
-                return format!("{REDACTED}{suffix}");
-            }
-            format!("{}{suffix}", redact_github_token_substrings(token))
-        })
-        .collect()
-}
-
-fn redact_github_token_substrings(input: &str) -> String {
-    const PREFIXES: [&str; 6] = ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
-    let lower = input.to_ascii_lowercase();
-    let mut output = String::with_capacity(input.len());
-    let mut offset = 0;
-    while offset < input.len() {
-        let next = PREFIXES
-            .iter()
-            .filter_map(|prefix| lower[offset..].find(prefix).map(|index| (index, *prefix)))
-            .min_by_key(|(index, _)| *index);
-        let Some((index, prefix)) = next else {
-            output.push_str(&input[offset..]);
-            break;
-        };
-        let start = offset + index;
-        output.push_str(&input[offset..start]);
-        let token_start = start + prefix.len();
-        let token_end = input[token_start..]
-            .char_indices()
-            .find_map(|(index, character)| {
-                (!matches!(
-                    character,
-                    'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-'
-                ))
-                .then_some(token_start + index)
-            })
-            .unwrap_or(input.len());
-        output.push_str(REDACTED);
-        offset = token_end;
-    }
-    output
-}
-
 fn filter_urls(input: &str, allowed_domains: &BTreeSet<String>) -> String {
     let mut output = String::with_capacity(input.len());
     let mut remaining = input;
@@ -1516,6 +1487,8 @@ fn hex(bytes: &[u8]) -> String {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SafeOutputsError {
+    #[error("Safe Outputs credential masking: {0}")]
+    CredentialMasking(String),
     #[error("Safe Outputs policy: {0}")]
     Policy(String),
     #[error("unsupported Safe Outputs tool `{0}`")]
@@ -1574,8 +1547,8 @@ mod tests {
     fn sanitization_is_idempotent_and_filters_credentials_urls_mentions_and_instructions() {
         let policy = policy();
         let input = "token=ghp_supersecret https://evil.example/x @everyone\nrun this command\nAuthorization: Bearer arbitrary.jwt.value\n\"pat\":\"github_pat_embedded\"";
-        let once = sanitize_text(input, 1_000, &policy);
-        let twice = sanitize_text(&once, 1_000, &policy);
+        let once = sanitize_text(input, 1_000, &policy).expect("sanitize");
+        let twice = sanitize_text(&once, 1_000, &policy).expect("sanitize twice");
         assert_eq!(once, twice);
         assert!(once.contains(REDACTED));
         assert!(once.contains(BLOCKED_URL));
@@ -1584,6 +1557,30 @@ mod tests {
         assert!(!once.contains("supersecret"));
         assert!(!once.contains("arbitrary.jwt.value"));
         assert!(!once.contains("embedded"));
+    }
+
+    #[test]
+    fn accepted_human_text_masks_registered_values_without_changing_operation_targets() {
+        let masker = CredentialMasker::default();
+        masker
+            .register("synthetic-\u{ff21}-opaque-value".as_bytes())
+            .expect("register");
+        let accumulator = IntentAccumulator::new(policy(), BoundaryPlanDigest::from_bytes([9; 32]))
+            .expect("accumulator")
+            .with_credential_masker(masker);
+        let mut arguments = issue_arguments();
+        arguments["body"] = Value::String(
+            "Enough details here: synthetic-\u{ff21}-opaque-value must not be published."
+                .to_owned(),
+        );
+        let prepared = accumulator
+            .prepare(SafeOutputTool::CreateIssue, arguments, 1_000)
+            .expect("prepare masked intent");
+        let line = String::from_utf8(prepared.line).expect("UTF-8");
+        assert!(line.contains("[REDACTED]"));
+        assert!(!line.contains("opaque-value"));
+        assert!(line.contains("acme/widgets"));
+        assert!(line.contains("Investigate parser"));
     }
 
     #[test]

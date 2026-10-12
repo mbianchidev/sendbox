@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod masking;
 mod safe_outputs;
 mod security;
 
@@ -267,6 +268,14 @@ impl HostRunReport {
 
 #[derive(Debug, Error)]
 pub enum HostError {
+    #[error("{message}")]
+    CredentialMasked {
+        message: String,
+        kind: &'static str,
+        cancelled: bool,
+    },
+    #[error("credential masking: {0}")]
+    CredentialMasking(#[from] sendbox_secrets::CredentialMaskingError),
     #[error("{0}")]
     Invalid(String),
     #[error("boundary plan: {0}")]
@@ -281,6 +290,13 @@ pub enum HostError {
     RuntimeSecurity {
         runtime: Box<HostError>,
         security: SessionSecurityError,
+    },
+    #[error("output delivery: {0}")]
+    Output(#[source] sendbox_agent::AgentError),
+    #[error("{runtime}; masked output finalization also failed: {output}")]
+    OutputFinalization {
+        runtime: Box<HostError>,
+        output: sendbox_agent::AgentError,
     },
     #[error("agent plan: {0}")]
     AgentPlan(#[from] sendbox_agent::AgentError),
@@ -303,6 +319,23 @@ pub enum HostError {
     },
     #[error("bundle verification: {0}")]
     Bundle(String),
+}
+
+impl HostError {
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        match self {
+            Self::AgentRun(failure) => {
+                matches!(failure.primary, sendbox_agent::AgentError::Cancelled)
+            }
+            Self::Runtime(RuntimeError::Cancelled) => true,
+            Self::RuntimeSecurity { runtime, .. } | Self::OutputFinalization { runtime, .. } => {
+                runtime.is_cancelled()
+            }
+            Self::CredentialMasked { cancelled, .. } => *cancelled,
+            _ => false,
+        }
+    }
 }
 
 pub struct PreparedHostRun {
@@ -389,20 +422,39 @@ impl PreparedHostRun {
             signed_plan_path: _,
             terminal_source,
         } = self;
+        let masker = secrets.masker.clone();
+        let masked_output = Arc::new(masking::MaskingOutputSink::new(masker.clone(), output));
         let runtime_inputs = RuntimeInputs {
             execution,
             secrets,
             safe_outputs,
-            output,
+            output: masked_output.clone(),
             signals,
             terminal_source,
         };
-        security::execute(
-            security,
-            move |audit| execute_runtime(runtime_inputs, audit, cancellation),
+        let runtime_masker = masker.clone();
+        let result = security::execute(
+            security.with_credential_masker(masker.clone()),
+            move |audit| async move {
+                let result = execute_runtime(runtime_inputs, audit, cancellation).await;
+                let result =
+                    result.and_then(|report| masking::mask_report(&runtime_masker, report));
+                let flush = masked_output.finish(&CancellationToken::new()).await;
+                let result = match (result, flush) {
+                    (Ok(report), Ok(())) => Ok(report),
+                    (Err(error), Ok(())) => Err(error),
+                    (Ok(_), Err(error)) => Err(HostError::Output(error)),
+                    (Err(error), Err(output)) => Err(HostError::OutputFinalization {
+                        runtime: Box::new(error),
+                        output,
+                    }),
+                };
+                result.map_err(|error| masking::mask_error(&runtime_masker, error))
+            },
             cancellation,
         )
-        .await
+        .await;
+        result.map_err(|error| masking::mask_error(&masker, error))
     }
 }
 
@@ -547,6 +599,16 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         random_bootstrap_secret()?,
         credentials.into_values(),
     )?);
+    for credential in &gateway_credentials {
+        secrets.masker.register(credential.expose_secret())?;
+    }
+    if let Some(registry) = &registry_proxy {
+        for credential in &registry.bootstrap.credentials {
+            secrets
+                .masker
+                .register(credential.expose_to_registry_proxy())?;
+        }
+    }
 
     let runtime = build_runtime(
         selected_runtime,
@@ -1194,6 +1256,7 @@ struct HostSecretResolver {
     bootstrap: Zeroizing<[u8; 32]>,
     ephemeral: BTreeMap<String, SecretValue>,
     native: Arc<dyn SecretStore>,
+    masker: sendbox_secrets::CredentialMasker,
 }
 
 impl HostSecretResolver {
@@ -1202,11 +1265,16 @@ impl HostSecretResolver {
         bootstrap: [u8; 32],
         ephemeral: BTreeMap<String, SecretValue>,
     ) -> Result<Self, HostError> {
+        let masker = sendbox_secrets::CredentialMasker::default();
+        for value in ephemeral.values() {
+            masker.register(value.expose_secret())?;
+        }
         Ok(Self {
             bootstrap_reference,
             bootstrap: Zeroizing::new(bootstrap),
             ephemeral,
             native: native_secret_store()?,
+            masker,
         })
     }
 
@@ -1255,6 +1323,12 @@ impl SecretResolver for HostSecretResolver {
                         reference: reference.as_str().to_owned(),
                         message: error.to_string(),
                     })?;
+            self.masker
+                .register(secret.value.expose_secret())
+                .map_err(|error| sendbox_agent::AgentError::Secret {
+                    reference: reference.as_str().to_owned(),
+                    message: error.to_string(),
+                })?;
             Ok(SecretEnvelope::new(
                 reference.clone(),
                 secret.value.expose_secret().to_vec(),
@@ -2884,6 +2958,60 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn workload_output_masks_credentials_in_both_streams_and_flushes_safely() {
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<(OutputStream, Vec<u8>)>>);
+        impl OutputSink for Sink {
+            fn write<'a>(
+                &'a self,
+                stream: OutputStream,
+                bytes: &'a [u8],
+                _: &'a CancellationToken,
+            ) -> BoxFuture<'a, Result<(), sendbox_agent::AgentError>> {
+                Box::pin(async move {
+                    self.0.lock().unwrap().push((stream, bytes.to_vec()));
+                    Ok(())
+                })
+            }
+        }
+        let sink = Arc::new(Sink::default());
+        let masker = sendbox_secrets::CredentialMasker::default();
+        masker.register(b"synthetic-session-credential").unwrap();
+        let output = crate::masking::MaskingOutputSink::new(masker, sink.clone());
+        let cancel = CancellationToken::new();
+        output
+            .write(OutputStream::Stdout, b"before synthetic-session-", &cancel)
+            .await
+            .unwrap();
+        output
+            .write(OutputStream::Stdout, b"credential after\n", &cancel)
+            .await
+            .unwrap();
+        output
+            .write(
+                OutputStream::Stderr,
+                b"Bearer synthetic-oauth-value\n",
+                &cancel,
+            )
+            .await
+            .unwrap();
+        output.finish(&cancel).await.unwrap();
+        let events = sink.0.lock().unwrap();
+        let stdout = events
+            .iter()
+            .filter(|(stream, _)| *stream == OutputStream::Stdout)
+            .flat_map(|(_, bytes)| bytes.clone())
+            .collect::<Vec<_>>();
+        let stderr = events
+            .iter()
+            .filter(|(stream, _)| *stream == OutputStream::Stderr)
+            .flat_map(|(_, bytes)| bytes.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(stdout, b"before [REDACTED] after\n");
+        assert_eq!(stderr, b"Bearer [REDACTED]\n");
+    }
 
     fn supported_configuration(project_path: PathBuf) -> SandboxConfiguration {
         let mut configuration = SandboxConfiguration::for_project(

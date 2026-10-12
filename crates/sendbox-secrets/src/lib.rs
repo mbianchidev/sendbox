@@ -7,6 +7,7 @@ mod error;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+mod masking;
 mod record;
 mod types;
 
@@ -24,6 +25,10 @@ pub use linux::LinuxFileStore;
 #[cfg(target_os = "macos")]
 pub use macos::{
     KeychainMigrationPlan, KeychainStore, MigrationAuthorization, SigningIdentityChange,
+};
+pub use masking::{
+    CREDENTIAL_MASK, CredentialMasker, CredentialMaskingError, CredentialMaskingStream,
+    is_credential_name,
 };
 pub use types::{
     MAX_SECRET_NAME_BYTES, MAX_SECRET_VALUE_BYTES, RecordVersion, Secret, SecretMetadata,

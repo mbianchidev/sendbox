@@ -10,6 +10,7 @@ use sendbox_mcp::safe_outputs::{
     AcceptedIntentV1, IntentAccumulator, MAX_SAFE_OUTPUTS_FRAME_BYTES, McpGateway, SafeOutputTool,
     SafeOutputsError, SafeOutputsRuntimePolicy, SafeOutputsSealV1,
 };
+use sendbox_secrets::CredentialMasker;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -23,12 +24,21 @@ const ARTIFACT_MODE: u32 = 0o600;
 const WRITER_SOCKET_MODE: u32 = 0o660;
 const CONTROL_DEPTH: usize = 4;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CollectedSafeOutputs {
     pub artifact: Vec<u8>,
     pub seal: Vec<u8>,
 }
 
+impl std::fmt::Debug for CollectedSafeOutputs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CollectedSafeOutputs")
+            .field("artifact_bytes", &self.artifact.len())
+            .field("seal_bytes", &self.seal.len())
+            .finish()
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecorderState {
     Open,
@@ -53,9 +63,16 @@ enum Control {
 pub struct SafeOutputsHandle {
     control: tokio::sync::mpsc::Sender<Control>,
     live: tokio::sync::watch::Receiver<bool>,
+    credential_masker: CredentialMasker,
 }
 
 impl SafeOutputsHandle {
+    pub(crate) fn register_credential(&self, value: &[u8]) -> Result<(), GuestError> {
+        self.credential_masker.register(value).map_err(|error| {
+            GuestError::Runtime(format!("Safe Outputs credential masking: {error}"))
+        })
+    }
+
     #[must_use]
     pub fn verified_live(&self) -> bool {
         *self.live.borrow() && !self.control.is_closed()
@@ -145,8 +162,10 @@ pub fn start(
     .map_err(|error| GuestError::io("setting Safe Outputs writer socket mode", error))?;
     std::os::unix::fs::chown(&policy.writer_socket, Some(owner_uid), Some(workload_gid))
         .map_err(|error| GuestError::io("assigning Safe Outputs writer socket", error))?;
-    let accumulator =
-        IntentAccumulator::new(policy.clone(), boundary_plan_digest).map_err(safe_outputs_error)?;
+    let credential_masker = CredentialMasker::default();
+    let accumulator = IntentAccumulator::new(policy.clone(), boundary_plan_digest)
+        .map_err(safe_outputs_error)?
+        .with_credential_masker(credential_masker.clone());
     let gateway = McpGateway::new(policy.clone()).map_err(safe_outputs_error)?;
     let (control, receiver) = tokio::sync::mpsc::channel(CONTROL_DEPTH);
     let actor = RecorderActor {
@@ -172,7 +191,14 @@ pub fn start(
         live_sender.send_replace(false);
         result
     });
-    Ok((SafeOutputsHandle { control, live }, task))
+    Ok((
+        SafeOutputsHandle {
+            control,
+            live,
+            credential_masker,
+        },
+        task,
+    ))
 }
 
 struct ActiveWriter {
@@ -642,8 +668,10 @@ mod tests {
         }))
         .expect("runtime policy");
         policy.validate().expect("valid runtime policy");
-        let accumulator =
-            IntentAccumulator::new(policy.clone(), boundary_plan_digest).expect("accumulator");
+        let credential_masker = CredentialMasker::default();
+        let accumulator = IntentAccumulator::new(policy.clone(), boundary_plan_digest)
+            .expect("accumulator")
+            .with_credential_masker(credential_masker.clone());
         let gateway = McpGateway::new(policy.clone()).expect("gateway");
         let seal_key = derive_seal_key(&[9; 32], session_id).expect("seal key");
         let (control, receiver) = tokio::sync::mpsc::channel(CONTROL_DEPTH);
@@ -676,7 +704,11 @@ mod tests {
             policy,
             boundary_plan_digest,
             seal_key,
-            handle: SafeOutputsHandle { control, live },
+            handle: SafeOutputsHandle {
+                control,
+                live,
+                credential_masker,
+            },
             task,
         }
     }

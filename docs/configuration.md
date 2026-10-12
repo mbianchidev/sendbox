@@ -152,6 +152,11 @@ configuration returns `2`; analysis failures return `3`; write failures and
 no-overwrite refusals return `4`. Text diagnostics use stderr, while `--json`
 failures use stdout only.
 
+Workload output, runtime failure diagnostics, captured MCP credentials, and
+Safe Outputs human text are credential-masked by default, without a disable
+switch. Authentication traffic is not modified. See
+[credential masking](cli-agents.md#credential-masking) for coverage and limits.
+
 ## GitHub and MCP boundaries
 
 GitHub repository forwarding currently supports `github.com`. Ordinary HTTPS

@@ -625,6 +625,20 @@ where
     }
 
     let execution = build_execution_request(&launch, terminal, broker, &services.secret_decryptor)?;
+    if let Some(safe_outputs) = &services.safe_outputs {
+        for secret in &launch.secrets {
+            let value = execution
+                .environment
+                .iter()
+                .find(|entry| entry.name == secret.reference)
+                .ok_or_else(|| {
+                    GuestError::Protocol(
+                        "decrypted credential is missing from the launch environment".to_owned(),
+                    )
+                })?;
+            safe_outputs.register_credential(value.value.as_bytes())?;
+        }
+    }
     let stream = UnixStream::connect(&broker.socket_path)
         .await
         .map_err(|error| GuestError::io("connecting execution broker", error))?;

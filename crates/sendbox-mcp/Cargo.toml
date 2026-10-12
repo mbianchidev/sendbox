@@ -25,6 +25,7 @@ sendbox-config = { path = "../sendbox-config" }
 sendbox-core = { path = "../sendbox-core" }
 sendbox-egress = { path = "../sendbox-egress" }
 sendbox-policy = { path = "../sendbox-policy" }
+sendbox-secrets = { path = "../sendbox-secrets" }
 rustls.workspace = true
 rustls-native-certs.workspace = true
 rustls-pki-types.workspace = true

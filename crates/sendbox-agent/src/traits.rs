@@ -119,10 +119,20 @@ pub enum GuestEvent {
     Terminal(GuestTerminal),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CollectedSafeOutputs {
     pub artifact: Vec<u8>,
     pub seal: Vec<u8>,
+}
+
+impl fmt::Debug for CollectedSafeOutputs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CollectedSafeOutputs")
+            .field("artifact_bytes", &self.artifact.len())
+            .field("seal_bytes", &self.seal.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

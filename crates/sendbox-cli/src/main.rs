@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use completions::CompletionShell;
-use sendbox_agent::{AgentError, AgentSignal, BoxFuture, NoSignals, OutputSink, SignalSource};
+use sendbox_agent::{AgentSignal, BoxFuture, NoSignals, OutputSink, SignalSource};
 use sendbox_config::{
     ConfigurationError, MigrationReport, PolicyPreset, RuntimeProvider, SandboxConfiguration,
 };
@@ -1297,6 +1297,15 @@ fn runtime_state_directory() -> Result<PathBuf, String> {
 
 fn host_error_exit_code(error: &HostError) -> u8 {
     match error {
+        HostError::CredentialMasked { kind, .. }
+            if matches!(
+                *kind,
+                "invalid" | "boundary" | "credentials" | "git_guard" | "agent_plan" | "bundle"
+            ) =>
+        {
+            INVALID_CONFIGURATION_EXIT
+        }
+        HostError::OutputFinalization { runtime, .. } => host_error_exit_code(runtime),
         HostError::Invalid(_)
         | HostError::Boundary(_)
         | HostError::Credentials(_)
@@ -1308,15 +1317,15 @@ fn host_error_exit_code(error: &HostError) -> u8 {
 }
 
 fn host_error_cancelled(error: &HostError) -> bool {
-    match error {
-        HostError::AgentRun(failure) => matches!(failure.primary, AgentError::Cancelled),
-        HostError::Runtime(sendbox_runtime::RuntimeError::Cancelled) => true,
-        HostError::RuntimeSecurity { runtime, .. } => host_error_cancelled(runtime),
-        _ => false,
-    }
+    error.is_cancelled()
 }
 
 fn emit_run_error(json: bool, exit_code: u8, message: &str) {
+    let masker = sendbox_secrets::CredentialMasker::default();
+    let message = match masker.mask(message.as_bytes()) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => format!("{error}; diagnostic withheld"),
+    };
     if json {
         print_json(&serde_json::json!({
             "event": "error",

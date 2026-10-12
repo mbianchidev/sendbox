@@ -232,7 +232,12 @@ observability:
 Inspection requires `policy.boundaries.enabled: true`. Paths outside
 `/var/log/sendbox`, duplicate transports, and unsupported transports are
 rejected. Payload text is omitted unless capture is explicitly enabled and is
-then truncated to the configured bound.
+then credential-masked before truncation to the configured bound. The observer
+masks admitted workload credentials and recognizable credential fields without
+changing forwarded MCP frames or authentication. JSON escapes are decoded
+before masking. Non-credential private content can still be captured; leave
+capture disabled unless it is needed. See
+[credential masking](cli-agents.md#credential-masking) for limits.
 
 The parser retains compatibility with legacy Swift trace lines:
 

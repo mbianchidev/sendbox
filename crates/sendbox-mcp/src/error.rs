@@ -96,6 +96,8 @@ pub enum BrokerError {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ObservationError {
+    #[error("MCP observation credential masking failed: {0}")]
+    CredentialMasking(String),
     #[error("invalid MCP observation event: {0}")]
     InvalidEvent(String),
     #[error(transparent)]

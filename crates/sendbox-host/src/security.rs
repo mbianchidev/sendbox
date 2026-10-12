@@ -70,6 +70,7 @@ pub(crate) struct HostSecurityContext {
     signing_key: SigningKeyMaterial,
     planned_secret_count: usize,
     package_report_validation: Option<PackageReportValidation>,
+    credential_masker: sendbox_secrets::CredentialMasker,
 }
 
 #[derive(Debug, Clone)]
@@ -119,7 +120,16 @@ impl HostSecurityContext {
             signing_key,
             planned_secret_count,
             package_report_validation,
+            credential_masker: sendbox_secrets::CredentialMasker::default(),
         }
+    }
+
+    pub(crate) fn with_credential_masker(
+        mut self,
+        masker: sendbox_secrets::CredentialMasker,
+    ) -> Self {
+        self.credential_masker = masker;
+        self
     }
 }
 
@@ -247,14 +257,16 @@ where
     match runtime(session.audit_recorder()).await {
         Ok(mut report) => {
             if let Err(error) = persist_package_report(&mut report, &context) {
-                return finalize_runtime_error(session, &clock, error);
+                return finalize_runtime_error(session, &clock, error, &context.credential_masker);
             }
             if let Err(error) = persist_syscall_report(&mut report, &context) {
-                return finalize_runtime_error(session, &clock, error);
+                return finalize_runtime_error(session, &clock, error, &context.credential_masker);
             }
             finalize_report(session, &clock, report)
         }
-        Err(runtime_error) => finalize_runtime_error(session, &clock, runtime_error),
+        Err(runtime_error) => {
+            finalize_runtime_error(session, &clock, runtime_error, &context.credential_masker)
+        }
     }
 }
 
@@ -469,7 +481,9 @@ fn finalize_runtime_error(
     mut session: SecuritySession<'_>,
     clock: &dyn LifecycleClock,
     runtime_error: HostError,
+    masker: &sendbox_secrets::CredentialMasker,
 ) -> Result<HostRunReport, HostError> {
+    let runtime_error = crate::masking::mask_error(masker, runtime_error);
     let audit_error = session
         .record_event(
             clock.now_unix_nanos(),
@@ -1158,8 +1172,12 @@ fn operation(stage: &'static str, error: impl std::fmt::Display) -> SessionSecur
 }
 
 impl HostError {
-    fn kind(&self) -> &'static str {
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
+            Self::CredentialMasked { kind, .. } => kind,
+            Self::CredentialMasking(_) => "credential_masking",
+            Self::Output(_) => "output",
+            Self::OutputFinalization { runtime, .. } => runtime.kind(),
             Self::Invalid(_) => "invalid",
             Self::Boundary(_) => "boundary",
             Self::Runtime(_) => "runtime",
@@ -1517,6 +1535,32 @@ mod tests {
             runtime_failure["event"]["metadata"]["error"],
             "runtime failed"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_failure_is_masked_before_audit_and_rollback_persistence() {
+        let temp = TempDir::new().expect("temp dir");
+        let now = unix_time().expect("current time");
+        let (context, _) = context(&temp, now, now + 300);
+        let state_directory = context.state_directory.clone();
+        let masker = sendbox_secrets::CredentialMasker::default();
+        masker
+            .register(b"synthetic-runtime-credential")
+            .expect("register");
+        let context = context.with_credential_masker(masker);
+        let error = execute_uncancelled(context, async {
+            Err(HostError::Runtime(sendbox_runtime::RuntimeError::Provider(
+                "provider failed: synthetic-runtime-credential".to_owned(),
+            )))
+        })
+        .await
+        .expect_err("must fail");
+        assert_eq!(error.kind(), "runtime");
+        assert!(error.to_string().contains("[REDACTED]"));
+        assert!(!format!("{error:?}").contains("synthetic-runtime-credential"));
+        let audit = fs::read_to_string(state_directory.join(AUDIT_LOG_FILE)).expect("audit");
+        assert!(audit.contains("[REDACTED]"));
+        assert!(!audit.contains("synthetic-runtime-credential"));
     }
 
     #[tokio::test]

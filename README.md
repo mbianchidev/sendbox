@@ -36,6 +36,9 @@ provider with a narrower capability set.
   credentials use authenticated encrypted host-to-guest envelopes. SSH keys are
   staged only for a trusted SSH child in an owner-only runtime directory and are
   removed afterward.
+- **Credential Masking** — Chunk-safe output filtering, masked runtime errors,
+  and credential-redacted MCP capture protect diagnostics without changing
+  authentication traffic. See [coverage and limits](docs/cli-agents.md#credential-masking).
 - **Undo & Rollback** — Descriptor-safe, content-addressed SHA-256 snapshots
   support capture, verify, restore, diff, and prune with versioned formats.
 - **Audit Trail** — Lifecycle operations and security decisions are committed to

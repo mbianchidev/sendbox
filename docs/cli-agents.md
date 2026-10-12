@@ -87,6 +87,35 @@ GitHub forwarding remains independently configurable. Disable
 `github.branch_protection.enabled` for non-Git projects. Keep server-side branch
 protection: local wrappers do not govern alternate clients or direct API writes.
 
+### Credential masking
+
+Credential masking is always enabled for workload stdout and stderr, including
+PTY output and JSON/hex CLI output. Values delivered from the vault or session
+credential forwarding are registered before the workload can print them.
+Gateway and registry credentials are also registered for runtime diagnostics.
+Credentials split across chunks are withheld until they can be masked safely;
+stdout and stderr have independent state. An ambiguous credential prefix at
+stream termination is masked rather than printed.
+
+Recognizable bearer/basic headers, sensitive assignments and JSON fields,
+common provider token prefixes, URL userinfo, and private-key blocks are
+replaced with `[REDACTED]` even when not registered in the vault. Runtime errors
+are masked before failure-audit persistence. Captured MCP payloads are decoded
+and masked before truncation or log serialization; decoded JSON escapes cannot
+hide a registered value. Safe Outputs human-readable titles, bodies, and
+messages use the same masker before sealing. Original authentication values,
+envelopes, MCP traffic, and proposed source patches are not rewritten.
+
+Masking is not a data-loss-prevention boundary. Arbitrary encodings,
+obfuscation, credentials assembled across separate output streams, newly
+created opaque credentials with no recognizable form, repository files, and
+source patches are not comprehensively scrubbed. Keep MCP payload capture
+disabled unless needed: non-credential private content may still be recorded.
+Known values are limited to 512 distinct credentials of at most 64 KiB each;
+registration or masking failures stop the affected operation without exposing
+the original diagnostic. Output byte counters describe the original guest
+bytes, not the replacement text.
+
 ## Repository or multi-repository filesystem scope
 
 By default, only `project_path` is shared read/write at `/workspace`.
