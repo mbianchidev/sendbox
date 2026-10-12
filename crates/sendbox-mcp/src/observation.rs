@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use sendbox_secrets::{CREDENTIAL_MASK, CredentialMasker, is_credential_name};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -8,6 +9,51 @@ use crate::jsonrpc::{MessageKind as RpcMessageKind, validate_message};
 
 pub const LEGACY_EVENT_MARKER: &str = "SENDBOX_MCP";
 pub const EVENT_V1_MARKER: &str = "SENDBOX_MCP_EVENT";
+
+pub fn mask_payload(json: &str, masker: &CredentialMasker) -> Result<String, ObservationError> {
+    let mut value: Value = serde_json::from_str(json)
+        .map_err(|error| ObservationError::InvalidEvent(format!("payload JSON: {error}")))?;
+    mask_value(&mut value, masker)?;
+    serde_json::to_string(&value)
+        .map_err(|error| ObservationError::InvalidEvent(format!("masked payload JSON: {error}")))
+}
+
+fn mask_text(text: &str, masker: &CredentialMasker) -> Result<String, ObservationError> {
+    let bytes = masker
+        .mask_complete(text.as_bytes())
+        .map_err(|error| ObservationError::CredentialMasking(error.to_string()))?;
+    String::from_utf8(bytes)
+        .map_err(|_| ObservationError::CredentialMasking("masked text is not UTF-8".to_owned()))
+}
+
+fn mask_value(value: &mut Value, masker: &CredentialMasker) -> Result<(), ObservationError> {
+    match value {
+        Value::String(text) => *text = mask_text(text, masker)?,
+        Value::Array(values) => {
+            for value in values {
+                mask_value(value, masker)?;
+            }
+        }
+        Value::Object(values) => {
+            for (key, mut value) in std::mem::take(values) {
+                if is_credential_name(&key) {
+                    value = Value::String(String::from_utf8_lossy(CREDENTIAL_MASK).into_owned());
+                } else {
+                    mask_value(&mut value, masker)?;
+                }
+                values.insert(mask_text(&key, masker)?, value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {
+            let text = value.to_string();
+            let masked = mask_text(&text, masker)?;
+            if masked != text {
+                *value = Value::String(masked);
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -232,21 +278,31 @@ impl ObservationParser {
             RpcMessageKind::Error => MessageKind::Error,
         };
         let raw_id = message.id.raw().map(str::to_owned);
-        let id = raw_id.as_deref().map(display_id);
-        let subject = if self.capture_payloads || message.method.as_deref() == Some("tools/call") {
-            message.subject
+        let masker = CredentialMasker::default();
+        let id = raw_id
+            .as_deref()
+            .map(display_id)
+            .map(|id| mask_text(&id, &masker))
+            .transpose()?;
+        let method = message
+            .method
+            .map(|method| mask_text(&method, &masker))
+            .transpose()?;
+        let command = command
+            .map(|command| mask_text(&command, &masker))
+            .transpose()?;
+        let subject = if self.capture_payloads || method.as_deref() == Some("tools/call") {
+            message
+                .subject
+                .map(|subject| mask_text(&subject, &masker))
+                .transpose()?
         } else {
             None
         };
         let raw = if self.capture_payloads {
-            json.trim().to_owned()
+            mask_payload(json, &masker)?
         } else {
-            redacted_envelope(
-                message.method.as_deref(),
-                id.as_deref(),
-                subject.as_deref(),
-                kind,
-            )
+            redacted_envelope(method.as_deref(), id.as_deref(), subject.as_deref(), kind)
         };
         Ok((
             ObservedCall {
@@ -255,7 +311,7 @@ impl ObservationParser {
                 command,
                 transport,
                 kind,
-                method: message.method,
+                method,
                 category,
                 id,
                 subject,
@@ -263,7 +319,9 @@ impl ObservationParser {
                 error_message: self
                     .capture_payloads
                     .then_some(message.error_message)
-                    .flatten(),
+                    .flatten()
+                    .map(|message| mask_text(&message, &masker))
+                    .transpose()?,
                 raw,
             },
             raw_id,

@@ -21,6 +21,8 @@ sendbox-policy = { path = "../sendbox-policy" }
 async-trait.workspace = true
 clap.workspace = true
 hickory-proto.workspace = true
+http.workspace = true
+httparse.workspace = true
 ipnet.workspace = true
 libc.workspace = true
 serde = { workspace = true }

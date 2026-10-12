@@ -35,6 +35,7 @@ use crate::connect_proto::{self, ConnectProtocol, ConnectStatus, ConnectTarget};
 use crate::dialer::Dialer;
 use crate::dns_budget::DnsGuard;
 use crate::domain;
+use crate::http_proxy;
 use crate::origin::OriginReservations;
 use crate::policy::PolicyEngine;
 use crate::resolver::UpstreamResolver;
@@ -59,6 +60,8 @@ pub enum ConnectFrontend {
     Custom,
     /// Standard SOCKS5 (RFC 1928), no-auth, CONNECT only.
     Socks5,
+    /// HTTP/1.x CONNECT and forward proxy requests.
+    Http,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +181,16 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         listener: TcpListener,
         cancel: CancellationToken,
     ) -> io::Result<()> {
+        let frontend = self.config.frontend;
+        self.run_with_frontend(listener, cancel, frontend).await
+    }
+
+    pub(crate) async fn run_with_frontend(
+        self: Arc<Self>,
+        listener: TcpListener,
+        cancel: CancellationToken,
+        frontend: ConnectFrontend,
+    ) -> io::Result<()> {
         loop {
             let (mut client, _peer) = tokio::select! {
                 biased;
@@ -192,7 +205,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                         tokio::select! {
                             biased;
                             () = task_cancel.cancelled() => {}
-                            result = broker.handle_client(client, permit) => {
+                            result = broker.handle_client_with_frontend(client, permit, frontend) => {
                                 let _ = result;
                             }
                         }
@@ -204,10 +217,16 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                     // For SOCKS the client has not negotiated yet, so there is
                     // no well-formed reply to send pre-handshake; closing the
                     // connection is the correct rejection.
-                    if self.config.frontend == ConnectFrontend::Custom {
+                    if frontend == ConnectFrontend::Custom {
                         let _ = timeout(
                             REJECTION_WRITE_TIMEOUT,
                             connect_proto::write_status(&mut client, ConnectStatus::LimitExceeded),
+                        )
+                        .await;
+                    } else if frontend == ConnectFrontend::Http {
+                        let _ = timeout(
+                            REJECTION_WRITE_TIMEOUT,
+                            http_proxy::write_status(&mut client, ConnectStatus::LimitExceeded),
                         )
                         .await;
                     }
@@ -223,10 +242,82 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         client: TcpStream,
         permit: OwnedSemaphorePermit,
     ) -> io::Result<()> {
-        match self.config.frontend {
+        self.handle_client_with_frontend(client, permit, self.config.frontend)
+            .await
+    }
+
+    async fn handle_client_with_frontend(
+        &self,
+        client: TcpStream,
+        permit: OwnedSemaphorePermit,
+        frontend: ConnectFrontend,
+    ) -> io::Result<()> {
+        match frontend {
             ConnectFrontend::Custom => self.handle_custom(client, permit).await,
             ConnectFrontend::Socks5 => self.handle_socks5(client, permit).await,
+            ConnectFrontend::Http => self.handle_http(client, permit).await,
         }
+    }
+
+    async fn handle_http(
+        &self,
+        mut client: TcpStream,
+        _permit: OwnedSemaphorePermit,
+    ) -> io::Result<()> {
+        let request = match timeout(
+            self.config.handshake_timeout,
+            http_proxy::read_request(&mut client),
+        )
+        .await
+        {
+            Ok(Ok(request)) => request,
+            result => {
+                let status = if result.is_err() {
+                    ConnectStatus::Timeout
+                } else {
+                    ConnectStatus::Malformed
+                };
+                self.audit.record(AuditEvent::ConnectError {
+                    detail: if result.is_err() {
+                        "handshake_timeout"
+                    } else {
+                        "http_handshake"
+                    },
+                });
+                http_proxy::write_status(&mut client, status).await?;
+                return Ok(());
+            }
+        };
+        let label = target_label(&request.target);
+        match self
+            .authorize_and_dial(&request.target, request.port, None)
+            .await
+        {
+            Ok(mut dial) => {
+                self.audit.record(AuditEvent::ConnectAllowed {
+                    target: label,
+                    ip: dial.target_ip,
+                    port: request.port,
+                });
+                if let Some(head) = &request.forwarded_head {
+                    tokio::io::AsyncWriteExt::write_all(&mut dial.upstream, head).await?;
+                } else {
+                    http_proxy::write_status(&mut client, ConnectStatus::Ok).await?;
+                }
+                tokio::io::AsyncWriteExt::write_all(&mut dial.upstream, &request.prefetched)
+                    .await?;
+                self.proxy(client, dial.upstream).await;
+            }
+            Err(status) => {
+                self.audit.record(AuditEvent::ConnectDenied {
+                    target: label,
+                    port: request.port,
+                    status: status.as_str(),
+                });
+                http_proxy::write_status(&mut client, status).await?;
+            }
+        }
+        Ok(())
     }
 
     /// The crate's native bounded CONNECT protocol front end.

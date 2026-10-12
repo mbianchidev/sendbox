@@ -152,6 +152,11 @@ configuration returns `2`; analysis failures return `3`; write failures and
 no-overwrite refusals return `4`. Text diagnostics use stderr, while `--json`
 failures use stdout only.
 
+Workload output, runtime failure diagnostics, captured MCP credentials, and
+Safe Outputs human text are credential-masked by default, without a disable
+switch. Authentication traffic is not modified. See
+[credential masking](cli-agents.md#credential-masking) for coverage and limits.
+
 ## GitHub and MCP boundaries
 
 GitHub repository forwarding currently supports `github.com`. Ordinary HTTPS
@@ -232,12 +237,17 @@ false-positive handling, reports, and future ecosystem adapter contracts.
 
 ## Configuration reference
 
+See [CLI agents](cli-agents.md) for agent-specific initialization, HTTP/SOCKS
+proxy environment, native MCP definitions, multi-repository scope, and bounded
+guest syscall tracing.
+
 | Section | Key | Description |
 |---|---|---|
 | `name` | string | Human-readable sandbox name |
-| `project_path` | string | Host project directory mounted into the guest |
+| `project_path` | string | Selected host project and initial guest cwd |
+| `workspace_path` | optional string | Explicit enclosing multi-repo mount root; otherwise only the project is shared |
 | `runtime.provider` | enum | `auto`, `apple`, `kata`, or `hyperlight` |
-| `runtime.kata.runtime_handler` | string | Kata containerd runtime v2 handler |
+| `runtime.kata.runtime_handler` | string | Supported Kata v2 handler; shared-kernel/unverified handlers are rejected |
 | `runtime.kata.namespace` | string | containerd namespace |
 | `runtime.kata.configuration_path` | string | Absolute Kata config path on the containerd host |
 | `runtime.hyperlight.kernel_path` | string | Hyperlight-compatible Unikraft shell kernel |
@@ -252,6 +262,8 @@ false-positive handling, reports, and future ecosystem adapter contracts.
 | `policy.packages.limits.max_report_bytes` | int | Bounded package report size, up to 98304 bytes |
 | `policy.boundaries.enabled` | bool | Install fail-closed MCP and syscall boundaries |
 | `policy.boundaries.tool_calls` | object | Exact stdio/HTTP MCP servers with independent tool and transport policy |
+| `policy.boundaries.tool_calls.servers.*.authorization` | object | Explicit stdio environment-auth method and per-server secret references |
+| `policy.boundaries.tool_calls.servers.*.http.allowed_auth_methods` | list | Admitted HTTP auth methods: `none`, `bearer` |
 | `policy.boundaries.syscalls.additional_denylist` | list | Extra syscall names blocked by seccomp |
 | `secrets` | list | Secret names injected at runtime |
 | `devcontainer.auto_generate` | bool | Generate a devcontainer spec |
@@ -268,3 +280,4 @@ false-positive handling, reports, and future ecosystem adapter contracts.
 | `github.safe_outputs.write_token_env` | string | Host-only environment variable read after runtime teardown |
 | `github.safe_outputs.allowed_repositories` | list | Exact `owner/repository` write targets |
 | `observability.mcp_inspection.enabled` | bool | Enable authenticated local stdio MCP observation on Apple or Kata |
+| `observability.syscall_tracing` | bool | Require cgroup-subtree guest observation and a verified redacted syscall report |

@@ -13,8 +13,9 @@ use thiserror::Error;
 
 use crate::policy::{PolicyEngine, PolicyError};
 
-pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 3;
+pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_CONNECT_PORT: u16 = 15_080;
+pub const DEFAULT_HTTP_PROXY_PORT: u16 = 15_083;
 pub const DEFAULT_DNS_PORT: u16 = 53;
 pub const DEFAULT_REGISTRY_PROXY_PORT: u16 = 14_873;
 pub const DEFAULT_TRUSTED_REGISTRY_PORT: u16 = 15_081;
@@ -31,6 +32,7 @@ pub struct RuntimePolicyDocument {
     pub table_name: String,
     pub broker_mark: u32,
     pub connect_port: u16,
+    pub http_proxy_port: u16,
     pub dns_port: Option<u16>,
     pub mcp_gateway_port: Option<u16>,
     pub reserved_mcp_origins: Vec<McpHttpOrigin>,
@@ -112,13 +114,14 @@ impl RuntimePolicyDocument {
             table_name,
             broker_mark,
             connect_port,
+            http_proxy_port: DEFAULT_HTTP_PROXY_PORT,
             dns_port,
             mcp_gateway_port: remote_mcp_active.then_some(DEFAULT_MCP_HTTP_GATEWAY_PORT),
             reserved_mcp_origins,
             deny_direct_ip: remote_mcp_active,
             network_policy,
             registry: None,
-            proxy_environment: proxy_environment(connect_port, None),
+            proxy_environment: proxy_environment(connect_port, DEFAULT_HTTP_PROXY_PORT, None),
         })
     }
 
@@ -134,7 +137,8 @@ impl RuntimePolicyDocument {
             trusted_upstream_port,
             upstream_network_policy,
         });
-        self.proxy_environment = proxy_environment(self.connect_port, Some(proxy_port));
+        self.proxy_environment =
+            proxy_environment(self.connect_port, self.http_proxy_port, Some(proxy_port));
         self
     }
 
@@ -192,7 +196,7 @@ impl RuntimePolicyDocument {
             return Err(RuntimePolicyError::InvalidRemoteMcp);
         }
 
-        let mut loopback_ports = vec![self.connect_port];
+        let mut loopback_ports = vec![self.connect_port, self.http_proxy_port];
         loopback_ports.extend(self.dns_port);
         loopback_ports.extend(self.mcp_gateway_port);
         if let Some(registry) = &self.registry {
@@ -209,6 +213,7 @@ impl RuntimePolicyDocument {
         if self.proxy_environment
             != proxy_environment(
                 self.connect_port,
+                self.http_proxy_port,
                 self.registry.as_ref().map(|registry| registry.proxy_port),
             )
         {
@@ -243,14 +248,21 @@ pub fn requires_enforcement(network: &NetworkPolicy) -> bool {
 #[must_use]
 pub fn proxy_environment(
     connect_port: u16,
+    http_proxy_port: u16,
     registry_proxy_port: Option<u16>,
 ) -> BTreeMap<String, String> {
     let proxy = format!("socks5h://127.0.0.1:{connect_port}");
+    let http_proxy = format!("http://127.0.0.1:{http_proxy_port}");
     let mut environment = BTreeMap::from([
         ("ALL_PROXY".to_owned(), proxy.clone()),
         ("NO_PROXY".to_owned(), NO_PROXY_VALUE.to_owned()),
         ("all_proxy".to_owned(), proxy),
         ("no_proxy".to_owned(), NO_PROXY_VALUE.to_owned()),
+        ("HTTP_PROXY".to_owned(), http_proxy.clone()),
+        ("HTTPS_PROXY".to_owned(), http_proxy.clone()),
+        ("http_proxy".to_owned(), http_proxy.clone()),
+        ("https_proxy".to_owned(), http_proxy),
+        ("NODE_USE_ENV_PROXY".to_owned(), "1".to_owned()),
     ]);
     if let Some(port) = registry_proxy_port {
         let registry = format!("http://127.0.0.1:{port}/");
@@ -325,6 +337,39 @@ mod tests {
         assert_eq!(
             policy.proxy_environment["NPM_CONFIG_IGNORE_SCRIPTS"],
             "true"
+        );
+    }
+
+    #[test]
+    fn runtime_proxy_environment_supports_http_and_socks_cli_agents() {
+        let policy =
+            RuntimePolicyDocument::for_session(SessionId::from_bytes([7; 16]), network_policy());
+        assert_eq!(
+            policy
+                .proxy_environment
+                .get("HTTPS_PROXY")
+                .map(String::as_str),
+            Some("http://127.0.0.1:15083"),
+        );
+        for name in ["HTTP_PROXY", "http_proxy", "https_proxy"] {
+            assert_eq!(
+                policy.proxy_environment.get(name),
+                policy.proxy_environment.get("HTTPS_PROXY")
+            );
+        }
+        assert_eq!(
+            policy
+                .proxy_environment
+                .get("ALL_PROXY")
+                .map(String::as_str),
+            Some("socks5h://127.0.0.1:15080"),
+        );
+        assert_eq!(
+            policy
+                .proxy_environment
+                .get("NODE_USE_ENV_PROXY")
+                .map(String::as_str),
+            Some("1"),
         );
     }
 

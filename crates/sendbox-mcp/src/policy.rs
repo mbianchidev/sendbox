@@ -92,6 +92,7 @@ pub fn resolve_stdio_server(
                 McpServerPolicy::Stdio {
                     command: configured,
                     tools,
+                    ..
                 } if configured == command => Some((id, tools)),
                 _ => None,
             });
@@ -423,6 +424,7 @@ mod tests {
                     "github".to_owned(),
                     McpServerPolicy::Stdio {
                         command: vec!["/usr/bin/github-mcp".to_owned(), "stdio".to_owned()],
+                        authorization: None,
                         tools: ServerToolPolicy {
                             default_action: Action::Deny,
                             allowlist: vec!["read_*".to_owned(), "shared".to_owned()],
@@ -434,6 +436,7 @@ mod tests {
                     "filesystem".to_owned(),
                     McpServerPolicy::Stdio {
                         command: vec!["/usr/bin/fs-mcp".to_owned()],
+                        authorization: None,
                         tools: ServerToolPolicy {
                             default_action: Action::Deny,
                             allowlist: vec!["list_*".to_owned()],

@@ -12,6 +12,10 @@ provider with a narrower capability set.
 
 ## Features
 
+- **CLI Agent Compatibility** — OpenCode, Claude Code, Codex, Copilot, Gemini,
+  and custom CLI programs share the same guest controls. Agent profiles admit
+  explicit commands/inference endpoints without requiring unrelated Copilot
+  credentials. See [CLI agents](docs/cli-agents.md).
 - **File Isolation** — Host visibility is limited to explicitly configured
   runtime mounts; state and workspace roots must be disjoint.
 - **Command Filtering** — Deny-first semantic policy applies to the brokered
@@ -32,6 +36,9 @@ provider with a narrower capability set.
   credentials use authenticated encrypted host-to-guest envelopes. SSH keys are
   staged only for a trusted SSH child in an owner-only runtime directory and are
   removed afterward.
+- **Credential Masking** — Chunk-safe output filtering, masked runtime errors,
+  and credential-redacted MCP capture protect diagnostics without changing
+  authentication traffic. See [coverage and limits](docs/cli-agents.md#credential-masking).
 - **Undo & Rollback** — Descriptor-safe, content-addressed SHA-256 snapshots
   support capture, verify, restore, diff, and prune with versioned formats.
 - **Audit Trail** — Lifecycle operations and security decisions are committed to
@@ -84,10 +91,10 @@ signed manifests, inventory, SBOM metadata, deterministic rootfs tarballs, and
 minimal scratch OCI images for Linux x86_64 and arm64. The image contains no
 Python, Node.js, compiler, bpftrace, or development headers.
 
-The production BPF programs are cgroup-scoped observation only. The Apple
-adapter can mount their signed bundle, but activation remains guest-policy
-driven and these programs do not claim exec, syscall, network, or MCP
-enforcement.
+The production BPF programs are cgroup-scoped observation only. Set
+`observability.syscall_tracing: true` to require a signed guest tracer on Apple
+or Kata and retain a bounded, redacted host report. The programs do not enforce
+exec, syscall, network, or MCP policy.
 
 ## Quick Start
 
@@ -148,6 +155,9 @@ Generate `.sendbox.yaml` in the project root, then edit it as needed using the
 ```bash
 sendbox init --project .
 sendbox init --project . --runtime kata
+sendbox init --project /projects/my-repo --agent opencode
+# Explicit multi-repository scope:
+sendbox init --project /projects/team/repo-one --workspace /projects/team --agent codex
 ```
 
 ### Run
@@ -169,7 +179,7 @@ trust it only after verifying the host or standalone guest archive attestation.
 
 ### Interactive terminal sessions
 
-`--interactive` runs terminal agents such as GitHub Copilot CLI, Claude Code,
+`--interactive` runs terminal agents such as OpenCode, GitHub Copilot CLI, Claude Code,
 Codex, and Gemini on a pseudoterminal inside the sandbox:
 
 ```bash
@@ -193,6 +203,7 @@ requirements, flow control, separate stderr, and troubleshooting.
 | YAML and policy options | [Configuration](docs/configuration.md) |
 | Commands and examples | [CLI reference](docs/cli-reference.md) |
 | Terminal agents | [Interactive sessions](docs/interactive-sessions.md) |
+| Agent profiles, multi-repo scope, MCP authentication and tracing | [CLI agents](docs/cli-agents.md) |
 | Runtime setup | [Apple](docs/apple-runtime.md), [Kata](docs/kata-containers.md), and [Hyperlight](docs/hyperlight.md) |
 | Threat model and guarantees | [Security model](docs/security-model.md) |
 | Package controls | [Package supply-chain proxy](docs/package-supply-chain.md) |
@@ -233,9 +244,9 @@ SendBox follows a **deny-by-default** security posture:
 2. **Commands** — Deny rules win over allow rules for the brokered top-level
    argv. Descendants inherit the guest execution boundary rather than being
    recursively reinterpreted as shell text.
-3. **Network** — Persistent workloads can reach only the loopback DNS and SOCKS5
-   brokers. Kernel rules deny direct external agent traffic and unmarked broker
-   traffic.
+3. **Network** — Persistent workloads use loopback DNS, SOCKS5, and HTTP
+   CONNECT/forward brokers with one policy and connection budget. Kernel rules
+   deny direct external agent traffic and unmarked broker traffic.
 4. **Packages** — Configured npm artifacts are quarantined, verified, and
    inspected before release.
 5. **Secrets** — Repository, Copilot, MCP gateway, and package registry

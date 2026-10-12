@@ -179,7 +179,7 @@ fn verified_boundary_plan(
             working_directory: command.working_directory.clone(),
         },
         workspace: MountDeclaration {
-            source: configuration.project_path.clone(),
+            source: configuration.workspace_root().to_path_buf(),
             destination: guest_workspace.to_path_buf(),
             writable: true,
         },
@@ -254,6 +254,43 @@ fn plan(
     .expect("run plan")
 }
 
+#[test]
+fn native_cli_agents_preserve_signed_workspace_scope_and_project_cwd() {
+    let resources = TempResource::new().expect("resources");
+    let mut configuration = configuration(resources.path().join("repo-one"));
+    configuration.workspace_path = Some(resources.path().to_path_buf());
+    for agent in ["opencode", "claude", "codex", "copilot", "custom-agent"] {
+        let session_id = SessionId::from_bytes([14; 16]);
+        let mut request = request_for_configuration(&resources, session_id, &configuration);
+        request.command.program = format!("/usr/local/bin/{agent}");
+        request.command.arguments = vec![
+            "--synthetic-option".to_owned(),
+            "one argument with spaces".to_owned(),
+        ];
+        request.command.working_directory = "/workspace/repo-one".to_owned();
+        request.boundary_plan = verified_boundary_plan(
+            &configuration,
+            session_id,
+            &request.image,
+            &request.guest_workspace,
+            &request.command,
+            &request.environment,
+            &request.mounts,
+        );
+        let plan = RunPlan::compile(
+            &configuration,
+            request,
+            &runtime_capabilities(),
+            plan_time(),
+        )
+        .expect("agent-neutral workspace plan");
+        assert_eq!(plan.workspace().host_path, resources.path());
+        assert_eq!(plan.command().working_directory, "/workspace/repo-one");
+        assert_eq!(plan.command().program, format!("/usr/local/bin/{agent}"));
+        assert_eq!(plan.command().arguments[1], "one argument with spaces");
+    }
+}
+
 fn safe_outputs_plan(
     resources: &TempResource,
     capabilities: &RuntimeCapabilities,
@@ -277,24 +314,6 @@ fn safe_outputs_plan(
         &request.mounts,
     );
     RunPlan::compile(&configuration, request, capabilities, plan_time()).expect("Safe Outputs plan")
-}
-
-fn package_plan(
-    resources: &TempResource,
-    capabilities: &RuntimeCapabilities,
-    session_id: SessionId,
-) -> RunPlan {
-    let mut configuration = configuration(resources.path().to_path_buf());
-    configuration.policy.packages.enabled = true;
-    configuration.policy.packages.registries =
-        vec![sendbox_policy::PackageRegistryPolicy::default()];
-    RunPlan::compile(
-        &configuration,
-        request_for_configuration(resources, session_id, &configuration),
-        capabilities,
-        plan_time(),
-    )
-    .expect("package run plan")
 }
 
 fn interactive_plan(
@@ -681,7 +700,22 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
     let capabilities = runtime_capabilities();
     let runtime = Arc::new(FakeRuntime::new(capabilities.clone()).expect("runtime"));
     let session_id = SessionId::from_bytes([3; 16]);
-    let plan = package_plan(&resources, &capabilities, session_id);
+    let mut configuration = configuration(resources.path().to_path_buf());
+    configuration.policy.packages.enabled = true;
+    configuration.policy.packages.registries =
+        vec![sendbox_policy::PackageRegistryPolicy::default()];
+    configuration
+        .observability
+        .as_mut()
+        .unwrap()
+        .syscall_tracing = true;
+    let plan = RunPlan::compile(
+        &configuration,
+        request_for_configuration(&resources, session_id, &configuration),
+        &capabilities,
+        plan_time(),
+    )
+    .expect("package and tracing run plan");
     let expected_policy_digest = plan.policy_digest();
     let expected_boundary_digest = plan.boundary_plan_digest();
     let (host, guest) = tokio::io::duplex(16 * 1024);
@@ -704,7 +738,7 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             .send(&Message::Event(Event {
                 stream_id: 0,
                 kind: EventKind::Lifecycle,
-                payload: br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true}]}"#
+                payload: br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true},{"id":"bpf","mandatory":true,"healthy":true}]}"#
                     .to_vec(),
             }))
             .await
@@ -799,6 +833,32 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             }))
             .await
             .expect("package report response");
+        let Message::Request(request) = reader.receive().await.expect("syscall report request")
+        else {
+            panic!("expected syscall report request");
+        };
+        assert_eq!(request.request_id, 4);
+        assert_eq!(
+            request.operation,
+            sendbox_protocol::SYSCALL_REPORT_OPERATION
+        );
+        let requested: sendbox_protocol::SyscallReportRequestV1 =
+            serde_json::from_slice(&request.payload).unwrap();
+        assert_eq!(requested.maximum_bytes, 96 * 1024);
+        let report_json = r#"{"synthetic_trace":true}"#;
+        writer
+            .send(&Message::Response(Response {
+                request_id: request.request_id,
+                status: ResponseStatus::Ok,
+                payload: serde_json::to_vec(&sendbox_protocol::SyscallReportResponseV1 {
+                    schema_version: 1,
+                    report_json: report_json.to_owned(),
+                    sha256: format!("sha256:{}", sha256_hex(report_json.as_bytes())),
+                })
+                .unwrap(),
+            }))
+            .await
+            .expect("syscall report response");
         assert!(matches!(
             reader.receive().await.expect("graceful close"),
             Message::GracefulClose(_)
@@ -818,6 +878,10 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
     guest_task.await.expect("guest task");
 
     assert_eq!(report.terminal, GuestTerminal::Exited { code: 0 });
+    assert_eq!(
+        report.syscall_report.expect("syscall report").json,
+        br#"{"synthetic_trace":true}"#
+    );
     assert_eq!(
         report.package_report.expect("package report").json,
         br#"{"schema_version":1,"proxy_enabled":true,"records":[],"allowed":0,"denied":0,"quarantined":0}"#
@@ -1235,6 +1299,7 @@ async fn protocol_connector_authenticates_over_unix_stream() {
                 capabilities: sendbox_protocol::agent_host_capabilities(),
                 required_capabilities: sendbox_protocol::agent_host_required_capabilities(),
                 safe_outputs_required: false,
+                syscall_tracing_required: false,
                 bootstrap_secret: vec![7; 32],
                 policy_digest: [9; 32],
             },

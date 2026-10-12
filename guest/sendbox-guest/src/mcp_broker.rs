@@ -19,13 +19,14 @@ use sendbox_mcp::config::{ApprovedCommand, NATIVE_BROKER_PATH};
 use sendbox_mcp::error::BrokerError;
 use sendbox_mcp::framing::FramingMode;
 use sendbox_mcp::observation::{
-    Direction, ObservationEventV1, ObservationMetadata, ObservationParser, Transport,
+    Direction, ObservationEventV1, ObservationMetadata, ObservationParser, Transport, mask_payload,
 };
 use sendbox_mcp::runtime::{
     NATIVE_AUDIT_SOCKET_PATH, NATIVE_POLICY_PATH, OBSERVATION_ROOT,
     RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
 use sendbox_mcp::safe_outputs::SAFE_OUTPUTS_MCP_PATH;
+use sendbox_secrets::CredentialMasker;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
@@ -63,7 +64,7 @@ pub fn safe_outputs_writer_socket() -> Result<PathBuf, GuestError> {
 
 pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
     let policy = read_policy(Path::new(NATIVE_POLICY_PATH))?;
-    let command = ApprovedCommand::from_argv(arguments)
+    let command = ApprovedCommand::from_broker_argv(arguments)
         .map_err(|error| GuestError::Runtime(format!("invalid MCP server command: {error}")))?;
     let approved = policy
         .approved_commands()
@@ -78,12 +79,36 @@ pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
     })?;
 
     let mut environment = policy.fixed_environment.clone();
-    environment.extend(
-        policy
-            .inherited_environment_keys
-            .iter()
-            .filter_map(|key| std::env::var(key).ok().map(|value| (key.clone(), value))),
-    );
+    let masker = CredentialMasker::default();
+    for key in &policy.inherited_environment_keys {
+        match std::env::var(key) {
+            Ok(value) => masker
+                .register(value.as_bytes())
+                .map_err(|error| GuestError::Runtime(format!("MCP credential masking: {error}")))?,
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(GuestError::Runtime(format!(
+                    "MCP credential '{key}' is not UTF-8"
+                )));
+            }
+        }
+    }
+    let inherited = policy
+        .inherited_environment_for(&command)
+        .map_err(|error| {
+            GuestError::Runtime(format!("MCP authentication admission failed: {error}"))
+        })?;
+    for key in inherited {
+        let value = std::env::var(&key).map_err(|_| {
+            GuestError::Runtime(format!(
+                "MCP authentication secret '{key}' was not delivered"
+            ))
+        })?;
+        masker
+            .register(value.as_bytes())
+            .map_err(|error| GuestError::Runtime(format!("MCP credential masking: {error}")))?;
+        environment.insert(key, value);
+    }
     let launcher = TokioProcessLauncher::new(environment, Some(policy.workspace_root.clone()));
     let compiled = resolved.compile();
     let configuration = BrokerConfiguration {
@@ -108,6 +133,7 @@ pub async fn execute_current(arguments: &[String]) -> Result<i32, GuestError> {
             observation,
             policy.workload_gid,
             command.executable(),
+            masker,
         )?));
     }
 
@@ -497,6 +523,7 @@ struct FileObserver {
     file: Mutex<File>,
     configuration: RuntimeObservationConfiguration,
     command: String,
+    masker: CredentialMasker,
 }
 
 impl FileObserver {
@@ -504,8 +531,9 @@ impl FileObserver {
         configuration: &RuntimeObservationConfiguration,
         workload_gid: u32,
         executable: &str,
+        masker: CredentialMasker,
     ) -> Result<Self, GuestError> {
-        Self::open_with_owner(configuration, 0, workload_gid, executable)
+        Self::open_with_owner(configuration, 0, workload_gid, executable, masker)
     }
 
     fn open_with_owner(
@@ -513,6 +541,7 @@ impl FileObserver {
         expected_uid: u32,
         workload_gid: u32,
         executable: &str,
+        masker: CredentialMasker,
     ) -> Result<Self, GuestError> {
         validate_regular_file(
             &configuration.log_path,
@@ -529,10 +558,14 @@ impl FileObserver {
         let observer = Self {
             file: Mutex::new(file),
             configuration: configuration.clone(),
-            command: executable.to_owned(),
+            command: String::from_utf8(masker.mask(executable.as_bytes()).map_err(|error| {
+                GuestError::Runtime(format!("MCP observation credential masking: {error}"))
+            })?)
+            .map_err(|_| GuestError::Runtime("masked MCP command is not UTF-8".to_owned()))?,
+            masker,
         };
         observer
-            .record(Direction::Spawn, executable.as_bytes().to_vec())
+            .record(Direction::Spawn, observer.command.as_bytes().to_vec())
             .map_err(|error| GuestError::Runtime(format!("recording MCP server spawn: {error}")))?;
         Ok(observer)
     }
@@ -583,6 +616,8 @@ impl BrokerObserver for FileObserver {
             BrokerDirection::ToServer => Direction::ToServer,
             BrokerDirection::FromServer => Direction::FromServer,
         };
+        let raw = mask_payload(&raw, &self.masker)
+            .map_err(|error| BrokerError::Io(std::io::Error::other(error)))?;
         self.record(
             direction,
             truncate_utf8(&raw, self.configuration.max_payload_bytes).into_bytes(),
@@ -683,9 +718,14 @@ mod tests {
         };
         let uid = rustix::process::getuid().as_raw();
         let gid = rustix::process::getgid().as_raw();
-        let observer =
-            FileObserver::open_with_owner(&configuration, uid, gid, "/usr/bin/mcp-server")
-                .expect("observer");
+        let observer = FileObserver::open_with_owner(
+            &configuration,
+            uid,
+            gid,
+            "/usr/bin/mcp-server",
+            CredentialMasker::default(),
+        )
+        .expect("observer");
         observer
             .observe(
                 BrokerDirection::ToServer,
@@ -699,6 +739,60 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].kind, MessageKind::Spawn);
         assert_eq!(calls[1].subject.as_deref(), Some("delete_file"));
+    }
+
+    #[test]
+    fn captured_observation_masks_decoded_credentials_before_truncation_without_changing_frames() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_path = temp.path().join("mcp.log");
+        fs::write(&log_path, b"").expect("log");
+        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o620)).expect("mode");
+        let configuration = RuntimeObservationConfiguration {
+            capture_payloads: true,
+            max_payload_bytes: 4096,
+            log_path: log_path.clone(),
+        };
+        let masker = CredentialMasker::default();
+        masker
+            .register(br#"synthetic"opaque\credential"#)
+            .expect("register");
+        let observer = FileObserver::open_with_owner(
+            &configuration,
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+            "/usr/bin/mcp-server",
+            masker,
+        )
+        .expect("observer");
+        let payload = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"description":"synthetic\"opaque\\credential","password":"synthetic-password","headers":{"Authorization":"Bearer synthetic-token"}}}}"#;
+        let original = payload.to_vec();
+        observer
+            .observe(BrokerDirection::ToServer, payload)
+            .expect("observe");
+        assert_eq!(payload, original.as_slice());
+        let log = fs::read_to_string(log_path).expect("log");
+        assert!(!log.contains("synthetic"));
+        let calls = ObservationParser::new(true).parse_log(&log);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].subject.as_deref(), Some("read"));
+        assert!(calls[1].raw.contains("[REDACTED]"));
+        assert!(serde_json::from_str::<serde_json::Value>(&calls[1].raw).is_ok());
+
+        let mut limited = observer.configuration.clone();
+        limited.max_payload_bytes = 110;
+        let observer = FileObserver::open_with_owner(
+            &limited,
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+            "/usr/bin/mcp-server",
+            observer.masker.clone(),
+        )
+        .expect("limited observer");
+        observer
+            .observe(BrokerDirection::ToServer, payload)
+            .expect("limited observe");
+        let log = fs::read_to_string(&limited.log_path).expect("limited log");
+        assert!(!log.contains("synthetic"));
     }
 
     #[test]

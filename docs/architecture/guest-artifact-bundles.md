@@ -74,8 +74,10 @@ unsafe code. The facade provides:
 
 The production programs observe `sched:sched_process_exec` and
 `raw_syscalls:sys_enter`. Attachment requires a non-zero target cgroup id, and
-both programs discard events outside that cgroup. This prevents a guest-wide or
-host-wide syscall firehose. The programs do not parse policy, network traffic,
+both programs discard events outside that cgroup. Subtree attachment supplies
+a retained cgroup descriptor through `scope_tree`, including nested execution
+leaves without relying on a guessed hierarchy depth. This prevents a guest-wide
+or host-wide syscall firehose. The programs do not parse policy, network traffic,
 daemon protocols, or MCP payloads.
 
 The MCP event ABI is reserved and bounded for a later, explicitly proven
@@ -103,6 +105,7 @@ Runtime requirements:
 Build inputs:
 
 - Rust 1.93.1 and Alpine 3.23;
+- pinned curl 8.22.0, OpenSSL 3.5.9, and zlib 1.3.2-r1 build dependencies;
 - clang/LLVM 21.1.2 and bpftool 6.19.14;
 - libbpf-rs 0.26.2 / libbpf 1.7.0;
 - BTFHub archive commit
@@ -112,6 +115,9 @@ Build inputs:
 - libseccomp 2.6.0 source archive with SHA-256 verification.
 
 Generated `vmlinux.h` and BPF objects are build outputs, not checked-in source.
+Configuration YAML uses the maintained YAML Organization `yaml_serde` 0.10.7
+implementation under the existing `serde_yaml_ng` dependency alias; the retired
+`unsafe-libyaml` dependency is no longer present.
 The C build enables strict warnings and compile-time ABI size assertions, then
 checks for `.BTF`, `.BTF.ext`, and both required tracepoint sections.
 `bpftool gen min_core_btf` resolves the object's CO-RE relocation requirements
@@ -125,12 +131,20 @@ The Apple and Kata runtime adapters:
    expected versions, architecture, and rollback floor;
 2. retain verified executable descriptors from the guest manifest verifier;
 3. probe the target guest kernel before attaching observation;
-4. identify the sandbox cgroup v2 id;
-5. call `EventStream::attach(object_bytes, AttachConfig { target_cgroup_id })`;
+4. identify the owned execution cgroup v2 subtree;
+5. start mandatory `ServiceId::Bpf` when `observability.syscall_tracing` is set,
+   calling `EventStream::attach_cgroup_tree` with the verified BPF bytes;
 6. poll bounded batches, record `LossSnapshot`, and keep the `EventStream` alive
    for the intended observation lifetime;
-7. treat any required observation failure according to explicit runtime policy,
-   without upgrading observation into an enforcement claim.
+7. reject missing requested readiness, collect a bounded argument-free report
+   over the authenticated channel after workload termination, and verify its
+   session, architecture, schema and digest before private host persistence.
+
+The tracer starts after egress and before Exec, and detaches before egress
+teardown. Its guest log is root-only and capped at 16 MiB; the host report keeps
+256 samples, syscall counters, and explicit loss/limit accounting. Workloads
+never receive BPF or performance-monitoring capabilities. See
+[CLI agents and tracing](../cli-agents.md).
 
 Hyperlight uses its separately signed one-shot Unikraft bundle and does not
 consume this persistent guest-service bundle.

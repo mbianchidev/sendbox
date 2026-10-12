@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{BpfError, DiagnosticKind, Event};
 
@@ -26,7 +26,8 @@ impl AttachConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LossSnapshot {
     pub kernel_ring_reserve_failures: u64,
     pub userspace_queue_drops: u64,
@@ -36,6 +37,10 @@ pub struct LossSnapshot {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::VecDeque;
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -54,6 +59,7 @@ mod linux {
     const EVENTS_MAP: &str = "events";
     const LOSSES_MAP: &str = "losses";
     const SCOPE_MAP: &str = "scope";
+    const SCOPE_TREE_MAP: &str = "scope_tree";
     const PROGRAMS: [&str; 2] = ["observe_exec", "observe_sys_enter"];
     const MAX_QUEUED_EVENTS: usize = 4096;
 
@@ -75,10 +81,51 @@ mod linux {
 
     impl EventStream {
         pub fn attach(object_bytes: &[u8], config: AttachConfig) -> Result<Self, BpfError> {
+            Self::attach_with_scope(object_bytes, config, None)
+        }
+
+        pub fn attach_cgroup_tree(object_bytes: &[u8], path: &Path) -> Result<Self, BpfError> {
+            let cgroup = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(path)
+                .map_err(|error| {
+                    BpfError::new(
+                        DiagnosticKind::Unavailable,
+                        "cgroup_open",
+                        error.to_string(),
+                        "select an existing delegated cgroup v2 directory",
+                    )
+                })?;
+            let id = cgroup
+                .metadata()
+                .map_err(|error| {
+                    BpfError::new(
+                        DiagnosticKind::Unavailable,
+                        "cgroup_stat",
+                        error.to_string(),
+                        "verify the delegated cgroup directory remains accessible",
+                    )
+                })?
+                .ino();
+            Self::attach_with_scope(
+                object_bytes,
+                AttachConfig {
+                    target_cgroup_id: id,
+                },
+                Some(&cgroup),
+            )
+        }
+
+        fn attach_with_scope(
+            object_bytes: &[u8],
+            config: AttachConfig,
+            cgroup: Option<&File>,
+        ) -> Result<Self, BpfError> {
             let config = config.validate()?;
             let report = inspect_host()?;
             require_live_ready(&report)?;
-            let mut attached = load_and_attach(object_bytes, config)?;
+            let mut attached = load_and_attach(object_bytes, config, cgroup)?;
             let events = Arc::new(Mutex::new(VecDeque::new()));
             let userspace_queue_drops = Arc::new(AtomicU64::new(0));
             let decode_failures = Arc::new(AtomicU64::new(0));
@@ -195,7 +242,11 @@ mod linux {
         }
     }
 
-    fn load_and_attach(object_bytes: &[u8], config: AttachConfig) -> Result<Attached, BpfError> {
+    fn load_and_attach(
+        object_bytes: &[u8],
+        config: AttachConfig,
+        cgroup: Option<&File>,
+    ) -> Result<Attached, BpfError> {
         let mut builder = ObjectBuilder::default();
         let open = capture_libbpf_logs(|| builder.open_memory(object_bytes))
             .map_err(|error| classify_libbpf("object_open", error, DiagnosticKind::LoadFailure))?;
@@ -212,6 +263,20 @@ mod linux {
                 MapFlags::ANY,
             )
             .map_err(|error| classify_libbpf("scope_update", error, DiagnosticKind::LoadFailure))?;
+        if let Some(cgroup) = cgroup {
+            let tree = object
+                .maps_mut()
+                .find(|map| map.name() == SCOPE_TREE_MAP)
+                .ok_or_else(|| missing_object_member("map", SCOPE_TREE_MAP))?;
+            tree.update(
+                &0_u32.to_ne_bytes(),
+                &cgroup.as_raw_fd().to_ne_bytes(),
+                MapFlags::ANY,
+            )
+            .map_err(|error| {
+                classify_libbpf("scope_tree_update", error, DiagnosticKind::LoadFailure)
+            })?;
+        }
 
         let mut links = Vec::with_capacity(PROGRAMS.len());
         for name in PROGRAMS {
@@ -415,6 +480,18 @@ pub struct EventStream;
 
 #[cfg(not(target_os = "linux"))]
 impl EventStream {
+    pub fn attach_cgroup_tree(
+        _object_bytes: &[u8],
+        _path: &std::path::Path,
+    ) -> Result<Self, BpfError> {
+        Err(BpfError::new(
+            DiagnosticKind::UnsupportedHost,
+            "attach",
+            format!("BPF loading is unsupported on {}", std::env::consts::OS),
+            "load cgroup-scoped observation programs in a Linux guest",
+        ))
+    }
+
     pub fn attach(_object_bytes: &[u8], config: AttachConfig) -> Result<Self, BpfError> {
         config.validate()?;
         Err(BpfError::new(

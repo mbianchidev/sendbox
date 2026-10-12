@@ -122,6 +122,41 @@ pub async fn run<P: PlatformControls>(
             .map(|policy| (policy, broker.workload_uid, broker.workload_gid))
     });
     let egress_configured = bootstrap.egress_policy.is_some();
+    let tracing_requested = bootstrap
+        .execution_broker
+        .as_ref()
+        .is_some_and(|broker| broker.syscall_tracing);
+    if let Some(broker) = bootstrap
+        .execution_broker
+        .as_ref()
+        .filter(|broker| broker.syscall_tracing)
+    {
+        let service = crate::trace::prepare(
+            runtime.session_dir(),
+            bootstrap.session_id,
+            &broker.cgroup_parent,
+            &verified_manifest,
+            egress_configured,
+        )?;
+        if bootstrap
+            .services
+            .iter()
+            .any(|existing| existing.id == ServiceId::Bpf)
+        {
+            return Err(GuestError::Runtime(
+                "syscall tracing service was configured more than once".to_owned(),
+            ));
+        }
+        bootstrap.services.push(service);
+        if !bootstrap.required_services.contains(&ServiceId::Bpf) {
+            bootstrap.required_services.push(ServiceId::Bpf);
+        }
+    }
+    let fixed_environment = bootstrap
+        .egress_policy
+        .as_ref()
+        .map(|policy| policy.proxy_environment.clone())
+        .unwrap_or_default();
     let registry_proxy = bootstrap.registry_proxy.take();
     let package_report = registry_proxy
         .as_ref()
@@ -175,10 +210,18 @@ pub async fn run<P: PlatformControls>(
         .execution_broker
         .take()
         .map(|configuration| {
-            broker::prepare(bootstrap.session_id, runtime.session_dir(), configuration)
+            broker::prepare(
+                bootstrap.session_id,
+                runtime.session_dir(),
+                configuration,
+                fixed_environment,
+            )
         })
         .transpose()?;
     if let Some((_, service)) = &mut broker_client {
+        if tracing_requested && !service.dependencies.contains(&ServiceId::Bpf) {
+            service.dependencies.push(ServiceId::Bpf);
+        }
         if egress_configured && !service.dependencies.contains(&ServiceId::Egress) {
             service.dependencies.push(ServiceId::Egress);
         }
@@ -353,6 +396,7 @@ pub async fn run<P: PlatformControls>(
                         secret_decryptor,
                     )
                     .with_package_report(package_report)
+                    .with_syscall_tracing(tracing_requested)
                     .with_safe_outputs(safe_outputs.clone()),
                 ) => protocol,
                 failure = services.wait_for_mandatory_failure() => Err(failure),

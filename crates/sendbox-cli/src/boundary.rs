@@ -99,7 +99,18 @@ fn inspect(arguments: InspectArgs) -> ExitCode {
             if let Some(gateway) = &server.local_gateway_url {
                 println!("  local gateway: {gateway}");
             }
+            if let Some(authorization) = &server.stdio_authorization {
+                println!(
+                    "  stdio authentication: environment; secret references: {:?}",
+                    authorization.secret_names()
+                );
+            }
             if let Some(http) = &server.http {
+                println!(
+                    "  authentication: {:?}; allowed methods: {:?}",
+                    http.authentication_method(),
+                    http.allowed_auth_methods,
+                );
                 println!(
                     "  HTTP limits: request={} response={} concurrent={} redirects={}",
                     http.max_request_bytes,

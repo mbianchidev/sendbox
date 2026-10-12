@@ -64,6 +64,7 @@ pub struct KataProviderConfiguration {
     pub command_policy: CommandPolicy,
     pub git_guard_policy: Option<GuardPolicyDocument>,
     pub mcp_policy: Option<RuntimePolicyDocument>,
+    pub syscall_tracing: bool,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
     pub gateway_credentials: Vec<GatewayCredential>,
     pub registry_proxy: Option<RegistryProxyConfiguration>,
@@ -99,6 +100,11 @@ impl std::fmt::Debug for KataRuntimeProvider {
 
 impl KataRuntimeProvider {
     pub fn new(configuration: KataProviderConfiguration) -> Result<Self, RuntimeError> {
+        if !sendbox_config::is_kata_runtime_handler(&configuration.runtime_handler) {
+            return Err(RuntimeError::Provider(
+                "Kata requires a supported io.containerd.kata runtime v2 handler; shared-kernel and unverified runtime handlers are rejected".to_owned(),
+            ));
+        }
         let executable = resolve_nerdctl(&configuration.executable)?;
         let resolver = SearchPathResolver::new([executable
             .parent()
@@ -289,6 +295,14 @@ impl KataRuntimeProvider {
         push_pair(&mut arguments, "--security-opt", "seccomp=unconfined");
         for capability in ["SYS_ADMIN", "SETUID", "SETGID", "SETPCAP", "KILL"] {
             push_pair(&mut arguments, "--cap-add", capability);
+        }
+        if self.configuration.egress_policy.is_some() {
+            push_pair(&mut arguments, "--cap-add", "NET_ADMIN");
+        }
+        if self.configuration.syscall_tracing {
+            for capability in ["BPF", "PERFMON", "SYS_RESOURCE"] {
+                push_pair(&mut arguments, "--cap-add", capability);
+            }
         }
         if !request.environment.is_empty() {
             push_pair(
@@ -1023,6 +1037,7 @@ fn bootstrap_payload(
                 command_policy: configuration.command_policy.clone(),
                 git_guard_policy: configuration.git_guard_policy.clone(),
                 mcp_policy: configuration.mcp_policy.clone(),
+                syscall_tracing: configuration.syscall_tracing,
             }),
             egress_policy: configuration.egress_policy.clone(),
             gateway_credentials: configuration.gateway_credentials.clone(),
@@ -1388,6 +1403,7 @@ mod tests {
             },
             git_guard_policy: None,
             mcp_policy: None,
+            syscall_tracing: false,
             egress_policy: None,
             gateway_credentials: Vec::new(),
             registry_proxy: None,
@@ -1424,6 +1440,17 @@ mod tests {
                 value: "exact value".to_owned(),
             }],
         }
+    }
+
+    #[test]
+    fn kata_provider_cannot_select_a_shared_kernel_runtime_handler() {
+        let executable = std::env::current_exe().unwrap();
+        let mut config = configuration(&executable, Path::new("/bundle"), Path::new("/trust.key"));
+        assert!(KataRuntimeProvider::new(config.clone()).is_ok());
+        config.runtime_handler = "io.containerd.kata-qemu.v2".to_owned();
+        assert!(KataRuntimeProvider::new(config.clone()).is_ok());
+        config.runtime_handler = "io.containerd.runc.v2".to_owned();
+        assert!(KataRuntimeProvider::new(config).is_err());
     }
 
     #[derive(serde::Deserialize)]

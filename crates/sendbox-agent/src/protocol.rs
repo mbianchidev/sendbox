@@ -6,9 +6,9 @@ use sendbox_protocol::{
     InteractiveLaunchRequestV2, LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION,
     PACKAGE_REPORT_OPERATION, PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1,
     PackageReportResponseV1, Request, ResponseStatus, SAFE_OUTPUTS_COLLECT_OPERATION,
-    SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION, SafeOutputsCollectRequestV1, SafeOutputsCollectionV1,
-    SecretEnvelopeV2, TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1, TerminalStateV1,
-    VersionRange,
+    SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION, SYSCALL_REPORT_OPERATION, SafeOutputsCollectRequestV1,
+    SafeOutputsCollectionV1, SecretEnvelopeV2, TerminalInputCreditV1, TerminalResultV2,
+    TerminalSizeV1, TerminalStateV1, VersionRange,
 };
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
 use sendbox_secrets::{
@@ -29,6 +29,7 @@ use crate::{
 const LAUNCH_REQUEST_ID: u64 = 1;
 const PACKAGE_REPORT_REQUEST_ID: u64 = 2;
 const SAFE_OUTPUTS_REQUEST_ID: u64 = 3;
+const SYSCALL_REPORT_REQUEST_ID: u64 = 4;
 const PROTOCOL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
@@ -52,6 +53,7 @@ impl GuestConnector for ProtocolGuestConnector {
                     AgentError::Guest(format!("derive secret envelope key: {error}"))
                 })?;
             let safe_outputs_required = configuration.safe_outputs_required;
+            let syscall_tracing_required = configuration.syscall_tracing_required;
             let handshake = HandshakeConfig::new(
                 configuration.session_id,
                 VersionRange::default(),
@@ -77,7 +79,11 @@ impl GuestConnector for ProtocolGuestConnector {
                     "guest readiness used an unexpected event kind".to_owned(),
                 ));
             }
-            validate_operational_readiness(&readiness.payload, safe_outputs_required)?;
+            validate_operational_readiness(
+                &readiness.payload,
+                safe_outputs_required,
+                syscall_tracing_required,
+            )?;
             Ok(Box::new(ProtocolGuestSession {
                 negotiated,
                 reader: Some(reader),
@@ -201,6 +207,7 @@ impl GuestSession for ProtocolGuestSession {
                 input: TerminalInputState::default(),
                 boundary_plan_digest: self.boundary_plan_digest,
                 report_fetched: false,
+                syscall_report_fetched: false,
             }) as Box<dyn GuestExecution>)
         })
     }
@@ -306,6 +313,7 @@ pub struct ProtocolGuestExecution {
     input: TerminalInputState,
     boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     report_fetched: bool,
+    syscall_report_fetched: bool,
 }
 
 #[derive(Debug, Default)]
@@ -719,80 +727,110 @@ impl GuestExecution for ProtocolGuestExecution {
         cancellation: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<GuestPackageReport, AgentError>> {
         Box::pin(async move {
-            if !self.terminal {
-                return Err(AgentError::Guest(
-                    "package report requested before terminal response".to_owned(),
-                ));
-            }
             if self.report_fetched {
                 return Err(AgentError::Guest(
                     "package report was already requested".to_owned(),
                 ));
             }
-            let maximum_bytes = u32::try_from(maximum_bytes).map_err(|_| {
-                AgentError::Guest("package report byte limit is out of range".to_owned())
-            })?;
-            let request = PackageReportRequestV1 {
-                schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
-                maximum_bytes,
-            };
-            request
-                .validate()
-                .map_err(|error| AgentError::Guest(error.to_owned()))?;
-            let payload = serde_json::to_vec(&request).map_err(|error| {
-                AgentError::Guest(format!("encode package report request: {error}"))
-            })?;
-            guest_io(
-                "send package report request",
-                cancellation,
-                self.writer.send_control(Message::Request(Request {
-                    request_id: PACKAGE_REPORT_REQUEST_ID,
-                    operation: PACKAGE_REPORT_OPERATION.to_owned(),
-                    payload,
-                })),
-            )
-            .await?;
             self.report_fetched = true;
-            let message = protocol_io(
-                "receive package report response",
+            self.fetch_json_report(
+                PACKAGE_REPORT_REQUEST_ID,
+                PACKAGE_REPORT_OPERATION,
+                maximum_bytes,
                 cancellation,
-                self.reader.receive(),
             )
-            .await?;
-            let Message::Response(response) = message else {
+            .await
+        })
+    }
+
+    fn fetch_syscall_report<'a>(
+        &'a mut self,
+        maximum_bytes: usize,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<crate::GuestSyscallReport, AgentError>> {
+        Box::pin(async move {
+            if self.syscall_report_fetched {
                 return Err(AgentError::Guest(
-                    "guest returned an unexpected package report message".to_owned(),
-                ));
-            };
-            if response.request_id != PACKAGE_REPORT_REQUEST_ID {
-                return Err(AgentError::Guest(
-                    "guest returned a package report with the wrong request ID".to_owned(),
-                ));
-            }
-            if response.status != ResponseStatus::Ok {
-                return Err(AgentError::Guest(format!(
-                    "guest rejected package report retrieval with status {:?}",
-                    response.status
-                )));
-            }
-            let response: PackageReportResponseV1 = serde_json::from_slice(&response.payload)
-                .map_err(|error| {
-                    AgentError::Guest(format!("decode package report response: {error}"))
-                })?;
-            response
-                .validate(maximum_bytes as usize)
-                .map_err(|error| AgentError::Guest(error.to_owned()))?;
-            let json = response.report_json.into_bytes();
-            let actual_digest = format!("sha256:{}", sendbox_boundary::sha256_hex(&json));
-            if response.sha256 != actual_digest {
-                return Err(AgentError::Guest(
-                    "package report SHA-256 digest mismatch".to_owned(),
+                    "syscall report was already requested".to_owned(),
                 ));
             }
-            Ok(GuestPackageReport {
-                json,
-                sha256: actual_digest,
-            })
+            self.syscall_report_fetched = true;
+            self.fetch_json_report(
+                SYSCALL_REPORT_REQUEST_ID,
+                SYSCALL_REPORT_OPERATION,
+                maximum_bytes,
+                cancellation,
+            )
+            .await
+        })
+    }
+}
+
+impl ProtocolGuestExecution {
+    async fn fetch_json_report(
+        &mut self,
+        request_id: u64,
+        operation: &str,
+        maximum_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<GuestPackageReport, AgentError> {
+        if !self.terminal {
+            return Err(AgentError::Guest(format!(
+                "{operation} requested before terminal response"
+            )));
+        }
+        let request = PackageReportRequestV1 {
+            schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+            maximum_bytes: u32::try_from(maximum_bytes).map_err(|_| {
+                AgentError::Guest("JSON report byte limit is out of range".to_owned())
+            })?,
+        };
+        request
+            .validate()
+            .map_err(|error| AgentError::Guest(error.to_owned()))?;
+        let payload = serde_json::to_vec(&request)
+            .map_err(|error| AgentError::Guest(format!("encode {operation} request: {error}")))?;
+        guest_io(
+            "send JSON report request",
+            cancellation,
+            self.writer.send_control(Message::Request(Request {
+                request_id,
+                operation: operation.to_owned(),
+                payload,
+            })),
+        )
+        .await?;
+        let message = protocol_io(
+            "receive JSON report response",
+            cancellation,
+            self.reader.receive(),
+        )
+        .await?;
+        let Message::Response(response) = message else {
+            return Err(AgentError::Guest(format!(
+                "guest returned an unexpected {operation} message"
+            )));
+        };
+        if response.request_id != request_id || response.status != ResponseStatus::Ok {
+            return Err(AgentError::Guest(format!(
+                "guest rejected or mismatched {operation} response"
+            )));
+        }
+        let response: PackageReportResponseV1 = serde_json::from_slice(&response.payload)
+            .map_err(|error| AgentError::Guest(format!("decode {operation} response: {error}")))?;
+        response
+            .validate(maximum_bytes)
+            .map_err(|error| AgentError::Guest(error.to_owned()))?;
+        let json = response.report_json.into_bytes();
+        let actual_digest = format!("sha256:{}", sendbox_boundary::sha256_hex(&json));
+        if response.sha256 != actual_digest {
+            return Err(AgentError::Guest(format!(
+                "{operation} SHA-256 digest mismatch"
+            )));
+        }
+        Ok(GuestPackageReport {
+            json,
+            sha256: actual_digest,
         })
     }
 }
@@ -800,6 +838,7 @@ impl GuestExecution for ProtocolGuestExecution {
 fn validate_operational_readiness(
     payload: &[u8],
     safe_outputs_required: bool,
+    syscall_tracing_required: bool,
 ) -> Result<(), AgentError> {
     let readiness: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|error| AgentError::Guest(format!("decode guest readiness: {error}")))?;
@@ -829,6 +868,11 @@ fn validate_operational_readiness(
     if safe_outputs_required && !service_live("safe_outputs") {
         return Err(AgentError::Guest(
             "guest readiness did not prove a live mandatory Safe Outputs recorder".to_owned(),
+        ));
+    }
+    if syscall_tracing_required && !service_live("bpf") {
+        return Err(AgentError::Guest(
+            "guest readiness did not prove a live mandatory syscall tracing service".to_owned(),
         ));
     }
     Ok(())
@@ -991,9 +1035,18 @@ mod tests {
     fn required_safe_outputs_service_must_be_present_and_healthy() {
         let exec_only =
             br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true}]}"#;
-        validate_operational_readiness(exec_only, false).expect("ordinary readiness");
-        assert!(validate_operational_readiness(exec_only, true).is_err());
+        validate_operational_readiness(exec_only, false, false).expect("ordinary readiness");
+        assert!(validate_operational_readiness(exec_only, true, false).is_err());
         let complete = br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true},{"id":"safe_outputs","mandatory":true,"healthy":true}]}"#;
-        validate_operational_readiness(complete, true).expect("Safe Outputs readiness");
+        validate_operational_readiness(complete, true, false).expect("Safe Outputs readiness");
+    }
+
+    #[test]
+    fn requested_tracing_must_be_present_in_authenticated_readiness() {
+        let exec_only =
+            br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true}]}"#;
+        assert!(validate_operational_readiness(exec_only, false, true).is_err());
+        let traced = br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true},{"id":"bpf","mandatory":true,"healthy":true}]}"#;
+        validate_operational_readiness(traced, false, true).expect("traced readiness");
     }
 }

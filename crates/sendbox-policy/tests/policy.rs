@@ -25,6 +25,63 @@ fn loads_and_validates_shipped_default_policy() {
 }
 
 #[test]
+fn mcp_authentication_requires_an_explicitly_admitted_method() {
+    for (methods, authorization, valid) in [
+        ("[none]", "", true),
+        (
+            "[bearer]",
+            "authorization: {bearer_secret: MCP_TOKEN}\n",
+            true,
+        ),
+        (
+            "[none]",
+            "authorization: {bearer_secret: MCP_TOKEN}\n",
+            false,
+        ),
+        ("[bearer]", "", false),
+        ("[]", "", false),
+        ("[none, none]", "", false),
+    ] {
+        let mut policy = sendbox_config_fixture();
+        let server = format!(
+            "transport: streamable_http\nurl: https://mcp.example.com/mcp\nhttp:\n  allowed_auth_methods: {methods}\n{}",
+            authorization
+                .lines()
+                .map(|line| format!("  {line}\n"))
+                .collect::<String>(),
+        );
+        policy.boundaries.tool_calls.servers.insert(
+            "docs".to_owned(),
+            serde_yaml_ng::from_str(&server).expect("authentication policy"),
+        );
+        assert_eq!(policy.validate().is_ok(), valid, "{server}");
+    }
+}
+
+#[test]
+fn stdio_authentication_explicitly_selects_environment_secret_references() {
+    let server: sendbox_policy::McpServerPolicy = serde_yaml_ng::from_str(
+        "transport: stdio\ncommand: ['/usr/bin/mcp-server']\nauthorization:\n  method: environment\n  secrets: [MCP_TOKEN]\n",
+    ).expect("stdio authentication policy");
+    let mut policy = sendbox_config_fixture();
+    policy
+        .boundaries
+        .tool_calls
+        .servers
+        .insert("docs".to_owned(), server);
+    policy.validate().expect("valid environment authentication");
+    let unsupported = "transport: stdio\ncommand: ['/usr/bin/mcp-server']\nauthorization:\n  method: oauth\n  secrets: [MCP_TOKEN]\n";
+    assert!(serde_yaml_ng::from_str::<sendbox_policy::McpServerPolicy>(unsupported).is_err());
+}
+
+fn sendbox_config_fixture() -> PolicyConfiguration {
+    serde_yaml_ng::from_str(
+        &fs::read_to_string(workspace_path("config/default-policy.yaml")).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
 fn shipped_default_policy_uses_default_egress_extensions() {
     // The shipped default policy predates the egress extensions and carries
     // no `allowed_networks`/`blocked_networks`/`allowed_ports`/`dns` keys, so

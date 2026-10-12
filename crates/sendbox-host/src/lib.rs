@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod masking;
 mod safe_outputs;
 mod security;
 
@@ -49,7 +50,7 @@ use sendbox_git::{
     RepositoryIdentity, SSH_KEY_ENVIRONMENT, SystemGitProcessRunner, TrustedGitBinary,
     discover_repository_identity,
 };
-use sendbox_mcp::config::{NATIVE_BROKER_PATH, PROJECT_CONFIG_PATHS};
+use sendbox_mcp::config::{NATIVE_BROKER_PATH, has_project_configuration};
 use sendbox_mcp::runtime::{
     RUNTIME_POLICY_SCHEMA_VERSION, RuntimeObservationConfiguration, RuntimePolicyDocument,
 };
@@ -94,6 +95,7 @@ const MCP_PROXY_ENVIRONMENT: &str = "SENDBOX_MCP_PROXY";
 const MAX_EXECUTION_ENVIRONMENT_ENTRY_BYTES: usize = 4 * 1024;
 const MAX_EXECUTION_ENVIRONMENT_BYTES: usize = 16 * 1024;
 pub const PACKAGE_SECURITY_REPORT_FILE: &str = "package-security-report.json";
+pub const SYSCALL_TRACE_REPORT_FILE: &str = "syscall-trace-report.json";
 #[cfg(target_os = "linux")]
 const SECRET_SERVICE: &str = "sendbox";
 
@@ -132,6 +134,7 @@ pub struct PersistentHostRunReport {
     session_id: SessionId,
     agent: AgentReport,
     package_report: Option<PersistedPackageReport>,
+    syscall_report: Option<PersistedSyscallReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -143,6 +146,29 @@ pub struct PersistedPackageReport {
     allowed: u32,
     denied: u32,
     quarantined: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersistedSyscallReport {
+    path: PathBuf,
+    sha256: String,
+    observed_events: u64,
+    sampled_events: usize,
+    sampled_out: u64,
+    log_limit_reached: bool,
+    losses: sendbox_bpf::LossSnapshot,
+}
+
+impl PersistedSyscallReport {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn incomplete_capture(&self) -> bool {
+        self.log_limit_reached || self.losses != sendbox_bpf::LossSnapshot::default()
+    }
 }
 
 impl PersistedPackageReport {
@@ -230,10 +256,26 @@ impl HostRunReport {
             Self::OneShot(_) => None,
         }
     }
+
+    #[must_use]
+    pub fn syscall_report(&self) -> Option<&PersistedSyscallReport> {
+        match self {
+            Self::Persistent(report) => report.syscall_report.as_ref(),
+            Self::OneShot(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum HostError {
+    #[error("{message}")]
+    CredentialMasked {
+        message: String,
+        kind: &'static str,
+        cancelled: bool,
+    },
+    #[error("credential masking: {0}")]
+    CredentialMasking(#[from] sendbox_secrets::CredentialMaskingError),
     #[error("{0}")]
     Invalid(String),
     #[error("boundary plan: {0}")]
@@ -248,6 +290,13 @@ pub enum HostError {
     RuntimeSecurity {
         runtime: Box<HostError>,
         security: SessionSecurityError,
+    },
+    #[error("output delivery: {0}")]
+    Output(#[source] sendbox_agent::AgentError),
+    #[error("{runtime}; masked output finalization also failed: {output}")]
+    OutputFinalization {
+        runtime: Box<HostError>,
+        output: sendbox_agent::AgentError,
     },
     #[error("agent plan: {0}")]
     AgentPlan(#[from] sendbox_agent::AgentError),
@@ -270,6 +319,23 @@ pub enum HostError {
     },
     #[error("bundle verification: {0}")]
     Bundle(String),
+}
+
+impl HostError {
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        match self {
+            Self::AgentRun(failure) => {
+                matches!(failure.primary, sendbox_agent::AgentError::Cancelled)
+            }
+            Self::Runtime(RuntimeError::Cancelled) => true,
+            Self::RuntimeSecurity { runtime, .. } | Self::OutputFinalization { runtime, .. } => {
+                runtime.is_cancelled()
+            }
+            Self::CredentialMasked { cancelled, .. } => *cancelled,
+            _ => false,
+        }
+    }
 }
 
 pub struct PreparedHostRun {
@@ -356,20 +422,39 @@ impl PreparedHostRun {
             signed_plan_path: _,
             terminal_source,
         } = self;
+        let masker = secrets.masker.clone();
+        let masked_output = Arc::new(masking::MaskingOutputSink::new(masker.clone(), output));
         let runtime_inputs = RuntimeInputs {
             execution,
             secrets,
             safe_outputs,
-            output,
+            output: masked_output.clone(),
             signals,
             terminal_source,
         };
-        security::execute(
-            security,
-            move |audit| execute_runtime(runtime_inputs, audit, cancellation),
+        let runtime_masker = masker.clone();
+        let result = security::execute(
+            security.with_credential_masker(masker.clone()),
+            move |audit| async move {
+                let result = execute_runtime(runtime_inputs, audit, cancellation).await;
+                let result =
+                    result.and_then(|report| masking::mask_report(&runtime_masker, report));
+                let flush = masked_output.finish(&CancellationToken::new()).await;
+                let result = match (result, flush) {
+                    (Ok(report), Ok(())) => Ok(report),
+                    (Err(error), Ok(())) => Err(error),
+                    (Ok(_), Err(error)) => Err(HostError::Output(error)),
+                    (Err(error), Err(output)) => Err(HostError::OutputFinalization {
+                        runtime: Box::new(error),
+                        output,
+                    }),
+                };
+                result.map_err(|error| masking::mask_error(&runtime_masker, error))
+            },
             cancellation,
         )
-        .await
+        .await;
+        result.map_err(|error| masking::mask_error(&masker, error))
     }
 }
 
@@ -393,8 +478,14 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let selection = select_runtime(runtime_request, host)?;
     let selected_runtime = selection.selected;
     validate_runtime_features(selected_runtime, &request.configuration)?;
-    let workspace_source =
-        canonical_file_or_directory(&request.configuration.project_path, "project root")?;
+    let workspace = resolve_workspace(&request.configuration)?;
+    let project_source = workspace.host_project;
+    let workspace_source = workspace.host_root;
+    let project_destination = workspace.guest_project;
+    request.configuration.project_path = project_source.clone();
+    if let Some(root) = &mut request.configuration.workspace_path {
+        root.clone_from(&workspace_source);
+    }
     let bundle_root = canonical_file_or_directory(&request.bundle_root, "bundle root")?;
     let trust_root = canonical_file_or_directory(&request.trust_root, "bundle trust root")?;
     let bundle = verify_bundle(&VerifyOptions {
@@ -410,7 +501,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let manifest_sha256 = hash_file(&bundle_root.join("manifest.json"))?;
     let bundle_id = format!("{}:{}", request.trust_root_id, bundle.release_sequence);
     let selected_repository =
-        discover_selected_repository(&request.configuration, &workspace_source)?;
+        discover_selected_repository(&request.configuration, &project_source)?;
     let credentials =
         prepare_effective_credentials(&request.configuration, selected_repository.as_ref()).await?;
     credentials.apply_to(&mut request.configuration);
@@ -421,9 +512,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     validate_reserved_secret_names(&request.configuration, Some(&credentials))?;
     let workspace_destination = PathBuf::from("/workspace");
     let workload_identity = match selected_runtime {
-        ResolvedRuntime::Apple | ResolvedRuntime::Kata => {
-            Some(project_identity(&workspace_source)?)
-        }
+        ResolvedRuntime::Apple | ResolvedRuntime::Kata => Some(project_identity(&project_source)?),
         ResolvedRuntime::Hyperlight => None,
     };
     let session_id = random_session_id()?;
@@ -441,8 +530,8 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         selected_runtime,
         &request.configuration,
         selected_repository.as_ref(),
-        &workspace_source,
-        &workspace_destination,
+        &project_source,
+        &project_destination,
         &credentials,
     )?;
     let mcp_policy = make_mcp_policy(
@@ -510,6 +599,16 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         random_bootstrap_secret()?,
         credentials.into_values(),
     )?);
+    for credential in &gateway_credentials {
+        secrets.masker.register(credential.expose_secret())?;
+    }
+    if let Some(registry) = &registry_proxy {
+        for credential in &registry.bootstrap.credentials {
+            secrets
+                .masker
+                .register(credential.expose_to_registry_proxy())?;
+        }
+    }
 
     let runtime = build_runtime(
         selected_runtime,
@@ -569,7 +668,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         command: CommandDeclaration {
             program: command.0.clone(),
             arguments: command.1.clone(),
-            working_directory: workspace_destination.display().to_string(),
+            working_directory: project_destination.display().to_string(),
         },
         mounts: registry_mounts.clone(),
         environment: environment
@@ -621,7 +720,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                 command: GuestCommand {
                     program: command.0,
                     arguments: command.1,
-                    working_directory: "/workspace".to_owned(),
+                    working_directory: project_destination.display().to_string(),
                 },
                 environment,
                 mounts: registry_mounts
@@ -670,13 +769,13 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                     writable: true,
                 }],
                 environment: Vec::new(),
-                working_directory: PathBuf::from("/workspace"),
+                working_directory: project_destination.clone(),
                 dns_servers: Vec::new(),
                 labels: Vec::new(),
             };
             let command = CommandSpec {
                 arguments: command.1.into_iter().map(CommandArgument::plain).collect(),
-                current_directory: Some(PathBuf::from("/workspace")),
+                current_directory: Some(project_destination),
                 environment: Vec::new(),
                 clear_environment: true,
                 ..CommandSpec::new(Program::Absolute(PathBuf::from(command.0)))
@@ -701,7 +800,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                 boundary_plan_digest: security_plan.digest(),
                 seal_key: secrets.safe_outputs_seal_key(session_id)?,
                 state_directory: state_directory.clone(),
-                workspace: workspace_source.clone(),
+                workspace: project_source,
             })
         })
         .transpose()?;
@@ -786,6 +885,7 @@ async fn execute_runtime(
                 session_id,
                 agent,
                 package_report: None,
+                syscall_report: None,
             }))
         }
         HostExecution::Hyperlight(execution) => {
@@ -863,6 +963,7 @@ fn build_runtime(
             configuration.command_policy = request.configuration.policy.commands.clone();
             configuration.git_guard_policy = git_guard_policy.cloned();
             configuration.mcp_policy = mcp_policy.cloned();
+            configuration.syscall_tracing = request.configuration.syscall_tracing_enabled();
             configuration.egress_policy = egress_policy.cloned();
             configuration.gateway_credentials = gateway_credentials.to_vec();
             configuration.registry_proxy =
@@ -930,6 +1031,7 @@ fn build_runtime(
                 command_policy: request.configuration.policy.commands.clone(),
                 git_guard_policy: git_guard_policy.cloned(),
                 mcp_policy: mcp_policy.cloned(),
+                syscall_tracing: request.configuration.syscall_tracing_enabled(),
                 egress_policy: egress_policy.cloned(),
                 gateway_credentials: gateway_credentials.to_vec(),
                 registry_proxy: registry_proxy.map(|prepared| prepared.bootstrap.clone()),
@@ -1154,6 +1256,7 @@ struct HostSecretResolver {
     bootstrap: Zeroizing<[u8; 32]>,
     ephemeral: BTreeMap<String, SecretValue>,
     native: Arc<dyn SecretStore>,
+    masker: sendbox_secrets::CredentialMasker,
 }
 
 impl HostSecretResolver {
@@ -1162,11 +1265,16 @@ impl HostSecretResolver {
         bootstrap: [u8; 32],
         ephemeral: BTreeMap<String, SecretValue>,
     ) -> Result<Self, HostError> {
+        let masker = sendbox_secrets::CredentialMasker::default();
+        for value in ephemeral.values() {
+            masker.register(value.expose_secret())?;
+        }
         Ok(Self {
             bootstrap_reference,
             bootstrap: Zeroizing::new(bootstrap),
             ephemeral,
             native: native_secret_store()?,
+            masker,
         })
     }
 
@@ -1215,6 +1323,12 @@ impl SecretResolver for HostSecretResolver {
                         reference: reference.as_str().to_owned(),
                         message: error.to_string(),
                     })?;
+            self.masker
+                .register(secret.value.expose_secret())
+                .map_err(|error| sendbox_agent::AgentError::Secret {
+                    reference: reference.as_str().to_owned(),
+                    message: error.to_string(),
+                })?;
             Ok(SecretEnvelope::new(
                 reference.clone(),
                 secret.value.expose_secret().to_vec(),
@@ -1290,6 +1404,11 @@ fn validate_runtime_features(
     selected_runtime: ResolvedRuntime,
     configuration: &SandboxConfiguration,
 ) -> Result<(), HostError> {
+    if selected_runtime == ResolvedRuntime::Hyperlight && configuration.syscall_tracing_enabled() {
+        return Err(HostError::Invalid(
+            "Hyperlight has no Linux guest kernel for cgroup-scoped syscall tracing".to_owned(),
+        ));
+    }
     if selected_runtime == ResolvedRuntime::Hyperlight && !configuration.secrets.is_empty() {
         return Err(HostError::Invalid(
             "Hyperlight does not support authenticated configured-secret delivery".to_owned(),
@@ -1530,16 +1649,20 @@ fn make_mcp_policy(
     workload_identity: Option<(u32, u32)>,
     egress_policy: Option<&EgressRuntimePolicyDocument>,
 ) -> Result<Option<RuntimePolicyDocument>, HostError> {
-    let has_project_configuration = PROJECT_CONFIG_PATHS
-        .iter()
-        .any(|relative| host_workspace.join(relative).symlink_metadata().is_ok());
+    let configuration_roots = mcp_configuration_roots(configuration, host_workspace)?;
+    let mut has_configuration = false;
+    for root in &configuration_roots {
+        has_configuration |= has_project_configuration(root).map_err(|error| {
+            HostError::Invalid(format!("unsafe MCP project configuration: {error}"))
+        })?;
+    }
     let inspection = configuration
         .observability
         .as_ref()
         .map(|observability| &observability.mcp_inspection)
         .filter(|inspection| inspection.enabled);
     let safe_outputs_enabled = configuration.github.safe_outputs.enabled;
-    if !has_project_configuration
+    if !has_configuration
         && configuration
             .policy
             .boundaries
@@ -1616,14 +1739,17 @@ fn make_mcp_policy(
         })
         .transpose()?;
     let mut fixed_environment = BTreeMap::from([
-        ("HOME".to_owned(), guest_workspace.display().to_string()),
+        (
+            "HOME".to_owned(),
+            format!("/run/sendbox-workload/{session_id}"),
+        ),
         ("LANG".to_owned(), "C.UTF-8".to_owned()),
         ("LOGNAME".to_owned(), "sendbox".to_owned()),
         (
             MCP_PROXY_ENVIRONMENT.to_owned(),
             NATIVE_BROKER_PATH.to_owned(),
         ),
-        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
         ("TMPDIR".to_owned(), "/tmp".to_owned()),
         ("USER".to_owned(), "sendbox".to_owned()),
     ]);
@@ -1710,14 +1836,32 @@ fn make_mcp_policy(
     policy
         .validate()
         .map_err(|error| HostError::Invalid(format!("invalid MCP runtime policy: {error}")))?;
-    policy
+    let validator = policy
         .project_validator()
-        .map_err(|error| HostError::Invalid(format!("invalid MCP project policy: {error}")))?
-        .validate_project(host_workspace)
-        .map_err(|error| {
+        .map_err(|error| HostError::Invalid(format!("invalid MCP project policy: {error}")))?;
+    for root in configuration_roots {
+        validator.validate_project(root).map_err(|error| {
             HostError::Invalid(format!("unsafe MCP project configuration: {error}"))
         })?;
+    }
     Ok(Some(policy))
+}
+
+fn mcp_configuration_roots<'a>(
+    configuration: &'a SandboxConfiguration,
+    host_workspace: &Path,
+) -> Result<Vec<&'a Path>, HostError> {
+    let roots = configuration
+        .project_path
+        .ancestors()
+        .take_while(|path| path.starts_with(host_workspace))
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Err(HostError::Invalid(
+            "MCP project must be inside the mounted workspace".to_owned(),
+        ));
+    }
+    Ok(roots)
 }
 
 fn runtime_environment(
@@ -1753,6 +1897,16 @@ fn boundary_features(
     credentials: &EffectiveCredentialSet,
 ) -> Result<BTreeMap<String, FeatureAdmission>, HostError> {
     let mut features = BTreeMap::new();
+    if configuration.syscall_tracing_enabled() {
+        features.insert(
+            "syscall_tracing".to_owned(),
+            FeatureAdmission {
+                decision: FeatureDecision::Enforced,
+                mechanism: "guest_cgroup_v2_bpf_observation_v1_with_bounded_redacted_report"
+                    .to_owned(),
+            },
+        );
+    }
     if let Some(policy) = git_guard_policy {
         let encoded =
             serde_json::to_vec(policy).map_err(|error| HostError::Invalid(error.to_string()))?;
@@ -2078,9 +2232,17 @@ fn validate_security_composition(composition: SecurityComposition<'_>) -> Result
             "authenticated Git guard composition is inconsistent".to_owned(),
         ));
     }
+    let relative_project = configuration
+        .project_path
+        .strip_prefix(host_workspace)
+        .map_err(|_| {
+            HostError::Invalid("selected project is outside the signed workspace".to_owned())
+        })?;
+    let expected_guest_project = guest_workspace.join(relative_project);
     if let Some(policy) = git_guard_policy
         && (selected_runtime == ResolvedRuntime::Hyperlight
             || Some(&policy.selected_repository) != selected_repository
+            || policy.selected_workspace != expected_guest_project
             || policy.branch_protection.enabled != configuration.github.branch_protection.enabled
             || policy.github_https_auth != credentials.github_https_auth
             || policy.git_ssh_auth != credentials.git_ssh_auth)
@@ -2408,6 +2570,35 @@ fn megabytes(value: i64, description: &str) -> Result<u64, HostError> {
         .ok_or_else(|| HostError::Invalid(format!("{description} is out of range")))
 }
 
+struct ResolvedWorkspace {
+    host_root: PathBuf,
+    host_project: PathBuf,
+    guest_project: PathBuf,
+}
+
+fn resolve_workspace(configuration: &SandboxConfiguration) -> Result<ResolvedWorkspace, HostError> {
+    let host_project = canonical_file_or_directory(&configuration.project_path, "project root")?;
+    let host_root = if configuration.workspace_path.is_some() {
+        canonical_file_or_directory(configuration.workspace_root(), "workspace root")?
+    } else {
+        host_project.clone()
+    };
+    if !host_project.is_dir() || !host_root.is_dir() {
+        return Err(HostError::Invalid(
+            "project and workspace roots must be directories".to_owned(),
+        ));
+    }
+    let relative = host_project.strip_prefix(&host_root).map_err(|_| {
+        HostError::Invalid("project root must be inside the mounted workspace".to_owned())
+    })?;
+    let guest_project = Path::new("/workspace").join(relative);
+    Ok(ResolvedWorkspace {
+        host_root,
+        host_project,
+        guest_project,
+    })
+}
+
 fn project_identity(path: &Path) -> Result<(u32, u32), HostError> {
     let metadata = fs::metadata(path).map_err(|source| HostError::Io {
         context: "inspect project root",
@@ -2693,6 +2884,48 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), HostError> {
     result
 }
 
+fn persist_syscall_artifact(
+    raw: &sendbox_agent::GuestSyscallReport,
+    state_directory: &Path,
+    session_id: SessionId,
+    architecture: sendbox_bpf::report::TraceArchitecture,
+) -> Result<PersistedSyscallReport, HostError> {
+    use sendbox_bpf::report::{MAX_TRACE_REPORT_BYTES, TraceReport};
+    if raw.json.len() > MAX_TRACE_REPORT_BYTES
+        || raw.sha256 != format!("sha256:{}", sha256_hex(&raw.json))
+    {
+        return Err(HostError::Invalid(
+            "syscall report size or digest does not match".to_owned(),
+        ));
+    }
+    let parsed: TraceReport = serde_json::from_slice(&raw.json)
+        .map_err(|error| HostError::Invalid(format!("decode syscall report: {error}")))?;
+    parsed.validate(session_id).map_err(HostError::Invalid)?;
+    if parsed.architecture != architecture {
+        return Err(HostError::Invalid(
+            "syscall report architecture does not match its guest".to_owned(),
+        ));
+    }
+    let canonical = serde_json::to_vec(&parsed)
+        .map_err(|error| HostError::Invalid(format!("encode syscall report: {error}")))?;
+    if canonical != raw.json {
+        return Err(HostError::Invalid(
+            "syscall report is not in canonical transport form".to_owned(),
+        ));
+    }
+    let path = state_directory.join(SYSCALL_TRACE_REPORT_FILE);
+    atomic_write(&path, &canonical, 0o600)?;
+    Ok(PersistedSyscallReport {
+        path,
+        sha256: raw.sha256.clone(),
+        observed_events: parsed.observed_events,
+        sampled_events: parsed.samples.len(),
+        sampled_out: parsed.sampled_out,
+        log_limit_reached: parsed.log_limit_reached,
+        losses: parsed.losses,
+    })
+}
+
 fn random_session_id() -> Result<SessionId, HostError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes)
@@ -2726,6 +2959,60 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn workload_output_masks_credentials_in_both_streams_and_flushes_safely() {
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<(OutputStream, Vec<u8>)>>);
+        impl OutputSink for Sink {
+            fn write<'a>(
+                &'a self,
+                stream: OutputStream,
+                bytes: &'a [u8],
+                _: &'a CancellationToken,
+            ) -> BoxFuture<'a, Result<(), sendbox_agent::AgentError>> {
+                Box::pin(async move {
+                    self.0.lock().unwrap().push((stream, bytes.to_vec()));
+                    Ok(())
+                })
+            }
+        }
+        let sink = Arc::new(Sink::default());
+        let masker = sendbox_secrets::CredentialMasker::default();
+        masker.register(b"synthetic-session-credential").unwrap();
+        let output = crate::masking::MaskingOutputSink::new(masker, sink.clone());
+        let cancel = CancellationToken::new();
+        output
+            .write(OutputStream::Stdout, b"before synthetic-session-", &cancel)
+            .await
+            .unwrap();
+        output
+            .write(OutputStream::Stdout, b"credential after\n", &cancel)
+            .await
+            .unwrap();
+        output
+            .write(
+                OutputStream::Stderr,
+                b"Bearer synthetic-oauth-value\n",
+                &cancel,
+            )
+            .await
+            .unwrap();
+        output.finish(&cancel).await.unwrap();
+        let events = sink.0.lock().unwrap();
+        let stdout = events
+            .iter()
+            .filter(|(stream, _)| *stream == OutputStream::Stdout)
+            .flat_map(|(_, bytes)| bytes.clone())
+            .collect::<Vec<_>>();
+        let stderr = events
+            .iter()
+            .filter(|(stream, _)| *stream == OutputStream::Stderr)
+            .flat_map(|(_, bytes)| bytes.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(stdout, b"before [REDACTED] after\n");
+        assert_eq!(stderr, b"Bearer [REDACTED]\n");
+    }
+
     fn supported_configuration(project_path: PathBuf) -> SandboxConfiguration {
         let mut configuration = SandboxConfiguration::for_project(
             project_path,
@@ -2753,6 +3040,91 @@ mod tests {
             .canonicalize()
             .expect("canonical test base");
         tempfile::tempdir_in(base).expect("secure temporary directory")
+    }
+
+    #[test]
+    fn workspace_scope_maps_only_the_selected_root_and_preserves_project_cwd() {
+        let temporary = secure_tempdir();
+        let root = temporary.path().join("workspace");
+        let project = root.join("repo-one");
+        fs::create_dir_all(&project).unwrap();
+        let mut configuration = supported_configuration(project.clone());
+        configuration.workspace_path = Some(root.clone());
+        let resolved = resolve_workspace(&configuration).expect("workspace scope");
+        assert_eq!(resolved.host_root, root);
+        assert_eq!(resolved.host_project, project);
+        assert_eq!(resolved.guest_project, Path::new("/workspace/repo-one"));
+        configuration.workspace_path = None;
+        let resolved = resolve_workspace(&configuration).expect("repository scope");
+        assert_eq!(resolved.host_root, project);
+        assert_eq!(resolved.guest_project, Path::new("/workspace"));
+    }
+
+    #[test]
+    fn syscall_tracing_is_signed_and_never_admitted_on_hyperlight() {
+        let mut configuration = supported_configuration(PathBuf::from("/projects/example"));
+        configuration
+            .observability
+            .as_mut()
+            .unwrap()
+            .syscall_tracing = true;
+        let credentials = EffectiveCredentialSet {
+            values: BTreeMap::new(),
+            github_https_auth: false,
+            copilot_auth: false,
+            git_ssh_auth: false,
+        };
+        let features = boundary_features(&configuration, None, None, None, &credentials).unwrap();
+        assert_eq!(
+            features["syscall_tracing"].decision,
+            FeatureDecision::Enforced
+        );
+        assert!(
+            features["syscall_tracing"]
+                .mechanism
+                .contains("observation")
+        );
+        assert!(validate_runtime_features(ResolvedRuntime::Kata, &configuration).is_ok());
+        assert!(validate_runtime_features(ResolvedRuntime::Hyperlight, &configuration).is_err());
+    }
+
+    #[test]
+    fn syscall_reports_are_verified_before_private_host_persistence() {
+        use sendbox_bpf::report::{TraceArchitecture, TraceReport};
+        let directory = secure_tempdir();
+        let session = test_session();
+        let json =
+            serde_json::to_vec(&TraceReport::new(session, TraceArchitecture::Aarch64)).unwrap();
+        let mut raw = sendbox_agent::GuestSyscallReport {
+            sha256: format!("sha256:{}", sha256_hex(&json)),
+            json,
+        };
+        let persisted =
+            persist_syscall_artifact(&raw, directory.path(), session, TraceArchitecture::Aarch64)
+                .expect("persistent report");
+        assert_eq!(fs::read(persisted.path()).unwrap(), raw.json);
+        assert_eq!(
+            fs::metadata(persisted.path()).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            persist_syscall_artifact(
+                &raw,
+                directory.path(),
+                SessionId::from_bytes([3; 16]),
+                TraceArchitecture::Aarch64
+            )
+            .is_err()
+        );
+        assert!(
+            persist_syscall_artifact(&raw, directory.path(), session, TraceArchitecture::X86_64)
+                .is_err()
+        );
+        raw.sha256 = "sha256:".to_owned() + &"00".repeat(32);
+        assert!(
+            persist_syscall_artifact(&raw, directory.path(), session, TraceArchitecture::Aarch64)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2817,6 +3189,7 @@ mod tests {
             "fixture-policy".to_owned(),
             McpServerPolicy::Stdio {
                 command: vec!["/usr/bin/mcp-server".to_owned(), "--stdio".to_owned()],
+                authorization: None,
                 tools: ServerToolPolicy {
                     default_action: Action::Deny,
                     allowlist: vec!["read_*".to_owned()],
@@ -2978,6 +3351,7 @@ mod tests {
             "fixture".to_owned(),
             McpServerPolicy::Stdio {
                 command: vec!["/usr/bin/mcp-server".to_owned()],
+                authorization: None,
                 tools: ServerToolPolicy::default(),
             },
         );
@@ -3052,6 +3426,7 @@ mod tests {
             SAFE_OUTPUTS_SERVER_ID.to_owned(),
             McpServerPolicy::Stdio {
                 command: vec!["/usr/bin/mcp-server".to_owned()],
+                authorization: None,
                 tools: ServerToolPolicy::default(),
             },
         );

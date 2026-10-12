@@ -162,6 +162,7 @@ pub struct ExecutionBrokerConfiguration {
     pub command_policy: CommandPolicy,
     pub git_guard_policy: Option<GuardPolicyDocument>,
     pub mcp_policy: Option<RuntimePolicyDocument>,
+    pub syscall_tracing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +182,12 @@ pub struct ExecutionBrokerBootstrap {
     pub git_guard_policy: Option<GuardPolicyDocument>,
     #[serde(default)]
     pub mcp_policy: Option<RuntimePolicyDocument>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub syscall_tracing: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +462,7 @@ pub fn encode_bootstrap_document(
                 command_policy: configuration.command_policy,
                 git_guard_policy: configuration.git_guard_policy,
                 mcp_policy: configuration.mcp_policy,
+                syscall_tracing: configuration.syscall_tracing,
             })
         })
         .transpose()?;
@@ -505,6 +513,7 @@ fn validate_configuration(
         configuration.minimum_release_sequence,
     )?;
     if let Some(broker) = &configuration.execution_broker {
+        validate_trace_scope(broker.syscall_tracing, &broker.cgroup_parent)?;
         validate_broker(
             broker.workload_uid,
             broker.workload_gid,
@@ -578,6 +587,7 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         wire.minimum_release_sequence,
     )?;
     if let Some(broker) = &wire.execution_broker {
+        validate_trace_scope(broker.syscall_tracing, &broker.cgroup_parent)?;
         validate_broker(
             broker.workload_uid,
             broker.workload_gid,
@@ -911,9 +921,14 @@ fn validate_broker(
         policy
             .validate()
             .map_err(|error| BootstrapError::Invalid(error.to_string()))?;
-        if policy.selected_workspace != workspace_root {
+        if !policy.selected_workspace.starts_with(workspace_root)
+            || policy
+                .selected_workspace
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
             return Err(BootstrapError::Invalid(
-                "Git guard workspace must match the execution broker workspace".to_owned(),
+                "Git guard repository must remain within the execution broker workspace".to_owned(),
             ));
         }
     }
@@ -928,6 +943,20 @@ fn validate_broker(
                     .to_owned(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_trace_scope(enabled: bool, cgroup_parent: &Path) -> Result<(), BootstrapError> {
+    if enabled
+        && (!cgroup_parent.starts_with("/sys/fs/cgroup/sendbox")
+            || cgroup_parent
+                .components()
+                .any(|part| matches!(part, Component::ParentDir)))
+    {
+        return Err(BootstrapError::Invalid(
+            "syscall tracing requires the owned execution cgroup".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1044,6 +1073,7 @@ mod tests {
                 },
                 git_guard_policy: None,
                 mcp_policy: None,
+                syscall_tracing: false,
             }),
             egress_policy: None,
             gateway_credentials: Vec::new(),
@@ -1153,6 +1183,60 @@ mod tests {
                 .mcp_policy,
             Some(mcp_policy())
         );
+    }
+
+    #[test]
+    fn tracing_bootstrap_preserves_the_request_and_rejects_unowned_cgroups() {
+        let mut config = configuration();
+        config.execution_broker.as_mut().unwrap().syscall_tracing = true;
+        let bytes = encode_bootstrap_document(config.clone(), &[7; 32]).unwrap();
+        assert!(
+            decode_bootstrap_document(&bytes)
+                .unwrap()
+                .execution_broker
+                .unwrap()
+                .syscall_tracing
+        );
+        config.execution_broker.as_mut().unwrap().cgroup_parent =
+            PathBuf::from("/sys/fs/cgroup/unowned");
+        assert!(encode_bootstrap_document(config, &[7; 32]).is_err());
+    }
+
+    #[test]
+    fn git_guard_selected_repository_can_be_a_workspace_descendant() {
+        for (workspace, valid) in [
+            ("/workspace/repo-one", true),
+            ("/outside/repo-one", false),
+            ("/workspace/../outside", false),
+        ] {
+            let mut config = configuration();
+            config.execution_broker.as_mut().unwrap().git_guard_policy =
+                Some(GuardPolicyDocument {
+                    schema_version: sendbox_git::PolicySchemaVersion::V1,
+                    selected_repository: sendbox_git::RepositoryIdentity::new(
+                        "github.com",
+                        "test-org",
+                        "test-repo",
+                    )
+                    .unwrap(),
+                    selected_workspace: PathBuf::from(workspace),
+                    branch_protection: sendbox_git::BranchPolicyConfiguration {
+                        enabled: false,
+                        username: None,
+                        protected_branches: Vec::new(),
+                        allowed_branch_patterns: Vec::new(),
+                    },
+                    environment: sendbox_git::EnvironmentPolicy::default(),
+                    github_https_auth: false,
+                    git_ssh_auth: false,
+                    limits: sendbox_git::GuardLimits::default(),
+                });
+            assert_eq!(
+                encode_bootstrap_document(config, &[7; 32]).is_ok(),
+                valid,
+                "{workspace}"
+            );
+        }
     }
 
     #[test]

@@ -27,5 +27,7 @@ pub mod service;
 pub mod state;
 #[cfg(feature = "execution-broker")]
 pub mod supervisor;
+#[cfg(feature = "execution-broker")]
+pub mod trace;
 
 pub use error::GuestError;

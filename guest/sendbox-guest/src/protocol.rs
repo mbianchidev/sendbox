@@ -5,13 +5,13 @@ use sendbox_protocol::{
     AGENT_LAUNCH_OPERATION, BootstrapSecret, CloseCode, Event, EventKind, FrameLimits,
     GracefulClose, GuestHandshake, HandshakeConfig, HealthResponseV2, INTERACTIVE_LAUNCH_OPERATION,
     INTERACTIVE_LAUNCH_OPERATION_V2, InteractiveLaunchRequestV1, InteractiveLaunchRequestV2,
-    LaunchRequestV2, Message, OPERATION_SCHEMA_VERSION, PACKAGE_REPORT_OPERATION,
-    PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1, PackageReportResponseV1,
-    ProtocolErrorCode, ProtocolErrorMessage, Request, Response, ResponseStatus,
-    SAFE_OUTPUTS_COLLECT_OPERATION, SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
-    SafeOutputsCollectRequestV1, SafeOutputsCollectionV1, TerminalInputCreditV1, TerminalResultV2,
-    TerminalSizeV1, TerminalStateV1, VersionRange, agent_guest_capabilities,
-    agent_guest_required_capabilities,
+    LaunchRequestV2, MAX_SYSCALL_REPORT_BYTES, Message, OPERATION_SCHEMA_VERSION,
+    PACKAGE_REPORT_OPERATION, PACKAGE_REPORT_SCHEMA_VERSION, PackageReportRequestV1,
+    PackageReportResponseV1, ProtocolErrorCode, ProtocolErrorMessage, Request, Response,
+    ResponseStatus, SAFE_OUTPUTS_COLLECT_OPERATION, SAFE_OUTPUTS_OPERATION_SCHEMA_VERSION,
+    SYSCALL_REPORT_OPERATION, SafeOutputsCollectRequestV1, SafeOutputsCollectionV1,
+    TerminalInputCreditV1, TerminalResultV2, TerminalSizeV1, TerminalStateV1, VersionRange,
+    agent_guest_capabilities, agent_guest_required_capabilities,
 };
 use sendbox_secrets::{
     EnvelopeBinding, EnvelopeCipher, RecipientRole, ReplayGuard, SecretName, SessionKeyMaterial,
@@ -86,6 +86,7 @@ pub(crate) struct ProtocolServices {
     package_report: Option<PackageReportSource>,
     secret_decryptor: GuestSecretDecryptor,
     safe_outputs: Option<SafeOutputsHandle>,
+    syscall_tracing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +134,7 @@ impl ProtocolServices {
             package_report: None,
             secret_decryptor,
             safe_outputs: None,
+            syscall_tracing: false,
         }
     }
 
@@ -142,6 +144,12 @@ impl ProtocolServices {
         package_report: Option<PackageReportSource>,
     ) -> Self {
         self.package_report = package_report;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_syscall_tracing(mut self, enabled: bool) -> Self {
+        self.syscall_tracing = enabled;
         self
     }
 
@@ -193,6 +201,7 @@ where
 
     let mut terminal_response_sent = false;
     let mut package_report_served = false;
+    let mut syscall_report_served = false;
     loop {
         match reader.receive().await? {
             Message::Request(request) if request.operation == AGENT_LAUNCH_OPERATION => {
@@ -238,6 +247,17 @@ where
                 package_report_served = response.status == ResponseStatus::Ok;
                 writer.send(&Message::Response(response)).await?;
             }
+            Message::Request(request) if request.operation == SYSCALL_REPORT_OPERATION => {
+                let response = handle_syscall_report_request(
+                    request,
+                    &services,
+                    terminal_response_sent,
+                    syscall_report_served,
+                )
+                .await?;
+                syscall_report_served = response.status == ResponseStatus::Ok;
+                writer.send(&Message::Response(response)).await?;
+            }
             // Operation-name negotiation preserves the legacy capability wire
             // profile while still making unsupported collection fail closed.
             Message::Request(request) if request.operation == SAFE_OUTPUTS_COLLECT_OPERATION => {
@@ -276,6 +296,78 @@ where
             }
         }
     }
+}
+
+fn validate_syscall_report_request(
+    payload: &[u8],
+    configured: bool,
+    terminal: bool,
+    served: bool,
+) -> Result<usize, &'static str> {
+    if !terminal {
+        return Err("terminal-response-required");
+    }
+    if served {
+        return Err("syscall-report-already-served");
+    }
+    if !configured {
+        return Err("syscall-report-not-configured");
+    }
+    let request: PackageReportRequestV1 =
+        serde_json::from_slice(payload).map_err(|_| "invalid-syscall-report-request")?;
+    request
+        .validate()
+        .map_err(|_| "invalid-syscall-report-request")?;
+    let maximum_bytes =
+        usize::try_from(request.maximum_bytes).map_err(|_| "invalid-syscall-report-request")?;
+    if maximum_bytes > MAX_SYSCALL_REPORT_BYTES {
+        return Err("invalid-syscall-report-request");
+    }
+    Ok(maximum_bytes)
+}
+
+async fn handle_syscall_report_request(
+    request: Request,
+    services: &ProtocolServices,
+    terminal: bool,
+    served: bool,
+) -> Result<Response, GuestError> {
+    let reject = |reason: &'static str| Response {
+        request_id: request.request_id,
+        status: ResponseStatus::Rejected,
+        payload: serde_json::json!({"reason": reason})
+            .to_string()
+            .into_bytes(),
+    };
+    let maximum_bytes = match validate_syscall_report_request(
+        &request.payload,
+        services.syscall_tracing,
+        terminal,
+        served,
+    ) {
+        Ok(maximum_bytes) => maximum_bytes,
+        Err(reason) => return Ok(reject(reason)),
+    };
+    let bytes = crate::trace::fetch_report(services.runtime.session_dir()).await?;
+    if bytes.len() > maximum_bytes {
+        return Err(GuestError::Protocol(
+            "syscall report exceeds the requested byte limit".to_owned(),
+        ));
+    }
+    let sha256 = sha256_label(&bytes);
+    let report_json = String::from_utf8(bytes)
+        .map_err(|_| GuestError::Protocol("syscall report is not UTF-8".to_owned()))?;
+    let payload = serde_json::to_vec(&PackageReportResponseV1 {
+        schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+        report_json,
+        sha256,
+    })
+    .map_err(|error| GuestError::Protocol(format!("encoding syscall report: {error}")))?;
+    Ok(Response {
+        request_id: request.request_id,
+        status: ResponseStatus::Ok,
+        payload,
+    })
 }
 
 fn handle_package_report_request(
@@ -533,6 +625,20 @@ where
     }
 
     let execution = build_execution_request(&launch, terminal, broker, &services.secret_decryptor)?;
+    if let Some(safe_outputs) = &services.safe_outputs {
+        for secret in &launch.secrets {
+            let value = execution
+                .environment
+                .iter()
+                .find(|entry| entry.name == secret.reference)
+                .ok_or_else(|| {
+                    GuestError::Protocol(
+                        "decrypted credential is missing from the launch environment".to_owned(),
+                    )
+                })?;
+            safe_outputs.register_credential(value.value.as_bytes())?;
+        }
+    }
     let stream = UnixStream::connect(&broker.socket_path)
         .await
         .map_err(|error| GuestError::io("connecting execution broker", error))?;
@@ -1261,6 +1367,28 @@ mod tests {
         assert_eq!(oversized.status, ResponseStatus::Rejected);
         let duplicate = handle_package_report_request(report_request(8), Some(&source), true, true);
         assert_eq!(duplicate.status, ResponseStatus::Rejected);
+    }
+
+    #[test]
+    fn syscall_report_admission_is_terminal_only_single_use_and_bounded() {
+        let payload = serde_json::to_vec(&PackageReportRequestV1 {
+            schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+            maximum_bytes: 1024,
+        })
+        .unwrap();
+        assert_eq!(
+            validate_syscall_report_request(&payload, true, true, false),
+            Ok(1024)
+        );
+        assert!(validate_syscall_report_request(&payload, true, false, false).is_err());
+        assert!(validate_syscall_report_request(&payload, false, true, false).is_err());
+        assert!(validate_syscall_report_request(&payload, true, true, true).is_err());
+        let oversized = serde_json::to_vec(&PackageReportRequestV1 {
+            schema_version: PACKAGE_REPORT_SCHEMA_VERSION,
+            maximum_bytes: 96 * 1024 + 1,
+        })
+        .unwrap();
+        assert!(validate_syscall_report_request(&oversized, true, true, false).is_err());
     }
 
     #[test]

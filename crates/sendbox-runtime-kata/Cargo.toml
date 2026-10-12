@@ -10,6 +10,7 @@ repository.workspace = true
 sendbox-bootstrap = { path = "../sendbox-bootstrap" }
 sendbox-bundle = { path = "../sendbox-bundle" }
 sendbox-core = { path = "../sendbox-core" }
+sendbox-config = { path = "../sendbox-config" }
 sendbox-egress = { path = "../sendbox-egress" }
 sendbox-git = { path = "../sendbox-git" }
 sendbox-mcp = { path = "../sendbox-mcp" }

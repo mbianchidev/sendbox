@@ -11,6 +11,7 @@ to a first run. Use this index for setup, operation, and implementation details.
 | [Configuration](configuration.md) | YAML examples, policy settings, and credential configuration |
 | [CLI reference](cli-reference.md) | Commands, run flags, and common examples |
 | [Interactive sessions](interactive-sessions.md) | Terminal requirements, behavior, and troubleshooting |
+| [CLI agents](cli-agents.md) | Agent profiles, native MCP formats, multi-repo scope, HTTP proxies, and syscall tracing |
 
 ## Runtime and operations
 

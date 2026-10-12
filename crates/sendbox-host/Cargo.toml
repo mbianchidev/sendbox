@@ -13,6 +13,7 @@ rustix.workspace = true
 sendbox-agent = { path = "../sendbox-agent" }
 sendbox-boundary = { path = "../sendbox-boundary" }
 sendbox-bootstrap = { path = "../sendbox-bootstrap" }
+sendbox-bpf = { path = "../sendbox-bpf" }
 sendbox-bundle = { path = "../sendbox-bundle" }
 sendbox-config = { path = "../sendbox-config" }
 sendbox-core = { path = "../sendbox-core" }

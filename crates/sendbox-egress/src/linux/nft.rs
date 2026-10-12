@@ -101,6 +101,7 @@ pub struct NftConfig {
     pub broker_mark: u32,
     /// The loopback TCP port the CONNECT broker listens on.
     pub connect_broker_tcp_port: u16,
+    pub http_proxy_tcp_port: Option<u16>,
     /// The loopback port the DNS broker listens on (UDP+TCP), or `None` when
     /// the policy disables DNS (`allow_dns = false`), in which case no DNS
     /// accept rule is emitted at all.
@@ -164,6 +165,7 @@ impl NftConfig {
             return Err(NftError::RegistryPortsMustPair);
         }
         let mut ports = vec![self.connect_broker_tcp_port];
+        ports.extend(self.http_proxy_tcp_port);
         if let Some(port) = self.dns_broker_port {
             ports.push(port);
         }
@@ -217,6 +219,9 @@ impl NftConfig {
         // destination + port; the *output* chain is what restricts who may
         // originate this traffic.
         self.push_loopback_accept(&mut out, "    iif lo", "tcp", self.connect_broker_tcp_port);
+        if let Some(port) = self.http_proxy_tcp_port {
+            self.push_loopback_accept(&mut out, "    iif lo", "tcp", port);
+        }
         if let Some(dns_port) = self.dns_broker_port {
             self.push_loopback_accept(&mut out, "    iif lo", "udp", dns_port);
             self.push_loopback_accept(&mut out, "    iif lo", "tcp", dns_port);
@@ -247,6 +252,9 @@ impl NftConfig {
             "    # agent cgroup -> loopback brokers only, exact ports"
         );
         self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", self.connect_broker_tcp_port);
+        if let Some(port) = self.http_proxy_tcp_port {
+            self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", port);
+        }
         if let Some(dns_port) = self.dns_broker_port {
             self.push_cgroup_loopback_accept(&mut out, &agent, "udp", dns_port);
             self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", dns_port);
@@ -498,6 +506,7 @@ mod tests {
             registry: identity("sendbox/inst01/registry"),
             broker_mark: 0x5b0e,
             connect_broker_tcp_port: 15080,
+            http_proxy_tcp_port: Some(15083),
             dns_broker_port: Some(15053),
             mcp_gateway_port: Some(15082),
             registry_proxy_tcp_port: Some(14873),

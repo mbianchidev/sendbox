@@ -70,6 +70,7 @@ pub(crate) struct HostSecurityContext {
     signing_key: SigningKeyMaterial,
     planned_secret_count: usize,
     package_report_validation: Option<PackageReportValidation>,
+    credential_masker: sendbox_secrets::CredentialMasker,
 }
 
 #[derive(Debug, Clone)]
@@ -119,7 +120,16 @@ impl HostSecurityContext {
             signing_key,
             planned_secret_count,
             package_report_validation,
+            credential_masker: sendbox_secrets::CredentialMasker::default(),
         }
+    }
+
+    pub(crate) fn with_credential_masker(
+        mut self,
+        masker: sendbox_secrets::CredentialMasker,
+    ) -> Self {
+        self.credential_masker = masker;
+        self
     }
 }
 
@@ -247,12 +257,60 @@ where
     match runtime(session.audit_recorder()).await {
         Ok(mut report) => {
             if let Err(error) = persist_package_report(&mut report, &context) {
-                return finalize_runtime_error(session, &clock, error);
+                return finalize_runtime_error(session, &clock, error, &context.credential_masker);
+            }
+            if let Err(error) = persist_syscall_report(&mut report, &context) {
+                return finalize_runtime_error(session, &clock, error, &context.credential_masker);
             }
             finalize_report(session, &clock, report)
         }
-        Err(runtime_error) => finalize_runtime_error(session, &clock, runtime_error),
+        Err(runtime_error) => {
+            finalize_runtime_error(session, &clock, runtime_error, &context.credential_masker)
+        }
     }
+}
+
+fn persist_syscall_report(
+    report: &mut HostRunReport,
+    context: &HostSecurityContext,
+) -> Result<(), HostError> {
+    let plan = context.verified_plan.plan();
+    let requested = plan
+        .features
+        .get("syscall_tracing")
+        .is_some_and(|feature| feature.decision == sendbox_boundary::FeatureDecision::Enforced);
+    let raw = match report {
+        HostRunReport::Persistent(report) => report.agent.syscall_report.take(),
+        HostRunReport::OneShot(_) => None,
+    };
+    if !requested {
+        if raw.is_some() {
+            return Err(HostError::Invalid(
+                "guest returned an unexpected syscall report".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let raw = raw.ok_or_else(|| {
+        HostError::Invalid("guest omitted the required syscall report".to_owned())
+    })?;
+    let architecture = match plan.selection.host.architecture {
+        sendbox_boundary::Architecture::Aarch64 => sendbox_bpf::report::TraceArchitecture::Aarch64,
+        sendbox_boundary::Architecture::X86_64 => sendbox_bpf::report::TraceArchitecture::X86_64,
+    };
+    let persisted = super::persist_syscall_artifact(
+        &raw,
+        &context.state_directory,
+        plan.session_id,
+        architecture,
+    )?;
+    let HostRunReport::Persistent(report) = report else {
+        return Err(HostError::Invalid(
+            "one-shot runs cannot return syscall reports".to_owned(),
+        ));
+    };
+    report.syscall_report = Some(persisted);
+    Ok(())
 }
 
 fn persist_package_report(
@@ -346,6 +404,30 @@ fn finalize_report(
     clock: &dyn LifecycleClock,
     report: HostRunReport,
 ) -> Result<HostRunReport, HostError> {
+    if let Some(trace) = report.syscall_report() {
+        record_or_abort(
+            &mut session,
+            clock,
+            AuditCategory::Provenance,
+            "syscall_trace_report_persisted",
+            trace.sha256.clone(),
+            AuditResult::Success,
+            BTreeMap::from([
+                (
+                    "file".to_owned(),
+                    super::SYSCALL_TRACE_REPORT_FILE.to_owned(),
+                ),
+                (
+                    "observed_events".to_owned(),
+                    trace.observed_events.to_string(),
+                ),
+                (
+                    "incomplete_capture".to_owned(),
+                    trace.incomplete_capture().to_string(),
+                ),
+            ]),
+        )?;
+    }
     if let Some(package) = report.package_report() {
         record_or_abort(
             &mut session,
@@ -399,7 +481,9 @@ fn finalize_runtime_error(
     mut session: SecuritySession<'_>,
     clock: &dyn LifecycleClock,
     runtime_error: HostError,
+    masker: &sendbox_secrets::CredentialMasker,
 ) -> Result<HostRunReport, HostError> {
+    let runtime_error = crate::masking::mask_error(masker, runtime_error);
     let audit_error = session
         .record_event(
             clock.now_unix_nanos(),
@@ -1088,8 +1172,12 @@ fn operation(stage: &'static str, error: impl std::fmt::Display) -> SessionSecur
 }
 
 impl HostError {
-    fn kind(&self) -> &'static str {
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
+            Self::CredentialMasked { kind, .. } => kind,
+            Self::CredentialMasking(_) => "credential_masking",
+            Self::Output(_) => "output",
+            Self::OutputFinalization { runtime, .. } => runtime.kind(),
             Self::Invalid(_) => "invalid",
             Self::Boundary(_) => "boundary",
             Self::Runtime(_) => "runtime",
@@ -1135,9 +1223,11 @@ mod tests {
                 terminal: GuestTerminal::Exited { code: 0 },
                 states: Vec::new(),
                 package_report: Some(GuestPackageReport { json, sha256 }),
+                syscall_report: None,
                 safe_outputs: None,
             },
             package_report: None,
+            syscall_report: None,
         })
     }
 
@@ -1445,6 +1535,32 @@ mod tests {
             runtime_failure["event"]["metadata"]["error"],
             "runtime failed"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_failure_is_masked_before_audit_and_rollback_persistence() {
+        let temp = TempDir::new().expect("temp dir");
+        let now = unix_time().expect("current time");
+        let (context, _) = context(&temp, now, now + 300);
+        let state_directory = context.state_directory.clone();
+        let masker = sendbox_secrets::CredentialMasker::default();
+        masker
+            .register(b"synthetic-runtime-credential")
+            .expect("register");
+        let context = context.with_credential_masker(masker);
+        let error = execute_uncancelled(context, async {
+            Err(HostError::Runtime(sendbox_runtime::RuntimeError::Provider(
+                "provider failed: synthetic-runtime-credential".to_owned(),
+            )))
+        })
+        .await
+        .expect_err("must fail");
+        assert_eq!(error.kind(), "runtime");
+        assert!(error.to_string().contains("[REDACTED]"));
+        assert!(!format!("{error:?}").contains("synthetic-runtime-credential"));
+        let audit = fs::read_to_string(state_directory.join(AUDIT_LOG_FILE)).expect("audit");
+        assert!(audit.contains("[REDACTED]"));
+        assert!(!audit.contains("synthetic-runtime-credential"));
     }
 
     #[tokio::test]

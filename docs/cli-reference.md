@@ -21,6 +21,15 @@ SUBCOMMANDS:
 Use `sendbox help` or `sendbox help <subcommand>` for the options supported by
 the installed version.
 
+## Init profiles and workspace scope
+
+`sendbox init --agent opencode|claude|codex|copilot|gemini|custom` selects the
+entry program and initial inference endpoints; `open-code` is an alias for
+`opencode`. Omit `--agent` to preserve the existing defaults.
+`--workspace PATH` explicitly shares an enclosing multi-repository root while
+`--project PATH` retains the selected repository and initial cwd. See
+[CLI agents](cli-agents.md) for credentials, native MCP formats, and examples.
+
 ## Run flags
 
 | Flag | Description |

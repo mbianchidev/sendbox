@@ -4,6 +4,7 @@ pub mod error;
 pub mod event;
 pub mod loader;
 pub mod preflight;
+pub mod report;
 
 pub use error::{BpfError, DiagnosticKind};
 pub use event::{
