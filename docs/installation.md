@@ -55,6 +55,41 @@ deterministic rootfs tarballs, and minimal scratch OCI images for Linux x86_64
 and arm64. See [guest artifact bundles](architecture/guest-artifact-bundles.md)
 for details.
 
+## Publishing a release
+
+Releases are triggered by pushing a `vX.Y.Z` tag, not by `make release`, which
+only builds locally. From a clean checkout with `origin` pointing to
+`mbianchidev/sendbox`, run:
+
+```bash
+./scripts/release.sh 0.2.0
+```
+
+The script requires Bash, Git, Cargo, Python 3.11 or newer, and an authenticated
+GitHub CLI account with permission to push branches and tags and merge PRs.
+Pass a stable `X.Y.Z` version greater than the version on `main`; a leading `v`
+is also accepted.
+
+It creates an isolated worktree from freshly fetched `origin/main`, updates
+`[workspace.package].version` and the CLI version assertion, and refreshes every
+committed Cargo lockfile, including standalone fuzz, spike, and qualification
+workspaces. Unrelated dependencies are not upgraded.
+
+It then opens a version-bump PR, waits for CI checks to pass, and merges without
+bypassing branch protections. An annotated tag is pushed at the PR's merged
+`main` commit, after verifying that its Cargo version matches the tag. The
+original checkout and branch are unchanged, even if `main` advances meanwhile.
+
+The script watches the [Release workflow](https://github.com/mbianchidev/sendbox/actions/workflows/release.yaml),
+which publishes GitHub assets and GHCR artifacts, including macOS installers,
+Linux archives, and signed guest bundles. The required release-signing secret
+is already configured; no local signing key is needed.
+
+On failure, the script stops and preserves any branch, PR, or tag already
+created. Uncommitted release files are retained in the temporary worktree whose
+path is printed for recovery. Check registration, merge completion, and release
+run discovery each have a ten-minute timeout; existing tags are never replaced.
+
 ## Build from source
 
 ```bash
