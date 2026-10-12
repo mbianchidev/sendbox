@@ -3,6 +3,8 @@ FROM rust:1.93.1-alpine3.23@sha256:4fec02de605563c297c78a31064c8335bc004fa2b0bf4
 
 ARG TARGETARCH
 
+ENV CARGO_BUILD_JOBS=1
+
 RUN apk add --no-cache \
         binutils=2.45.1-r0 \
         bpftool=6.19.14-r0 \
