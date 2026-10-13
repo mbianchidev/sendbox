@@ -279,6 +279,9 @@ Contributions are welcome! Please:
 
 For larger changes, please open an issue first to discuss the approach.
 
+Maintainers publish tag-triggered releases with `./scripts/release.sh VERSION`;
+see [publishing a release](docs/installation.md#publishing-a-release).
+
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
