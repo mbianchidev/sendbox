@@ -7,11 +7,14 @@ to a first run. Use this index for setup, operation, and implementation details.
 
 | Guide | Contents |
 |---|---|
-| [Installation](installation.md) | Release verification, source builds, and macOS package notes |
+| [Installation](installation.md) | Host/runtime requirements, workload images, release verification, source builds, and macOS package notes |
 | [Configuration](configuration.md) | YAML examples, policy settings, and credential configuration |
 | [CLI reference](cli-reference.md) | Commands, run flags, and common examples |
 | [Interactive sessions](interactive-sessions.md) | Terminal requirements, behavior, and troubleshooting |
 | [CLI agents](cli-agents.md) | Agent profiles, native MCP formats, multi-repo scope, HTTP proxies, and syscall tracing |
+| [Integrations](integrations.md) | MCP, GitHub, model providers, private registries, devcontainers, and CI workflows |
+| [Alternatives](alternatives.md) | Choosing between SendBox, Docker Sandboxes, dev containers, E2B, and Daytona |
+| [Contributing](contributing.md) | Source setup, checks, documentation conventions, and release procedures |
 
 ## Runtime and operations
 
