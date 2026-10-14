@@ -3,8 +3,46 @@
 Install SendBox from a verified release artifact for the simplest setup, or
 build the host binary from source when developing the project.
 
-See the root [requirements table](../README.md#requirements) before installing a
-runtime provider.
+## Requirements
+
+Choose a runtime before installing. Apple and Kata support interactive and
+headless agent sessions; Hyperlight is an explicit one-shot provider with a
+narrower capability set.
+
+| Scope | Dependency | Required version or setup |
+|---|---|---|
+| Source build | Rust | 1.93.1 (pinned by `rust-toolchain.toml`) |
+| Linux source build | Native compiler and headers | `build-essential clang cmake libelf-dev libseccomp-dev libzstd-dev pkg-config zlib1g-dev` on Debian/Ubuntu |
+| Apple runtime | macOS | 26 (Tahoe) or newer |
+| Apple runtime | Hardware | Apple silicon |
+| Apple runtime | Xcode | 26 |
+| Apple runtime | Official `container` CLI | Exactly 0.10.0; service already registered and running |
+| Kata runtime | Linux | Bare metal or nested virtualization |
+| Kata runtime | Kata Containers | 3.28 or newer |
+| Kata runtime | containerd | 1.7 or newer |
+| Kata runtime | nerdctl and CNI plugins | Compatible releases; access to KVM and the containerd socket |
+| Linux host binary | libseccomp, libelf, zlib, and zstd runtime libraries | Distribution packages such as `libseccomp2`, `libelf1`, `zlib1g`, and `libzstd1` |
+| Hyperlight runtime | Operator-pinned `hyperlight-unikraft`, signed Unikraft bundle, and KVM | See [Hyperlight](hyperlight.md) |
+
+The [Apple](apple-runtime.md) and [Kata](kata-containers.md) guides cover runtime
+setup and preflight. Run SendBox as your normal user, not with `sudo` to work
+around runtime access problems.
+
+### Workload image versus guest bundle
+
+Persistent agent sessions need both:
+
+- A **digest-pinned Linux workload image** for the guest architecture, containing
+  your agent, its runtime dependencies, certificates, shell, and development
+  tools.
+- A **verified signed guest bundle and trust root**, containing SendBox's
+  security services. These do not install the agent or its development tools.
+
+The production guest image is intentionally minimal: it contains no Python,
+Node.js, compiler, bpftrace, or development headers. Keep bundle executables,
+metadata, and trust roots in the root-owned locations described below. A public
+key shipped beside a bundle is not self-authenticating; verify release
+provenance before trusting it.
 
 ## Release artifacts
 
