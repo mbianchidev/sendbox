@@ -164,6 +164,11 @@ Privilege drop, capabilities, and seccomp are represented by the injected
 `PlatformControls` trait. The production Linux adapter requires root identity,
 prepares and verifies the delegated cgroup v2 parent, starts the mandatory broker,
 then installs and verifies the NNP/TSYNC direct-exec filter before readiness.
+Controller delegation may move guest init into `/sendbox-runtime`; this changes
+process membership, not the cgroup namespace root. Egress admission accepts init
+only at `/` or that trusted runtime leaf and independently requires a single
+read/write cgroup2 mount rooted at `/` at `/sys/fs/cgroup`. Subtree mounts,
+read-only mounts, and unrelated init cgroups fail closed.
 The launcher drops brokered workloads to the non-root project uid/gid and applies
 the production capability, rlimit, cgroup, pidfd, and command seccomp controls.
 Tests retain a deterministic unprivileged adapter.

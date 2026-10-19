@@ -19,6 +19,11 @@ shell or language bridge.
 - an explicit Linux arm64 image and any configured kernel, mounts, network,
   DNS, CPU, memory, and ulimit values
 
+The workload image must include `nft` and its runtime libraries, and the guest
+kernel must support the mandatory
+[egress enforcement prerequisites](installation.md#workload-image-versus-guest-bundle).
+A plain Alpine base image does not include `nftables`.
+
 `setup.sh` installs only the qualified 0.10.0 signed package and verifies its
 pinned SHA-256 digest plus package signature before invoking the installer.
 Already-installed later versions fail preflight rather than being accepted
@@ -108,3 +113,17 @@ identities and always attempts channel cleanup, stop, and targeted delete.
 - Bundle and trust-root mounts depend on official CLI bind-mount semantics and
   are fail-closed by guest-side mode, owner, digest, version, and rollback
   checks.
+
+## Guest readiness troubleshooting
+
+Controller delegation moves guest init from `/` to `/sendbox-runtime` without
+changing the cgroup namespace root. Guest admission checks the full writable
+cgroup2 mount independently of this membership change. It still rejects
+subtree mounts, read-only mounts, and unrelated init cgroups.
+
+The v0.2.0 guest incorrectly required init to remain at `/` after moving it,
+causing the mandatory egress service to exit before authenticated readiness.
+Replacing only the host CLI cannot correct that guest defect: rebuild and sign
+the guest bundle as well. Host/guest manifest versions must match the binaries,
+and trust-root identity, architecture, release sequence, digests, and ownership
+must still verify. Never edit an installed signed bundle in place.

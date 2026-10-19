@@ -5,6 +5,9 @@ pub use sendbox_bootstrap::ControlKind;
 
 use crate::GuestError;
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const RUNTIME_CGROUP_NAME: &str = "sendbox-runtime";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlStatus {
     pub control: ControlKind,
@@ -102,7 +105,7 @@ impl LinuxPlatformControls {
         if processes.trim().is_empty() {
             return Ok(());
         }
-        let runtime_cgroup = hierarchy_root.join("sendbox-runtime");
+        let runtime_cgroup = hierarchy_root.join(RUNTIME_CGROUP_NAME);
         if !runtime_cgroup.exists() {
             std::fs::create_dir(&runtime_cgroup)
                 .map_err(|error| GuestError::io("creating runtime cgroup", error))?;

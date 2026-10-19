@@ -1768,16 +1768,54 @@ fn remove_socket_if_present(path: &Path) -> Result<(), GuestError> {
 fn require_root_cgroup_namespace() -> Result<(), GuestError> {
     let cgroup = fs::read_to_string("/proc/1/cgroup")
         .map_err(|error| GuestError::io("inspecting guest cgroup namespace", error))?;
-    if cgroup
-        .lines()
-        .any(|line| line.split_once("::") == Some(("0", "/")))
-    {
-        Ok(())
-    } else {
-        Err(GuestError::Runtime(
-            "egress enforcement requires the guest init cgroup namespace rooted at /".to_owned(),
-        ))
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| GuestError::io("inspecting guest cgroup mount", error))?;
+    validate_root_cgroup_namespace(&cgroup, &mountinfo)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_root_cgroup_namespace(cgroup: &str, mountinfo: &str) -> Result<(), GuestError> {
+    let mut memberships = cgroup.lines().filter_map(|line| line.strip_prefix("0::"));
+    let expected_init = memberships.next().is_some_and(|path| {
+        path == "/" || path.strip_prefix('/') == Some(crate::platform::RUNTIME_CGROUP_NAME)
+    });
+    if !expected_init || memberships.next().is_some() {
+        return Err(GuestError::Runtime(
+            "egress enforcement requires guest init in the cgroup root or trusted runtime leaf"
+                .to_owned(),
+        ));
     }
+
+    // Controller delegation moves PID 1 into the runtime leaf, not into a new
+    // cgroup namespace. Verify the mounted hierarchy root independently.
+    let mut mounts = mountinfo.lines().filter_map(|line| {
+        let (mount, filesystem) = line.split_once(" - ")?;
+        let mut fields = mount.split_whitespace();
+        let root = fields.nth(3)?;
+        let mountpoint = fields.next()?;
+        let options = fields.next()?;
+        if mountpoint != sendbox_egress::runtime::DEFAULT_CGROUP_ROOT {
+            return None;
+        }
+        let mut filesystem = filesystem.split_whitespace();
+        let kind = filesystem.next()?;
+        let _source = filesystem.next()?;
+        let super_options = filesystem.next()?;
+        Some((root, options, kind, super_options))
+    });
+    let root_is_writable = matches!(
+        mounts.next(),
+        Some(("/", options, "cgroup2", super_options))
+            if options.split(',').any(|option| option == "rw")
+                && super_options.split(',').any(|option| option == "rw")
+    );
+    if !root_is_writable || mounts.next().is_some() {
+        return Err(GuestError::Runtime(
+            "egress enforcement requires one writable cgroup2 mount rooted at / at /sys/fs/cgroup"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1785,6 +1823,53 @@ mod tests {
     use super::*;
     use sendbox_core::SessionId;
     use sendbox_policy::{Action, McpHttpPolicy, McpServerPolicy, NetworkPolicy, ToolCallPolicy};
+
+    const ROOT_CGROUP_MOUNT: &str =
+        "50 46 0:23 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 none rw\n";
+
+    #[test]
+    fn cgroup_namespace_accepts_init_after_controller_delegation() {
+        for membership in ["0::/\n", "0::/sendbox-runtime\n"] {
+            validate_root_cgroup_namespace(membership, ROOT_CGROUP_MOUNT)
+                .expect("init may move to the trusted runtime leaf without changing its namespace");
+        }
+    }
+
+    #[test]
+    fn cgroup_namespace_rejects_unexpected_init_memberships() {
+        for membership in [
+            "",
+            "1:name=systemd:/\n",
+            "0::/unrelated\n",
+            "0::/sendbox-runtime/nested\n",
+            "0::/sendbox-runtime-other\n",
+            "0::/../sendbox-runtime\n",
+            "0::/\n0::/unrelated\n",
+        ] {
+            assert!(
+                validate_root_cgroup_namespace(membership, ROOT_CGROUP_MOUNT).is_err(),
+                "unexpected init membership was accepted: {membership:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cgroup_namespace_rejects_non_root_or_unwritable_mounts() {
+        for mountinfo in [
+            String::new(),
+            ROOT_CGROUP_MOUNT.replace(" / /sys/fs/cgroup ", " /subtree /sys/fs/cgroup "),
+            ROOT_CGROUP_MOUNT.replace("/sys/fs/cgroup", "/other/cgroup"),
+            ROOT_CGROUP_MOUNT.replace("rw,nosuid", "ro,nosuid"),
+            ROOT_CGROUP_MOUNT.replace("none rw", "none ro"),
+            ROOT_CGROUP_MOUNT.replace(" - cgroup2 ", " - cgroup "),
+            ROOT_CGROUP_MOUNT.repeat(2),
+        ] {
+            assert!(
+                validate_root_cgroup_namespace("0::/\n", &mountinfo).is_err(),
+                "invalid cgroup mount was accepted: {mountinfo:?}"
+            );
+        }
+    }
 
     fn mcp_gateway_policies() -> (RuntimePolicyDocument, McpRuntimePolicyDocument) {
         let tool_policy = ToolCallPolicy {

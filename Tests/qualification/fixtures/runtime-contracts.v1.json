@@ -8,6 +8,7 @@
     "channel_ownership": "runtime_lifecycle_owned_single_accept_idempotent_cleanup",
     "brokered_execution": "agent_workload_uses_authenticated_guest_channel_runtime_exec_is_bootstrap_only",
     "readiness": "bounded_deadline_wrong_session_or_capabilities_fail_closed",
+    "guest_cgroup_namespace": "init_at_root_or_trusted_runtime_leaf_with_one_full_writable_cgroup2_mount_subtrees_and_unrelated_memberships_rejected",
     "secret_transfer": "one_shot_runtime_injection_over_bootstrap_exec_never_secret_argv",
     "kata_bundle": "host_and_guest_signature_version_arch_digest_owner_mode_rollback_and_static_elf_verification_before_agent_launch",
     "kata_live": "required_self_hosted_kvm_gate_unqualified_until_recorded",

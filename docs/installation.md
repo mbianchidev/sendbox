@@ -38,6 +38,13 @@ Persistent agent sessions need both:
 - A **verified signed guest bundle and trust root**, containing SendBox's
   security services. These do not install the agent or its development tools.
 
+Apple and Kata workload images must also provide the `nft` executable and its
+shared-library dependencies. Mandatory egress enforcement requires a writable
+cgroup v2 root, delegated memory/PID controllers, `CAP_NET_ADMIN`, `SO_MARK`, and
+kernel support for nftables `socket cgroupv2`. A plain Alpine image without
+`nftables` is not sufficient, even when the network policy denies all traffic.
+Missing enforcement prerequisites are errors, not grounds to skip hardening.
+
 The production guest image is intentionally minimal: it contains no Python,
 Node.js, compiler, bpftrace, or development headers. Keep bundle executables,
 metadata, and trust roots in the root-owned locations described below. A public
