@@ -127,6 +127,9 @@ Its execution broker also treated the supervisor's connect/disconnect socket
 health probe as its sole execution connection and exited on the empty request.
 The broker must survive that empty probe without accepting malformed requests
 or weakening peer/session authentication.
+The concurrent stdio relay can also repopulate the root cgroup during controller
+delegation. Startup refreshes and migrates those processes when the kernel returns
+`EBUSY`, retrying for at most five seconds rather than disabling the controllers.
 Replacing only the host CLI cannot correct that guest defect: rebuild and sign
 the guest bundle as well. Host/guest manifest versions must match the binaries,
 and trust-root identity, architecture, release sequence, digests, and ownership

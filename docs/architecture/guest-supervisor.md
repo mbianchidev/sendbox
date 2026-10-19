@@ -175,6 +175,11 @@ process membership, not the cgroup namespace root. Egress admission accepts init
 only at `/` or that trusted runtime leaf and independently requires a single
 read/write cgroup2 mount rooted at `/` at `/sys/fs/cgroup`. Subtree mounts,
 read-only mounts, and unrelated init cgroups fail closed.
+The runtime may start its stdio relay while controllers are being delegated.
+An `EBUSY` write refreshes and migrates the current root processes before retrying,
+within a five-second deadline. Processes that have already exited are logged and
+skipped; other migration errors, permission errors, and an exhausted deadline
+remain fatal. No controller requirement is skipped to make readiness succeed.
 The launcher drops brokered workloads to the non-root project uid/gid and applies
 the production capability, rlimit, cgroup, pidfd, and command seccomp controls.
 Tests retain a deterministic unprivileged adapter.
