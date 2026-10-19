@@ -20,8 +20,9 @@ guest `PlatformControls`.
 
 The final rootfs contains no Python, Node.js, compiler, bpftrace, development
 headers, or shared runtime libraries. CI builds each architecture twice with
-`--no-cache` and compares the rootfs, manifest, signature, inventory, SBOM,
-static-link proofs, and pinned `vmlinux.h` digest byte for byte.
+`--no-cache` in independent parallel jobs and compares the rootfs, manifest,
+signature, inventory, SBOM, static-link proofs, and pinned `vmlinux.h` digest byte
+for byte.
 
 ## Signing boundary
 
@@ -124,6 +125,23 @@ checks for `.BTF`, `.BTF.ext`, and both required tracepoint sections.
 against the pinned architecture BTF and emits a reproducible proof digest.
 
 ## Continuous integration
+
+Portable Rust CI separates checks from build/install qualification so they can
+run in parallel, with compiler- and lockfile-keyed dependency caches. The guest
+quality job caches its pinned toolchain, system dependencies, and audit tool
+through BuildKit, but disables caching for the quality stage so formatting,
+Clippy, tests, fuzz compilation, and the dependency audit always run. Only the
+quality base is exported to the shared cache, not the test results or compiled
+workspace target directories.
+
+Each architecture has two independent, fail-fast clean-build matrix entries.
+Both use `--no-cache`, without importing external build caches, and CI archives
+their outputs before transfer to retain the original file modes. Verification
+jobs compare every reproducibility proof and check the installed bundle as an
+unprivileged user before uploading the final artifacts. OCI export reuses the
+first build's local layers instead of performing a third clean compilation.
+CI sets `CARGO_BUILD_JOBS=2`; local and release builds retain the Dockerfile's
+default of one Cargo job unless explicitly overridden with a build argument.
 
 The [production guest workflow](../../.github/workflows/guest-artifacts.yaml)
 automatically runs the privileged live BPF smoke test on relevant pull requests

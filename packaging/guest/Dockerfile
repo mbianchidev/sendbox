@@ -2,8 +2,10 @@
 FROM rust:1.93.1-alpine3.23@sha256:4fec02de605563c297c78a31064c8335bc004fa2b0bf406b1b99441da64e2d2d AS toolchain
 
 ARG TARGETARCH
+ARG CARGO_BUILD_JOBS=1
 
-ENV CARGO_BUILD_JOBS=1
+ENV CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS
+ENV SOURCE_DATE_EPOCH=0
 
 RUN apk add --no-cache \
         binutils=2.45.1-r0 \
@@ -94,16 +96,18 @@ COPY guest guest
 COPY native native
 COPY test-fixtures test-fixtures
 COPY packaging/guest packaging/guest
-RUN chmod +x packaging/guest/verify-bpf.sh packaging/guest/verify-static.sh
+RUN chmod +x packaging/guest/verify-static.sh
 
 ENV CARGO_INCREMENTAL=0
 ENV LIBSECCOMP_STATIC=1
 ENV LIBBPF_SYS_EXTRA_CFLAGS="-Wno-error=deprecated-declarations"
 ENV PKG_CONFIG_ALL_STATIC=1
 ENV PKG_CONFIG_PATH=/opt/libseccomp/lib/pkgconfig
-ENV SOURCE_DATE_EPOCH=0
 
-FROM source AS bpf
+FROM toolchain AS bpf
+WORKDIR /workspace
+COPY native/bpf native/bpf
+COPY --chmod=0755 packaging/guest/verify-bpf.sh packaging/guest/verify-bpf.sh
 RUN arch="$(cat /opt/btf-architecture)" \
     && target_arch="$([ "$arch" = x86_64 ] && echo x86 || echo arm64)" \
     && mkdir -p /out \
@@ -139,9 +143,11 @@ RUN arch="$(cat /opt/btf-architecture)" \
 FROM scratch AS bpf-artifact
 COPY --from=bpf /out/ /
 
-FROM source AS quality
+FROM source AS quality-base
 COPY --from=audit-tool /usr/local/cargo/bin/cargo-audit /usr/local/cargo/bin/cargo-audit
 COPY --from=bpf /out/observe.bpf.o /tmp/observe.bpf.o
+
+FROM quality-base AS quality
 RUN target="$(cat /opt/target-triple)" \
     && cargo fmt --all --check \
     && cargo clippy --locked -p sendbox-bpf -p sendbox-bundle -p sendbox-guest \

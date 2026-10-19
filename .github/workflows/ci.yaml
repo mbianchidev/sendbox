@@ -12,12 +12,14 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Rust (${{ matrix.os }})
+    name: ${{ matrix.task == 'checks' && 'Rust' || 'Build and install' }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         os: [macos-15, ubuntu-24.04]
+        task: [checks, build]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -39,24 +41,36 @@ jobs:
       - name: Rust version
         run: rustc --version --verbose
 
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.task }}
+
       - name: Check formatting
+        if: matrix.task == 'checks'
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
+        if: matrix.task == 'checks'
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Run tests
+        if: matrix.task == 'checks'
         run: cargo test --locked --workspace --all-features
 
       - name: Compile fuzz targets
+        if: matrix.task == 'checks'
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: make fuzz-check
 
       - name: Build debug and release workspaces
+        if: matrix.task == 'build'
         run: |
           cargo build --locked --workspace
           cargo build --locked --workspace --release
 
       - name: Verify production CLI
+        if: matrix.task == 'build'
         run: |
           ./target/release/sendbox --version
           ./target/release/sendbox policy validate \
@@ -82,6 +96,7 @@ jobs:
             --json
 
       - name: Verify staged Cargo installation
+        if: matrix.task == 'build'
         run: |
           raw_root="$(mktemp -d)"
           trap 'rm -rf "$raw_root"' EXIT
@@ -100,6 +115,7 @@ jobs:
             "$install_root/home/.config/fish/completions/sendbox.fish"
 
       - name: Qualify setup and release packaging
+        if: matrix.task == 'build'
         env:
           SENDBOX_REQUIRE_SUDO: "1"
         run: ./scripts/qualify-setup-release.sh
@@ -110,7 +126,15 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Cache cargo-audit executable
+        id: audit-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ runner.arch }}-0.22.2
+
       - name: Install cargo-audit
+        if: steps.audit-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Audit dependencies
