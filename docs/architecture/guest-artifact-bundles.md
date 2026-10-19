@@ -123,6 +123,26 @@ checks for `.BTF`, `.BTF.ext`, and both required tracepoint sections.
 `bpftool gen min_core_btf` resolves the object's CO-RE relocation requirements
 against the pinned architecture BTF and emits a reproducible proof digest.
 
+## Continuous integration
+
+The [production guest workflow](../../.github/workflows/guest-artifacts.yaml)
+automatically runs the privileged live BPF smoke test on relevant pull requests
+to `main` and pushes to `main`, using the workflow's existing path filters.
+Manual dispatch runs the same test without an additional `live` input.
+
+The matrix uses native `ubuntu-24.04` (`x86_64`) and `ubuntu-24.04-arm`
+(`aarch64`) runners. Each job builds its architecture-specific CO-RE object,
+exports it through the Dockerfile's `bpf-artifact` target, mounts tracefs if
+needed, and runs the live test with `SENDBOX_BPF_LIVE=1` under `sudo`. The test
+loads and attaches the programs, executes `/bin/true`, and requires both exec
+and syscall-entry events. Missing kernel support, privileges, or events fail
+the job rather than silently skipping it.
+
+The environment variable remains an explicit opt-in for local Rust test runs.
+CI privileges apply only to loading and attaching the observation programs;
+application workloads receive no additional privileges, and these tracepoints
+do not enforce sandbox policy.
+
 ## Runtime integration
 
 The Apple and Kata runtime adapters:

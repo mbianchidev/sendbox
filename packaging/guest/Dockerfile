@@ -136,6 +136,9 @@ RUN arch="$(cat /opt/btf-architecture)" \
     && cp /opt/btf-archive.digest /out/btf-archive.sha256 \
     && cp /opt/vmlinux.sha256 /out/
 
+FROM scratch AS bpf-artifact
+COPY --from=bpf /out/ /
+
 FROM source AS quality
 COPY --from=audit-tool /usr/local/cargo/bin/cargo-audit /usr/local/cargo/bin/cargo-audit
 COPY --from=bpf /out/observe.bpf.o /tmp/observe.bpf.o

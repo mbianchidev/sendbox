@@ -40,12 +40,6 @@ on:
       - "setup.sh"
       - "docs/architecture/guest-artifact-bundles.md"
   workflow_dispatch:
-    inputs:
-      live:
-        description: Run privileged native BPF event tests
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -184,7 +178,6 @@ jobs:
 
   live-event:
     name: Privileged live BPF (${{ matrix.arch }})
-    if: github.event_name == 'workflow_dispatch' && inputs.live
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -211,14 +204,20 @@ jobs:
           docker build \
             --no-cache \
             --platform "linux/${{ matrix.platform }}" \
-            --target bpf \
+            --target bpf-artifact \
             --output "type=local,dest=dist/bpf" \
             -f packaging/guest/Dockerfile \
             .
 
-      - name: Compile and run opt-in live event test
+      - name: Mount kernel tracefs if needed
         run: |
-          cargo test -p sendbox-bpf --test live --no-run
+          if ! mountpoint -q /sys/kernel/tracing; then
+            sudo mount -t tracefs tracefs /sys/kernel/tracing
+          fi
+
+      - name: Compile and run live event smoke test
+        run: |
+          cargo test --locked -p sendbox-bpf --test live --no-run
           test_binary="$(
             find target/debug/deps -maxdepth 1 -type f -perm -111 \
               -name 'live-*' | sort | head -1
