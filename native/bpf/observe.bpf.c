@@ -1,4 +1,5 @@
 #include "vmlinux.h"
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 
 #define EVENT_SCHEMA_VERSION 1
@@ -151,6 +152,7 @@ SEC("tracepoint/raw_syscalls/sys_enter")
 int observe_sys_enter(struct trace_event_raw_sys_enter *context)
 {
     struct syscall_event *event;
+    long result;
 
     if (!in_scope())
         return 0;
@@ -168,7 +170,12 @@ int observe_sys_enter(struct trace_event_raw_sys_enter *context)
     fill_identity(&event->pid, &event->tgid, &event->uid, &event->gid);
     event->syscall_id = (__u32)context->id;
     event->reserved = 0;
-    __builtin_memcpy(event->arguments, context->args, sizeof(event->arguments));
+    result = bpf_core_read(event->arguments, sizeof(event->arguments), &context->args);
+    if (result != 0) {
+        bpf_printk("sendbox: syscall argument read failed: %ld", result);
+        bpf_ringbuf_discard(event, 0);
+        return 0;
+    }
     bpf_ringbuf_submit(event, 0);
     return 0;
 }
