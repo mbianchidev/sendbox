@@ -123,6 +123,10 @@ subtree mounts, read-only mounts, and unrelated init cgroups.
 
 The v0.2.0 guest incorrectly required init to remain at `/` after moving it,
 causing the mandatory egress service to exit before authenticated readiness.
+Its execution broker also treated the supervisor's connect/disconnect socket
+health probe as its sole execution connection and exited on the empty request.
+The broker must survive that empty probe without accepting malformed requests
+or weakening peer/session authentication.
 Replacing only the host CLI cannot correct that guest defect: rebuild and sign
 the guest bundle as well. Host/guest manifest versions must match the binaries,
 and trust-root identity, architecture, release sequence, digests, and ownership

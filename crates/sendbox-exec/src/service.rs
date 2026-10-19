@@ -105,6 +105,8 @@ pub enum ServerFrame {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
+    #[error("peer disconnected before the execution request")]
+    DisconnectedBeforeRequest,
     #[error("service io failed: {0}")]
     Io(#[from] io::Error),
     #[error("service protocol failed: {0}")]
@@ -129,7 +131,16 @@ impl<B: ExecutionBackend + 'static> BrokerService<B> {
         &self,
         listener: &AuthenticatedUnixListener,
     ) -> Result<ExecutionResult, ServiceError> {
-        self.serve_connection(listener.accept()?)
+        loop {
+            match self.serve_connection(listener.accept()?) {
+                Err(ServiceError::DisconnectedBeforeRequest) => {
+                    eprintln!(
+                        "sendbox-broker: peer disconnected before its first request; waiting for execution"
+                    );
+                }
+                result => return result,
+            }
+        }
     }
 
     pub fn serve_connection(
@@ -139,7 +150,9 @@ impl<B: ExecutionBackend + 'static> BrokerService<B> {
         let read_stream = stream.try_clone()?;
         let shutdown_stream = stream.try_clone()?;
         let mut reader = BufReader::new(read_stream);
-        let Some(ClientFrame::Execute { request }) = read_frame(&mut reader)? else {
+        let first: ClientFrame =
+            read_frame(&mut reader)?.ok_or(ServiceError::DisconnectedBeforeRequest)?;
+        let ClientFrame::Execute { request } = first else {
             write_frame(
                 &mut stream,
                 &ServerFrame::ProtocolError {
@@ -327,6 +340,8 @@ fn read_bounded_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::MetadataExt;
     use std::time::Duration;
 
     use sendbox_policy::{Action, CommandPolicy};
@@ -388,20 +403,7 @@ mod tests {
     #[test]
     fn service_streams_typed_events_and_propagates_cancel() {
         let session = Arc::new(BrokerSession::generate().expect("session"));
-        let broker = Arc::new(Broker::new(
-            Arc::clone(&session),
-            CompiledCommandPolicy::compile(&CommandPolicy {
-                default_action: Action::Allow,
-                allowlist: Vec::new(),
-                denylist: Vec::new(),
-                log_blocked: true,
-            })
-            .expect("policy"),
-            EnvironmentPolicy::default(),
-            RequestLimits::default(),
-            CancellableBackend,
-        ));
-        let service = BrokerService::new(broker);
+        let service = service(&session);
         let (server, mut client) = UnixStream::pair().expect("pair");
         let service_thread =
             thread::spawn(move || service.serve_connection(server).expect("serve connection"));
@@ -436,6 +438,104 @@ mod tests {
             service_thread.join().expect("service thread").terminal,
             TerminalState::Cancelled
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn startup_health_connection_does_not_consume_the_execution_session() {
+        let temporary = tempfile::tempdir_in(std::fs::canonicalize("/tmp").expect("short root"))
+            .expect("runtime parent");
+        let session = Arc::new(BrokerSession::generate().expect("session"));
+        let uid = temporary.path().metadata().expect("runtime owner").uid();
+        let runtime = crate::runtime::RuntimeDirectory::create(temporary.path(), session.id(), uid)
+            .expect("runtime");
+        let listener = Arc::new(runtime.initialize(&session).expect("listener"));
+        let server_listener = Arc::clone(&listener);
+        let service = service(&session);
+        let service_thread = thread::spawn(move || service.serve_once(&server_listener));
+
+        let health = UnixStream::connect(runtime.socket_path()).expect("health connection");
+        health.shutdown(Shutdown::Both).expect("health disconnect");
+        drop(health);
+
+        let mut client = crate::runtime::connect(&runtime.socket_path(), uid).expect("client");
+        let request = request(&session);
+        write_frame(
+            &mut client,
+            &ClientFrame::Execute {
+                request: Box::new(request.clone()),
+            },
+        )
+        .expect("execute frame");
+        write_frame(
+            &mut client,
+            &ClientFrame::Cancel {
+                correlation_id: request.correlation_id,
+            },
+        )
+        .expect("cancel frame");
+        let result = service_thread
+            .join()
+            .expect("service thread")
+            .expect("health connection must not terminate the one-session broker");
+        assert_eq!(result.terminal, TerminalState::Cancelled);
+        drop(client);
+        runtime
+            .cleanup(Arc::try_unwrap(listener).expect("listener is no longer shared"))
+            .expect("runtime cleanup");
+    }
+
+    #[test]
+    fn empty_pre_request_disconnect_is_distinct_from_a_protocol_failure() {
+        let session = Arc::new(BrokerSession::generate().expect("session"));
+        let service = service(&session);
+        let (server, client) = UnixStream::pair().expect("pair");
+        drop(client);
+        let error = service
+            .serve_connection(server)
+            .expect_err("no execution was requested");
+        assert_eq!(
+            error.to_string(),
+            "peer disconnected before the execution request"
+        );
+    }
+
+    #[test]
+    fn nonempty_invalid_first_frames_remain_fatal() {
+        for frame in [
+            b"{".as_slice(),
+            b"{\"kind\":\"graceful_shutdown\"}\n".as_slice(),
+        ] {
+            let session = Arc::new(BrokerSession::generate().expect("session"));
+            let service = service(&session);
+            let (server, mut client) = UnixStream::pair().expect("pair");
+            client.write_all(frame).expect("invalid request");
+            client.shutdown(Shutdown::Write).expect("end request");
+            let error = service
+                .serve_connection(server)
+                .expect_err("invalid first frame must fail");
+            assert_ne!(
+                error.to_string(),
+                "peer disconnected before the execution request"
+            );
+        }
+    }
+
+    fn service(session: &Arc<BrokerSession>) -> BrokerService<CancellableBackend> {
+        let broker = Arc::new(Broker::new(
+            Arc::clone(session),
+            CompiledCommandPolicy::compile(&CommandPolicy {
+                default_action: Action::Allow,
+                allowlist: Vec::new(),
+                denylist: Vec::new(),
+                log_blocked: true,
+            })
+            .expect("policy"),
+            EnvironmentPolicy::default(),
+            RequestLimits::default(),
+            CancellableBackend,
+        ));
+        BrokerService::new(broker)
     }
 
     #[test]

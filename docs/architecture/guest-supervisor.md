@@ -140,6 +140,12 @@ dependencies are rejected before spawn. A mandatory service cannot depend on an
 optional service. Services run in dedicated process groups.
 Output is drained concurrently and retained only up to the configured bound.
 
+The execution broker's connection-only startup health probe must not consume its
+single execution session. It retries only a peer-checked connection that closes
+without sending any request bytes. Nonempty malformed frames, invalid first
+operations, wrong peer identities, and invalid session authentication still fail;
+the actual execution request remains single-use.
+
 Optional services restart only within their declared budget, and dependents are
 re-health-checked after an optional dependency restart. Any mandatory service
 exit revokes the launch gate immediately; mandatory services are never restarted
