@@ -2,9 +2,11 @@
 
 `sendbox-runtime-apple` is the production Rust `RuntimeProvider` for the
 official Apple `container` CLI and service. It invokes the executable directly
-with exact argv, clears the inherited environment, supplies only `PATH`,
-`LANG`, `LC_ALL`, and explicitly marked secret variables, and never invokes a
-shell or language bridge.
+with exact argv, clears the inherited environment, supplies `PATH`, `LANG`,
+`LC_ALL`, the host `HOME`/`USER`/`TMPDIR` needed by the registered service, and
+explicitly marked secret variables, and never invokes a shell or language
+bridge. Supplying the host service environment does not mount the host home
+inside the VM.
 
 ## Requirements
 
@@ -23,6 +25,8 @@ The workload image must include `nft` and its runtime libraries, and the guest
 kernel must support the mandatory
 [egress enforcement prerequisites](installation.md#workload-image-versus-guest-bundle).
 A plain Alpine base image does not include `nftables`.
+Entrypoint and working-directory paths must also be symlink-free; see the
+[workload image requirements](installation.md#workload-image-versus-guest-bundle).
 
 `setup.sh` installs only the qualified 0.10.0 signed package and verifies its
 pinned SHA-256 digest plus package signature before invoking the installer.
@@ -134,3 +138,18 @@ Replacing only the host CLI cannot correct that guest defect: rebuild and sign
 the guest bundle as well. Host/guest manifest versions must match the binaries,
 and trust-root identity, architecture, release sequence, digests, and ownership
 must still verify. Never edit an installed signed bundle in place.
+
+If readiness succeeds but launch reports `openat2`/`Symbolic link loop`, fix the
+workload image or select its actual regular executable path. For a minimal
+qualification image, the original Alpine base can be extended without relaxing
+the broker:
+
+```dockerfile
+FROM alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+RUN apk add --no-cache nftables \
+    && cp /bin/busybox /bin/sh.sendbox \
+    && mv -f /bin/sh.sendbox /bin/sh
+```
+
+Build without cache and pin the resulting image digest. This image is only a
+minimal shell qualification image; it does not install a coding agent.

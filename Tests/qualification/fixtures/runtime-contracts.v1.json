@@ -11,6 +11,7 @@
     "guest_cgroup_namespace": "init_at_root_or_trusted_runtime_leaf_with_one_full_writable_cgroup2_mount_subtrees_and_unrelated_memberships_rejected",
     "broker_startup_health": "empty_peer_checked_pre_request_disconnect_is_non_consuming_authentication_and_invalid_frame_rejection_remain_enforced",
     "cgroup_delegation_startup_race": "busy_controller_writes_refresh_root_processes_within_a_bounded_deadline_other_errors_and_deadline_exhaustion_remain_fatal",
+    "persistent_failure_diagnostics": "terminal_failure_reason_is_credential_masked_and_exposed_in_json_message_or_stderr_without_changing_exit_codes_or_success_results",
     "secret_transfer": "one_shot_runtime_injection_over_bootstrap_exec_never_secret_argv",
     "kata_bundle": "host_and_guest_signature_version_arch_digest_owner_mode_rollback_and_static_elf_verification_before_agent_launch",
     "kata_live": "required_self_hosted_kvm_gate_unqualified_until_recorded",

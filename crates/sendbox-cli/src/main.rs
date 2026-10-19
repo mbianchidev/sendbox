@@ -560,7 +560,7 @@ async fn run(arguments: RunArgs) -> ExitCode {
         Ok(report) => {
             let code = report.exit_code();
             if arguments.json {
-                print_json(&serde_json::json!({
+                let mut result = serde_json::json!({
                     "event": "result",
                     "ok": code == 0,
                     "exit_code": code,
@@ -579,13 +579,22 @@ async fn run(arguments: RunArgs) -> ExitCode {
                         "quarantined": package.quarantined(),
                     })),
                     "syscall_report": report.syscall_report(),
-                }));
-            } else if let Some(trace) = report.syscall_report() {
-                eprintln!("syscall report: {}", trace.path().display());
-                if trace.incomplete_capture() {
-                    eprintln!(
-                        "sendbox: syscall capture reported loss or reached its guest log limit"
-                    );
+                });
+                if let Some(message) = report.failure_message() {
+                    result["message"] = Value::String(message.to_owned());
+                }
+                print_json(&result);
+            } else {
+                if let Some(message) = report.failure_message() {
+                    eprintln!("sendbox run: {message}");
+                }
+                if let Some(trace) = report.syscall_report() {
+                    eprintln!("syscall report: {}", trace.path().display());
+                    if trace.incomplete_capture() {
+                        eprintln!(
+                            "sendbox: syscall capture reported loss or reached its guest log limit"
+                        );
+                    }
                 }
             }
             exit_code(code)

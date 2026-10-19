@@ -126,6 +126,41 @@ mod tests {
     use sendbox_agent::{CleanupFailure, RunFailure};
 
     #[test]
+    fn persistent_terminal_failures_expose_only_the_masked_diagnostic() {
+        let masker = CredentialMasker::default();
+        masker.register(b"synthetic-terminal-credential").unwrap();
+        let report = HostRunReport::Persistent(crate::PersistentHostRunReport {
+            session_id: sendbox_core::SessionId::from_bytes([0x45; 16]),
+            agent: sendbox_agent::AgentReport {
+                terminal: sendbox_agent::GuestTerminal::Failed {
+                    message: "synthetic launch failure: synthetic-terminal-credential".to_owned(),
+                },
+                states: Vec::new(),
+                safe_outputs: None,
+                package_report: None,
+                syscall_report: None,
+            },
+            package_report: None,
+            syscall_report: None,
+        });
+        let masked = mask_report(&masker, report).unwrap();
+        assert_eq!(
+            masked.failure_message(),
+            Some("synthetic launch failure: [REDACTED]")
+        );
+        assert!(!format!("{masked:?}").contains("synthetic-terminal-credential"));
+    }
+
+    #[test]
+    fn successful_reports_do_not_invent_a_failure_diagnostic() {
+        let report = HostRunReport::OneShot(sendbox_runtime::ProcessOutcome::successful(
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert_eq!(report.failure_message(), None);
+    }
+
+    #[test]
     fn diagnostics_preserve_kind_and_cancellation_without_debug_leaks() {
         let masker = CredentialMasker::default();
         masker.register(b"synthetic-opaque-value").unwrap();

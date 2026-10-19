@@ -45,6 +45,12 @@ entry program and initial inference endpoints; `open-code` is an alias for
 See [interactive sessions](interactive-sessions.md) for terminal-specific
 requirements and [configuration](configuration.md) for the YAML reference.
 
+JSON workload output events carry `encoding: "hex"`; decode their `data` before
+comparing payload bytes. A persistent launch/runtime failure reports its already
+credential-masked terminal diagnostic in the result's `message` field and keeps
+the existing nonzero exit code. Text mode prints that diagnostic to stderr.
+Successful result objects do not add a failure message.
+
 ## Examples
 
 ```bash

@@ -210,6 +210,17 @@ impl PersistedPackageReport {
 
 impl HostRunReport {
     #[must_use]
+    pub fn failure_message(&self) -> Option<&str> {
+        match self {
+            Self::Persistent(report) => match &report.agent.terminal {
+                GuestTerminal::Failed { message } => Some(message),
+                _ => None,
+            },
+            Self::OneShot(_) => None,
+        }
+    }
+
+    #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Persistent(report) => match &report.agent.terminal {
