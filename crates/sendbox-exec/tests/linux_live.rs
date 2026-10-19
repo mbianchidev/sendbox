@@ -105,7 +105,14 @@ fn direct_exec_bypass_is_denied_before_untrusted_callback() {
         bootstrap
             .verify_exec_path_denied(&script)
             .expect("shebang execve probe denied");
-        assert_eq!(bootstrap.run_untrusted(|| 41 + 1), 42);
+        assert_eq!(
+            bootstrap.run_untrusted(|| {
+                std::thread::spawn(|| 41 + 1)
+                    .join()
+                    .expect("ordinary threads remain permitted after bootstrap")
+            }),
+            42
+        );
         return;
     }
     let status = Command::new(std::env::current_exe().expect("current exe"))
@@ -537,7 +544,7 @@ fn descendant_clone3_is_denied_by_child_only_filter() {
     let script = concat!(
         "import ctypes\n",
         "libc=ctypes.CDLL(None, use_errno=True)\n",
-        "result=libc.syscall(435, 0)\n",
+        "result=libc.syscall(435, ctypes.c_void_p(), ctypes.c_size_t(0))\n",
         "print('clone3', result, ctypes.get_errno(), flush=True)\n",
     );
     let invocation = launcher_invocation(
@@ -556,8 +563,48 @@ fn descendant_clone3_is_denied_by_child_only_filter() {
     let (result, output) = invoke_launcher(&invocation);
     assert!(matches!(result.terminal, TerminalState::Exited(_)));
     assert!(
-        String::from_utf8_lossy(&output).contains("clone3 -1 1"),
-        "clone3 did not return EPERM: {}",
+        String::from_utf8_lossy(&output).contains("clone3 -1 38"),
+        "clone3 did not remain denied with ENOSYS: {}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn descendant_threads_work_while_namespace_and_process_controls_remain_denied() {
+    let session = BrokerSession::generate().expect("session");
+    let Some(parent) = qualified_cgroup_parent(&session) else {
+        return;
+    };
+    let Some((python, executable)) = python_helper() else {
+        return;
+    };
+    let invocation = launcher_invocation(
+        &session,
+        parent,
+        LaunchCase {
+            correlation: "live-thread-compat",
+            executable: &executable,
+            argv: vec![
+                python,
+                "-c".into(),
+                include_str!("fixtures/thread_compatibility.py").into(),
+            ],
+            timeout: Duration::from_secs(5),
+            containment: ContainmentProfile::default(),
+            output_event_limit: None,
+            stdin: sendbox_exec::StandardInput::Null,
+        },
+    );
+    let (result, output) = invoke_launcher(&invocation);
+    assert_clean_exit(&result.terminal);
+    assert!(
+        result.cleanup.is_complete(),
+        "{:?}",
+        result.cleanup.failures
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("GENERATED_THREADS_AND_DENIALS_READY"),
+        "{}",
         String::from_utf8_lossy(&output)
     );
 }

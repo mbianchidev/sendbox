@@ -115,6 +115,14 @@ The command tree receives:
   flag bypass after the trusted launcher has used `clone3` itself;
 - a constrained environment and no inherited control, cgroup, or launcher FDs.
 
+`clone3` remains unconditionally denied after the trusted launch, but returns
+`ENOSYS` rather than `EPERM`. Modern glibc uses `clone3` for `pthread_create` and
+falls back to classic `clone` only when it is unavailable. The fallback stays
+inside the existing namespace-flag filters, capability drop, NNP, inherited
+seccomp, and cgroup containment. No pointer-based clone arguments are admitted.
+Other dangerous-syscall denials still return `EPERM`; the trusted launcher's
+atomic `clone3(CLONE_INTO_CGROUP|CLONE_PIDFD)` path is unchanged.
+
 Cleanup order is fixed:
 
 1. record timeout, cancellation, disconnect, saturation, shutdown, supervisor

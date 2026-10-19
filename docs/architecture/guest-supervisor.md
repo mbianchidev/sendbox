@@ -9,6 +9,12 @@ mandatory MCP audit service and, for remote MCP, a trusted HTTP gateway inside
 the egress broker. When enabled, the supervisor also owns the Safe Outputs
 recorder and its seal key. BPF activation remains explicit guest policy.
 
+Threaded glibc workloads retain ordinary pthread support through classic `clone`
+fallback. Both the agent bootstrap and child-only filter reject `clone3` with
+`ENOSYS`, not an allow decision. Namespace clone flags and dangerous
+process-control syscalls remain denied, and the bootstrap verifies the expected
+`clone3` denial before publishing readiness.
+
 ## Process and command model
 
 `sendbox-guest` is a static multi-call binary with these entrypoints:

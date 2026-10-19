@@ -257,8 +257,7 @@ impl PlatformControls for LinuxPlatformControls {
             .find(|status| status.control == ControlKind::Seccomp)
             .ok_or_else(|| GuestError::Runtime("seccomp status was not prepared".to_owned()))?;
         seccomp.verified = true;
-        seccomp.detail =
-            "NNP and TSYNC deny direct execve, execveat, clone3, and memfd_create".to_owned();
+        seccomp.detail = "NNP and TSYNC deny direct execve, execveat, and memfd_create; clone3 returns ENOSYS while classic clone namespace flags remain denied".to_owned();
         self.self_test(&statuses)?;
         Ok(statuses)
     }

@@ -48,6 +48,7 @@ impl AgentBootstrap {
         }
         raw::verify_direct_execveat_denied(execveat_probe.as_raw_fd())?;
         raw::verify_memfd_denied()?;
+        raw::verify_clone3_denied()?;
         Ok(Self { _private: () })
     }
 

@@ -8,6 +8,9 @@ use libseccomp::{
 
 use crate::error::{KernelPrimitive, PlatformError, UnsupportedKernel};
 
+// libc may fall back to the argument-filtered clone syscall only on ENOSYS.
+pub(crate) const CLONE3_DENIAL_ERRNO: i32 = libc::ENOSYS;
+
 const CLONE_NEWNS: u64 = 0x0002_0000;
 const CLONE_NEWCGROUP: u64 = 0x0200_0000;
 const CLONE_NEWUTS: u64 = 0x0400_0000;
@@ -158,9 +161,17 @@ fn add_deny_rule(
     name: &str,
 ) -> Result<(), PlatformError> {
     context
-        .add_rule(ScmpAction::Errno(libc::EPERM), syscall)
+        .add_rule(denial_action(name), syscall)
         .map(|_| ())
         .map_err(|error| PlatformError::SecuritySetup(format!("deny syscall {name:?}: {error}")))
+}
+
+fn denial_action(name: &str) -> ScmpAction {
+    ScmpAction::Errno(if name == "clone3" {
+        CLONE3_DENIAL_ERRNO
+    } else {
+        libc::EPERM
+    })
 }
 
 fn deny_namespace_clone(context: &mut ScmpFilterContext) -> Result<(), PlatformError> {
@@ -185,5 +196,23 @@ fn deny_namespace_clone(context: &mut ScmpFilterContext) -> Result<(), PlatformE
                 ))
             })?;
     }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone3_is_unavailable_not_allowed_for_libc_fallback() {
+        assert_eq!(denial_action("clone3"), ScmpAction::Errno(libc::ENOSYS));
+    }
+
+    #[test]
+    fn other_privilege_process_and_exec_denials_keep_eperm() {
+        for name in ALWAYS_DENIED.iter().copied().chain(["execve", "execveat"]) {
+            assert_eq!(denial_action(name), ScmpAction::Errno(libc::EPERM));
+        }
+    }
 }
