@@ -814,14 +814,14 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sendbox-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "sendbox-secrets"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cap-std",
  "chacha20poly1305",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-security"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-session-security"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "sendbox-core",
  "sendbox-secrets",
