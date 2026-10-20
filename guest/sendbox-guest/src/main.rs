@@ -343,6 +343,7 @@ async fn execute(cli: Cli) -> Result<(), GuestError> {
                 .create(parent)
                 .map_err(|error| GuestError::io("creating bootstrap injection directory", error))?;
         }
+        sendbox_guest::platform::prepare_native_exec_cgroup(Path::new("/sys/fs/cgroup"))?;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
             .map_err(|error| GuestError::io("setting bootstrap injection directory mode", error))?;
         let mut encoded = Vec::new();
@@ -438,6 +439,7 @@ async fn bootstrap_install(args: BootstrapInstallArgs) -> Result<(), GuestError>
         std::path::Path::new("/var/lib/sendbox/replay"),
         "bootstrap replay directory",
     )?;
+    sendbox_guest::platform::prepare_native_exec_cgroup(Path::new("/sys/fs/cgroup"))?;
     let mut bytes = zeroize::Zeroizing::new(Vec::new());
     tokio::io::stdin()
         .take(u64::try_from(MAX_BOOTSTRAP_BYTES + 1).expect("bootstrap bound fits u64"))
