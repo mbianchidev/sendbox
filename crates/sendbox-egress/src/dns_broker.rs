@@ -36,7 +36,7 @@ use crate::audit::{AuditEvent, AuditSink};
 use crate::authorization::AuthorizationCache;
 use crate::dns_budget::DnsGuard;
 use crate::policy::PolicyEngine;
-use crate::resolver::{ResolveError, UpstreamResolver};
+use crate::resolver::{ResolveError, ResolveFailure, ResolveFailureKind, UpstreamResolver};
 
 /// Maximum UDP datagram accepted before it is even parsed. Chosen well above
 /// the classic 512-byte limit to tolerate EDNS0-sized queries while staying
@@ -235,16 +235,35 @@ impl<R: UpstreamResolver + 'static> DnsBroker<R> {
         let resolved =
             match timeout(self.config.upstream_timeout, self.resolver.resolve(name)).await {
                 Ok(Ok(chain)) => chain,
-                Ok(Err(ResolveError::NxDomain(_))) => {
+                Ok(Err(error)) => {
+                    let nxdomain = matches!(error, ResolveError::NxDomain(_));
+                    self.audit.record(AuditEvent::DnsResolutionFailed {
+                        name: original.clone(),
+                        source: "dns",
+                        failure: error.diagnostic(),
+                    });
                     return QueryOutcome::Denied {
-                        code: ResponseCode::NXDomain,
-                        reason: "upstream reports nxdomain",
+                        code: if nxdomain {
+                            ResponseCode::NXDomain
+                        } else {
+                            ResponseCode::ServFail
+                        },
+                        reason: if nxdomain {
+                            "upstream reports nxdomain"
+                        } else {
+                            "upstream resolution failed"
+                        },
                     };
                 }
-                Ok(Err(_)) | Err(_) => {
+                Err(_) => {
+                    self.audit.record(AuditEvent::DnsResolutionFailed {
+                        name: original.clone(),
+                        source: "dns",
+                        failure: ResolveFailure::new(ResolveFailureKind::BrokerTimeout),
+                    });
                     return QueryOutcome::Denied {
                         code: ResponseCode::ServFail,
-                        reason: "upstream resolution failed",
+                        reason: "upstream resolution deadline exceeded",
                     };
                 }
             };

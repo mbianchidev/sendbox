@@ -164,6 +164,13 @@ allowing a public API hostname does not implicitly authorize its canonical
 backend names. Keep those denials intact and require explicit policy approval
 for any additional names.
 
+For first-request DNS failures, use the credential-free
+[cold-start diagnostic](dns-cold-start.md). It measures a new VM's first
+SOCKS/HTTP request without a lookup, warm-up or application retry, retains
+sanitized resolver failure details, checks deny-first containment, and records
+per-request latency and owned-VM cleanup. A successful later request is not
+proof that the cold request worked.
+
 If readiness succeeds but launch reports `openat2`/`Symbolic link loop`, fix the
 workload image or select its actual regular executable path. For a minimal
 qualification image, the original Alpine base can be extended without relaxing
