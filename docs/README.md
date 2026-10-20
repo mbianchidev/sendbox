@@ -19,6 +19,7 @@ to a first run. Use this index for setup, operation, and implementation details.
 ## Runtime and operations
 
 - [Apple runtime](apple-runtime.md)
+- [Cold-start DNS diagnostics](dns-cold-start.md)
 - [Kata Containers](kata-containers.md)
 - [Hyperlight](hyperlight.md)
 - [Package supply-chain proxy](package-supply-chain.md)

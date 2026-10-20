@@ -1,7 +1,7 @@
 //! Typed, deterministic egress audit events.
 //!
 //! Every allow, deny, error, rate-limit, and unsupported-protocol decision in
-//! both brokers emits exactly one [`AuditEvent`] through an [`AuditSink`].
+//! both brokers emits an [`AuditEvent`] through an [`AuditSink`].
 //! Events are serializable to stable JSON (fixed field order per variant) so
 //! they can be asserted in tests and shipped to a host audit trail. Errors are
 //! surfaced as events, never swallowed.
@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 use crate::dns_budget::DnsLimit;
+use crate::resolver::ResolveFailure;
 
 /// A single, self-describing egress decision record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -30,6 +31,12 @@ pub enum AuditEvent {
         name: String,
         response_code: &'static str,
         reason: &'static str,
+    },
+    /// Sanitized resolver detail accompanying a DNS or CONNECT failure.
+    DnsResolutionFailed {
+        name: String,
+        source: &'static str,
+        failure: ResolveFailure,
     },
     /// A DNS query was rejected by a per-query structural limit.
     DnsStructuralRejected { name: String, limit: DnsLimit },
@@ -50,6 +57,12 @@ pub enum AuditEvent {
         target: String,
         port: u16,
         status: &'static str,
+    },
+    ConnectDialFailed {
+        target: String,
+        port: u16,
+        io_kind: String,
+        os_error: Option<i32>,
     },
     /// A CONNECT request used a non-TCP protocol (UDP/QUIC), which is always
     /// denied.

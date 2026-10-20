@@ -9,16 +9,20 @@
 //!   must match the query name and type; otherwise the answer is rejected.
 //! * A query is sent over UDP first; if the response has the truncation bit
 //!   set it is retried once over TCP.
+//! * A missing UDP reply is retransmitted once on the same socket, halfway
+//!   through the query budget. Retransmission never restarts that budget.
 //! * The CNAME chain is followed only within the single returned message, to a
 //!   bounded depth, with loop detection.
 //! * The number of address records is capped.
-//! * Every network read/write is bounded by a per-query timeout (the broker
-//!   additionally wraps the whole `resolve` call in its own timeout).
+//! * One per-query deadline bounds socket setup, both UDP attempts and any
+//!   TCP fallback (the broker additionally bounds the whole `resolve` call).
 //!
 //! A and AAAA are queried concurrently and merged, since the
 //! [`UpstreamResolver`] contract returns a name's full address set and the
 //! broker filters by QTYPE afterward.
 
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -26,10 +30,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
+use sendbox_policy::DnsRecordType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout_at};
 
-use crate::resolver::{ResolveError, ResolvedAddress, ResolvedChain, UpstreamResolver};
+use crate::resolver::{
+    DnsOperation, DnsTransport, ResolveError, ResolvedAddress, ResolvedChain, UpstreamResolver,
+};
 
 /// Maximum CNAME hops followed within a single response before the chain is
 /// rejected as abusive/looping.
@@ -45,7 +52,7 @@ pub const MAX_TCP_RESPONSE_BYTES: usize = 65535;
 pub struct ForwardingResolverConfig {
     /// Fixed upstream resolver address. Dialed directly; never re-resolved.
     pub upstream: SocketAddr,
-    /// Bound on each individual UDP/TCP exchange.
+    /// Total budget per QTYPE, including one UDP retransmission and TCP fallback.
     pub query_timeout: Duration,
     /// Optional `SO_MARK` applied to every upstream socket. In a Linux
     /// enforcement topology this is the broker mark, so the DNS broker's own
@@ -95,33 +102,41 @@ impl ForwardingResolver {
     async fn query_type(
         &self,
         name: &Name,
-        record_type: RecordType,
+        qtype: DnsRecordType,
     ) -> Result<SingleResult, ResolveError> {
-        let id = self.next_id();
-        let mut message = Message::new(id, MessageType::Query, OpCode::Query);
-        message.metadata.recursion_desired = true;
-        message.add_query(Query::query(name.clone(), record_type));
-        let query_bytes = message
-            .to_vec()
-            .map_err(|e| ResolveError::Upstream(format!("encode query: {e}")))?;
+        let result = async {
+            let record_type = match qtype {
+                DnsRecordType::A => RecordType::A,
+                DnsRecordType::Aaaa => RecordType::AAAA,
+            };
+            let id = self.next_id();
+            let mut message = Message::new(id, MessageType::Query, OpCode::Query);
+            message.metadata.recursion_desired = true;
+            message.add_query(Query::query(name.clone(), record_type));
+            let query_bytes = message
+                .to_vec()
+                .map_err(|e| ResolveError::Upstream(format!("encode query: {e}")))?;
 
-        let response = self.exchange(&query_bytes, id, name, record_type).await?;
+            let response = self.exchange(&query_bytes, id, name, record_type).await?;
 
-        match response.metadata.response_code {
-            ResponseCode::NoError => {}
-            ResponseCode::NXDomain => return Ok(SingleResult::NxDomain),
-            other => {
-                return Err(ResolveError::Upstream(format!(
-                    "upstream response code {other:?}"
-                )));
+            match response.metadata.response_code {
+                ResponseCode::NoError => {}
+                ResponseCode::NXDomain => return Ok(SingleResult::NxDomain),
+                other => return Err(ResolveError::ResponseCode(u16::from(other))),
             }
-        }
 
-        reconstruct(name, record_type, &response)
+            reconstruct(name, record_type, &response)
+        }
+        .await;
+        result.map_err(|source| ResolveError::Query {
+            upstream: self.config.upstream,
+            qtype,
+            source: Box::new(source),
+        })
     }
 
-    /// Performs one UDP exchange, retrying over TCP if the response is
-    /// truncated. Validates the response ID and echoed question in both cases.
+    /// Performs a bounded UDP exchange, retrying over TCP if the response is
+    /// truncated. Both transports share one absolute deadline.
     async fn exchange(
         &self,
         query_bytes: &[u8],
@@ -129,106 +144,160 @@ impl ForwardingResolver {
         name: &Name,
         record_type: RecordType,
     ) -> Result<Message, ResolveError> {
-        let udp = self.exchange_udp(query_bytes).await?;
+        let deadline = Instant::now() + self.config.query_timeout;
+        let udp = self.exchange_udp(query_bytes, deadline).await?;
         validate_response(&udp, id, name, record_type)?;
         if udp.metadata.truncation {
-            let tcp = self.exchange_tcp(query_bytes).await?;
+            let tcp = self.exchange_tcp(query_bytes, deadline).await?;
             validate_response(&tcp, id, name, record_type)?;
+            if tcp.metadata.truncation {
+                return Err(ResolveError::InvalidResponse("truncated_tcp"));
+            }
             return Ok(tcp);
         }
         Ok(udp)
     }
 
-    async fn exchange_udp(&self, query_bytes: &[u8]) -> Result<Message, ResolveError> {
+    async fn exchange_udp(
+        &self,
+        query_bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<Message, ResolveError> {
         let bind_addr = match self.config.upstream.ip() {
             IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
         };
-        let socket = crate::dialer::bind_udp(bind_addr, self.config.socket_mark)
-            .await
-            .map_err(|e| ResolveError::Upstream(format!("udp bind: {e}")))?;
+        let socket = bounded_io(
+            deadline,
+            DnsTransport::Udp,
+            DnsOperation::Bind,
+            crate::dialer::bind_udp(bind_addr, self.config.socket_mark),
+        )
+        .await?;
         // Connect the UDP socket to the fixed upstream so the kernel only
         // delivers datagrams whose source is *exactly* the configured upstream
         // — the full address **and** port (the 4-tuple), not merely the same
         // IP. This is the primary anti-spoofing control; a reply forged from
         // the right IP but a different port is dropped by the kernel and never
         // seen here.
-        socket
-            .connect(self.config.upstream)
-            .await
-            .map_err(|e| ResolveError::Upstream(format!("udp connect: {e}")))?;
-        timeout(self.config.query_timeout, socket.send(query_bytes))
-            .await
-            .map_err(|_| ResolveError::Timeout)?
-            .map_err(|e| ResolveError::Upstream(format!("udp send: {e}")))?;
+        bounded_io(
+            deadline,
+            DnsTransport::Udp,
+            DnsOperation::Connect,
+            socket.connect(self.config.upstream),
+        )
+        .await?;
 
         let mut buf = vec![0u8; MAX_UDP_RESPONSE_BYTES];
-        // `recv_from` on the connected socket still yields the peer address, so
-        // we re-check the full `SocketAddr` as defense in depth even though the
-        // kernel has already filtered by the 4-tuple.
-        let (len, from) = timeout(self.config.query_timeout, socket.recv_from(&mut buf))
-            .await
-            .map_err(|_| ResolveError::Timeout)?
-            .map_err(|e| ResolveError::Upstream(format!("udp recv: {e}")))?;
-        if from != self.config.upstream {
-            return Err(ResolveError::Upstream(
-                "udp response from unexpected source".to_owned(),
-            ));
+        let retry_at = deadline - self.config.query_timeout / 2;
+        for attempt in 0..2 {
+            if Instant::now() >= deadline {
+                return Err(ResolveError::ExchangeTimeout {
+                    transport: DnsTransport::Udp,
+                    operation: DnsOperation::Receive,
+                });
+            }
+            bounded_io(
+                deadline,
+                DnsTransport::Udp,
+                DnsOperation::Send,
+                socket.send(query_bytes),
+            )
+            .await?;
+            let receive_deadline = if attempt == 0 { retry_at } else { deadline };
+            let received = bounded_io(
+                receive_deadline,
+                DnsTransport::Udp,
+                DnsOperation::Receive,
+                socket.recv_from(&mut buf),
+            )
+            .await;
+            let (len, from) = match received {
+                Err(ResolveError::ExchangeTimeout { .. }) if attempt == 0 => continue,
+                result => result?,
+            };
+            if from != self.config.upstream {
+                return Err(ResolveError::InvalidResponse("udp_source_mismatch"));
+            }
+            return Message::from_vec(&buf[..len])
+                .map_err(|_| ResolveError::InvalidResponse("udp_decode"));
         }
-        Message::from_vec(&buf[..len])
-            .map_err(|e| ResolveError::Upstream(format!("udp decode: {e}")))
+        Err(ResolveError::ExchangeTimeout {
+            transport: DnsTransport::Udp,
+            operation: DnsOperation::Receive,
+        })
     }
 
-    async fn exchange_tcp(&self, query_bytes: &[u8]) -> Result<Message, ResolveError> {
-        let mut stream = crate::dialer::connect_tcp(
-            self.config.upstream,
-            self.config.query_timeout,
-            self.config.socket_mark,
+    async fn exchange_tcp(
+        &self,
+        query_bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<Message, ResolveError> {
+        let mut stream = bounded_io(
+            deadline,
+            DnsTransport::Tcp,
+            DnsOperation::Connect,
+            crate::dialer::connect_tcp(
+                self.config.upstream,
+                deadline.saturating_duration_since(Instant::now()),
+                self.config.socket_mark,
+            ),
         )
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                ResolveError::Timeout
-            } else {
-                ResolveError::Upstream(format!("tcp connect: {e}"))
-            }
-        })?;
+        .await?;
 
         let len = u16::try_from(query_bytes.len())
             .map_err(|_| ResolveError::Upstream("query too large for tcp".to_owned()))?;
-        timeout(self.config.query_timeout, async {
+        bounded_io(deadline, DnsTransport::Tcp, DnsOperation::Send, async {
             stream.write_all(&len.to_be_bytes()).await?;
             stream.write_all(query_bytes).await
         })
-        .await
-        .map_err(|_| ResolveError::Timeout)?
-        .map_err(|e| ResolveError::Upstream(format!("tcp send: {e}")))?;
+        .await?;
 
         let mut len_buf = [0u8; 2];
-        timeout(self.config.query_timeout, stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| ResolveError::Timeout)?
-            .map_err(|e| ResolveError::Upstream(format!("tcp len: {e}")))?;
+        bounded_io(
+            deadline,
+            DnsTransport::Tcp,
+            DnsOperation::ReadLength,
+            stream.read_exact(&mut len_buf),
+        )
+        .await?;
         let response_len = u16::from_be_bytes(len_buf) as usize;
         if response_len == 0 || response_len > MAX_TCP_RESPONSE_BYTES {
-            return Err(ResolveError::Upstream(
-                "tcp response length out of bounds".to_owned(),
-            ));
+            return Err(ResolveError::InvalidResponse("tcp_response_length"));
         }
         let mut response_buf = vec![0u8; response_len];
-        timeout(
-            self.config.query_timeout,
+        bounded_io(
+            deadline,
+            DnsTransport::Tcp,
+            DnsOperation::ReadBody,
             stream.read_exact(&mut response_buf),
         )
-        .await
-        .map_err(|_| ResolveError::Timeout)?
-        .map_err(|e| ResolveError::Upstream(format!("tcp body: {e}")))?;
-        Message::from_vec(&response_buf)
-            .map_err(|e| ResolveError::Upstream(format!("tcp decode: {e}")))
+        .await?;
+        Message::from_vec(&response_buf).map_err(|_| ResolveError::InvalidResponse("tcp_decode"))
     }
 }
 
+async fn bounded_io<T>(
+    deadline: Instant,
+    transport: DnsTransport,
+    operation: DnsOperation,
+    exchange: impl Future<Output = io::Result<T>>,
+) -> Result<T, ResolveError> {
+    timeout_at(deadline, exchange)
+        .await
+        .map_err(|_| ResolveError::ExchangeTimeout {
+            transport,
+            operation,
+        })?
+        .map_err(|source| ResolveError::Transport {
+            transport,
+            operation,
+            source,
+        })
+}
+
 /// Per-type result before merging A and AAAA.
+#[derive(Debug)]
 enum SingleResult {
     NxDomain,
     Answer {
@@ -245,21 +314,17 @@ fn validate_response(
     record_type: RecordType,
 ) -> Result<(), ResolveError> {
     if response.metadata.id != id {
-        return Err(ResolveError::Upstream("response id mismatch".to_owned()));
+        return Err(ResolveError::InvalidResponse("id_mismatch"));
     }
     if response.metadata.message_type != MessageType::Response {
-        return Err(ResolveError::Upstream(
-            "response is not a reply message".to_owned(),
-        ));
+        return Err(ResolveError::InvalidResponse("not_a_response"));
     }
     let question_ok = response
         .queries
         .iter()
         .any(|q| q.query_type() == record_type && names_equal(q.name(), name));
     if !question_ok {
-        return Err(ResolveError::Upstream(
-            "response question does not echo the query".to_owned(),
-        ));
+        return Err(ResolveError::InvalidResponse("question_mismatch"));
     }
     Ok(())
 }
@@ -290,12 +355,12 @@ fn reconstruct(
         match next {
             Some(target) => {
                 if chain_targets.len() >= MAX_CNAME_DEPTH {
-                    return Err(ResolveError::Upstream("cname chain too long".to_owned()));
+                    return Err(ResolveError::InvalidResponse("cname_chain_too_long"));
                 }
                 if names_equal(&target, name)
                     || chain_targets.iter().any(|t| names_equal(t, &target))
                 {
-                    return Err(ResolveError::Upstream("cname loop detected".to_owned()));
+                    return Err(ResolveError::InvalidResponse("cname_loop"));
                 }
                 current = target.clone();
                 chain_targets.push(target);
@@ -344,8 +409,8 @@ fn reconstruct(
 impl UpstreamResolver for ForwardingResolver {
     async fn resolve(&self, name: &Name) -> Result<ResolvedChain, ResolveError> {
         let (a_result, aaaa_result) = tokio::join!(
-            self.query_type(name, RecordType::A),
-            self.query_type(name, RecordType::AAAA)
+            self.query_type(name, DnsRecordType::A),
+            self.query_type(name, DnsRecordType::Aaaa)
         );
 
         let a = a_result?;
@@ -376,9 +441,7 @@ impl UpstreamResolver for ForwardingResolver {
                 },
             ) => {
                 if !chains_agree(&a_chain, &a_final, &q_chain, &q_final) {
-                    return Err(ResolveError::Upstream(
-                        "A and AAAA resolved through different CNAME chains".to_owned(),
-                    ));
+                    return Err(ResolveError::InvalidResponse("cname_chain_conflict"));
                 }
                 let mut addresses = a_addr;
                 addresses.extend(q_addr);
@@ -428,12 +491,133 @@ fn chains_agree(a_chain: &[Name], a_final: &Name, q_chain: &[Name], q_final: &Na
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::{AuditEvent, CollectingAuditSink};
+    use crate::authorization::AuthorizationCache;
+    use crate::connect_broker::ConnectBrokerConfig;
+    use crate::connect_proto::{
+        self, ConnectProtocol, ConnectRequest, ConnectStatus, ConnectTarget,
+    };
+    use crate::dialer::DirectDialer;
+    use crate::gateway::{Gateway, GatewayConfig, GatewayListeners};
+    use crate::policy::PolicyEngine;
+    use crate::resolver::ResolveFailureKind;
     use hickory_proto::rr::Record;
     use hickory_proto::rr::rdata::{A, AAAA, CNAME};
+    use sendbox_policy::{Action, DnsPolicy, NetworkPolicy};
     use std::net::Ipv4Addr;
     use std::str::FromStr;
     use std::sync::Arc;
-    use tokio::net::UdpSocket;
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
+    use tokio_util::sync::CancellationToken;
+
+    struct ColdGateway {
+        upstream: UdpSocket,
+        echo: TcpListener,
+        connect: SocketAddr,
+        authorizations: Arc<AuthorizationCache>,
+        audit: Arc<CollectingAuditSink>,
+        cancel: CancellationToken,
+    }
+
+    impl Drop for ColdGateway {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
+    }
+
+    async fn cold_gateway(resolve_timeout: Duration) -> ColdGateway {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let policy = NetworkPolicy {
+            default_action: Action::Deny,
+            allowed_domains: vec![
+                "allowed.example".to_owned(),
+                "canonical.allowed.example".to_owned(),
+            ],
+            blocked_domains: vec![],
+            allow_dns: true,
+            max_connections: Some(2),
+            allowed_networks: vec!["127.0.0.1/32".to_owned()],
+            blocked_networks: vec![],
+            allowed_ports: vec![],
+            dns: DnsPolicy::default(),
+        };
+        let audit = Arc::new(CollectingAuditSink::new());
+        let gateway = Gateway::new(
+            Arc::new(PolicyEngine::compile(&policy).unwrap()),
+            Arc::new(ForwardingResolver::new(ForwardingResolverConfig::new(
+                upstream.local_addr().unwrap(),
+            ))),
+            Arc::new(DirectDialer),
+            Arc::clone(&audit) as Arc<_>,
+            GatewayConfig {
+                connect: ConnectBrokerConfig {
+                    resolve_timeout,
+                    ..ConnectBrokerConfig::default()
+                },
+                ..GatewayConfig::default()
+            },
+        );
+        let listeners = GatewayListeners::bind(
+            Some("127.0.0.1:0".parse().unwrap()),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        let connect = listeners.connect_addr();
+        let authorizations = gateway.authorizations();
+        let cancel = CancellationToken::new();
+        let serving = cancel.clone();
+        tokio::spawn(async move { gateway.serve(listeners, serving).await.unwrap() });
+        ColdGateway {
+            upstream,
+            echo,
+            connect,
+            authorizations,
+            audit,
+            cancel,
+        }
+    }
+
+    fn first_connect(fixture: &ColdGateway) -> tokio::task::JoinHandle<io::Result<u8>> {
+        let address = fixture.connect;
+        let port = fixture.echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await?;
+            stream
+                .write_all(&connect_proto::encode_request(&ConnectRequest {
+                    protocol: ConnectProtocol::Tcp,
+                    target: ConnectTarget::Hostname("allowed.example".to_owned()),
+                    port,
+                    expected_ip: None,
+                }))
+                .await?;
+            let mut status = [0; 2];
+            stream.read_exact(&mut status).await?;
+            Ok(status[1])
+        })
+    }
+
+    async fn answer_query(socket: &UdpSocket, bytes: &[u8], peer: SocketAddr, canonical: &str) {
+        let query = Message::from_vec(bytes).unwrap();
+        let canonical = Name::from_ascii(canonical).unwrap();
+        let mut records = vec![Record::from_rdata(
+            query.queries[0].name().clone(),
+            60,
+            RData::CNAME(CNAME(canonical.clone())),
+        )];
+        if query.queries[0].query_type() == RecordType::A {
+            records.push(Record::from_rdata(
+                canonical,
+                60,
+                RData::A(A(Ipv4Addr::LOCALHOST)),
+            ));
+        }
+        socket
+            .send_to(&answer_for(&query, records).to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+    }
 
     /// A tiny UDP DNS server that answers from a closure, for testing the
     /// forwarding resolver against real encoded/decoded messages.
@@ -473,6 +657,480 @@ mod tests {
             response.add_answer(record);
         }
         response
+    }
+
+    async fn receive_query(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut bytes = vec![0; 4096];
+        loop {
+            match socket.try_recv_from(&mut bytes) {
+                Ok((length, peer)) => {
+                    bytes.truncate(length);
+                    return (bytes, peer);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("fixture receive failed: {error}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected a DNS datagram without advancing the resolver clock"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn finish<T>(task: tokio::task::JoinHandle<T>) -> T {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !task.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resolver task did not finish at the expected virtual deadline"
+            );
+            tokio::task::yield_now().await;
+        }
+        task.await.expect("resolver task panicked")
+    }
+
+    async fn flush_io() {
+        // Keep virtual time frozen while the reactor consumes loopback replies,
+        // so advancing a timer does not outrun already-delivered network data.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retransmits_a_lost_first_datagram_without_restarting_the_deadline() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(
+            upstream.local_addr().unwrap(),
+        ));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        let (first, peer) = receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_millis(1499)).await;
+        assert_no_query(&upstream);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let (retry, retry_peer) = receive_query(&upstream).await;
+        assert!(
+            retry == first,
+            "retransmission must preserve the question and ID"
+        );
+        assert_eq!(
+            retry_peer, peer,
+            "retransmission must preserve the UDP peer"
+        );
+        let query = Message::from_vec(&retry).unwrap();
+        let response = answer_for(
+            &query,
+            vec![Record::from_rdata(
+                Name::from_ascii("cold.example.").unwrap(),
+                60,
+                RData::A(A(Ipv4Addr::new(203, 0, 113, 7))),
+            )],
+        );
+        upstream
+            .send_to(&response.to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+        assert!(matches!(
+            finish(task).await.unwrap(),
+            SingleResult::Answer { addresses, .. } if addresses.len() == 1
+        ));
+    }
+
+    fn assert_no_query(socket: &UdpSocket) {
+        assert!(
+            socket
+                .try_recv_from(&mut [0; 4096])
+                .is_err_and(|error| { error.kind() == std::io::ErrorKind::WouldBlock }),
+            "unexpected DNS retransmission"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_blackhole_is_bounded_to_two_sends_and_one_deadline() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        let (first, peer) = receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        assert!(receive_query(&upstream).await == (first, peer));
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        let failure = finish(task).await.unwrap_err().diagnostic();
+        assert_eq!(failure.kind, crate::resolver::ResolveFailureKind::Timeout);
+        assert_eq!(failure.transport, Some(DnsTransport::Udp));
+        assert_eq!(failure.operation, Some(DnsOperation::Receive));
+        assert_eq!(failure.qtype, Some(DnsRecordType::A));
+        assert_eq!(failure.upstream, Some(address));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reply_before_retry_deadline_does_not_send_another_query() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(
+            upstream.local_addr().unwrap(),
+        ));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        let (bytes, peer) = receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_millis(1499)).await;
+        let query = Message::from_vec(&bytes).unwrap();
+        upstream
+            .send_to(&answer_for(&query, vec![]).to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+        finish(task).await.unwrap();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_before_retry_drops_the_socket_and_stops_transmission() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(
+            upstream.local_addr().unwrap(),
+        ));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_millis(1499)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lost_aaaa_reply_retries_only_aaaa_and_preserves_the_a_answer() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(
+            upstream.local_addr().unwrap(),
+        ));
+        let task = tokio::spawn(async move {
+            resolver
+                .resolve(&Name::from_ascii("cold.example.").unwrap())
+                .await
+        });
+        let mut aaaa = None;
+        for _ in 0..2 {
+            let (bytes, peer) = receive_query(&upstream).await;
+            let query = Message::from_vec(&bytes).unwrap();
+            if query.queries[0].query_type() == RecordType::AAAA {
+                aaaa = Some((bytes, peer));
+            } else {
+                let response = answer_for(
+                    &query,
+                    vec![Record::from_rdata(
+                        Name::from_ascii("cold.example.").unwrap(),
+                        60,
+                        RData::A(A(Ipv4Addr::new(203, 0, 113, 7))),
+                    )],
+                );
+                upstream
+                    .send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        }
+        flush_io().await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        let retry = receive_query(&upstream).await;
+        assert!(
+            Some(&retry) == aaaa.as_ref(),
+            "only the unanswered AAAA query may retry"
+        );
+        assert_no_query(&upstream);
+        let response = answer_for(&Message::from_vec(&retry.0).unwrap(), vec![]);
+        upstream
+            .send_to(&response.to_vec().unwrap(), retry.1)
+            .await
+            .unwrap();
+        let chain = finish(task).await.unwrap();
+        assert_eq!(chain.addresses.len(), 1);
+        assert_eq!(
+            chain.addresses[0].ip,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))
+        );
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_response_error_is_not_retried() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(
+            upstream.local_addr().unwrap(),
+        ));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        let (bytes, peer) = receive_query(&upstream).await;
+        let mut response = answer_for(&Message::from_vec(&bytes).unwrap(), vec![]);
+        response.metadata.response_code = ResponseCode::ServFail;
+        upstream
+            .send_to(&response.to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+        let failure = finish(task).await.unwrap_err().diagnostic();
+        assert_eq!(
+            failure.kind,
+            crate::resolver::ResolveFailureKind::ResponseCode
+        );
+        assert_eq!(failure.response_code, Some(2));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_fallback_body_cannot_restart_the_udp_deadline() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let tcp = tokio::net::TcpListener::bind(address).await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        let (bytes, peer) = receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut response = answer_for(&Message::from_vec(&bytes).unwrap(), vec![]);
+        response.metadata.truncation = true;
+        upstream
+            .send_to(&response.to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+        let (mut stream, _) =
+            finish(tokio::spawn(async move { tcp.accept().await.unwrap() })).await;
+        stream.write_all(&100u16.to_be_bytes()).await.unwrap();
+        flush_io().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let failure = finish(task).await.unwrap_err().diagnostic();
+        assert_eq!(failure.kind, crate::resolver::ResolveFailureKind::Timeout);
+        assert_eq!(failure.transport, Some(DnsTransport::Tcp));
+        assert_eq!(failure.operation, Some(DnsOperation::ReadBody));
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_tcp_fallback_closes_the_connection() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let tcp = tokio::net::TcpListener::bind(address).await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        let (bytes, peer) = receive_query(&upstream).await;
+        let mut response = answer_for(&Message::from_vec(&bytes).unwrap(), vec![]);
+        response.metadata.truncation = true;
+        upstream
+            .send_to(&response.to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+        let (mut stream, _) =
+            finish(tokio::spawn(async move { tcp.accept().await.unwrap() })).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        finish(tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stream
+                .read_to_end(&mut bytes)
+                .await
+                .expect("cancelled TCP peer must close");
+        }))
+        .await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_connect_recovers_lost_dns_without_priming_authorizations() {
+        let fixture = cold_gateway(Duration::from_secs(5)).await;
+        assert!(fixture.authorizations.is_empty());
+        let client = first_connect(&fixture);
+        let first = receive_query(&fixture.upstream).await;
+        let second = receive_query(&fixture.upstream).await;
+        assert!(fixture.authorizations.is_empty());
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        for _ in 0..2 {
+            let retry = receive_query(&fixture.upstream).await;
+            assert!(
+                retry == first || retry == second,
+                "retry must preserve its original peer and question"
+            );
+            answer_query(
+                &fixture.upstream,
+                &retry.0,
+                retry.1,
+                "canonical.allowed.example.",
+            )
+            .await;
+        }
+        assert_eq!(finish(client).await.unwrap(), ConnectStatus::Ok as u8);
+        assert_eq!(
+            fixture
+                .authorizations
+                .authorized_addresses("allowed.example"),
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_a_answer_is_not_authorized_when_aaaa_times_out() {
+        let fixture = cold_gateway(Duration::from_secs(5)).await;
+        let client = first_connect(&fixture);
+        for _ in 0..2 {
+            let (bytes, peer) = receive_query(&fixture.upstream).await;
+            if Message::from_vec(&bytes).unwrap().queries[0].query_type() == RecordType::A {
+                answer_query(
+                    &fixture.upstream,
+                    &bytes,
+                    peer,
+                    "canonical.allowed.example.",
+                )
+                .await;
+            }
+        }
+        flush_io().await;
+        assert!(fixture.authorizations.is_empty());
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        let (retry, _) = receive_query(&fixture.upstream).await;
+        assert_eq!(
+            Message::from_vec(&retry).unwrap().queries[0].query_type(),
+            RecordType::AAAA
+        );
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        assert_eq!(
+            finish(client).await.unwrap(),
+            ConnectStatus::ResolutionFailed as u8
+        );
+        assert!(fixture.authorizations.is_empty());
+        assert!(fixture.audit.events().iter().any(|event| matches!(
+            event,
+            AuditEvent::DnsResolutionFailed { source: "connect", failure, .. }
+                if failure.kind == ResolveFailureKind::Timeout
+                    && failure.qtype == Some(DnsRecordType::Aaaa)
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn broker_deadline_cancels_dns_before_retry_and_keeps_the_cache_empty() {
+        let fixture = cold_gateway(Duration::from_secs(1)).await;
+        let client = first_connect(&fixture);
+        let first = receive_query(&fixture.upstream).await;
+        let second = receive_query(&fixture.upstream).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            finish(client).await.unwrap(),
+            ConnectStatus::ResolutionFailed as u8
+        );
+        for (bytes, peer) in [first, second] {
+            answer_query(
+                &fixture.upstream,
+                &bytes,
+                peer,
+                "canonical.allowed.example.",
+            )
+            .await;
+        }
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&fixture.upstream);
+        assert!(fixture.authorizations.is_empty());
+        assert!(fixture.audit.events().iter().any(|event| matches!(
+            event,
+            AuditEvent::DnsResolutionFailed { failure, .. }
+                if failure.kind == ResolveFailureKind::BrokerTimeout
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_cancellation_wins_the_retry_race_and_rejects_late_answers() {
+        let fixture = cold_gateway(Duration::from_secs(5)).await;
+        let client = first_connect(&fixture);
+        let first = receive_query(&fixture.upstream).await;
+        let second = receive_query(&fixture.upstream).await;
+        tokio::time::advance(Duration::from_millis(1499)).await;
+        fixture.cancel.cancel();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(finish(client).await.is_err());
+        for (bytes, peer) in [first, second] {
+            answer_query(
+                &fixture.upstream,
+                &bytes,
+                peer,
+                "canonical.allowed.example.",
+            )
+            .await;
+        }
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&fixture.upstream);
+        assert!(fixture.authorizations.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_does_not_authorize_a_denied_cname_or_dial_its_address() {
+        let fixture = cold_gateway(Duration::from_secs(5)).await;
+        let client = first_connect(&fixture);
+        receive_query(&fixture.upstream).await;
+        receive_query(&fixture.upstream).await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        for _ in 0..2 {
+            let (bytes, peer) = receive_query(&fixture.upstream).await;
+            answer_query(&fixture.upstream, &bytes, peer, "denied.example.").await;
+        }
+        assert_eq!(
+            finish(client).await.unwrap(),
+            ConnectStatus::PolicyDenied as u8
+        );
+        assert!(fixture.authorizations.is_empty());
+        assert!(
+            timeout_at(Instant::now(), fixture.echo.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -624,7 +1282,7 @@ mod tests {
         let result = resolver
             .resolve(&Name::from_str("example.com.").unwrap())
             .await;
-        assert!(matches!(result, Err(ResolveError::Upstream(_))));
+        assert_eq!(result.unwrap_err().diagnostic().detail, Some("id_mismatch"));
     }
 
     #[tokio::test]
@@ -669,7 +1327,7 @@ mod tests {
         let result = resolver
             .resolve(&Name::from_str("a.example.").unwrap())
             .await;
-        assert!(matches!(result, Err(ResolveError::Upstream(_))));
+        assert_eq!(result.unwrap_err().diagnostic().detail, Some("cname_loop"));
     }
 
     #[tokio::test]
@@ -775,13 +1433,16 @@ mod tests {
         let result = resolver
             .resolve(&Name::from_str("www.example.").unwrap())
             .await;
-        assert!(matches!(result, Err(ResolveError::Upstream(_))));
+        assert_eq!(
+            result.unwrap_err().diagnostic().detail,
+            Some("cname_chain_conflict")
+        );
     }
 
     /// A UDP fixture that always truncates plus a TCP fixture that returns the
     /// full answer, both on the same port, so the resolver must fall back to
     /// TCP on the truncation bit.
-    async fn spawn_truncating_dns_server() -> SocketAddr {
+    async fn spawn_truncating_dns_server(tcp_truncated: bool) -> SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let addr = udp.local_addr().unwrap();
@@ -838,6 +1499,7 @@ mod tests {
                         vec![]
                     };
                     let mut response = Message::response(query.metadata.id, OpCode::Query);
+                    response.metadata.truncation = tcp_truncated;
                     for q in &query.queries {
                         response.add_query(q.clone());
                     }
@@ -856,7 +1518,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_udp_response_falls_back_to_tcp() {
-        let addr = spawn_truncating_dns_server().await;
+        let addr = spawn_truncating_dns_server(false).await;
         let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(addr));
         let chain = resolver
             .resolve(&Name::from_str("tcp-only.example.").unwrap())
@@ -869,5 +1531,17 @@ mod tests {
                 ttl_secs: 60,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_response_with_truncation_still_set_is_rejected() {
+        let addr = spawn_truncating_dns_server(true).await;
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(addr));
+        let failure = resolver
+            .resolve(&Name::from_ascii("tcp-only.example.").unwrap())
+            .await
+            .unwrap_err()
+            .diagnostic();
+        assert_eq!(failure.detail, Some("truncated_tcp"));
     }
 }

@@ -5,6 +5,7 @@ use http::{Method, Uri, uri::Authority};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::connect_proto::{ConnectStatus, ConnectTarget};
+use crate::resolver::ResolveFailure;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
@@ -244,7 +245,10 @@ pub(crate) async fn write_status<S: AsyncWrite + Unpin>(
         ConnectStatus::Timeout => {
             "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         }
-        ConnectStatus::ResolutionFailed | ConnectStatus::ConnectFailed => {
+        ConnectStatus::ResolutionFailed => {
+            "HTTP/1.1 502 Bad Gateway\r\nProxy-Status: sendbox; error=dns_error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
+        ConnectStatus::ConnectFailed => {
             "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         }
         ConnectStatus::Malformed | ConnectStatus::UnsupportedProtocol => {
@@ -252,6 +256,24 @@ pub(crate) async fn write_status<S: AsyncWrite + Unpin>(
         }
     };
     stream.write_all(response.as_bytes()).await
+}
+
+pub(crate) async fn write_resolution_failure<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    failure: &ResolveFailure,
+) -> io::Result<()> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": "resolution_failed",
+        "dns": failure,
+    }))
+    .map_err(io::Error::other)?;
+    let header = format!(
+        "HTTP/1.1 502 Bad Gateway\r\nProxy-Status: sendbox; error=dns_error\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(&body).await
 }
 
 fn invalid(message: &'static str) -> io::Error {

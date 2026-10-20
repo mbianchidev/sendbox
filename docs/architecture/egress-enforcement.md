@@ -137,6 +137,28 @@ deterministic exfiltration budget — and audits any denial or rate limit. When
 relies solely on prior cached authorizations, so disabling DNS truly closes the
 resolution path.
 
+### Resolver loss handling and diagnostics
+
+The forwarding resolver gives each concurrent A/AAAA query one absolute
+three-second deadline. A missing UDP reply is retransmitted once halfway
+through that budget, preserving the connected socket, upstream, socket mark,
+question and ID. Socket setup and TCP fallback on a validated truncation flag
+consume that same budget; no read, retransmission or TCP phase restarts it.
+Permanent response errors and invalid replies are not retried.
+
+Both family results must complete before CNAME agreement and policy validation
+can authorize any address. A timeout, cancellation, or denied CNAME does not
+prime the shared authorization cache. The brokers retain their separate
+five-second upstream-resolution bounds and cancellation gates.
+
+Resolver failures retain typed, sanitized query/transport/operation and OS-code
+metadata in `DnsResolutionFailed` audit events. HTTP CONNECT keeps status 502
+but returns a DNS `Proxy-Status` and bounded JSON diagnostic; free-form upstream
+errors and packet contents are excluded. SOCKS/native status bytes do not
+change. See [cold-start qualification](../dns-cold-start.md) for the distinction
+between local service readiness, an external DNS failure and controlled loss
+testing.
+
 ## Descriptor-relative cgroup operations
 
 Every cgroup filesystem operation is **descriptor-relative and symlink-race

@@ -129,6 +129,8 @@ explicitly with `--runtime`.
 Drop `--interactive` and supply your agent's headless arguments for automation.
 See [terminal troubleshooting](docs/interactive-sessions.md) and the
 [CLI reference](docs/cli-reference.md) for more options.
+For first-request networking failures, use the credential-free
+[cold-start DNS diagnostic](docs/dns-cold-start.md), not a warmed retry.
 
 ## Integrations
 

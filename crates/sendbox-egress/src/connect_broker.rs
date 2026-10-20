@@ -38,7 +38,7 @@ use crate::domain;
 use crate::http_proxy;
 use crate::origin::OriginReservations;
 use crate::policy::PolicyEngine;
-use crate::resolver::UpstreamResolver;
+use crate::resolver::{ResolveFailure, ResolveFailureKind, UpstreamResolver};
 use crate::socks5;
 use sendbox_policy::{DnsRecordType, Protocol};
 
@@ -308,13 +308,18 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                     .await?;
                 self.proxy(client, dial.upstream).await;
             }
-            Err(status) => {
+            Err(failure) => {
                 self.audit.record(AuditEvent::ConnectDenied {
                     target: label,
                     port: request.port,
-                    status: status.as_str(),
+                    status: failure.status.as_str(),
                 });
-                http_proxy::write_status(&mut client, status).await?;
+                match failure.resolution {
+                    Some(reason) => {
+                        http_proxy::write_resolution_failure(&mut client, &reason).await?
+                    }
+                    None => http_proxy::write_status(&mut client, failure.status).await?,
+                }
             }
         }
         Ok(())
@@ -373,13 +378,13 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                 });
                 self.proxy(client, dial.upstream).await;
             }
-            Err(status) => {
+            Err(failure) => {
                 self.audit.record(AuditEvent::ConnectDenied {
                     target: label,
                     port: request.port,
-                    status: status.as_str(),
+                    status: failure.status.as_str(),
                 });
-                let _ = connect_proto::write_status(&mut client, status).await;
+                let _ = connect_proto::write_status(&mut client, failure.status).await;
             }
         }
         Ok(())
@@ -486,13 +491,14 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                 });
                 self.proxy(client, dial.upstream).await;
             }
-            Err(status) => {
+            Err(failure) => {
                 self.audit.record(AuditEvent::ConnectDenied {
                     target: label,
                     port: request.port,
-                    status: status.as_str(),
+                    status: failure.status.as_str(),
                 });
-                let _ = socks5::write_failure(&mut client, socks_reply_for_status(status)).await;
+                let _ = socks5::write_failure(&mut client, socks_reply_for_status(failure.status))
+                    .await;
             }
         }
         Ok(())
@@ -502,20 +508,20 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
     /// a hostname (or validates a direct IP), makes the final port-aware policy
     /// decision, and dials the exact validated `SocketAddr` through the
     /// [`crate::dialer::Dialer`]. Returns the connected upstream and the pinned
-    /// target IP, or the canonical [`ConnectStatus`] denial.
+    /// target IP, or the canonical denial with sanitized resolver diagnostics.
     async fn authorize_and_dial(
         &self,
         target: &ConnectTarget,
         port: u16,
         expected_ip: Option<IpAddr>,
-    ) -> Result<AuthorizedDial, ConnectStatus> {
+    ) -> Result<AuthorizedDial, ConnectFailure> {
         let reserved = match target {
             ConnectTarget::Hostname(host) => self.reservations.denies_hostname(host, port),
             ConnectTarget::Ip(address) => self.reservations.denies_direct_ip(*address, port),
         }
         .map_err(|_| ConnectStatus::Malformed)?;
         if reserved {
-            return Err(ConnectStatus::PolicyDenied);
+            return Err(ConnectStatus::PolicyDenied.into());
         }
         let (target_ip, hostname_for_decision) = match target {
             ConnectTarget::Hostname(host) => match self.resolve_pinned(host, expected_ip).await {
@@ -526,7 +532,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                 if let Some(expected) = expected_ip
                     && expected != *ip
                 {
-                    return Err(ConnectStatus::ExpectedIpMismatch);
+                    return Err(ConnectStatus::ExpectedIpMismatch.into());
                 }
                 (*ip, None)
             }
@@ -539,7 +545,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
             None => self.policy.decide_direct_ip(target_ip, port, Protocol::Tcp),
         };
         if !decision.allowed {
-            return Err(ConnectStatus::PolicyDenied);
+            return Err(ConnectStatus::PolicyDenied.into());
         }
 
         let dial_addr = SocketAddr::new(target_ip, port);
@@ -552,7 +558,15 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                 upstream,
                 target_ip,
             }),
-            Err(_) => Err(ConnectStatus::ConnectFailed),
+            Err(error) => {
+                self.audit.record(AuditEvent::ConnectDialFailed {
+                    target: target_label(target),
+                    port,
+                    io_kind: format!("{:?}", error.kind()),
+                    os_error: error.raw_os_error(),
+                });
+                Err(ConnectStatus::ConnectFailed.into())
+            }
         }
     }
 
@@ -583,7 +597,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         &self,
         host: &str,
         expected_ip: Option<std::net::IpAddr>,
-    ) -> Result<(String, std::net::IpAddr), ConnectStatus> {
+    ) -> Result<(String, std::net::IpAddr), ConnectFailure> {
         let normalized = domain::normalize_domain(host).map_err(|_| ConnectStatus::Malformed)?;
 
         // Structural QNAME limits (bounded, stateless) apply to every hostname.
@@ -592,13 +606,13 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                 name: normalized.clone(),
                 limit,
             });
-            return Err(ConnectStatus::PolicyDenied);
+            return Err(ConnectStatus::PolicyDenied.into());
         }
 
         match self.policy.evaluate_domain_name(&normalized) {
             Ok(true) => {}
-            Ok(false) => return Err(ConnectStatus::PolicyDenied),
-            Err(_) => return Err(ConnectStatus::Malformed),
+            Ok(false) => return Err(ConnectStatus::PolicyDenied.into()),
+            Err(_) => return Err(ConnectStatus::Malformed.into()),
         }
 
         let mut candidates = self.authorizations.authorized_addresses(&normalized);
@@ -611,7 +625,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                 // DNS is disabled: no DNS broker exists, so the only valid
                 // authorizations are ones already cached. Refuse to resolve.
                 if candidates.is_empty() {
-                    return Err(ConnectStatus::ResolutionFailed);
+                    return Err(ConnectStatus::ResolutionFailed.into());
                 }
             } else {
                 self.fresh_resolve(&normalized, &mut candidates).await?;
@@ -619,12 +633,12 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         }
 
         if candidates.is_empty() {
-            return Err(ConnectStatus::PolicyDenied);
+            return Err(ConnectStatus::PolicyDenied.into());
         }
 
         match expected_ip {
             Some(expected) if candidates.contains(&expected) => Ok((normalized, expected)),
-            Some(_) => Err(ConnectStatus::ExpectedIpMismatch),
+            Some(_) => Err(ConnectStatus::ExpectedIpMismatch.into()),
             None => Ok((normalized, candidates[0])),
         }
     }
@@ -637,7 +651,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         &self,
         normalized: &str,
         candidates: &mut Vec<std::net::IpAddr>,
-    ) -> Result<(), ConnectStatus> {
+    ) -> Result<(), ConnectFailure> {
         // Charge the deterministic budget for this resolution (only reached for
         // domain-allowed names, matching the DNS broker).
         if let Err(limit) = self.guard.admit(normalized, Instant::now()) {
@@ -645,27 +659,40 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                 name: normalized.to_owned(),
                 limit,
             });
-            return Err(ConnectStatus::PolicyDenied);
+            return Err(ConnectStatus::PolicyDenied.into());
         }
 
         let name =
             Name::from_ascii(format!("{normalized}.")).map_err(|_| ConnectStatus::Malformed)?;
-        let resolved =
+        let resolution =
             match timeout(self.config.resolve_timeout, self.resolver.resolve(&name)).await {
-                Ok(Ok(resolved)) => resolved,
-                Ok(Err(_)) | Err(_) => {
-                    if candidates.is_empty() {
-                        return Err(ConnectStatus::ResolutionFailed);
-                    }
-                    return Ok(());
-                }
+                Ok(Ok(resolved)) => Ok(resolved),
+                Ok(Err(error)) => Err(error.diagnostic()),
+                Err(_) => Err(ResolveFailure::new(ResolveFailureKind::BrokerTimeout)),
             };
+        let resolved = match resolution {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                self.audit.record(AuditEvent::DnsResolutionFailed {
+                    name: normalized.to_owned(),
+                    source: "connect",
+                    failure: failure.clone(),
+                });
+                if candidates.is_empty() {
+                    return Err(ConnectFailure {
+                        status: ConnectStatus::ResolutionFailed,
+                        resolution: Some(Box::new(failure)),
+                    });
+                }
+                return Ok(());
+            }
+        };
 
         for hop in resolved.names_to_validate() {
             let hop_str = hop.to_utf8();
             match self.policy.evaluate_domain_name(&hop_str) {
                 Ok(true) => {}
-                _ => return Err(ConnectStatus::PolicyDenied),
+                _ => return Err(ConnectStatus::PolicyDenied.into()),
             }
         }
 
@@ -715,6 +742,20 @@ fn target_label(target: &ConnectTarget) -> String {
 struct AuthorizedDial {
     upstream: TcpStream,
     target_ip: IpAddr,
+}
+
+struct ConnectFailure {
+    status: ConnectStatus,
+    resolution: Option<Box<ResolveFailure>>,
+}
+
+impl From<ConnectStatus> for ConnectFailure {
+    fn from(status: ConnectStatus) -> Self {
+        Self {
+            status,
+            resolution: None,
+        }
+    }
 }
 
 /// Maps the canonical [`ConnectStatus`] denial to a deterministic SOCKS5 reply
@@ -883,6 +924,35 @@ mod tests {
             8 => ConnectStatus::Timeout,
             _ => panic!("unknown status byte {byte}"),
         }
+    }
+
+    #[tokio::test]
+    async fn http_resolution_failure_preserves_sanitized_dns_reason() {
+        let audit = Arc::new(CollectingAuditSink::new());
+        let broker = broker_with_audit(
+            base_policy(),
+            Arc::new(StaticResolver::new()),
+            ConnectBrokerConfig {
+                frontend: ConnectFrontend::Http,
+                ..ConnectBrokerConfig::default()
+            },
+            audit,
+        );
+        let (addr, cancel) = spawn_broker(broker).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        cancel.cancel();
+        assert!(response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(response.contains("Proxy-Status: sendbox; error=dns_error\r\n"));
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["error"], "resolution_failed");
+        assert_eq!(body["dns"]["kind"], "nxdomain");
     }
 
     #[tokio::test]
