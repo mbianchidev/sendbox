@@ -40,12 +40,6 @@ on:
       - "setup.sh"
       - "docs/architecture/guest-artifact-bundles.md"
   workflow_dispatch:
-    inputs:
-      live:
-        description: Run privileged native BPF event tests
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -62,22 +56,43 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Run pinned no-cache quality environment
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.33.0
+          driver-opts: image=moby/buildkit:buildx-stable-1@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Cache pinned quality build dependencies
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: packaging/guest/Dockerfile
+          platforms: linux/amd64
+          target: quality-base
+          build-args: CARGO_BUILD_JOBS=2
+          cache-from: type=gha,scope=guest-quality-amd64
+          cache-to: type=gha,mode=max,scope=guest-quality-amd64
+          outputs: type=cacheonly
+
+      - name: Run fresh quality checks
         run: |
-          docker build \
-            --no-cache \
+          docker buildx build \
+            --no-cache-filter quality \
             --platform linux/amd64 \
+            --build-arg CARGO_BUILD_JOBS=2 \
             --target quality \
+            --output type=cacheonly \
             -f packaging/guest/Dockerfile \
             .
 
-  artifacts:
-    name: Reproducible ${{ matrix.architecture }} bundle
+  artifact-build:
+    name: Clean ${{ matrix.architecture }} bundle (${{ matrix.attempt }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 240
+    timeout-minutes: 120
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
+        architecture: [amd64, arm64]
+        attempt: [first, second]
         include:
           - architecture: amd64
             runner: ubuntu-24.04
@@ -96,17 +111,74 @@ jobs:
           printf '77777777777777777777777777777777' >"$RUNNER_TEMP/guest-artifact-ci.key"
           chmod 0400 "$RUNNER_TEMP/guest-artifact-ci.key"
 
-      - name: Build twice without cache
+      - name: Build independent bundle without cache
+        run: |
+          docker buildx build \
+            --no-cache \
+            --platform "linux/${{ matrix.architecture }}" \
+            --build-arg CARGO_BUILD_JOBS=2 \
+            --target artifact \
+            --secret "id=release_signing_key,src=$RUNNER_TEMP/guest-artifact-ci.key" \
+            --output "type=local,dest=dist/${{ matrix.architecture }}/${{ matrix.attempt }}" \
+            -f packaging/guest/Dockerfile \
+            .
+
+      - name: Export OCI layout from the same build
+        if: matrix.attempt == 'first'
+        run: |
+          docker buildx build \
+            --platform "linux/${{ matrix.architecture }}" \
+            --build-arg CARGO_BUILD_JOBS=2 \
+            --target image \
+            --secret "id=release_signing_key,src=$RUNNER_TEMP/guest-artifact-ci.key" \
+            --output "type=oci,dest=dist/${{ matrix.architecture }}/guest-image.oci.tar" \
+            -f packaging/guest/Dockerfile \
+            .
+
+      - name: Archive build output with file modes intact
+        run: |
+          tar -cf "$RUNNER_TEMP/bundle.tar" \
+            -C "dist/${{ matrix.architecture }}/${{ matrix.attempt }}" .
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: guest-build-${{ matrix.architecture }}-${{ matrix.attempt }}
+          path: ${{ runner.temp }}/bundle.tar
+          compression-level: 1
+          retention-days: 1
+          if-no-files-found: error
+
+  artifacts:
+    name: Reproducible ${{ matrix.architecture }} bundle
+    needs: artifact-build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: guest-build-${{ matrix.architecture }}-*
+          path: ${{ runner.temp }}/guest-builds
+
+      - name: Restore independent build outputs
         run: |
           for attempt in first second; do
-            docker buildx build \
-              --no-cache \
-              --platform "linux/${{ matrix.architecture }}" \
-              --target artifact \
-              --secret "id=release_signing_key,src=$RUNNER_TEMP/guest-artifact-ci.key" \
-              --output "type=local,dest=dist/${{ matrix.architecture }}/${attempt}" \
-              -f packaging/guest/Dockerfile \
-              .
+            output="dist/${{ matrix.architecture }}/$attempt"
+            mkdir -p "$output"
+            tar -xf \
+              "$RUNNER_TEMP/guest-builds/guest-build-${{ matrix.architecture }}-$attempt/bundle.tar" \
+              -C "$output"
           done
 
       - name: Verify byte reproducibility and minimal inventory
@@ -165,30 +237,19 @@ jobs:
             --guest-version 0.1.0 \
             --minimum-release-sequence 1
 
-      - name: Build OCI image layout
-        run: |
-          docker buildx build \
-            --no-cache \
-            --platform "linux/${{ matrix.architecture }}" \
-            --target image \
-            --secret "id=release_signing_key,src=$RUNNER_TEMP/guest-artifact-ci.key" \
-            --output "type=oci,dest=dist/${{ matrix.architecture }}/guest-image.oci.tar" \
-            -f packaging/guest/Dockerfile \
-            .
-
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: guest-artifacts-${{ matrix.architecture }}
           path: dist/${{ matrix.architecture }}/first/
+          compression-level: 1
           if-no-files-found: error
 
   live-event:
     name: Privileged live BPF (${{ matrix.arch }})
-    if: github.event_name == 'workflow_dispatch' && inputs.live
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - arch: x86_64
@@ -199,6 +260,8 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install loader build dependencies
         run: |
@@ -211,14 +274,20 @@ jobs:
           docker build \
             --no-cache \
             --platform "linux/${{ matrix.platform }}" \
-            --target bpf \
+            --target bpf-artifact \
             --output "type=local,dest=dist/bpf" \
             -f packaging/guest/Dockerfile \
             .
 
-      - name: Compile and run opt-in live event test
+      - name: Mount kernel tracefs if needed
         run: |
-          cargo test -p sendbox-bpf --test live --no-run
+          if ! mountpoint -q /sys/kernel/tracing; then
+            sudo mount -t tracefs tracefs /sys/kernel/tracing
+          fi
+
+      - name: Compile and run live event smoke test
+        run: |
+          cargo test --locked -p sendbox-bpf --test live --no-run
           test_binary="$(
             find target/debug/deps -maxdepth 1 -type f -perm -111 \
               -name 'live-*' | sort | head -1

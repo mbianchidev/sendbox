@@ -35,6 +35,18 @@ workspace with its committed lockfile. `make audit` requires `cargo-audit`.
 Runtime-specific live qualification needs a prepared host; see
 [qualification](qualification.md) and the individual runtime guides.
 
+CI runs portable checks and build/install qualification in parallel on macOS
+and Linux, with fail-fast matrices. Rust dependency caches are isolated by
+toolchain, platform, lockfiles, and job task; every check still runs. Standalone
+fuzz workspaces share the root target directory in CI instead of recompiling
+their common dependencies into separate target directories. The `cargo-audit`
+executable is cached, but every run refreshes and checks the advisory database.
+
+Guest artifact CI runs the two clean builds for each architecture in separate
+parallel jobs and compares their outputs before publishing the verified bundle.
+See [guest artifact CI](architecture/guest-artifact-bundles.md#continuous-integration)
+for cache boundaries and the automatic privileged BPF smoke tests.
+
 For documentation-only changes, check examples, relative links, and heading
 anchors. Keep the root README focused on evaluating the project and starting a
 session; put detailed operational and architecture material under `docs/` and
