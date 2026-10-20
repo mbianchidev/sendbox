@@ -15,6 +15,27 @@ from probe import HOST, dns_header, emit
 FAULT_TABLE = "sendbox_dns_cold_fixture"
 
 
+def nameservers():
+    return [
+        fields[1] for line in Path("/etc/resolv.conf").read_text().splitlines()
+        if len(fields := line.split()) >= 2 and fields[0] == "nameserver"
+    ]
+
+
+def network_state():
+    links = [{
+        "interface": path.name,
+        "operstate": (path / "operstate").read_text().strip(),
+        "carrier": (path / "carrier").read_text().strip(),
+    } for path in sorted(Path("/sys/class/net").iterdir())]
+    routes = [{
+        "interface": fields[0],
+        "gateway": socket.inet_ntoa(struct.pack("<I", int(fields[2], 16))),
+    } for line in Path("/proc/net/route").read_text().splitlines()[1:]
+        if len(fields := line.split()) >= 4 and fields[1] == "00000000"]
+    return {"links": links, "default_routes": routes}
+
+
 def install_loss_fixture(nameservers):
     upstream = next(ipaddress.ip_address(value) for value in nameservers
                     if not ipaddress.ip_address(value).is_loopback)
@@ -43,14 +64,12 @@ def main():
     parser.add_argument("--drop-first-replies", action="store_true")
     arguments = parser.parse_args()
     started = time.monotonic()
-    nameservers = [
-        fields[1] for line in Path("/etc/resolv.conf").read_text().splitlines()
-        if len(fields := line.split()) >= 2 and fields[0] == "nameserver"
-    ]
+    selected = nameservers()
     if arguments.drop_first_replies:
-        install_loss_fixture(nameservers)
+        install_loss_fixture(selected)
     observed_drops = 0
-    emit("dns_trace_started", nameservers=nameservers,
+    observed_query = False
+    emit("dns_trace_started", nameservers=selected, network=network_state(),
          guest_uptime_s=float(Path("/proc/uptime").read_text().split()[0]))
     with socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0003)) as capture:
         capture.settimeout(0.5)
@@ -89,6 +108,10 @@ def main():
                 emit("dns_trace_invalid_header", **fields)
                 continue
             if header["qname"] == HOST:
+                if not observed_query:
+                    emit("dns_resolver_configuration", phase="first_query",
+                         nameservers=nameservers(), elapsed_ms=fields["elapsed_ms"])
+                    observed_query = True
                 emit("dns_trace_udp", **fields, **header)
                 if arguments.drop_first_replies and header["reply"] and observed_drops < 2:
                     observed_drops = dropped_replies()

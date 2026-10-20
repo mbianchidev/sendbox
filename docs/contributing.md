@@ -41,6 +41,9 @@ toolchain, platform, lockfiles, and job task; every check still runs. Standalone
 fuzz workspaces share the root target directory in CI instead of recompiling
 their common dependencies into separate target directories. The `cargo-audit`
 executable is cached, but every run refreshes and checks the advisory database.
+The portable-check jobs also run the credential-free cold-start diagnostic
+harness's Python standard-library tests. Live VM qualification remains an
+explicit prepared-host check; see [cold-start DNS diagnostics](dns-cold-start.md).
 
 Guest artifact CI runs the two clean builds for each architecture in separate
 parallel jobs and compares their outputs before publishing the verified bundle.

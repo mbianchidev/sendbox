@@ -18,6 +18,10 @@ SPEC = importlib.util.spec_from_file_location(
     "dns_qualification", ROOT / "scripts/qualify-dns-cold-start.py")
 QUALIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QUALIFY)
+TRACE_SPEC = importlib.util.spec_from_file_location(
+    "cold_dns_trace", Path(__file__).resolve().parent / "trace.py")
+TRACE = importlib.util.module_from_spec(TRACE_SPEC)
+TRACE_SPEC.loader.exec_module(TRACE)
 
 
 class Stream:
@@ -93,6 +97,20 @@ class ProbeTests(unittest.TestCase):
         packet = struct.pack("!6H", 1, 0x8180, 1, 0, 0, 0) + b"\xc0\x0c\x00\x01\x00\x01"
         with self.assertRaises(ValueError):
             probe.dns_header(packet)
+
+    def test_loss_fixture_only_adds_two_drops_for_the_selected_upstream(self):
+        with patch.object(TRACE.subprocess, "run") as execute, \
+                patch.object(TRACE, "emit"):
+            TRACE.install_loss_fixture(["127.0.0.1", "192.0.2.53"])
+        self.assertEqual(execute.call_args.args[0], ["nft", "--file", "-"])
+        rules = execute.call_args.kwargs["input"]
+        self.assertIn("ip saddr 192.0.2.53 udp sport 53", rules)
+        self.assertIn("numgen inc mod 2147483647 < 2 counter drop", rules)
+        self.assertIn("hook input priority -10", rules)
+        self.assertNotIn("flush", rules)
+        self.assertNotIn("destroy", rules)
+        self.assertNotIn("meta mark", rules)
+        self.assertTrue(all(TRACE.FAULT_TABLE in line for line in rules.splitlines()))
 
 
 class QualificationTests(unittest.TestCase):

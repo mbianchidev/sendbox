@@ -85,6 +85,94 @@ a bounded JSON diagnostic. Free-form resolver messages, DNS packet contents,
 credentials, bootstrap files and gateway control tokens are never included.
 SOCKS and native CONNECT reply codes remain compatible.
 
+## Qualification results
+
+The official 0.2.1 host was also used with a separately signed development
+guest built from this change. The test trust root was
+`dns-cold-test-b5f8686b`, release sequence 6, with matching host/guest version
+0.2.1. The guest SHA-256 was
+`681105e407d4625d2e19698340c138acd853cc174f346df8afd747cbc0c255f9`.
+The unchanged signed-release launcher and BPF object were reused; both
+executables passed static ELF verification. The temporary signing seed was
+destroyed, and the official installed bundle/key were not replaced.
+
+Each cohort below used sequential, unique-boot VMs. Within each VM there was
+no preceding DNS lookup, warm-up, or application retry. Shared host/upstream
+caches were not flushed or claimed to be empty. First-request time runs from
+opening the loopback proxy through receipt of the unauthenticated API response headers,
+including CONNECT and verified TLS; VM boot/cleanup and response bodies are
+excluded.
+
+| Guest | Fresh VMs | First failures | Median ms | p95 ms | Maximum ms |
+|---|---:|---:|---:|---:|---:|
+| Official 0.2.1, no injected loss | 20 | 0 | 596.795 | 706.852 | 732.704 |
+| Patched test guest, no injected loss | 20 | 0 | 566.914 | 675.600 | 2136.019 |
+
+All first responses were HTTP 400 after successful SOCKS/HTTP CONNECT and TLS.
+Both cohorts passed 40/40 deny checks. Every measured workload was non-root,
+with `NoNewPrivs=1`, `Seccomp=2`, and zero effective/permitted/ambient
+capabilities. Every cohort reported zero owned VMs remaining, also confirmed
+by the final scoped container listing.
+
+The patched per-VM results, including the slowest sample without discarding it:
+
+| VM | Front end | CONNECT ms | First request ms | Result |
+|---:|---|---:|---:|---|
+| 1 | SOCKS | 123.389 | 549.224 | pass |
+| 2 | HTTP | 132.087 | 675.600 | pass |
+| 3 | SOCKS | 166.293 | 665.139 | pass |
+| 4 | HTTP | 106.548 | 531.070 | pass |
+| 5 | SOCKS | 103.443 | 506.896 | pass |
+| 6 | HTTP | 105.750 | 518.138 | pass |
+| 7 | SOCKS | 109.215 | 523.824 | pass |
+| 8 | HTTP | 110.875 | 423.481 | pass |
+| 9 | SOCKS | 137.089 | 566.320 | pass |
+| 10 | HTTP | 105.425 | 391.788 | pass |
+| 11 | SOCKS | 194.434 | 629.375 | pass |
+| 12 | HTTP | 212.704 | 648.495 | pass |
+| 13 | SOCKS | 108.735 | 569.387 | pass |
+| 14 | HTTP | 190.937 | 612.174 | pass |
+| 15 | SOCKS | 125.839 | 567.507 | pass |
+| 16 | HTTP | 467.981 | 2136.019 | pass |
+| 17 | SOCKS | 218.164 | 593.784 | pass |
+| 18 | HTTP | 147.900 | 667.463 | pass |
+| 19 | SOCKS | 112.161 | 534.874 | pass |
+| 20 | HTTP | 104.305 | 529.690 | pass |
+
+The trace observed `eth0` up with carrier, a default route through
+`192.168.64.1`, and the original upstream in `/etc/resolv.conf` at approximately
+0.38 seconds guest uptime. At the first query, resolver configuration had
+changed to `127.0.0.1` while the broker's actual upstream packets still targeted
+`192.168.64.1:53`. Link/route readiness is not proof of DNS-server readiness.
+
+Controlled loss was then compared in separate fresh VMs. A test-only guest
+input rule dropped the first two upstream replies, one A and one AAAA:
+
+| Guest | Front end | First result | First request ms |
+|---|---|---|---:|
+| Official 0.2.1 | SOCKS | REP `0x04`, failure | 3004.633 |
+| Official 0.2.1 | HTTP | CONNECT 502, failure | 3002.812 |
+| Patched test guest | SOCKS | REP `0x00`, TLS, HTTP 400 | 2063.331 |
+| Patched test guest | HTTP | CONNECT 200, TLS, HTTP 400 | 2809.843 |
+
+The drop counters verified exactly two lost replies in each experiment.
+Patched retransmissions retained each original question, ID and source port,
+at approximately 1502 ms after the initial send. There was no retry of the
+measured application request. Both patched cold requests passed, and all four
+VMs kept both denials and containment checks intact and were deleted.
+
+In the released fault-injection runs, the *later denial check* on API port 444
+caused a new resolution around three seconds later, which received replies but
+still denied the forbidden port. That later DNS success was not substituted
+for the failed first request.
+
+The injected loss boundary was deliberately inside the owned guest, between
+interface capture and the resolver socket: the trace can see the replies that
+the test rule drops. This is not evidence that the original naturally missing
+replies were lost at that boundary. The natural incident's external cause
+remains unconfirmed; this delivery fixes and verifies SendBox's identified
+single-loss handling, not an established Apple/upstream defect.
+
 ## Build the standalone fixture
 
 Use the existing Apple service without restarting or reconfiguring it:
@@ -127,9 +215,11 @@ that `denied.example:443` and the API on port 444 remain denied. Those later
 checks cannot turn a failed first request into a pass.
 
 JSONL records include every first-request and CONNECT latency, containment
-checks, denials, cleanup status and summary percentiles. `--trace` captures only
-scoped DNS headers in the owned VM. It does not delay the workload waiting for
-capture and does not retain raw packets. The runner bounds a host invocation
+checks, denials, cleanup status and summary percentiles. A batch header records
+the unique owned-VM prefix before launch, including for interrupted batches.
+`--trace` captures scoped DNS headers plus numeric resolver, link and route
+metadata in the owned VM. It does not delay the workload waiting for capture
+and does not retain raw packets. The runner bounds a host invocation
 to 120 seconds, allows cancellation cleanup, and targets only its unique VM
 names. It never stops the Apple service or touches unrelated containers.
 
@@ -137,7 +227,8 @@ To verify the mitigation against controlled loss, add `--drop-first-replies`.
 This opts into an additional nftables table **inside each owned test VM** that
 drops exactly the first two upstream UDP replies. Its earlier input hook
 cannot bypass the mandatory SendBox filter. The fixture records its drop
-counter; a run cannot pass this qualification without verifying two drops.
+counter; a run cannot pass this qualification without verifying two drops and
+capturing both initial A/AAAA exchanges.
 Use a separate output file and report these runs as fault injection, not as
 natural upstream failures.
 
@@ -180,3 +271,11 @@ reply, TCP fallback/body deadlines, cancellation in UDP and TCP, permanent
 errors, failed-resolution cache isolation, broker timeout, cancellation racing
 retry, and CNAME denial after retransmission. No test uses personal credentials
 or customer data.
+
+Local checks passed on macOS and in the native aarch64 guest build environment,
+including 50 repetitions of the 24-case resolver/cold-gateway suite, the
+11-test standalone harness suite, dependent guest/MCP/Apple adapter tests,
+release build and staged host installation, and dependency audit.
+Local host Rust 1.99.1 also reported two pre-existing, untouched warnings:
+deprecated `Atomic::fetch_update` in `sendbox-testkit` and an unused `BodyExt`
+test import in `sendbox-mcp`. The native guest used the pinned Rust 1.93.1.

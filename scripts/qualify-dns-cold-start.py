@@ -174,6 +174,12 @@ def main():
             output.write(line + "\n")
             output.flush()
 
+        record({
+            "event": "fresh_vm_batch", "vm_prefix": prefix,
+            "count": arguments.count, "mode": arguments.mode,
+            "image": arguments.image, "trace": arguments.trace,
+            "drop_first_replies": arguments.drop_first_replies,
+        })
         with tempfile.TemporaryDirectory(prefix=prefix + "-", dir=arguments.output.parent) as root:
             root = Path(root)
             for index in range(arguments.count):
@@ -219,13 +225,19 @@ def main():
                 trace_started = any(r["event"] == "dns_trace_started" for r in trace_records)
                 drops = max((r["dropped_replies"] for r in trace_records
                              if r["event"] == "dns_fault_state"), default=0)
+                first_sends = [r["qtype"] for r in trace_records
+                               if r["event"] == "dns_trace_udp" and not r["reply"]][:2]
+                first_replies = [r["qtype"] for r in trace_records
+                                 if r["event"] == "dns_trace_udp" and r["reply"]][:2]
+                verified_loss = drops == 2 and set(first_sends) == {1, 28} and set(first_replies) == {1, 28}
                 if arguments.trace:
                     ok = ok and trace_started
                 if arguments.drop_first_replies:
-                    ok = ok and drops == 2
+                    ok = ok and verified_loss
                 boot_ids.add(boot)
                 check = {
                     "event": "fresh_vm_check", "index": index + 1, "mode": mode,
+                    "vm_name_prefix": name,
                     "ok": bool(ok), "host_exit_code": code, "timed_out": timed_out,
                     "hardened": hardened, "recovered_vms": recovered,
                     "host_elapsed_ms": round((time.monotonic() - started) * 1000, 3),
@@ -235,6 +247,7 @@ def main():
                     check["trace"] = trace_records
                 if arguments.drop_first_replies:
                     check["injected_dropped_replies"] = drops
+                    check["verified_reply_loss"] = verified_loss
                 if first is None:
                     check["host_result"] = terminal
                     check["host_stderr_bytes"] = len(stderr)
