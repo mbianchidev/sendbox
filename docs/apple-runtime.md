@@ -2,9 +2,11 @@
 
 `sendbox-runtime-apple` is the production Rust `RuntimeProvider` for the
 official Apple `container` CLI and service. It invokes the executable directly
-with exact argv, clears the inherited environment, supplies only `PATH`,
-`LANG`, `LC_ALL`, and explicitly marked secret variables, and never invokes a
-shell or language bridge.
+with exact argv, clears the inherited environment, supplies `PATH`, `LANG`,
+`LC_ALL`, the host `HOME`/`USER`/`TMPDIR` needed by the registered service, and
+explicitly marked secret variables, and never invokes a shell or language
+bridge. Supplying the host service environment does not mount the host home
+inside the VM.
 
 ## Requirements
 
@@ -18,6 +20,13 @@ shell or language bridge.
   pass `sendbox-bundle` verification
 - an explicit Linux arm64 image and any configured kernel, mounts, network,
   DNS, CPU, memory, and ulimit values
+
+The workload image must include `nft` and its runtime libraries, and the guest
+kernel must support the mandatory
+[egress enforcement prerequisites](installation.md#workload-image-versus-guest-bundle).
+A plain Alpine base image does not include `nftables`.
+Entrypoint and working-directory paths must also be symlink-free; see the
+[workload image requirements](installation.md#workload-image-versus-guest-bundle).
 
 `setup.sh` installs only the qualified 0.10.0 signed package and verifies its
 pinned SHA-256 digest plus package signature before invoking the installer.
@@ -51,7 +60,8 @@ It uses another official CLI surface:
 1. The provider combines the per-session secret with the signed trust metadata,
    hardening requirements, and broker policy in the shared typed guest-bootstrap
    schema, then `container exec --interactive` installs it as a root-created,
-   mode `0400` guest file.
+   mode `0400` guest file. Before completing injection, the signed helper moves
+   init into the trusted runtime cgroup without enabling any controllers.
 2. A detached bootstrap/control exec starts the verified guest supervisor.
 3. A second interactive exec runs the signed `stdio-bridge`, which connects to
    the session-unique guest Unix socket and relays raw stdin/stdout.
@@ -108,3 +118,63 @@ identities and always attempts channel cleanup, stop, and targeted delete.
 - Bundle and trust-root mounts depend on official CLI bind-mount semantics and
   are fail-closed by guest-side mode, owner, digest, version, and rollback
   checks.
+
+## Guest readiness troubleshooting
+
+Bootstrap injection moves guest init from `/` to `/sendbox-runtime` before
+controller delegation, without changing the cgroup namespace root.
+Guest admission checks the full writable
+cgroup2 mount independently of this membership change. It still rejects
+subtree mounts, read-only mounts, and unrelated init cgroups.
+
+The v0.2.0 guest incorrectly required init to remain at `/` after moving it,
+causing the mandatory egress service to exit before authenticated readiness.
+Its execution broker also treated the supervisor's connect/disconnect socket
+health probe as its sole execution connection and exited on the empty request.
+The broker must survive that empty probe without accepting malformed requests
+or weakening peer/session authentication.
+The concurrent stdio relay can also repopulate the root cgroup during controller
+delegation. Startup refreshes and migrates those processes when the kernel returns
+`EBUSY`, retrying for at most five seconds rather than disabling the controllers.
+Native exec also snapshots init's cgroup before attaching the new process.
+Moving init only during concurrent supervisor startup leaves a window where
+Apple targets the old root after controllers make it a non-leaf. The bootstrap
+injection helpers now establish `/sendbox-runtime` before returning, so later
+supervisor/control execs use a stable leaf. Controllers are still enabled and
+verified by the supervisor, not by the injection helper.
+
+In one retained failed run, Apple reported `vmexec ... read ack pipe` while
+starting the control relay; the guest was locally ready but the relay never
+reached the handshake. Apple 0.10.0 can also wait indefinitely after such a start
+failure. The upstream [waiter fix](https://github.com/apple/container/pull/1289)
+is included in 0.11.0, but later Apple versions remain unqualified by this
+adapter. Do not infer that a later successful retry repaired an earlier failed
+run or upgrade the host service as an implicit workaround.
+
+Replacing only the host CLI cannot correct that guest defect: rebuild and sign
+the guest bundle as well. Host/guest manifest versions must match the binaries,
+and trust-root identity, architecture, release sequence, digests, and ownership
+must still verify. Never edit an installed signed bundle in place.
+
+A Node `fetch` error saying `Request was cancelled` can wrap a proxy failure
+rather than application cancellation. Inspect its nested cause or Undici
+diagnostics: HTTP CONNECT 502 indicates upstream resolution/connection failure;
+403 is a policy denial. Domain policy validates the complete CNAME chain, so
+allowing a public API hostname does not implicitly authorize its canonical
+backend names. Keep those denials intact and require explicit policy approval
+for any additional names.
+
+If readiness succeeds but launch reports `openat2`/`Symbolic link loop`, fix the
+workload image or select its actual regular executable path. For a minimal
+qualification image, the original Alpine base can be extended without relaxing
+the broker:
+
+```dockerfile
+FROM alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+RUN apk add --no-cache nftables \
+    && cp /bin/busybox /bin/sh.sendbox \
+    && mv -f /bin/sh.sendbox /bin/sh
+```
+
+Build without cache and pin the resulting image digest. This image is only a
+minimal shell qualification image; it does not install a coding agent.

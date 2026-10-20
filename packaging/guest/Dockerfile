@@ -150,9 +150,9 @@ COPY --from=bpf /out/observe.bpf.o /tmp/observe.bpf.o
 FROM quality-base AS quality
 RUN target="$(cat /opt/target-triple)" \
     && cargo fmt --all --check \
-    && cargo clippy --locked -p sendbox-bpf -p sendbox-bundle -p sendbox-guest \
+    && cargo clippy --locked -p sendbox-bpf -p sendbox-bundle -p sendbox-exec -p sendbox-guest \
         --all-targets --all-features --target "$target" -- -D warnings \
-    && cargo test --locked -p sendbox-bpf -p sendbox-bundle -p sendbox-guest \
+    && cargo test --locked -p sendbox-bpf -p sendbox-bundle -p sendbox-exec -p sendbox-guest \
         --all-targets --all-features --target "$target" \
     && cargo check --locked --manifest-path fuzz/bpf/Cargo.toml --bins \
     && cargo audit --deny warnings \

@@ -197,6 +197,8 @@ docker buildx build \
   --platform linux/arm64 \
   --target artifact \
   --secret id=release_signing_key,src=/secure/path/release-ed25519.key \
+  --build-arg HOST_VERSION=0.2.0 \
+  --build-arg GUEST_VERSION=0.2.0 \
   --output type=local,dest=dist/arm64 \
   -f packaging/guest/Dockerfile \
   .
@@ -205,6 +207,17 @@ docker buildx build \
 Use `linux/amd64` for x86_64. Never place a production private key in the build
 context, image, repository, CI variables exposed to pull requests, or command
 line.
+
+Set the expected host/guest versions to the versions of the binaries being
+qualified, not an older build default. A guest-bootstrap fix requires rebuilding
+and signing the guest bundle, not only rebuilding the host CLI.
+
+For development qualification, use a separately generated test-only signing key,
+trust-root ID, release sequence, and root-owned installation path. Keep the key
+outside the build context and remove it after signing. Never replace an installed
+release's trust key or bundle with test material. A local signature is not a
+release attestation, and portable fixtures or kernel prerequisite probes are not
+evidence of an authenticated, fully hardened workload running in a real VM.
 
 The release secret is a base64 encoding of an exact 32-byte Ed25519 seed. It is
 decoded only on the tag-release runner, checked for length, mounted into

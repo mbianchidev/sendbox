@@ -570,6 +570,20 @@ pub(crate) fn verify_memfd_denied() -> Result<(), PlatformError> {
     require_eperm(result as libc::c_long, "memfd_create")
 }
 
+pub(crate) fn verify_clone3_denied() -> Result<(), PlatformError> {
+    // SAFETY: null arguments and zero size cannot create a child even if the
+    // filter is missing; the installed filter must reject before validation.
+    let result = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<CloneArgs>(), 0_usize) };
+    if result == -1
+        && io::Error::last_os_error().raw_os_error() == Some(super::seccomp::CLONE3_DENIAL_ERRNO)
+    {
+        return Ok(());
+    }
+    Err(PlatformError::SecuritySetup(
+        "clone3 verification did not return ENOSYS".to_owned(),
+    ))
+}
+
 fn require_eperm(result: libc::c_long, operation: &'static str) -> Result<(), PlatformError> {
     if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
         return Ok(());
@@ -672,7 +686,10 @@ fn child_clone3_filter() -> Result<Vec<libc::sock_filter>, PlatformError> {
             bpf_statement(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
             bpf_jump(BPF_JMP_JEQ_K, CLONE3_SYSCALL_NUMBER, 1, 0),
             bpf_jump(BPF_JMP_JEQ_K, X32_SYSCALL_BIT | CLONE3_SYSCALL_NUMBER, 0, 1),
-            bpf_statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+            bpf_statement(
+                BPF_RET_K,
+                SECCOMP_RET_ERRNO | super::seccomp::CLONE3_DENIAL_ERRNO as u32,
+            ),
             bpf_statement(BPF_RET_K, SECCOMP_RET_ALLOW),
         ])
     }
@@ -922,6 +939,57 @@ fn waitid_error() -> PlatformError {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn evaluate_child_filter(architecture: u32, syscall: u32) -> u32 {
+        let filter = child_clone3_filter().expect("filter");
+        let mut accumulator = 0;
+        let mut instruction = 0;
+        loop {
+            let current = &filter[instruction];
+            match current.code {
+                BPF_LD_W_ABS => {
+                    accumulator = match current.k {
+                        SECCOMP_DATA_ARCH_OFFSET => architecture,
+                        SECCOMP_DATA_NR_OFFSET => syscall,
+                        offset => panic!("unexpected filter load offset {offset}"),
+                    };
+                    instruction += 1;
+                }
+                BPF_JMP_JEQ_K => {
+                    instruction += 1 + usize::from(if accumulator == current.k {
+                        current.jt
+                    } else {
+                        current.jf
+                    });
+                }
+                BPF_RET_K => return current.k,
+                code => panic!("unexpected filter instruction {code}"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn child_clone3_filter_denies_native_compat_and_x32_with_enosys() {
+        #[cfg(target_arch = "x86_64")]
+        let architectures = [0xc000_003e, 0x4000_0003];
+        #[cfg(target_arch = "aarch64")]
+        let architectures = [0xc000_00b7, 0x4000_0028];
+        for architecture in architectures {
+            for syscall in [
+                CLONE3_SYSCALL_NUMBER,
+                X32_SYSCALL_BIT | CLONE3_SYSCALL_NUMBER,
+            ] {
+                assert_eq!(
+                    evaluate_child_filter(architecture, syscall),
+                    SECCOMP_RET_ERRNO | libc::ENOSYS as u32
+                );
+            }
+            assert_eq!(evaluate_child_filter(architecture, 0), SECCOMP_RET_ALLOW);
+        }
+        assert_eq!(evaluate_child_filter(0, 0), SECCOMP_RET_KILL_PROCESS);
+    }
 
     #[test]
     fn openat2_rejects_symlinks_beneath_root() {

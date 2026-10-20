@@ -1,9 +1,96 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", test))]
+use std::time::Duration;
 
 pub use sendbox_bootstrap::ControlKind;
 
 use crate::GuestError;
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const RUNTIME_CGROUP_NAME: &str = "sendbox-runtime";
+
+/// Stabilize init placement before native execs can race controller delegation.
+pub fn prepare_native_exec_cgroup(hierarchy_root: &Path) -> Result<(), GuestError> {
+    #[cfg(any(target_os = "linux", test))]
+    {
+        if !hierarchy_root.join("cgroup.controllers").is_file() {
+            return Err(GuestError::Runtime(
+                "cgroup v2 is not mounted at /sys/fs/cgroup".to_owned(),
+            ));
+        }
+        move_root_processes_to_runtime_cgroup(hierarchy_root)
+    }
+    #[cfg(not(any(target_os = "linux", test)))]
+    {
+        let _ = hierarchy_root;
+        Err(GuestError::Runtime(
+            "Linux cgroup preparation requires Linux".to_owned(),
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn move_root_processes_to_runtime_cgroup(hierarchy_root: &Path) -> Result<(), GuestError> {
+    let processes = std::fs::read_to_string(hierarchy_root.join("cgroup.procs"))
+        .map_err(|error| GuestError::io("reading root cgroup processes", error))?;
+    if processes.trim().is_empty() {
+        return Ok(());
+    }
+    let runtime_cgroup = hierarchy_root.join(RUNTIME_CGROUP_NAME);
+    if !runtime_cgroup.exists() {
+        std::fs::create_dir(&runtime_cgroup)
+            .map_err(|error| GuestError::io("creating runtime cgroup", error))?;
+    }
+    for process in processes.lines().filter(|value| !value.is_empty()) {
+        match std::fs::write(runtime_cgroup.join("cgroup.procs"), process) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => {
+                eprintln!(
+                    "sendbox-guest: runtime process {process} exited before cgroup migration"
+                );
+            }
+            Err(error) => {
+                return Err(GuestError::io("moving process into runtime cgroup", error));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn delegate_controllers_with_retry(
+    mut migrate: impl FnMut() -> Result<(), GuestError>,
+    mut enable: impl FnMut() -> std::io::Result<()>,
+    timeout: Duration,
+) -> Result<(), GuestError> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut retrying = false;
+    loop {
+        migrate()?;
+        match enable() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.raw_os_error() == Some(rustix::io::Errno::BUSY.raw_os_error())
+                    && std::time::Instant::now() < deadline =>
+            {
+                if !retrying {
+                    eprintln!(
+                        "sendbox-guest: runtime processes raced with cgroup delegation; refreshing before retry"
+                    );
+                    retrying = true;
+                }
+                std::thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+            }
+            Err(error) => {
+                return Err(GuestError::io("delegating cgroup controllers", error));
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlStatus {
@@ -71,11 +158,7 @@ impl LinuxPlatformControls {
         let root = self.cgroup_parent.parent().ok_or_else(|| {
             GuestError::Runtime("cgroup parent does not have a hierarchy root".to_owned())
         })?;
-        if !root.join("cgroup.controllers").is_file() {
-            return Err(GuestError::Runtime(
-                "cgroup v2 is not mounted at /sys/fs/cgroup".to_owned(),
-            ));
-        }
+        prepare_native_exec_cgroup(root)?;
         if !self.cgroup_parent.exists() {
             std::fs::create_dir(&self.cgroup_parent)
                 .map_err(|error| GuestError::io("creating broker cgroup parent", error))?;
@@ -86,30 +169,11 @@ impl LinuxPlatformControls {
             .map_err(|error| GuestError::io("reading delegated cgroup controllers", error))?;
         let requested = Self::controllers_to_delegate(&controllers, &delegated);
         if !requested.is_empty() {
-            self.move_root_processes_to_runtime_cgroup(root)?;
-            std::fs::write(root.join("cgroup.subtree_control"), requested)
-                .map_err(|error| GuestError::io("delegating cgroup controllers", error))?;
-        }
-        Ok(())
-    }
-
-    fn move_root_processes_to_runtime_cgroup(
-        &self,
-        hierarchy_root: &std::path::Path,
-    ) -> Result<(), GuestError> {
-        let processes = std::fs::read_to_string(hierarchy_root.join("cgroup.procs"))
-            .map_err(|error| GuestError::io("reading root cgroup processes", error))?;
-        if processes.trim().is_empty() {
-            return Ok(());
-        }
-        let runtime_cgroup = hierarchy_root.join("sendbox-runtime");
-        if !runtime_cgroup.exists() {
-            std::fs::create_dir(&runtime_cgroup)
-                .map_err(|error| GuestError::io("creating runtime cgroup", error))?;
-        }
-        for process in processes.lines().filter(|value| !value.is_empty()) {
-            std::fs::write(runtime_cgroup.join("cgroup.procs"), process)
-                .map_err(|error| GuestError::io("moving process into runtime cgroup", error))?;
+            delegate_controllers_with_retry(
+                || move_root_processes_to_runtime_cgroup(root),
+                || std::fs::write(root.join("cgroup.subtree_control"), requested.as_bytes()),
+                Duration::from_secs(5),
+            )?;
         }
         Ok(())
     }
@@ -205,8 +269,7 @@ impl PlatformControls for LinuxPlatformControls {
             .find(|status| status.control == ControlKind::Seccomp)
             .ok_or_else(|| GuestError::Runtime("seccomp status was not prepared".to_owned()))?;
         seccomp.verified = true;
-        seccomp.detail =
-            "NNP and TSYNC deny direct execve, execveat, clone3, and memfd_create".to_owned();
+        seccomp.detail = "NNP and TSYNC deny direct execve, execveat, and memfd_create; clone3 returns ENOSYS while classic clone namespace flags remain denied".to_owned();
         self.self_test(&statuses)?;
         Ok(statuses)
     }
@@ -262,6 +325,150 @@ pub fn reject_unverified_required(statuses: &[ControlStatus]) -> Result<(), Gues
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_exec_preparation_moves_init_before_controller_delegation() {
+        let root = tempfile::tempdir().expect("isolated cgroup filesystem fixture");
+        std::fs::write(root.path().join("cgroup.controllers"), "cpu memory pids")
+            .expect("available controllers");
+        std::fs::write(root.path().join("cgroup.subtree_control"), "")
+            .expect("initial controller state");
+        std::fs::write(root.path().join("cgroup.procs"), "1\n").expect("init membership");
+
+        prepare_native_exec_cgroup(root.path()).expect("prepare native exec placement");
+        prepare_native_exec_cgroup(root.path()).expect("repeated preparation is idempotent");
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(RUNTIME_CGROUP_NAME).join("cgroup.procs"))
+                .expect("init must be moved before bootstrap installation completes"),
+            "1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("cgroup.subtree_control"))
+                .expect("controller state"),
+            ""
+        );
+        assert!(!root.path().join("sendbox").exists());
+    }
+
+    #[test]
+    fn native_exec_preparation_rejects_missing_cgroup_v2() {
+        let root = tempfile::tempdir().expect("isolated filesystem fixture");
+        assert!(matches!(
+            prepare_native_exec_cgroup(root.path()),
+            Err(GuestError::Runtime(_))
+        ));
+        assert!(!root.path().join(RUNTIME_CGROUP_NAME).exists());
+    }
+
+    #[test]
+    fn native_exec_preparation_fails_closed_on_process_migration_error() {
+        let root = tempfile::tempdir().expect("isolated cgroup filesystem fixture");
+        std::fs::write(root.path().join("cgroup.controllers"), "cpu memory pids")
+            .expect("available controllers");
+        std::fs::write(root.path().join("cgroup.procs"), "1\n").expect("init membership");
+        std::fs::write(root.path().join(RUNTIME_CGROUP_NAME), "not a directory")
+            .expect("invalid migration target");
+        assert!(matches!(
+            prepare_native_exec_cgroup(root.path()),
+            Err(GuestError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn busy_delegation_refreshes_processes_before_each_retry() {
+        let operations = std::cell::RefCell::new(Vec::new());
+        delegate_controllers_with_retry(
+            || {
+                operations.borrow_mut().push("migrate");
+                Ok(())
+            },
+            || {
+                let mut operations = operations.borrow_mut();
+                operations.push("enable");
+                if operations
+                    .iter()
+                    .filter(|operation| **operation == "enable")
+                    .count()
+                    < 3
+                {
+                    Err(std::io::Error::from_raw_os_error(
+                        rustix::io::Errno::BUSY.raw_os_error(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            Duration::from_secs(1),
+        )
+        .expect("transient control-process arrivals must not abort startup");
+        assert_eq!(
+            *operations.borrow(),
+            [
+                "migrate", "enable", "migrate", "enable", "migrate", "enable"
+            ]
+        );
+    }
+
+    #[test]
+    fn delegation_permission_errors_are_not_retried() {
+        let attempts = std::cell::Cell::new(0);
+        let error = delegate_controllers_with_retry(
+            || Ok(()),
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::PERM.raw_os_error(),
+                ))
+            },
+            Duration::from_secs(1),
+        )
+        .expect_err("permission failure must remain fatal");
+        assert_eq!(attempts.get(), 1);
+        assert!(matches!(
+            error,
+            GuestError::Io { source, .. }
+                if source.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error())
+        ));
+    }
+
+    #[test]
+    fn busy_delegation_deadline_fails_closed() {
+        let attempts = std::cell::Cell::new(0);
+        let error = delegate_controllers_with_retry(
+            || Ok(()),
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::BUSY.raw_os_error(),
+                ))
+            },
+            Duration::ZERO,
+        )
+        .expect_err("busy hierarchy must not become a readiness success");
+        assert_eq!(attempts.get(), 1);
+        assert!(matches!(
+            error,
+            GuestError::Io { source, .. }
+                if source.raw_os_error() == Some(rustix::io::Errno::BUSY.raw_os_error())
+        ));
+    }
+
+    #[test]
+    fn failed_process_migration_never_enables_controllers() {
+        let enabled = std::cell::Cell::new(false);
+        let error = delegate_controllers_with_retry(
+            || Err(GuestError::Runtime("migration failed".to_owned())),
+            || {
+                enabled.set(true);
+                Ok(())
+            },
+            Duration::from_secs(1),
+        )
+        .expect_err("migration failure");
+        assert!(!enabled.get());
+        assert!(matches!(error, GuestError::Runtime(_)));
+    }
 
     struct VerifiedTestControls;
 

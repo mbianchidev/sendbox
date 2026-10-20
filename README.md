@@ -53,8 +53,10 @@ unsupported capability is an error, **not a fallback to running on the host**.
 
 Profiles configure the agent's entry command and initial inference hosts; they
 **do not install the agent or log you in**. Your workload image must contain the
-Linux agent, its dependencies, certificates, and development tools. Use its
-actual installed executable path when launching.
+Linux agent, its dependencies, certificates, development tools, and `nftables`
+for mandatory guest egress enforcement. Use the agent's actual installed
+executable path when launching; entrypoint and working-directory paths must not
+traverse symlinks.
 
 Non-Copilot profiles do not require Copilot credentials. Add any extra model
 provider, authentication, package, or plugin endpoints you need explicitly.

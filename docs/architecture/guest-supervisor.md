@@ -9,6 +9,12 @@ mandatory MCP audit service and, for remote MCP, a trusted HTTP gateway inside
 the egress broker. When enabled, the supervisor also owns the Safe Outputs
 recorder and its seal key. BPF activation remains explicit guest policy.
 
+Threaded glibc workloads retain ordinary pthread support through classic `clone`
+fallback. Both the agent bootstrap and child-only filter reject `clone3` with
+`ENOSYS`, not an allow decision. Namespace clone flags and dangerous
+process-control syscalls remain denied, and the bootstrap verifies the expected
+`clone3` denial before publishing readiness.
+
 ## Process and command model
 
 `sendbox-guest` is a static multi-call binary with these entrypoints:
@@ -140,6 +146,12 @@ dependencies are rejected before spawn. A mandatory service cannot depend on an
 optional service. Services run in dedicated process groups.
 Output is drained concurrently and retained only up to the configured bound.
 
+The execution broker's connection-only startup health probe must not consume its
+single execution session. It retries only a peer-checked connection that closes
+without sending any request bytes. Nonempty malformed frames, invalid first
+operations, wrong peer identities, and invalid session authentication still fail;
+the actual execution request remains single-use.
+
 Optional services restart only within their declared budget, and dependents are
 re-health-checked after an optional dependency restart. Any mandatory service
 exit revokes the launch gate immediately; mandatory services are never restarted
@@ -164,6 +176,20 @@ Privilege drop, capabilities, and seccomp are represented by the injected
 `PlatformControls` trait. The production Linux adapter requires root identity,
 prepares and verifies the delegated cgroup v2 parent, starts the mandatory broker,
 then installs and verifies the NNP/TSYNC direct-exec filter before readiness.
+The bootstrap injection helper first moves init into `/sendbox-runtime`, before
+completing injection or enabling any controllers. Native runtimes can snapshot
+init's cgroup while preparing later control execs; its membership must be stable
+before concurrent controller delegation makes the old root a non-leaf. Migration
+failure aborts injection. This changes process membership, not the cgroup
+namespace root. Egress admission accepts init
+only at `/` or that trusted runtime leaf and independently requires a single
+read/write cgroup2 mount rooted at `/` at `/sys/fs/cgroup`. Subtree mounts,
+read-only mounts, and unrelated init cgroups fail closed.
+The runtime may start its stdio relay while controllers are being delegated.
+An `EBUSY` write refreshes and migrates the current root processes before retrying,
+within a five-second deadline. Processes that have already exited are logged and
+skipped; other migration errors, permission errors, and an exhausted deadline
+remain fatal. No controller requirement is skipped to make readiness succeed.
 The launcher drops brokered workloads to the non-root project uid/gid and applies
 the production capability, rlimit, cgroup, pidfd, and command seccomp controls.
 Tests retain a deterministic unprivileged adapter.
