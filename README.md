@@ -12,6 +12,7 @@ environment.
 
 [Quick start](#quick-start) |
 [Supported agents](#supported-coding-agents) |
+[Configuration and commands](#configuration-and-commands) |
 [Integrations](#integrations) |
 [Alternatives](#how-does-it-compare) |
 [Documentation](docs/README.md)
@@ -88,15 +89,45 @@ and checksum, and follow the [installation guide](docs/installation.md).
 Host release artifacts include the matching signed guest bundle; source builds
 need that bundle separately.
 
-| Your host | Session runtime | Setup |
+| Your host | Session runtime and prerequisites | Setup |
 |---|---|---|
-| macOS 26+ on Apple silicon | Apple Containerization | [Apple runtime](docs/apple-runtime.md) |
-| Linux with hardware or nested virtualization | Kata Containers via nerdctl/containerd | [Kata runtime](docs/kata-containers.md) |
+| macOS 26+ on Apple silicon | Apple Containerization, Xcode 26, and official `container` CLI **0.10.0** with its service registered and running | [Apple runtime](docs/apple-runtime.md) |
+| Linux x86_64 or aarch64 with hardware or nested virtualization | Kata Containers **3.28+**, containerd **1.7+**, nerdctl, CNI plugins, and user access to `/dev/kvm` and containerd | [Kata runtime](docs/kata-containers.md) |
+
+Linux host binaries also need libseccomp, libelf, zlib, and zstd runtime libraries
+(on Debian/Ubuntu: `libseccomp2 libelf1 zlib1g libzstd1`). Rust is only required
+when building from source.
 
 Run the installed `setup.sh` as your normal user for runtime preflight and
-configuration assistance. See [full requirements](docs/installation.md#requirements)
-for pinned tooling and native libraries. macOS installers are currently unsigned
-and unnotarized; follow the [package instructions](docs/installation.md#unsigned-macos-packages).
+configuration assistance, not `sudo sendbox`. For macOS package/DMG installs,
+the helper is `/usr/local/share/sendbox/setup.sh`; for tarballs it is in the
+extracted release directory. See [full requirements](docs/installation.md#requirements).
+macOS installers are **unsigned and unnotarized**; follow the
+[package instructions](docs/installation.md#unsigned-macos-packages).
+
+Confirm the binary is on your `PATH`:
+
+```bash
+sendbox --version
+sendbox help run
+```
+
+#### Build from source instead
+
+Install the pinned Rust **1.93.1** toolchain and the
+[native build dependencies](docs/installation.md#requirements), then:
+
+```bash
+git clone https://github.com/mbianchidev/sendbox.git
+cd sendbox
+make install PREFIX="$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+sendbox --version
+```
+
+This builds and installs the host CLI, not a VM runtime, an agent image, or the
+signed guest bundle. Obtain the matching verified bundle and trust root
+separately before `sendbox run`.
 
 ### 2. Configure your project and agent
 
@@ -107,27 +138,48 @@ sendbox init --project . --agent claude
 sendbox secrets add ANTHROPIC_API_KEY
 ```
 
-Edit the generated `.sendbox.yaml` to reference the stored credential:
+`init` creates a private `.sendbox.yaml` in the project root and refuses to
+overwrite an existing one. `secrets add` prompts for the value without putting
+it in shell history. Edit the generated file to reference the stored credential,
+preserving its other settings:
 
 ```yaml
 secrets: [ANTHROPIC_API_KEY]
 ```
 
-Review the generated command and network policy before running. GitHub forwarding
-and branch protection are configured independently: set up repository
-authentication when using them, or explicitly disable the features you do not
-need. The [credential guide](docs/cli-agents.md#credentials-and-agent-state)
-explains these settings; host login files are not copied into the VM.
+Review the generated command and network policy before running. The Claude
+profile adds `claude` and `api.anthropic.com`; it is not a minimal network
+allowlist, so remove any default development endpoints you do not need.
+
+Generated configurations enable GitHub repository forwarding and branch guards.
+For a `github.com` checkout, authenticate the host's `gh` CLI, for example with
+`gh auth login`. Private repository access additionally requires
+`github.allow_private_repository_access: true`. If no GitHub credential is
+needed, set `github.forward_auth: false`; for a non-Git project also set
+`github.branch_protection.enabled: false`. Non-Copilot profiles already disable
+Copilot token forwarding. See the
+[credential guide](docs/cli-agents.md#credentials-and-agent-state); host login
+files are not copied into the VM.
+
+Validate and inspect the policy before starting a VM:
+
+```bash
+sendbox policy validate --config .sendbox.yaml
+sendbox policy show --config .sendbox.yaml --json
+```
+
+Validation should exit successfully. It checks configuration and policy, not
+runtime readiness, image contents, or whether credentials can be retrieved.
 
 ### 3. Start a terminal session
 
-Set `WORKLOAD_IMAGE` to your **digest-pinned image containing Claude Code** and
-`GUEST_DIR` to the root-owned guest artifact directory from your verified
-installation. These are placeholders, not a published agent image:
+Set `WORKLOAD_IMAGE` to your **digest-pinned image containing Claude Code**.
+The image below is a placeholder, not a published agent image.
+`GUEST_DIR` below matches a macOS package/DMG installation:
 
 ```bash
 WORKLOAD_IMAGE='your-registry/agent-tools@sha256:REPLACE_WITH_DIGEST'
-GUEST_DIR='/usr/local/share/sendbox/guest/x86_64'
+GUEST_DIR='/usr/local/share/sendbox/guest/aarch64'
 
 sendbox run --interactive \
   --config .sendbox.yaml \
@@ -137,17 +189,61 @@ sendbox run --interactive \
   -- /usr/local/bin/claude
 ```
 
-Use `aarch64` instead of `x86_64` for an arm64 guest bundle. For Homebrew installs,
-use the versioned root-owned `GUEST_DIR` from the installation guide. For tarball
-installs, use `guest/<architecture>/` under the root-owned extracted release directory.
+For Homebrew installs, use the versioned root-owned `GUEST_DIR` from the
+[guest staging guide](docs/installation.md#stage-the-guest-bundle), not the
+macOS package path above.
+
+For tarball installs, use `guest/aarch64/` or `guest/x86_64/` under the root-owned
+extracted release directory. The workload image and bundle architectures must
+match; **ARM guest directories are named `aarch64`, not `arm64`**. Bundle files,
+the trust root, and their ancestors must meet the runtime's ownership and
+permission checks. Moving only the public key into a trusted location is not
+sufficient.
+
 `auto` selects Apple on macOS arm64 and Kata on Linux; you can select a provider
-explicitly with `--runtime`.
+explicitly with `--runtime`. Once authenticated guest services are ready, the
+agent starts in the shared project at `/workspace`. A successful zero exit
+preserves workspace edits; the session's guest home and login state are discarded.
 
 Drop `--interactive` and supply your agent's headless arguments for automation.
+`--json` emits machine-readable events in headless mode and cannot be combined
+with `--interactive`; workload output bytes are hex encoded.
 See [terminal troubleshooting](docs/interactive-sessions.md) and the
 [CLI reference](docs/cli-reference.md) for more options.
 For first-request networking failures, use the credential-free
 [cold-start DNS diagnostic](docs/dns-cold-start.md), not a warmed retry.
+
+## Configuration and commands
+
+The generated `.sendbox.yaml` is the starting point, not a requirement to use
+every integration. Review `project_path` and optional `workspace_path`, CPU and
+memory resources, `policy.commands`, `policy.network`, `secrets`, and `github`
+for each project. Sharing a parent workspace exposes its sibling repositories
+too. Package inspection, Safe Outputs, and syscall tracing are opt-in.
+
+Use the [configuration guide](docs/configuration.md) and
+[annotated YAML reference](config/example-sandbox.yaml) for individual settings.
+These commands do not launch a VM or require an agent login:
+
+```bash
+# Inspect the configured boundary declaration, not a live session
+sendbox boundary inspect --config .sendbox.yaml --json
+
+# Analyze a project without writing generated files
+sendbox analyze --project . --json
+
+# Write .devcontainer/devcontainer.json from native project analysis
+sendbox devcontainer generate --project .
+
+# Install completions for your shell (bash, zsh, or fish)
+sendbox completions install --shell zsh
+```
+
+Devcontainer generation merges an existing configuration and rewrites it as
+JSON; JSONC comments are not preserved. Review the resulting diff. A generated
+devcontainer is development-environment configuration, not a replacement for
+`sendbox run` or its security services. Use `sendbox help <subcommand>` for
+options supported by your installed version.
 
 ## Integrations
 
@@ -178,21 +274,36 @@ tradeoffs, and isolation considerations, with links to the projects' own
 documentation. There is no universal winner: choose for your trust boundary,
 tooling needs, and operational model.
 
-## Security expectations
+## Limitations and security expectations
 
 VM isolation does not make agent-generated changes trustworthy. The shared
 workspace is writable, and credentials deliberately delivered to an agent are
 available to that agent. Review changes before executing them on your host.
+
+Workspace mounts are live, not an isolated copy waiting to be merged.
+Nonzero exits, runtime failures, and normal session cancellation trigger
+snapshot rollback of the shared workspace. Avoid concurrent host edits during
+a session: they can be included in a rollback. A failed run is not a way to
+retain partial agent changes.
 
 Command policy covers the brokered top-level argv, not recursive semantic
 inspection of every descendant command. Credential masking is not comprehensive
 data-loss prevention, and local Git guards do not replace server-side branch
 protection. Optional syscall tracing observes activity; it does not enforce policy.
 
+Agents must honor the configured HTTP/SOCKS proxies to reach allowed external
+services. Direct connections and UDP/QUIC remain blocked; a client that ignores
+the proxies will fail even if its destination is allowed. See
+[agent networking](docs/cli-agents.md#agent-compatible-network-proxy).
+
 Apple and Kata support the full persistent guest-service path.
 [Hyperlight](docs/hyperlight.md) is an explicit Linux/KVM **one-shot** provider,
 not an interactive agent runtime; it rejects MCP, credential delivery, and
 restrictive-egress composition rather than silently downgrading them.
+
+There is no Windows or Intel macOS runtime, Kubernetes backend, or graphical
+dashboard. CI sessions require a prepared runner with the selected runtime and
+virtualization access; ordinary container-only runners are not enough.
 
 Read the [security model](docs/security-model.md) for guarantees and assumptions,
 and the [documentation index](docs/README.md) for configuration, architecture,
@@ -200,8 +311,10 @@ and operational guides.
 
 ## Contributing
 
-See the [contribution guide](docs/contributing.md) for source setup, checks, and
-release procedures. The [roadmap](ROADMAP.md) tracks planned work.
+Contributions are welcome. See the [contribution guide](docs/contributing.md)
+for source setup, checks, and release procedures. The [roadmap](ROADMAP.md)
+includes future proposals and historical designs; use the CLI and runtime
+guides above for current behavior.
 
 ## License
 
