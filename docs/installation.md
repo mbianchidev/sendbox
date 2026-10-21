@@ -227,15 +227,22 @@ Actions workflows. Cargo is also required when preparing a new version bump.
 For a new release, pass a stable `X.Y.Z` version greater than the version on
 `main`; a leading `v` is also accepted.
 
-It creates an isolated worktree from freshly fetched `origin/main`, updates
-`[workspace.package].version` and the CLI version assertion, and refreshes every
-committed Cargo lockfile, including standalone fuzz, spike, and qualification
-workspaces. Unrelated dependencies are not upgraded.
+After its preflight safety checks, the script switches the invoking checkout
+to `main` and pulls `origin/main` with `--ff-only` before inspecting or resuming
+a release. A failed pull or divergent local `main` stops the script before any
+release operations. If `main` is checked out in another Git worktree, run from
+that checkout instead; the script never forces a second checkout of `main`.
+
+For a new release, it creates an isolated worktree from updated `origin/main`,
+updates `[workspace.package].version` and the CLI version assertion, and
+refreshes every committed Cargo lockfile, including standalone fuzz, spike,
+and qualification workspaces. Unrelated dependencies are not upgraded.
 
 It then opens a version-bump PR, waits for CI checks to pass, and merges without
 bypassing branch protections. An annotated tag is pushed at the PR's merged
 `main` commit, after verifying that its Cargo version matches the tag. The
-original checkout and branch are unchanged, even if `main` advances meanwhile.
+invoking checkout stays on `main` at its startup pull, while the original
+feature branch is unchanged and version edits remain in the isolated worktree.
 
 The script watches the [Release workflow](https://github.com/mbianchidev/sendbox/actions/workflows/release.yaml),
 which publishes GitHub assets and GHCR artifacts, including macOS installers,

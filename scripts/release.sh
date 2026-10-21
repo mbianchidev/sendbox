@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    printf 'Usage: %s VERSION\nCreate or resume a release, keeping its existing PR and tag.\n' \
+    printf 'Usage: %s VERSION\nSwitch to main, pull fast-forward-only, then create or resume a release.\n' \
         "${0##*/}"
 }
 
@@ -83,7 +83,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+git switch main || fail "could not switch to main; make sure it is available in this checkout"
+git pull --ff-only --no-tags origin refs/heads/main:refs/remotes/origin/main \
+    || fail "could not fast-forward main from origin/main; resolve the pull error before retrying"
 LOCAL_TAG="$(git tag --list "$TAG" --format='%(objectname)')"
 REMOTE_TAG="$(git ls-remote origin "refs/tags/$TAG")"
 REMOTE_TAG="${REMOTE_TAG%%$'\t'*}"

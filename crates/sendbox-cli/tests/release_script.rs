@@ -407,9 +407,21 @@ exec "$RELEASE_TEST_CARGO" "$@"
 }
 
 #[test]
-fn releases_the_merged_commit_and_refreshes_every_lockfile_without_switching_the_caller() {
+fn switches_to_updated_main_before_releasing_and_refreshing_every_lockfile() {
     let repository = ReleaseRepository::new();
     let original_head = git(&repository.checkout, &["rev-parse", "HEAD"]);
+    git(
+        &repository.origin,
+        &[
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "--allow-empty",
+            "-m",
+            "Upstream main update",
+        ],
+    );
+    let pulled_head = git(&repository.origin, &["rev-parse", "main"]);
     let result = repository.run(&["0.2.0"], "success");
     repository.assert_succeeded(&result);
     let merge = fs::read_to_string(repository.state.join("merge")).unwrap();
@@ -451,10 +463,14 @@ fn releases_the_merged_commit_and_refreshes_every_lockfile_without_switching_the
     );
     assert_eq!(
         git(&repository.checkout, &["branch", "--show-current"]),
-        "unrelated-feature"
+        "main"
     );
     assert_eq!(
         git(&repository.checkout, &["rev-parse", "HEAD"]),
+        pulled_head
+    );
+    assert_eq!(
+        git(&repository.checkout, &["rev-parse", "unrelated-feature"]),
         original_head
     );
     assert!(git(&repository.checkout, &["status", "--porcelain"]).is_empty());
@@ -473,6 +489,10 @@ fn rejects_invalid_versions_without_creating_a_release_branch() {
         repository.assert_failed(&result, "version");
     }
     assert!(git(&repository.checkout, &["branch", "--list", "release/v*"]).is_empty());
+    assert_eq!(
+        git(&repository.checkout, &["branch", "--show-current"]),
+        "unrelated-feature"
+    );
     assert!(repository.trace().is_empty());
 }
 
@@ -483,6 +503,10 @@ fn rejects_a_dirty_checkout_and_non_increasing_versions() {
         let result = repository.run(&[version], "success");
         repository.assert_failed(&result, "greater");
     }
+    git(
+        &repository.checkout,
+        &["switch", "--quiet", "unrelated-feature"],
+    );
     write(repository.checkout.join("uncommitted.txt"), "keep this\n");
     let result = repository.run(&["0.2.0"], "success");
     repository.assert_failed(&result, "clean");
@@ -490,7 +514,79 @@ fn rejects_a_dirty_checkout_and_non_increasing_versions() {
         fs::read_to_string(repository.checkout.join("uncommitted.txt")).unwrap(),
         "keep this\n"
     );
+    assert_eq!(
+        git(&repository.checkout, &["branch", "--show-current"]),
+        "unrelated-feature"
+    );
     assert!(!repository.trace().contains("gh pr create"));
+}
+
+#[test]
+fn stops_before_release_operations_when_main_cannot_be_fast_forwarded() {
+    let repository = ReleaseRepository::new();
+    git(&repository.checkout, &["switch", "--quiet", "main"]);
+    git(
+        &repository.checkout,
+        &[
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "--allow-empty",
+            "-m",
+            "Local main update",
+        ],
+    );
+    let local_main = git(&repository.checkout, &["rev-parse", "main"]);
+    git(
+        &repository.checkout,
+        &["switch", "--quiet", "unrelated-feature"],
+    );
+    git(
+        &repository.origin,
+        &[
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "--allow-empty",
+            "-m",
+            "Conflicting upstream update",
+        ],
+    );
+    let result = repository.run(&["0.2.0"], "success");
+    repository.assert_failed(&result, "could not fast-forward main");
+    assert_eq!(
+        git(&repository.checkout, &["rev-parse", "main"]),
+        local_main
+    );
+    assert!(!repository.trace().contains("gh pr list"));
+    assert!(!repository.trace().contains("cargo "));
+    assert!(git(&repository.checkout, &["branch", "--list", "release/v*"]).is_empty());
+    repository.assert_no_tag();
+}
+
+#[test]
+fn stops_before_release_operations_when_main_is_checked_out_elsewhere() {
+    let repository = ReleaseRepository::new();
+    let other_worktree = repository.temporary.join("main-checkout");
+    git(
+        &repository.checkout,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            other_worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let result = repository.run(&["0.2.0"], "success");
+    repository.assert_failed(&result, "could not switch to main");
+    assert_eq!(
+        git(&repository.checkout, &["branch", "--show-current"]),
+        "unrelated-feature"
+    );
+    assert!(!repository.trace().contains("gh pr list"));
+    assert!(!repository.trace().contains("cargo "));
+    repository.assert_no_tag();
 }
 
 #[test]
