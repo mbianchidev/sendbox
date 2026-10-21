@@ -22,7 +22,33 @@ case "$1 $2" in
             printf 'mbianchidev/sendbox\n'
         fi
         ;;
-    "pr create") printf 'https://github.com/mbianchidev/sendbox/pull/1\n' ;;
+    "pr list")
+        if [[ "$RELEASE_TEST_SCENARIO" == ambiguous_pr ]]; then
+            printf 'multiple release PRs; inspect the previous release attempts\n' >&2
+            exit 1
+        fi
+        if [[ -f "$RELEASE_TEST_STATE/pr" ]]; then
+            head="$(git -C "$RELEASE_TEST_ORIGIN" rev-parse release/v0.2.0)"
+            state=OPEN
+            merge=""
+            cross_repository=false
+            if [[ -f "$RELEASE_TEST_STATE/merge" ]]; then
+                state=MERGED
+                merge="$(cat "$RELEASE_TEST_STATE/merge")"
+            fi
+            if [[ "$RELEASE_TEST_SCENARIO" == closed_pr ]]; then
+                state=CLOSED
+            elif [[ "$RELEASE_TEST_SCENARIO" == foreign_pr ]]; then
+                cross_repository=true
+            fi
+            printf 'https://github.com/mbianchidev/sendbox/pull/1\t%s\t%s\t%s\t%s\n' \
+                "$state" "$head" "$cross_repository" "$merge"
+        fi
+        ;;
+    "pr create")
+        touch "$RELEASE_TEST_STATE/pr"
+        printf 'https://github.com/mbianchidev/sendbox/pull/1\n'
+        ;;
     "pr view")
         if [[ "$*" == *statusCheckRollup* ]]; then
             if [[ "$RELEASE_TEST_SCENARIO" == no_checks ]]; then
@@ -77,12 +103,53 @@ case "$1 $2" in
             printf '123\n'
         fi
         ;;
+    "run view")
+        if [[ ! -f "$RELEASE_TEST_STATE/attempt" ]]; then
+            printf '1\n' >"$RELEASE_TEST_STATE/attempt"
+        fi
+        attempt="$(cat "$RELEASE_TEST_STATE/attempt")"
+        if [[ " $* " == *" --json attempt "* ]]; then
+            if [[ -f "$RELEASE_TEST_STATE/retry-pending" && "$RELEASE_TEST_SCENARIO" != retry_timeout ]]; then
+                polls="$(cat "$RELEASE_TEST_STATE/retry-pending")"
+                if [[ "$polls" -gt 0 ]]; then
+                    printf '%s\n' "$((polls - 1))" >"$RELEASE_TEST_STATE/retry-pending"
+                else
+                    attempt="$((attempt + 1))"
+                    printf '%s\n' "$attempt" >"$RELEASE_TEST_STATE/attempt"
+                    rm "$RELEASE_TEST_STATE/retry-pending" "$RELEASE_TEST_STATE/conclusion"
+                fi
+            fi
+            printf '%s\n' "$attempt"
+        elif [[ -f "$RELEASE_TEST_STATE/conclusion" ]]; then
+            printf '%s\tcompleted\t%s\n' "$attempt" "$(cat "$RELEASE_TEST_STATE/conclusion")"
+        else
+            printf '%s\tin_progress\t\n' "$attempt"
+        fi
+        ;;
+    "run rerun")
+        if [[ "$RELEASE_TEST_SCENARIO" == rerun_failure ]]; then
+            printf 'Mock rerun permission denied\n' >&2
+            exit 1
+        fi
+        if [[ "$(cat "$RELEASE_TEST_STATE/conclusion")" == failure ]]; then
+            [[ " $* " == *" --failed "* ]]
+        else
+            [[ " $* " != *" --failed "* ]]
+        fi
+        printf '2\n' >"$RELEASE_TEST_STATE/retry-pending"
+        ;;
     "run watch")
         [[ " $* " == *" --exit-status "* ]]
+        if [[ -f "$RELEASE_TEST_STATE/retry-pending" ]]; then
+            printf 'Mock watch observed the old attempt\n' >&2
+            exit 1
+        fi
         if [[ "$RELEASE_TEST_SCENARIO" == release_failure ]]; then
+            printf 'failure\n' >"$RELEASE_TEST_STATE/conclusion"
             printf 'Mock Release workflow failed\n' >&2
             exit 1
         fi
+        printf 'success\n' >"$RELEASE_TEST_STATE/conclusion"
         ;;
     "release view") printf 'https://github.com/mbianchidev/sendbox/releases/tag/v0.2.0\n' ;;
     *)
@@ -278,7 +345,7 @@ exec "$RELEASE_TEST_CARGO" "$@"
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
         )
         .unwrap();
-        Command::new("bash")
+        Command::new("/bin/bash")
             .arg(self.checkout.join("scripts/release.sh"))
             .args(arguments)
             .current_dir(self.checkout.join("crates/sendbox-cli"))
@@ -315,6 +382,25 @@ exec "$RELEASE_TEST_CARGO" "$@"
         );
     }
 
+    fn assert_succeeded(&self, result: &Output) {
+        assert!(
+            result.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    fn tag_id(&self, directory: &Path) -> String {
+        git(directory, &["rev-parse", "refs/tags/v0.2.0"])
+    }
+
+    fn failed_release(&self) -> String {
+        let result = self.run(&["0.2.0"], "release_failure");
+        self.assert_failed(&result, "Mock Release workflow failed");
+        self.tag_id(&self.origin)
+    }
+
     fn assert_no_tag(&self) {
         assert!(git(&self.origin, &["tag", "--list", "v0.2.0"]).is_empty());
     }
@@ -325,12 +411,7 @@ fn releases_the_merged_commit_and_refreshes_every_lockfile_without_switching_the
     let repository = ReleaseRepository::new();
     let original_head = git(&repository.checkout, &["rev-parse", "HEAD"]);
     let result = repository.run(&["0.2.0"], "success");
-    assert!(
-        result.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+    repository.assert_succeeded(&result);
     let merge = fs::read_to_string(repository.state.join("merge")).unwrap();
     let tag = git(
         &repository.origin,
@@ -451,13 +532,258 @@ fn reports_a_missing_or_failed_release_workflow_after_pushing_the_tag() {
 }
 
 #[test]
-fn refuses_an_existing_tag_or_a_different_repository() {
+fn retries_failed_publication_without_recreating_the_tag_pr_or_version_bump() {
+    let repository = ReleaseRepository::new();
+    let tag = repository.failed_release();
+    let cargo_calls = repository.trace().matches("cargo ").count();
+    let result = repository.run(&["v0.2.0"], "success");
+    repository.assert_succeeded(&result);
+    assert_eq!(repository.tag_id(&repository.origin), tag);
+    assert_eq!(repository.tag_id(&repository.checkout), tag);
+    let trace = repository.trace();
+    assert_eq!(trace.matches("cargo ").count(), cargo_calls);
+    assert_eq!(trace.matches("gh pr create").count(), 1);
+    assert_eq!(trace.matches("gh pr merge").count(), 1);
+    assert_eq!(trace.matches("gh run rerun").count(), 1);
+    assert!(trace.contains("gh run rerun 123 --repo mbianchidev/sendbox --failed"));
+    assert_eq!(
+        fs::read_to_string(repository.state.join("attempt")).unwrap(),
+        "2\n"
+    );
+}
+
+#[test]
+fn watches_active_and_successful_attempts_without_restarting_them() {
+    let repository = ReleaseRepository::new();
+    repository.assert_succeeded(&repository.run(&["0.2.0"], "success"));
+    fs::remove_file(repository.state.join("conclusion")).unwrap();
+    repository.assert_succeeded(&repository.run(&["0.2.0"], "success"));
+    repository.assert_succeeded(&repository.run(&["0.2.0"], "success"));
+    let trace = repository.trace();
+    assert!(!trace.contains("gh run rerun"));
+    assert_eq!(trace.matches("gh pr create").count(), 1);
+    assert_eq!(trace.matches("gh run watch").count(), 3);
+}
+
+#[test]
+fn restarts_cancelled_and_timed_out_attempts_without_changing_the_tag() {
+    for conclusion in ["cancelled", "timed_out"] {
+        let repository = ReleaseRepository::new();
+        let tag = repository.failed_release();
+        write(repository.state.join("conclusion"), conclusion);
+        repository.assert_succeeded(&repository.run(&["0.2.0"], "success"));
+        assert_eq!(repository.tag_id(&repository.origin), tag);
+        let trace = repository.trace();
+        let rerun = trace
+            .lines()
+            .find(|line| line.starts_with("gh run rerun"))
+            .unwrap();
+        assert!(!rerun.contains("--failed"));
+    }
+}
+
+#[test]
+fn keeps_the_tag_when_a_rerun_is_denied_stalls_or_fails_again() {
+    for (scenario, message) in [
+        ("rerun_failure", "Mock rerun permission denied"),
+        ("retry_timeout", "retry did not start within 10 minutes"),
+        ("release_failure", "Mock Release workflow failed"),
+    ] {
+        let repository = ReleaseRepository::new();
+        let tag = repository.failed_release();
+        let result = repository.run(&["0.2.0"], scenario);
+        repository.assert_failed(&result, message);
+        assert_eq!(repository.tag_id(&repository.origin), tag);
+        assert_eq!(repository.tag_id(&repository.checkout), tag);
+        assert_eq!(repository.trace().matches("gh run rerun").count(), 1);
+    }
+}
+
+#[test]
+fn fetches_an_existing_tag_and_retries_even_after_main_version_advances() {
+    let repository = ReleaseRepository::new();
+    let tag = repository.failed_release();
+    git(&repository.checkout, &["tag", "--delete", "v0.2.0"]);
+    let manifest = fs::read_to_string(repository.origin.join("Cargo.toml")).unwrap();
+    write(
+        repository.origin.join("Cargo.toml"),
+        &manifest.replace("version = \"0.2.0\"", "version = \"0.3.0\""),
+    );
+    git(&repository.origin, &["add", "Cargo.toml"]);
+    git(
+        &repository.origin,
+        &[
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "-m",
+            "Later fixture release",
+        ],
+    );
+    repository.assert_succeeded(&repository.run(&["0.2.0"], "success"));
+    assert_eq!(repository.tag_id(&repository.origin), tag);
+    assert_eq!(repository.tag_id(&repository.checkout), tag);
+    assert_eq!(repository.trace().matches("gh pr create").count(), 1);
+}
+
+#[test]
+fn pushes_an_existing_local_tag_without_replacing_it() {
+    let repository = ReleaseRepository::new();
+    let tag = repository.failed_release();
+    git(&repository.origin, &["tag", "--delete", "v0.2.0"]);
+    repository.assert_succeeded(&repository.run(&["0.2.0"], "success"));
+    assert_eq!(repository.tag_id(&repository.origin), tag);
+    assert_eq!(repository.tag_id(&repository.checkout), tag);
+}
+
+#[test]
+fn resumes_merged_pr_without_remerging_or_rebumping() {
+    let repository = ReleaseRepository::new();
+    let result = repository.run(&["0.2.0"], "no_release_run");
+    repository.assert_failed(&result, "Release workflow");
+    let cargo_calls = repository.trace().matches("cargo ").count();
+    for directory in [&repository.origin, &repository.checkout] {
+        git(directory, &["tag", "--delete", "v0.2.0"]);
+    }
+    repository.assert_succeeded(&repository.run(&["0.2.0"], "success"));
+    let merge = fs::read_to_string(repository.state.join("merge")).unwrap();
+    assert_eq!(
+        git(&repository.origin, &["rev-parse", "v0.2.0^{commit}"]),
+        merge.trim()
+    );
+    let trace = repository.trace();
+    assert_eq!(trace.matches("gh pr create").count(), 1);
+    assert_eq!(trace.matches("gh pr merge").count(), 1);
+    assert_eq!(trace.matches("cargo ").count(), cargo_calls);
+}
+
+#[test]
+fn resumes_open_pr_after_ci_failure_without_creating_another_pr() {
+    let repository = ReleaseRepository::new();
+    let result = repository.run(&["0.2.0"], "ci_failure");
+    repository.assert_failed(&result, "Mock CI failed");
+    let cargo_calls = repository.trace().matches("cargo ").count();
+    repository.assert_succeeded(&repository.run(&["0.2.0"], "success"));
+    let trace = repository.trace();
+    assert_eq!(trace.matches("gh pr create").count(), 1);
+    assert_eq!(trace.matches("gh pr merge").count(), 1);
+    assert_eq!(trace.matches("cargo ").count(), cargo_calls);
+}
+
+#[test]
+fn reuses_a_committed_local_or_remote_release_branch_without_a_pr() {
+    for local_only in [false, true] {
+        let repository = ReleaseRepository::new();
+        let result = repository.run(&["0.2.0"], "ci_failure");
+        repository.assert_failed(&result, "Mock CI failed");
+        let cargo_calls = repository.trace().matches("cargo ").count();
+        fs::remove_file(repository.state.join("pr")).unwrap();
+        let directory = if local_only {
+            &repository.origin
+        } else {
+            &repository.checkout
+        };
+        git(
+            directory,
+            &["branch", "--delete", "--force", "release/v0.2.0"],
+        );
+        repository.assert_succeeded(&repository.run(&["0.2.0"], "success"));
+        assert_eq!(repository.trace().matches("cargo ").count(), cargo_calls);
+    }
+}
+
+#[test]
+fn refuses_conflicting_local_and_remote_tags() {
+    let repository = ReleaseRepository::new();
+    let remote_tag = repository.failed_release();
+    let commit = git(
+        &repository.checkout,
+        &["rev-parse", "refs/tags/v0.2.0^{commit}"],
+    );
+    git(&repository.checkout, &["tag", "--delete", "v0.2.0"]);
+    git(
+        &repository.checkout,
+        &["-c", "tag.gpgSign=false", "tag", "v0.2.0", &commit],
+    );
+    let local_tag = repository.tag_id(&repository.checkout);
+    let result = repository.run(&["0.2.0"], "success");
+    repository.assert_failed(&result, "does not match origin");
+    assert_eq!(repository.tag_id(&repository.origin), remote_tag);
+    assert_eq!(repository.tag_id(&repository.checkout), local_tag);
+    assert!(!repository.trace().contains("gh run rerun"));
+}
+
+#[test]
+fn refuses_conflicting_local_and_remote_branches() {
+    let repository = ReleaseRepository::new();
+    let result = repository.run(&["0.2.0"], "ci_failure");
+    repository.assert_failed(&result, "Mock CI failed");
+    let remote_head = git(&repository.origin, &["rev-parse", "release/v0.2.0"]);
+    git(
+        &repository.checkout,
+        &["switch", "--quiet", "release/v0.2.0"],
+    );
+    git(
+        &repository.checkout,
+        &[
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "--allow-empty",
+            "-m",
+            "Unpushed fixture change",
+        ],
+    );
+    git(
+        &repository.checkout,
+        &["switch", "--quiet", "unrelated-feature"],
+    );
+    let result = repository.run(&["0.2.0"], "success");
+    repository.assert_failed(&result, "does not match origin");
+    assert_eq!(
+        git(&repository.origin, &["rev-parse", "release/v0.2.0"]),
+        remote_head
+    );
+    assert!(!repository.trace().contains("gh pr merge"));
+    repository.assert_no_tag();
+}
+
+#[test]
+fn refuses_tags_for_unmerged_commits() {
+    let repository = ReleaseRepository::new();
+    let result = repository.run(&["0.2.0"], "ci_failure");
+    repository.assert_failed(&result, "Mock CI failed");
+    git(&repository.origin, &["tag", "v0.2.0", "release/v0.2.0"]);
+    let result = repository.run(&["0.2.0"], "success");
+    repository.assert_failed(&result, "not on origin/main");
+    assert!(!repository.trace().contains("gh run list"));
+}
+
+#[test]
+fn refuses_closed_ambiguous_or_foreign_release_prs() {
+    for (scenario, message) in [
+        ("closed_pr", "not open or merged"),
+        ("ambiguous_pr", "multiple release PRs"),
+        ("foreign_pr", "must belong"),
+    ] {
+        let repository = ReleaseRepository::new();
+        let result = repository.run(&["0.2.0"], "ci_failure");
+        repository.assert_failed(&result, "Mock CI failed");
+        let result = repository.run(&["0.2.0"], scenario);
+        repository.assert_failed(&result, message);
+        assert!(!repository.trace().contains("gh pr merge"));
+        repository.assert_no_tag();
+    }
+}
+
+#[test]
+fn refuses_a_mismatched_existing_tag_or_a_different_repository() {
     let repository = ReleaseRepository::new();
     let result = repository.run(&["0.2.0"], "wrong_repo");
     repository.assert_failed(&result, "origin");
     git(&repository.origin, &["tag", "v0.2.0"]);
     let result = repository.run(&["0.2.0"], "success");
-    repository.assert_failed(&result, "already exists");
+    repository.assert_failed(&result, "does not match");
     assert!(!repository.trace().contains("gh pr create"));
 }
 
@@ -532,4 +858,7 @@ fn preserves_uncommitted_version_changes_when_lockfile_refresh_fails() {
     );
     assert!(!repository.trace().contains("gh pr create"));
     repository.assert_no_tag();
+    let result = repository.run(&["0.2.0"], "success");
+    repository.assert_failed(&result, "inspect the recovery worktree");
+    assert!(temporary.join("checkout/Cargo.toml").exists());
 }

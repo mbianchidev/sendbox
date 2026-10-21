@@ -68,12 +68,6 @@ jobs:
         if: matrix.task == 'checks'
         run: cargo fmt --all -- --check
 
-      - name: Test release orchestration
-        if: matrix.task == 'checks'
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
-        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
-
       - name: Test cold-start diagnostic harness
         if: matrix.task == 'checks'
         env:

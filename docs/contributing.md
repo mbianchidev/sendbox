@@ -54,13 +54,12 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s packaging/homebrew -p 'test_*.py'
 ```
 
-The portable-check jobs also exercise release creation and same-version
-recovery using temporary local Git repositories and mocked GitHub/Cargo
-commands. These tests never publish a release or contact GitHub:
+The CLI integration suite also exercises release creation and same-version
+recovery using temporary local Git repositories, offline Cargo fixtures, and
+mocked GitHub commands. These tests never publish a release or contact GitHub:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
-  -s scripts/tests -p 'test_*.py'
+cargo test --locked -p sendbox-cli --test release_script
 ```
 
 Guest artifact CI runs the two clean builds for each architecture in separate
