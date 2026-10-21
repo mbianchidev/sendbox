@@ -1,0 +1,110 @@
+name: Homebrew stable update
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Published stable release tag
+        required: true
+        type: string
+    secrets:
+      SENDBOX_HOMEBREW_TAP_SSH_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable release tag to retry (vX.Y.Z)
+        required: true
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  attestations: read
+
+concurrency:
+  group: homebrew-stable-updates
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Prepare verified tap update
+    if: >-
+      (github.event_name != 'release' ||
+       (!github.event.release.prerelease && !github.event.release.draft)) &&
+      !contains(inputs.tag || github.event.release.tag_name, '-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Read existing tap
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/mbianchidev/homebrew-tap.git "$RUNNER_TEMP/homebrew-tap"
+
+      - name: Verify published artifacts and prepare formula
+        id: formula
+        run: |
+          python3 packaging/homebrew/update.py \
+            --tag "$RELEASE_TAG" \
+            --tap "$RUNNER_TEMP/homebrew-tap" >"$RUNNER_TEMP/homebrew-update.json"
+          cat "$RUNNER_TEMP/homebrew-update.json"
+          jq -r '"updated=\(.updated)\nbranch=\(.branch)\nversion=\(.version)"' \
+            "$RUNNER_TEMP/homebrew-update.json" >>"$GITHUB_OUTPUT"
+
+      - name: Push only the package update branch
+        if: steps.formula.outputs.updated == 'true'
+        env:
+          TAP_SSH_KEY: ${{ secrets.SENDBOX_HOMEBREW_TAP_SSH_KEY }}
+          UPDATE_BRANCH: ${{ steps.formula.outputs.branch }}
+          VERSION: ${{ steps.formula.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -n "$TAP_SSH_KEY" || {
+            echo "::error::Configure the dedicated SENDBOX_HOMEBREW_TAP_SSH_KEY secret." >&2
+            exit 1
+          }
+          key="$RUNNER_TEMP/sendbox-tap-key"
+          known_hosts="$RUNNER_TEMP/sendbox-tap-known-hosts"
+          trap 'rm -f "$key" "$known_hosts"' EXIT
+          umask 077
+          printf '%s\n' "$TAP_SSH_KEY" >"$key"
+          unset TAP_SSH_KEY
+          gh api --hostname github.com meta \
+            --jq '.ssh_keys[] | select(startswith("ssh-ed25519 ")) | "github.com " + .' \
+            >"$known_hosts"
+          test -s "$known_hosts"
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i $key -o IdentityAgent=none -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
+          cd "$RUNNER_TEMP/homebrew-tap"
+          test "$(git status --porcelain --untracked-files=all)" = " M Formula/sendbox.rb"
+          git diff --check
+          existing="$(git ls-remote git@github.com:mbianchidev/homebrew-tap.git "refs/heads/$UPDATE_BRANCH")"
+          if test -n "$existing"; then
+            git fetch --depth 1 git@github.com:mbianchidev/homebrew-tap.git \
+              "refs/heads/$UPDATE_BRANCH"
+            if cmp -s Formula/sendbox.rb <(git show FETCH_HEAD:Formula/sendbox.rb); then
+              echo "The verified formula already exists on $UPDATE_BRANCH; no push needed."
+              exit 0
+            fi
+            echo "::error::Update branch $UPDATE_BRANCH has different content. Inspect its PR; never force-push or replace it." >&2
+            exit 1
+          fi
+          git switch -c "$UPDATE_BRANCH"
+          git config user.name "Sendbox release"
+          git config user.email "sendbox-releases@users.noreply.github.com"
+          git add -- Formula/sendbox.rb
+          git commit --no-gpg-sign -m "sendbox: update to $VERSION"
+          git push git@github.com:mbianchidev/homebrew-tap.git \
+            "HEAD:refs/heads/$UPDATE_BRANCH"
+          {
+            printf 'Prepared **Sendbox %s** in mbianchidev/homebrew-tap.\n\n' "$VERSION"
+            printf 'Tap CI validates the branch and prepares a draft PR. Human approval and merge are required.\n'
+          } >>"$GITHUB_STEP_SUMMARY"

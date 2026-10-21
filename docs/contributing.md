@@ -44,6 +44,15 @@ executable is cached, but every run refreshes and checks the advisory database.
 The portable-check jobs also run the credential-free cold-start diagnostic
 harness's Python standard-library tests. Live VM qualification remains an
 explicit prepared-host check; see [cold-start DNS diagnostics](dns-cold-start.md).
+The separate Homebrew updater check uses Python standard-library tests for
+stable-release gating, checksum/provenance failures, atomic formula updates,
+and preservation of other tap packages. Run it locally without installing or
+starting SendBox:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+  -s packaging/homebrew -p 'test_*.py'
+```
 
 Guest artifact CI runs the two clean builds for each architecture in separate
 parallel jobs and compares their outputs before publishing the verified bundle.
@@ -66,3 +75,11 @@ Maintainers publish tag-triggered releases with:
 `make release` only builds locally. See
 [publishing a release](installation.md#publishing-a-release) for prerequisites,
 version-bump review, CI, tags, and recovery behavior.
+
+Stable releases reuse the published archives to prepare a Homebrew formula
+update in the existing tap; they do not compile a separate Homebrew binary.
+Release builds cache Rust dependencies by toolchain/platform/lockfile and
+reuse each signed guest artifact for the host packages and publication.
+Clean guest-container builds and the existing macOS/Linux checks remain in
+place. See [stable Homebrew updates](installation.md#stable-homebrew-updates)
+for deploy-key scope, draft PR review, activation, and retry procedures.
