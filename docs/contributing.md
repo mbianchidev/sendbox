@@ -54,6 +54,14 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s packaging/homebrew -p 'test_*.py'
 ```
 
+The CLI integration suite also exercises release creation and same-version
+recovery using temporary local Git repositories, offline Cargo fixtures, and
+mocked GitHub commands. These tests never publish a release or contact GitHub:
+
+```bash
+cargo test --locked -p sendbox-cli --test release_script
+```
+
 Guest artifact CI runs the two clean builds for each architecture in separate
 parallel jobs and compares their outputs before publishing the verified bundle.
 See [guest artifact CI](architecture/guest-artifact-bundles.md#continuous-integration)
@@ -74,7 +82,10 @@ Maintainers publish tag-triggered releases with:
 
 `make release` only builds locally. See
 [publishing a release](installation.md#publishing-a-release) for prerequisites,
-version-bump review, CI, tags, and recovery behavior.
+version-bump review, CI, tags, and recovery behavior. After preflight checks, the
+script switches to `main` and pulls fast-forward-only before release operations.
+Retry a failed attempt with the same command and version; existing release tags
+are not moved or replaced.
 
 Stable releases reuse the published archives to prepare a Homebrew formula
 update in the existing tap; they do not compile a separate Homebrew binary.

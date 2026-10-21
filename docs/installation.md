@@ -221,20 +221,28 @@ only builds locally. From a clean checkout with `origin` pointing to
 ./scripts/release.sh 0.2.0
 ```
 
-The script requires Bash, Git, Cargo, Python 3.11 or newer, and an authenticated
-GitHub CLI account with permission to push branches and tags and merge PRs.
-Pass a stable `X.Y.Z` version greater than the version on `main`; a leading `v`
-is also accepted.
+The script requires Bash, Git, Python 3.11 or newer, and an authenticated GitHub
+CLI account with permission to push branches and tags, merge PRs, and rerun
+Actions workflows. Cargo is also required when preparing a new version bump.
+For a new release, pass a stable `X.Y.Z` version greater than the version on
+`main`; a leading `v` is also accepted.
 
-It creates an isolated worktree from freshly fetched `origin/main`, updates
-`[workspace.package].version` and the CLI version assertion, and refreshes every
-committed Cargo lockfile, including standalone fuzz, spike, and qualification
-workspaces. Unrelated dependencies are not upgraded.
+After its preflight safety checks, the script switches the invoking checkout
+to `main` and pulls `origin/main` with `--ff-only` before inspecting or resuming
+a release. A failed pull or divergent local `main` stops the script before any
+release operations. If `main` is checked out in another Git worktree, run from
+that checkout instead; the script never forces a second checkout of `main`.
+
+For a new release, it creates an isolated worktree from updated `origin/main`,
+updates `[workspace.package].version` and the CLI version assertion, and
+refreshes every committed Cargo lockfile, including standalone fuzz, spike,
+and qualification workspaces. Unrelated dependencies are not upgraded.
 
 It then opens a version-bump PR, waits for CI checks to pass, and merges without
 bypassing branch protections. An annotated tag is pushed at the PR's merged
 `main` commit, after verifying that its Cargo version matches the tag. The
-original checkout and branch are unchanged, even if `main` advances meanwhile.
+invoking checkout stays on `main` at its startup pull, while the original
+feature branch is unchanged and version edits remain in the isolated worktree.
 
 The script watches the [Release workflow](https://github.com/mbianchidev/sendbox/actions/workflows/release.yaml),
 which publishes GitHub assets and GHCR artifacts, including macOS installers,
@@ -242,9 +250,24 @@ Linux archives, and signed guest bundles. The required release-signing secret
 is already configured; no local signing key is needed.
 
 On failure, the script stops and preserves any branch, PR, or tag already
-created. Uncommitted release files are retained in the temporary worktree whose
-path is printed for recovery. Check registration, merge completion, and release
-run discovery each have a ten-minute timeout; existing tags are never replaced.
+created. Resolve the underlying failure, then run the **same command with the
+same version** to resume. It reuses a committed `release/vX.Y.Z` branch and its
+open or merged version-bump PR rather than creating duplicates. Uncommitted
+release files are retained in the temporary worktree whose path is printed for
+recovery; inspect and finish that work before retrying.
+
+If the tag already exists, the script verifies its Cargo version and ancestry
+on `origin/main`, then watches its existing Release workflow. Failed runs rerun
+only failed jobs and their dependents, retaining successful build outputs.
+Cancelled or otherwise unsuccessful completed runs restart the whole workflow.
+The script waits for the new attempt before watching it; active runs are only
+watched, and successful runs are not restarted. Retries remain subject to
+GitHub's rerun window and artifact retention.
+
+A local tag not yet pushed is published unchanged. Existing tags are never
+replaced, and conflicting local and remote tags or release branches require
+manual inspection. Check registration, merge completion, release run discovery,
+and retry registration each have a ten-minute timeout.
 
 ### Stable Homebrew updates
 
