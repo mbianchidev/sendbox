@@ -68,10 +68,26 @@ multi-repo workspaces, and nested agent sandbox settings.
 
 ### 1. Install SendBox and a runtime
 
-Download a matching [release](https://github.com/mbianchidev/sendbox/releases),
-verify its attestation and checksum, and follow the
-[installation guide](docs/installation.md). Host release artifacts include the
-matching signed guest bundle; source builds need that bundle separately.
+**Homebrew activation is pending an approved patched stable release.** Published
+v0.2.2 predates the TLS fixes for RUSTSEC-2026-0382/0383. The tap bootstrap stays
+draft until its formula references verified patched artifacts.
+
+Install the CLI from the existing Homebrew tap:
+
+```bash
+brew install mbianchidev/tap/sendbox
+```
+
+The formula supports macOS on Apple silicon and Linux on x86_64/aarch64. Follow
+the [Homebrew setup](docs/installation.md#homebrew) to stage its signed guest
+bundle in a root-owned location before running a VM session. Homebrew does not
+provision or start a runtime.
+
+Alternatively, download a matching
+[release](https://github.com/mbianchidev/sendbox/releases), verify its attestation
+and checksum, and follow the [installation guide](docs/installation.md).
+Host release artifacts include the matching signed guest bundle; source builds
+need that bundle separately.
 
 | Your host | Session runtime and prerequisites | Setup |
 |---|---|---|
@@ -172,6 +188,10 @@ sendbox run --interactive \
   --trust-root "$GUEST_DIR/release-public.key" \
   -- /usr/local/bin/claude
 ```
+
+For Homebrew installs, use the versioned root-owned `GUEST_DIR` from the
+[guest staging guide](docs/installation.md#stage-the-guest-bundle), not the
+macOS package path above.
 
 For tarball installs, use `guest/aarch64/` or `guest/x86_64/` under the root-owned
 extracted release directory. The workload image and bundle architectures must

@@ -22,7 +22,7 @@ RUN apk add --no-cache \
         linux-headers=6.16.12-r0 \
         llvm21=21.1.2-r1 \
         make=4.4.1-r3 \
-        musl-dev=1.2.5-r23 \
+        musl-dev=1.2.5-r24 \
         openssl-dev=3.5.9-r0 \
         pkgconf=2.5.1-r0 \
         tar=1.35-r4 \

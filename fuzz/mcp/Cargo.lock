@@ -1126,9 +1126,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -1190,7 +1190,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sendbox-config"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "rustix",
  "sendbox-core",
@@ -1204,14 +1204,14 @@ dependencies = [
 
 [[package]]
 name = "sendbox-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "sendbox-egress"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "cap-std",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-git"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "rustix",
  "sendbox-core",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-mcp"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-policy"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "sendbox-core",
  "serde",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-secrets"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "cap-std",
  "chacha20poly1305",

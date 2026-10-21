@@ -7,10 +7,29 @@ on:
     branches: [main]
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  RUST_TEST_THREADS: "2"
+
 jobs:
+  homebrew:
+    name: Homebrew updater
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Test stable release verification and formula updates
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s packaging/homebrew -p 'test_*.py'
+
   build-and-test:
     name: ${{ matrix.task == 'checks' && 'Rust' || 'Build and install' }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
