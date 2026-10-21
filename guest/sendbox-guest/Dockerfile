@@ -15,7 +15,7 @@ RUN apk add --no-cache \
         linux-headers=6.16.12-r0 \
         make=4.4.1-r3 \
         pkgconf=2.5.1-r0 \
-        musl-dev=1.2.5-r23 \
+        musl-dev=1.2.5-r24 \
         zlib=1.3.2-r1 \
         zlib-dev=1.3.2-r1 \
         zlib-static=1.3.2-r1 \
