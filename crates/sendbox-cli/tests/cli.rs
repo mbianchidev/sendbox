@@ -42,7 +42,7 @@ fn prints_version() {
     let output = run(&["--version"]);
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "sendbox 0.2.2\n");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "sendbox 0.2.3\n");
     assert!(output.stderr.is_empty());
 }
 
