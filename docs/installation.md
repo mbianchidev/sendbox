@@ -61,7 +61,21 @@ provenance before trusting it.
 ## Homebrew
 
 The existing [mbianchidev/tap](https://github.com/mbianchidev/homebrew-tap)
-distributes a **formula**, not a GUI cask:
+uses a **formula**, not a GUI cask.
+
+**Activation is blocked pending an approved patched stable release.** The
+bootstrap PR verifies the immutable v0.2.2 artifacts for isolated lifecycle
+qualification, but those binaries predate
+[RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382) and
+[RUSTSEC-2026-0383](https://rustsec.org/advisories/RUSTSEC-2026-0383).
+The source lockfiles update `rustls-webpki` to 0.103.16 and
+`webpki-root-certs` to 1.0.10; published binaries cannot inherit source fixes.
+Do not merge or activate that formula until a newly approved patched stable
+release replaces its URLs/checksums and passes tap CI. The updater rejects
+published releases older than v0.2.3. No replacement release is published by
+this packaging work.
+
+After activation:
 
 ```bash
 brew install mbianchidev/tap/sendbox
@@ -242,7 +256,9 @@ this repository's tag-triggered Release workflow on GitHub-hosted runners.
 It does not rebuild the CLI or guest bundles.
 
 Only a published, non-draft, non-prerelease `vX.Y.Z` matching GitHub's latest
-stable release can update the formula. Older releases, a newer formula, and a
+stable release at or above the patched-release floor v0.2.3 can update the
+formula. The floor prevents known-affected existing releases from activating.
+Older releases, a newer formula, and a
 stable release that supersedes an in-flight verification cannot downgrade it.
 Prereleases do not update the stable formula, GitHub's latest release, or the
 GHCR `latest` tag.
@@ -263,21 +279,36 @@ branch and prepares a draft PR. A human must approve and merge it before
 `brew update` offers the release. Existing branches are not force-pushed:
 identical retries are a no-op, conflicting content requires inspection.
 
-Activation after reviewing the two bootstrap PRs:
+Activation after reviewing the two draft PRs:
 
-1. Merge the tap PR to make the verified initial formula available.
-2. Merge the SendBox PR to enable the future release hook.
-3. In the tap's Actions settings, enable **Allow GitHub Actions to create and
+1. With human approval, merge the SendBox source/security changes. This does not
+   publish a release or activate the tap.
+2. Separately approve and publish a patched stable release newer than v0.2.2.
+   Do not reuse existing v0.2.2 tags, assets, or checksums.
+3. Update the still-draft tap bootstrap branch from that release's verified
+   artifacts, rerun its isolated CI, then approve and merge it. For example,
+   **only after an approved v0.2.3 exists**, run the updater from a SendBox
+   checkout against the bootstrap tap checkout:
+
+   ```bash
+   python3 packaging/homebrew/update.py --tag v0.2.3 \
+     --tap /path/to/bootstrap-tap-checkout
+   ```
+
+   Commit/push only that tap feature branch, never `main`. The normal release
+   hook requires a formula already on tap `main`, so the first bootstrap update
+   is deliberately explicit rather than trusting an unmerged branch.
+4. In the tap's Actions settings, enable **Allow GitHub Actions to create and
    approve pull requests** so its scoped workflow token can create update
    drafts. The workflow creates drafts only; it never approves or merges.
 
-No new stable release is required for the initial formula. To retry a failed
-update after these changes are on `main`, dispatch **Homebrew stable update**
-with the already published latest stable tag, for example:
+To retry a failed update after the patched release and formula are available
+on `main`, dispatch **Homebrew stable update** with that published latest
+stable tag, for example after v0.2.3 has been approved and published:
 
 ```bash
 gh workflow run homebrew.yaml --repo mbianchidev/sendbox \
-  --ref main -f tag=v0.2.2
+  --ref main -f tag=v0.2.3
 ```
 
 If the formula already matches that verified release, the workflow is a no-op.

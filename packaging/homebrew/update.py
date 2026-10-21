@@ -14,6 +14,8 @@ import tempfile
 
 REPOSITORY = "mbianchidev/sendbox"
 PLATFORMS = ("macos-arm64", "linux-x86_64", "linux-aarch64")
+# Published <=0.2.2 artifacts predate the fixes for RUSTSEC-2026-0382/0383.
+MINIMUM_RELEASE = (0, 2, 3)
 STABLE_VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 FORMULA_VERSION = re.compile(r'^  version "(' + STABLE_VERSION + r')"$', re.MULTILINE)
 
@@ -142,6 +144,11 @@ def verified_checksums(release, tag, destination):
 
 def prepare_update(tap, tag):
     requested_version = stable_version(tag)
+    if requested_version < MINIMUM_RELEASE:
+        raise UpdateError(
+            "activation requires an approved patched stable release v0.2.3 or newer; "
+            "published <=v0.2.2 artifacts contain RUSTSEC-2026-0382/0383"
+        )
     release = github_json(f"repos/{REPOSITORY}/releases/tags/{tag}")
     validate_release(release, tag)
     latest = github_json(f"repos/{REPOSITORY}/releases/latest")
@@ -188,7 +195,7 @@ def prepare_update(tap, tag):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tag", required=True, help="Published stable tag, for example v0.2.2")
+    parser.add_argument("--tag", required=True, help="Published patched stable tag (v0.2.3 or newer)")
     parser.add_argument("--tap", required=True, type=Path, help="Clean checkout of mbianchidev/homebrew-tap")
     arguments = parser.parse_args()
     try:

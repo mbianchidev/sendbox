@@ -165,32 +165,32 @@ class PreparationTests(unittest.TestCase):
         self.tap = Path(self.temporary.name)
         (self.tap / "Formula").mkdir()
         self.path = self.tap / "Formula/sendbox.rb"
-        self.original = formula()
+        self.original = formula("0.2.2")
         self.path.write_text(self.original)
         (self.tap / "Formula/another-package.rb").write_text("preserve other packages\n")
         self.checksums = {platform: hashlib.sha256(platform.encode()).hexdigest() for platform in update.PLATFORMS}
-        self.api = patch("update.github_json", return_value=published_release()).start()
+        self.api = patch("update.github_json", return_value=published_release("v0.2.3")).start()
         self.addCleanup(patch.stopall)
         self.verify = patch("update.verified_checksums", return_value=self.checksums).start()
 
     def test_update_is_atomic_and_preserves_other_packages(self):
-        result = update.prepare_update(self.tap, "v0.2.2")
+        result = update.prepare_update(self.tap, "v0.2.3")
         self.assertTrue(result["updated"])
-        self.assertEqual(result["branch"], "automation/sendbox-v0.2.2")
-        self.assertIn('version "0.2.2"', self.path.read_text())
+        self.assertEqual(result["branch"], "automation/sendbox-v0.2.3")
+        self.assertIn('version "0.2.3"', self.path.read_text())
         self.assertEqual((self.tap / "Formula/another-package.rb").read_text(), "preserve other packages\n")
         self.assertEqual(sorted(path.name for path in self.path.parent.iterdir()), ["another-package.rb", "sendbox.rb"])
-        self.assertFalse(update.prepare_update(self.tap, "v0.2.2")["updated"])
+        self.assertFalse(update.prepare_update(self.tap, "v0.2.3")["updated"])
 
     def test_obsolete_release_cannot_replace_latest_stable(self):
-        self.api.side_effect = [published_release("v0.2.1"), published_release()]
-        self.assertFalse(update.prepare_update(self.tap, "v0.2.1")["updated"])
+        self.api.side_effect = [published_release("v0.2.3"), published_release("v0.2.4")]
+        self.assertFalse(update.prepare_update(self.tap, "v0.2.3")["updated"])
         self.verify.assert_not_called()
         self.assertEqual(self.path.read_text(), self.original)
 
     def test_never_downgrades_a_newer_formula(self):
         self.path.write_text(formula("1.0.0"))
-        self.assertFalse(update.prepare_update(self.tap, "v0.2.2")["updated"])
+        self.assertFalse(update.prepare_update(self.tap, "v0.2.3")["updated"])
         self.verify.assert_not_called()
         self.assertEqual(update.formula_version(self.path.read_text()), (1, 0, 0))
 
@@ -200,22 +200,32 @@ class PreparationTests(unittest.TestCase):
         self.api.assert_not_called()
         self.verify.assert_not_called()
 
+    def test_known_affected_stable_releases_cannot_activate(self):
+        for tag in ("v0.0.2", "v0.1.0", "v0.2.1", "v0.2.2"):
+            with self.subTest(tag=tag), self.assertRaisesRegex(update.UpdateError, "patched stable"):
+                update.prepare_update(self.tap, tag)
+        self.api.assert_not_called()
+        self.verify.assert_not_called()
+        self.assertEqual(self.path.read_text(), self.original)
+
     def test_flagged_prerelease_is_rejected_even_with_stable_tag(self):
-        self.api.return_value = published_release() | {"prerelease": True}
+        self.api.return_value = published_release("v0.2.3") | {"prerelease": True}
         with self.assertRaises(update.UpdateError):
-            update.prepare_update(self.tap, "v0.2.2")
+            update.prepare_update(self.tap, "v0.2.3")
         self.verify.assert_not_called()
         self.assertEqual(self.path.read_text(), self.original)
 
     def test_failed_attestation_leaves_formula_unchanged(self):
         self.verify.side_effect = subprocess.CalledProcessError(1, "gh attestation verify")
         with self.assertRaises(subprocess.CalledProcessError):
-            update.prepare_update(self.tap, "v0.2.2")
+            update.prepare_update(self.tap, "v0.2.3")
         self.assertEqual(self.path.read_text(), self.original)
 
     def test_new_stable_during_verification_leaves_formula_unchanged(self):
-        self.api.side_effect = [published_release(), published_release(), published_release("v0.2.3")]
-        self.assertFalse(update.prepare_update(self.tap, "v0.2.2")["updated"])
+        self.api.side_effect = [
+            published_release("v0.2.3"), published_release("v0.2.3"), published_release("v0.2.4")
+        ]
+        self.assertFalse(update.prepare_update(self.tap, "v0.2.3")["updated"])
         self.assertEqual(self.path.read_text(), self.original)
 
     def test_concurrent_formula_edits_are_not_overwritten(self):
@@ -227,13 +237,13 @@ class PreparationTests(unittest.TestCase):
 
         self.verify.side_effect = verify
         with self.assertRaisesRegex(update.UpdateError, "formula changed"):
-            update.prepare_update(self.tap, "v0.2.2")
+            update.prepare_update(self.tap, "v0.2.3")
         self.assertEqual(self.path.read_text(), changed)
 
     def test_missing_formula_requires_bootstrap_not_placeholder(self):
         self.path.unlink()
         with self.assertRaisesRegex(update.UpdateError, "bootstrap PR"):
-            update.prepare_update(self.tap, "v0.2.2")
+            update.prepare_update(self.tap, "v0.2.3")
         self.verify.assert_not_called()
 
     def test_symlink_formula_is_rejected(self):
@@ -241,7 +251,7 @@ class PreparationTests(unittest.TestCase):
         self.path.unlink()
         self.path.symlink_to(other)
         with self.assertRaisesRegex(update.UpdateError, "regular file"):
-            update.prepare_update(self.tap, "v0.2.2")
+            update.prepare_update(self.tap, "v0.2.3")
         self.assertEqual(other.read_text(), "preserve other packages\n")
 
 
