@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    printf 'Usage: %s VERSION\nMerge a version-bump PR, push its release tag, and watch publishing.\n' \
+    printf 'Usage: %s VERSION\nCreate or resume a release, keeping its existing PR and tag.\n' \
         "${0##*/}"
 }
 
@@ -26,7 +26,7 @@ if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; th
     exit 2
 fi
 
-for tool in git cargo gh python3; do
+for tool in git gh python3; do
     command -v "$tool" >/dev/null || fail "required command not found: $tool"
 done
 python3 -c 'import tomllib' || fail "Python 3.11 or newer is required"
@@ -57,7 +57,8 @@ cleanup() {
         fi
     fi
     if [[ "$status" -ne 0 ]]; then
-        printf 'release: stopped; any created branch, PR, or tag is kept. Inspect it before retrying.\n' >&2
+        printf 'release: stopped; created branches, PRs, and tags are kept. Resolve the failure and rerun scripts/release.sh %s to resume.\n' \
+            "$VERSION" >&2
     fi
     exit "$status"
 }
@@ -78,13 +79,42 @@ if [[ "$PUSH_ORIGIN" != "$ORIGIN" ]]; then
         || fail "origin's push URL must point to $REPOSITORY"
 fi
 
-EXISTING_LOCAL="$(git for-each-ref --format='%(refname)' "refs/tags/$TAG" "refs/heads/$BRANCH")"
-EXISTING_REMOTE="$(git ls-remote origin "refs/tags/$TAG" "refs/heads/$BRANCH")"
-[[ -z "$EXISTING_LOCAL" && -z "$EXISTING_REMOTE" ]] \
-    || fail "$TAG or $BRANCH already exists; inspect the previous release attempt"
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
-CURRENT_VERSION="$(git show origin/main:Cargo.toml | workspace_version)"
-python3 - "$CURRENT_VERSION" "$VERSION" <<'PY'
+LOCAL_TAG="$(git tag --list "$TAG" --format='%(objectname)')"
+REMOTE_TAG="$(git ls-remote origin "refs/tags/$TAG")"
+REMOTE_TAG="${REMOTE_TAG%%$'\t'*}"
+MERGE_COMMIT=""
+
+if [[ -n "$LOCAL_TAG" || -n "$REMOTE_TAG" ]]; then
+    if [[ -n "$REMOTE_TAG" ]]; then
+        [[ -z "$LOCAL_TAG" || "$LOCAL_TAG" == "$REMOTE_TAG" ]] \
+            || fail "local $TAG does not match origin; inspect both tags before retrying"
+        git fetch --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+    fi
+    MERGE_COMMIT="$(git rev-parse "refs/tags/$TAG^{commit}")"
+    printf 'Resuming release %s at %s\n' "$TAG" "$MERGE_COMMIT"
+else
+    PR_DETAILS="$(gh pr list --repo "$REPOSITORY" --base main --head "$BRANCH" \
+        --state all --limit 2 --json url,state,headRefOid,isCrossRepository,mergeCommit \
+        --jq 'if length > 1 then error("multiple release PRs; inspect the previous release attempts") else .[] | [.url, .state, .headRefOid, .isCrossRepository, (.mergeCommit.oid // "")] | @tsv end')"
+    IFS=$'\t' read -r PR_URL STATE PR_HEAD CROSS_REPOSITORY MERGE_COMMIT <<<"$PR_DETAILS"
+    if [[ -n "$PR_URL" ]]; then
+        [[ "$CROSS_REPOSITORY" == false ]] || fail "release PR must belong to $REPOSITORY"
+        case "$STATE" in
+            OPEN) ;;
+            MERGED) [[ -n "$MERGE_COMMIT" ]] || fail "merged PR has no merge commit" ;;
+            *) fail "release PR is not open or merged: $STATE" ;;
+        esac
+        printf 'Resuming version-bump PR: %s\n' "$PR_URL"
+    fi
+
+    if [[ "$STATE" != MERGED ]]; then
+        CURRENT_VERSION="$(git show origin/main:Cargo.toml | workspace_version)"
+        python3 - "$CURRENT_VERSION" "$VERSION" <<'PY'
 import re
 import sys
 
@@ -95,15 +125,25 @@ if tuple(map(int, requested.split("."))) <= tuple(map(int, current.split("."))):
     sys.exit(f"release: version must be greater than main's Cargo version {current}")
 PY
 
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sendbox-release.XXXXXX")"
-WORKTREE="$TEMP_DIR/checkout"
-git worktree add -b "$BRANCH" "$WORKTREE" origin/main
-cd "$WORKTREE"
+        LOCAL_BRANCH="$(git branch --list "$BRANCH" --format='%(objectname)')"
+        REMOTE_BRANCH="$(git ls-remote origin "refs/heads/$BRANCH")"
+        REMOTE_BRANCH="${REMOTE_BRANCH%%$'\t'*}"
+        if [[ -n "$REMOTE_BRANCH" ]]; then
+            [[ -z "$LOCAL_BRANCH" || "$LOCAL_BRANCH" == "$REMOTE_BRANCH" ]] \
+                || fail "local $BRANCH does not match origin; inspect the previous release attempt"
+            git fetch --no-tags origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            HEAD_COMMIT="$(git rev-parse "refs/remotes/origin/$BRANCH")"
+        elif [[ -n "$LOCAL_BRANCH" ]]; then
+            HEAD_COMMIT="$LOCAL_BRANCH"
+        else
+            [[ -z "$PR_URL" ]] || fail "release PR branch is missing on origin"
+            command -v cargo >/dev/null || fail "required command not found: cargo"
+            TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sendbox-release.XXXXXX")"
+            WORKTREE="$TEMP_DIR/checkout"
+            git worktree add -b "$BRANCH" "$WORKTREE" origin/main
+            cd "$WORKTREE"
 
-python3 - "$VERSION" <<'PY'
+            python3 - "$VERSION" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -134,68 +174,80 @@ manifest.write_text(text[:section.start()] + replacement + text[section.end():],
 tests.write_text(test_text.replace(expected, f'"sendbox {version}\\n"'), encoding="utf-8")
 PY
 
-FILES=(Cargo.toml crates/sendbox-cli/tests/cli.rs)
-git ls-files --error-unmatch Cargo.lock >/dev/null
-while IFS= read -r -d '' lockfile; do
-    manifest="${lockfile%Cargo.lock}Cargo.toml"
-    [[ -f "$manifest" ]] || fail "manifest not found for $lockfile"
-    cargo update --workspace --manifest-path "$manifest"
-    cargo metadata --locked --format-version 1 --manifest-path "$manifest" >/dev/null
-    FILES+=("$lockfile")
-done < <(git ls-files -z -- 'Cargo.lock' '*/Cargo.lock')
-CLI_VERSION="$(
-    cargo metadata --locked --no-deps --format-version 1 \
-        | python3 -c 'import json, sys; packages = json.load(sys.stdin)["packages"]; print(next(p["version"] for p in packages if p["name"] == "sendbox-cli"))'
-)"
-[[ "$CLI_VERSION" == "$VERSION" ]] \
-    || fail "sendbox-cli version $CLI_VERSION does not match $TAG"
+            FILES=(Cargo.toml crates/sendbox-cli/tests/cli.rs)
+            git ls-files --error-unmatch Cargo.lock >/dev/null
+            while IFS= read -r -d '' lockfile; do
+                manifest="${lockfile%Cargo.lock}Cargo.toml"
+                [[ -f "$manifest" ]] || fail "manifest not found for $lockfile"
+                cargo update --workspace --manifest-path "$manifest"
+                cargo metadata --locked --format-version 1 --manifest-path "$manifest" >/dev/null
+                FILES+=("$lockfile")
+            done < <(git ls-files -z -- 'Cargo.lock' '*/Cargo.lock')
+            CLI_VERSION="$(
+                cargo metadata --locked --no-deps --format-version 1 \
+                    | python3 -c 'import json, sys; packages = json.load(sys.stdin)["packages"]; print(next(p["version"] for p in packages if p["name"] == "sendbox-cli"))'
+            )"
+            [[ "$CLI_VERSION" == "$VERSION" ]] \
+                || fail "sendbox-cli version $CLI_VERSION does not match $TAG"
 
-git add -- "${FILES[@]}"
-git diff --cached --check
-git commit --no-gpg-sign -m "Bump version to $VERSION"
-HEAD_COMMIT="$(git rev-parse HEAD)"
-git push --set-upstream origin "$BRANCH"
-PR_URL="$(
-    gh pr create --repo "$REPOSITORY" --base main --head "$BRANCH" \
-        --title "Release $TAG" \
-        --body "Bump the workspace and CLI version to $VERSION and refresh all committed Cargo lockfiles.
+            git add -- "${FILES[@]}"
+            git diff --cached --check
+            git commit --no-gpg-sign -m "Bump version to $VERSION"
+            HEAD_COMMIT="$(git rev-parse HEAD)"
+        fi
+        BRANCH_VERSION="$(git show "$HEAD_COMMIT:Cargo.toml" | workspace_version)"
+        [[ "$BRANCH_VERSION" == "$VERSION" ]] \
+            || fail "$BRANCH Cargo version $BRANCH_VERSION does not match $TAG; inspect the recovery worktree"
+        [[ -z "$PR_URL" || "$PR_HEAD" == "$HEAD_COMMIT" ]] \
+            || fail "PR head changed; inspect the previous release attempt"
+        if [[ -z "$REMOTE_BRANCH" ]]; then
+            git push --set-upstream origin "$BRANCH"
+        fi
+        if [[ -z "$PR_URL" ]]; then
+            PR_URL="$(
+                gh pr create --repo "$REPOSITORY" --base main --head "$BRANCH" \
+                    --title "Release $TAG" \
+                    --body "Bump the workspace and CLI version to $VERSION and refresh all committed Cargo lockfiles.
 
 After CI passes, scripts/release.sh merges this PR and tags its merged main commit. The tag-triggered Release workflow publishes GitHub assets and GHCR artifacts."
-)"
-printf 'Version-bump PR: %s\n' "$PR_URL"
+            )"
+            printf 'Version-bump PR: %s\n' "$PR_URL"
+        fi
 
-CHECK_COUNT=0
-for attempt in {1..60}; do
-    CHECK_COUNT="$(gh pr view "$PR_URL" --repo "$REPOSITORY" \
-        --json statusCheckRollup --jq '.statusCheckRollup | length')"
-    [[ "$CHECK_COUNT" =~ ^[0-9]+$ ]] || fail "could not read PR checks"
-    if [[ "$CHECK_COUNT" -gt 0 ]]; then
-        break
+        CHECK_COUNT=0
+        for attempt in {1..60}; do
+            CHECK_COUNT="$(gh pr view "$PR_URL" --repo "$REPOSITORY" \
+                --json statusCheckRollup --jq '.statusCheckRollup | length')"
+            [[ "$CHECK_COUNT" =~ ^[0-9]+$ ]] || fail "could not read PR checks"
+            if [[ "$CHECK_COUNT" -gt 0 ]]; then
+                break
+            fi
+            sleep 10
+        done
+        [[ "$CHECK_COUNT" -gt 0 ]] || fail "no PR checks appeared within 10 minutes; the PR is left open"
+        gh pr checks "$PR_URL" --repo "$REPOSITORY" --watch --fail-fast --interval 10
+        CHECKED_HEAD="$(gh pr view "$PR_URL" --repo "$REPOSITORY" --json headRefOid --jq '.headRefOid')"
+        [[ "$CHECKED_HEAD" == "$HEAD_COMMIT" ]] || fail "PR head changed while waiting for CI; refusing to merge"
+        gh pr merge "$PR_URL" --repo "$REPOSITORY" --squash --match-head-commit "$HEAD_COMMIT"
+
+        STATE=""
+        MERGE_COMMIT=""
+        for attempt in {1..60}; do
+            DETAILS="$(gh pr view "$PR_URL" --repo "$REPOSITORY" \
+                --json state,headRefOid,mergeCommit \
+                --jq '[.state, .headRefOid, (.mergeCommit.oid // "")] | @tsv')"
+            IFS=$'\t' read -r STATE MERGED_HEAD MERGE_COMMIT <<<"$DETAILS"
+            [[ "$MERGED_HEAD" == "$HEAD_COMMIT" ]] || fail "PR head changed before merging; refusing to tag"
+            case "$STATE" in
+                MERGED) break ;;
+                OPEN) sleep 10 ;;
+                *) fail "PR is not open or merged: $STATE" ;;
+            esac
+        done
+        [[ "$STATE" == MERGED && -n "$MERGE_COMMIT" ]] \
+            || fail "PR did not merge within 10 minutes; refusing to tag"
     fi
-    sleep 10
-done
-[[ "$CHECK_COUNT" -gt 0 ]] || fail "no PR checks appeared within 10 minutes; the PR is left open"
-gh pr checks "$PR_URL" --repo "$REPOSITORY" --watch --fail-fast --interval 10
-CHECKED_HEAD="$(gh pr view "$PR_URL" --repo "$REPOSITORY" --json headRefOid --jq '.headRefOid')"
-[[ "$CHECKED_HEAD" == "$HEAD_COMMIT" ]] || fail "PR head changed while waiting for CI; refusing to merge"
-gh pr merge "$PR_URL" --repo "$REPOSITORY" --squash --match-head-commit "$HEAD_COMMIT"
-
-STATE=""
-MERGE_COMMIT=""
-for attempt in {1..60}; do
-    DETAILS="$(gh pr view "$PR_URL" --repo "$REPOSITORY" \
-        --json state,headRefOid,mergeCommit \
-        --jq '[.state, .headRefOid, (.mergeCommit.oid // "")] | @tsv')"
-    IFS=$'\t' read -r STATE MERGED_HEAD MERGE_COMMIT <<<"$DETAILS"
-    [[ "$MERGED_HEAD" == "$HEAD_COMMIT" ]] || fail "PR head changed before merging; refusing to tag"
-    case "$STATE" in
-        MERGED) break ;;
-        OPEN) sleep 10 ;;
-        *) fail "PR is not open or merged: $STATE" ;;
-    esac
-done
-[[ "$STATE" == MERGED && -n "$MERGE_COMMIT" ]] \
-    || fail "PR did not merge within 10 minutes; refusing to tag"
+fi
 
 git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
 git merge-base --is-ancestor "$MERGE_COMMIT" origin/main \
@@ -203,8 +255,12 @@ git merge-base --is-ancestor "$MERGE_COMMIT" origin/main \
 MERGED_VERSION="$(git show "$MERGE_COMMIT:Cargo.toml" | workspace_version)"
 [[ "$MERGED_VERSION" == "$VERSION" ]] \
     || fail "merged Cargo version $MERGED_VERSION does not match $TAG"
-git -c tag.gpgSign=false tag -a "$TAG" "$MERGE_COMMIT" -m "Release $TAG"
-git push origin "$TAG"
+if [[ -z "$LOCAL_TAG" && -z "$REMOTE_TAG" ]]; then
+    git -c tag.gpgSign=false tag -a "$TAG" "$MERGE_COMMIT" -m "Release $TAG"
+fi
+if [[ -z "$REMOTE_TAG" ]]; then
+    git push origin "refs/tags/$TAG:refs/tags/$TAG"
+fi
 
 RUN_ID=""
 for attempt in {1..60}; do
@@ -218,5 +274,31 @@ for attempt in {1..60}; do
 done
 [[ -n "$RUN_ID" ]] \
     || fail "Release workflow did not appear within 10 minutes; $TAG is already pushed"
+RUN_DETAILS="$(gh run view "$RUN_ID" --repo "$REPOSITORY" \
+    --json attempt,status,conclusion --jq '[.attempt, .status, .conclusion] | @tsv')"
+IFS=$'\t' read -r RUN_ATTEMPT RUN_STATUS RUN_CONCLUSION <<<"$RUN_DETAILS"
+[[ "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ && -n "$RUN_STATUS" ]] \
+    || fail "could not read Release workflow state"
+if [[ "$RUN_STATUS" == completed && "$RUN_CONCLUSION" != success ]]; then
+    printf 'Retrying Release workflow %s for %s (previous result: %s)\n' \
+        "$RUN_ID" "$TAG" "$RUN_CONCLUSION"
+    if [[ "$RUN_CONCLUSION" == failure ]]; then
+        gh run rerun "$RUN_ID" --repo "$REPOSITORY" --failed
+    else
+        gh run rerun "$RUN_ID" --repo "$REPOSITORY"
+    fi
+    CURRENT_ATTEMPT="$RUN_ATTEMPT"
+    for attempt in {1..60}; do
+        CURRENT_ATTEMPT="$(gh run view "$RUN_ID" --repo "$REPOSITORY" \
+            --json attempt --jq '.attempt')"
+        [[ "$CURRENT_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || fail "could not read Release workflow attempt"
+        if [[ "$CURRENT_ATTEMPT" -gt "$RUN_ATTEMPT" ]]; then
+            break
+        fi
+        sleep 10
+    done
+    [[ "$CURRENT_ATTEMPT" -gt "$RUN_ATTEMPT" ]] \
+        || fail "Release workflow retry did not start within 10 minutes; $TAG is unchanged"
+fi
 gh run watch "$RUN_ID" --repo "$REPOSITORY" --exit-status --interval 10
 gh release view "$TAG" --repo "$REPOSITORY" --json url --jq '.url'

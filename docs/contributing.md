@@ -54,6 +54,15 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s packaging/homebrew -p 'test_*.py'
 ```
 
+The portable-check jobs also exercise release creation and same-version
+recovery using temporary local Git repositories and mocked GitHub/Cargo
+commands. These tests never publish a release or contact GitHub:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+  -s scripts/tests -p 'test_*.py'
+```
+
 Guest artifact CI runs the two clean builds for each architecture in separate
 parallel jobs and compares their outputs before publishing the verified bundle.
 See [guest artifact CI](architecture/guest-artifact-bundles.md#continuous-integration)
@@ -74,7 +83,8 @@ Maintainers publish tag-triggered releases with:
 
 `make release` only builds locally. See
 [publishing a release](installation.md#publishing-a-release) for prerequisites,
-version-bump review, CI, tags, and recovery behavior.
+version-bump review, CI, tags, and recovery behavior. Retry a failed attempt with
+the same command and version; existing release tags are not moved or replaced.
 
 Stable releases reuse the published archives to prepare a Homebrew formula
 update in the existing tap; they do not compile a separate Homebrew binary.
