@@ -67,10 +67,22 @@ multi-repo workspaces, and nested agent sandbox settings.
 
 ### 1. Install SendBox and a runtime
 
-Download a matching [release](https://github.com/mbianchidev/sendbox/releases),
-verify its attestation and checksum, and follow the
-[installation guide](docs/installation.md). Host release artifacts include the
-matching signed guest bundle; source builds need that bundle separately.
+Install the CLI from the existing Homebrew tap:
+
+```bash
+brew install mbianchidev/tap/sendbox
+```
+
+The formula supports macOS on Apple silicon and Linux on x86_64/aarch64. Follow
+the [Homebrew setup](docs/installation.md#homebrew) to stage its signed guest
+bundle in a root-owned location before running a VM session. Homebrew does not
+provision or start a runtime.
+
+Alternatively, download a matching
+[release](https://github.com/mbianchidev/sendbox/releases), verify its attestation
+and checksum, and follow the [installation guide](docs/installation.md).
+Host release artifacts include the matching signed guest bundle; source builds
+need that bundle separately.
 
 | Your host | Session runtime | Setup |
 |---|---|---|
@@ -121,8 +133,9 @@ sendbox run --interactive \
   -- /usr/local/bin/claude
 ```
 
-Use `arm64` instead of `x86_64` for an arm64 guest bundle. For tarball installs,
-use `guest/<architecture>/` under the root-owned extracted release directory.
+Use `aarch64` instead of `x86_64` for an arm64 guest bundle. For Homebrew installs,
+use the versioned root-owned `GUEST_DIR` from the installation guide. For tarball
+installs, use `guest/<architecture>/` under the root-owned extracted release directory.
 `auto` selects Apple on macOS arm64 and Kata on Linux; you can select a provider
 explicitly with `--runtime`.
 

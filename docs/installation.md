@@ -1,7 +1,7 @@
 # Installation
 
-Install SendBox from a verified release artifact for the simplest setup, or
-build the host binary from source when developing the project.
+Install SendBox through Homebrew or a verified release artifact, or build the
+host binary from source when developing the project.
 
 ## Requirements
 
@@ -57,6 +57,96 @@ Node.js, compiler, bpftrace, or development headers. Keep bundle executables,
 metadata, and trust roots in the root-owned locations described below. A public
 key shipped beside a bundle is not self-authenticating; verify release
 provenance before trusting it.
+
+## Homebrew
+
+The existing [mbianchidev/tap](https://github.com/mbianchidev/homebrew-tap)
+distributes a **formula**, not a GUI cask:
+
+```bash
+brew install mbianchidev/tap/sendbox
+sendbox --version
+sendbox --help
+```
+
+It reuses verified published host archives for macOS arm64, Linux x86_64, and
+Linux aarch64. There is no frontend build, background service, or automatic
+runtime installation. Intel Macs are not supported. The Apple runtime still
+requires macOS 26+, Apple silicon, and the pinned `container` CLI; Linux needs
+the Kata/KVM runtime described above.
+
+The binary is linked into Homebrew's `bin`; the complete release payload,
+including `setup.sh`, configuration examples, and signed guest assets, lives
+under `$(brew --prefix mbianchidev/tap/sendbox)/libexec`.
+
+### Stage the guest bundle
+
+Homebrew's Cellar is user-owned. **Do not pass the Cellar's guest bundle or
+public key directly to `sendbox run`**, change Cellar ownership, or run Homebrew
+with `sudo`. SendBox deliberately requires root-owned runtime artifacts and
+trusted ancestors. A formula install does not weaken that requirement.
+
+Before trusting the embedded guest key, independently verify the original
+archive's provenance:
+
+```bash
+brew fetch --formula mbianchidev/tap/sendbox
+gh attestation verify "$(brew --cache --formula mbianchidev/tap/sendbox)" \
+  --repo mbianchidev/sendbox \
+  --signer-workflow mbianchidev/sendbox/.github/workflows/release.yaml
+```
+
+Copy the matching payload to a **new, versioned, root-owned location**. The
+following commands are an explicit administrator step, not a formula hook.
+Stop if the destination already exists and inspect it instead of overwriting
+an existing runtime installation:
+
+```bash
+prefix="$(brew --prefix mbianchidev/tap/sendbox)"
+version="$(sendbox --version | awk '{print $2}')"
+case "$(uname -m)" in
+  arm64|aarch64) architecture=aarch64 ;;
+  x86_64) architecture=x86_64 ;;
+  *) printf 'Unsupported architecture\n' >&2; exit 1 ;;
+esac
+GUEST_DIR="/opt/sendbox/$version/guest/$architecture"
+test ! -e "/opt/sendbox/$version" || {
+  printf 'Guest destination already exists; inspect it before continuing\n' >&2
+  exit 1
+}
+sudo install -d -o 0 -g 0 -m 0755 /opt/sendbox "$GUEST_DIR"
+sudo cp -R "$prefix/libexec/guest/$architecture/bundle" \
+  "$prefix/libexec/guest/$architecture/release-public.key" "$GUEST_DIR/"
+sudo chown -R 0:0 "/opt/sendbox/$version"
+sudo find "/opt/sendbox/$version" -type d -exec chmod 0755 {} +
+sudo find "/opt/sendbox/$version" -type f -exec chmod 0444 {} +
+sudo find "$GUEST_DIR/bundle/bin" -type f -exec chmod 0555 {} +
+```
+
+Ensure `/opt` and `/opt/sendbox` are real root-owned directories, not symlinks,
+and are not group/world writable. Launch the CLI as your **normal user**, with
+`--bundle "$GUEST_DIR/bundle"` and
+`--trust-root "$GUEST_DIR/release-public.key"`. Configure the runtime separately
+using the [Apple](apple-runtime.md) or [Kata](kata-containers.md) guide.
+
+### Upgrade and removal
+
+```bash
+brew update
+brew upgrade mbianchidev/tap/sendbox
+brew uninstall mbianchidev/tap/sendbox
+```
+
+After upgrading, verify and stage the new version's guest bundle before using
+it with the new CLI. Keep old root-owned bundles until no sessions need them;
+they are outside the Cellar and are not removed by Homebrew.
+
+Upgrades and removal preserve project `.sendbox.yaml` files, workspace contents,
+user state under `~/.sendbox`, and macOS Keychain credentials. No uninstall or
+cleanup hook deletes these locations. Remove retained state and versioned
+`/opt/sendbox` payloads separately only when you intentionally want to erase
+them. Do not mix a manual `/usr/local/bin/sendbox` install with Homebrew or use
+`brew link --overwrite`; inspect and migrate the old installation explicitly.
 
 ## Release artifacts
 
@@ -141,6 +231,60 @@ On failure, the script stops and preserves any branch, PR, or tag already
 created. Uncommitted release files are retained in the temporary worktree whose
 path is printed for recovery. Check registration, merge completion, and release
 run discovery each have a ten-minute timeout; existing tags are never replaced.
+
+### Stable Homebrew updates
+
+After the Release workflow publishes and attests its existing build outputs,
+it calls `homebrew.yaml`. A human-published stable release also triggers this
+workflow. It downloads the three host archives and their checksum files,
+recomputes SHA-256, checks GitHub's asset digests, and verifies provenance from
+this repository's tag-triggered Release workflow on GitHub-hosted runners.
+It does not rebuild the CLI or guest bundles.
+
+Only a published, non-draft, non-prerelease `vX.Y.Z` matching GitHub's latest
+stable release can update the formula. Older releases, a newer formula, and a
+stable release that supersedes an in-flight verification cannot downgrade it.
+Prereleases do not update the stable formula, GitHub's latest release, or the
+GHCR `latest` tag.
+
+The dedicated write-enabled SSH deploy key is registered **only** on
+`mbianchidev/homebrew-tap`; its private half is stored **only** as the SendBox
+Actions secret `SENDBOX_HOMEBREW_TAP_SSH_KEY`. It is separate from other
+projects' keys. The workflow authenticates with that identity alone, obtains
+GitHub SSH host keys over the authenticated HTTPS API, and removes its
+temporary SSH files on exit. Signing keys and SSH credentials are never cached.
+Rotate by generating a new key pair, registering its public key on the existing
+tap, replacing this secret, verifying access, and then revoking the old deploy
+key. Never copy another project's key.
+
+The updater changes only `Formula/sendbox.rb` and pushes
+`automation/sendbox-vX.Y.Z`, **never `main`**. Tap CI validates the checked-out
+branch and prepares a draft PR. A human must approve and merge it before
+`brew update` offers the release. Existing branches are not force-pushed:
+identical retries are a no-op, conflicting content requires inspection.
+
+Activation after reviewing the two bootstrap PRs:
+
+1. Merge the tap PR to make the verified initial formula available.
+2. Merge the SendBox PR to enable the future release hook.
+3. In the tap's Actions settings, enable **Allow GitHub Actions to create and
+   approve pull requests** so its scoped workflow token can create update
+   drafts. The workflow creates drafts only; it never approves or merges.
+
+No new stable release is required for the initial formula. To retry a failed
+update after these changes are on `main`, dispatch **Homebrew stable update**
+with the already published latest stable tag, for example:
+
+```bash
+gh workflow run homebrew.yaml --repo mbianchidev/sendbox \
+  --ref main -f tag=v0.2.2
+```
+
+If the formula already matches that verified release, the workflow is a no-op.
+If a branch already exists, inspect its tap CI and draft PR; rerun the failed
+tap job after fixing permissions rather than replacing the branch. This retry
+path never runs `scripts/release.sh`, merges a PR, creates a tag, or republishes
+assets.
 
 ## Build from source
 
