@@ -45,6 +45,71 @@ const GATEWAY_START_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(target_os = "linux")]
 const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(any(target_os = "linux", test))]
+struct MetadataFileAuditSink {
+    path: PathBuf,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl sendbox_egress::audit::AuditSink for MetadataFileAuditSink {
+    fn record(&self, event: sendbox_egress::audit::AuditEvent) {
+        sendbox_egress::audit::StderrJsonAuditSink.record(event);
+    }
+
+    fn record_github_meta(
+        &self,
+        status: sendbox_egress::github_meta::GitHubMetaStatus,
+    ) -> io::Result<()> {
+        crate::runtime::atomic_json(&self.path, &status).map_err(io::Error::other)?;
+        self.record(sendbox_egress::audit::AuditEvent::GitHubMeta {
+            status: Box::new(status),
+        });
+        Ok(())
+    }
+}
+
+fn metadata_status_path(session_dir: &Path, registry: bool) -> PathBuf {
+    session_dir.join(if registry {
+        "egress-registry-meta.json"
+    } else {
+        "egress-workload-meta.json"
+    })
+}
+
+pub(crate) fn metadata_report_sources(
+    session_dir: &Path,
+    policy: Option<&RuntimePolicyDocument>,
+) -> Result<Vec<crate::protocol::NetworkReportSource>, GuestError> {
+    let mut sources = Vec::new();
+    let Some(policy) = policy else {
+        return Ok(sources);
+    };
+    let candidates = std::iter::once(("workload", false, &policy.network_policy)).chain(
+        policy
+            .registry
+            .as_ref()
+            .map(|registry| ("registry", true, &registry.upstream_network_policy)),
+    );
+    for (role, registry, network) in candidates {
+        let engine = sendbox_egress::policy::PolicyEngine::compile(network).map_err(|error| {
+            GuestError::Runtime(format!("compile network report policy: {error}"))
+        })?;
+        if engine.github_meta().is_some() {
+            sources.push(crate::protocol::NetworkReportSource {
+                role,
+                configured_policy: network.clone(),
+                report: crate::protocol::PackageReportSource::new(
+                    metadata_status_path(session_dir, registry),
+                    0,
+                    0,
+                    sendbox_egress::github_meta::MAX_META_BYTES as u64,
+                )?,
+            });
+        }
+    }
+    Ok(sources)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SupervisorProcessConfiguration {
@@ -727,7 +792,6 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::sync::Arc;
 
-    use sendbox_egress::audit::StderrJsonAuditSink;
     use sendbox_egress::connect_broker::{ConnectBrokerConfig, ConnectFrontend};
     use sendbox_egress::forwarding_resolver::{ForwardingResolver, ForwardingResolverConfig};
     use sendbox_egress::gateway::{Gateway, GatewayConfig, GatewayListeners};
@@ -857,7 +921,14 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
         engine,
         resolver,
         Arc::new(MarkDialer::new(config.policy.broker_mark)),
-        Arc::new(StderrJsonAuditSink),
+        Arc::new(MetadataFileAuditSink {
+            path: metadata_status_path(
+                config_path
+                    .parent()
+                    .expect("validated gateway configuration parent"),
+                config.role == GatewayRole::Registry,
+            ),
+        }),
         GatewayConfig {
             connect: ConnectBrokerConfig {
                 frontend: ConnectFrontend::Socks5,
@@ -938,6 +1009,10 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
         }
     };
     let cancellation = CancellationToken::new();
+    gateway
+        .prepare_github_meta(&cancellation)
+        .await
+        .map_err(|error| GuestError::io("preparing GitHub Meta egress scope", error))?;
     let gateway_cancellation = cancellation.clone();
     let mut gateway_task =
         tokio::spawn(async move { gateway.serve(listeners, gateway_cancellation).await });
@@ -1826,6 +1901,28 @@ mod tests {
 
     const ROOT_CGROUP_MOUNT: &str =
         "50 46 0:23 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 none rw\n";
+
+    #[test]
+    fn metadata_audit_publishes_one_private_atomic_status_file() {
+        use sendbox_egress::audit::AuditSink;
+        let temporary = crate::secure_fs::secure_tempdir();
+        let path = metadata_status_path(temporary.path(), false);
+        let sink = MetadataFileAuditSink { path: path.clone() };
+        let metadata = sendbox_egress::github_meta::GitHubMeta::default();
+        let mut status = metadata.status();
+        sink.record_github_meta(status.clone()).unwrap();
+        status.state = sendbox_egress::github_meta::GitHubMetaState::Unavailable;
+        status.last_error = Some(sendbox_egress::github_meta::GitHubMetaError::HttpStatus(
+            503,
+        ));
+        sink.record_github_meta(status.clone()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap(),
+            serde_json::to_value(status).unwrap()
+        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn cgroup_namespace_accepts_init_after_controller_delegation() {

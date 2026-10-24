@@ -30,6 +30,7 @@ const LAUNCH_REQUEST_ID: u64 = 1;
 const PACKAGE_REPORT_REQUEST_ID: u64 = 2;
 const SAFE_OUTPUTS_REQUEST_ID: u64 = 3;
 const SYSCALL_REPORT_REQUEST_ID: u64 = 4;
+const NETWORK_REPORT_REQUEST_ID: u64 = 5;
 const PROTOCOL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
@@ -208,6 +209,7 @@ impl GuestSession for ProtocolGuestSession {
                 boundary_plan_digest: self.boundary_plan_digest,
                 report_fetched: false,
                 syscall_report_fetched: false,
+                network_report_fetched: false,
             }) as Box<dyn GuestExecution>)
         })
     }
@@ -314,6 +316,7 @@ pub struct ProtocolGuestExecution {
     boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     report_fetched: bool,
     syscall_report_fetched: bool,
+    network_report_fetched: bool,
 }
 
 #[derive(Debug, Default)]
@@ -743,6 +746,24 @@ impl GuestExecution for ProtocolGuestExecution {
         })
     }
 
+    fn fetch_network_report<'a>(
+        &'a mut self,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<crate::GuestNetworkReport, AgentError>> {
+        Box::pin(async move {
+            if !self.terminal || self.network_report_fetched {
+                return Err(AgentError::Guest(
+                    "network report requires a terminal response and can only be requested once"
+                        .to_owned(),
+                ));
+            }
+            self.network_report_fetched = true;
+            tokio::time::timeout(PROTOCOL_IO_TIMEOUT, self.read_network_report(cancellation))
+                .await
+                .map_err(|_| AgentError::Guest("network report retrieval timed out".to_owned()))?
+        })
+    }
+
     fn fetch_syscall_report<'a>(
         &'a mut self,
         maximum_bytes: usize,
@@ -767,6 +788,115 @@ impl GuestExecution for ProtocolGuestExecution {
 }
 
 impl ProtocolGuestExecution {
+    async fn read_network_report(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::GuestNetworkReport, AgentError> {
+        use sendbox_protocol::{
+            NETWORK_REPORT_OPERATION, NETWORK_REPORT_SCHEMA_VERSION, NetworkReportChunkV1,
+            NetworkReportRequestV1,
+        };
+        let mut bytes = Vec::new();
+        let mut identity = None;
+        loop {
+            let payload = serde_json::to_vec(&NetworkReportRequestV1 {
+                schema_version: NETWORK_REPORT_SCHEMA_VERSION,
+                offset: u32::try_from(bytes.len()).map_err(|_| {
+                    AgentError::Guest("network report offset exceeds its limit".to_owned())
+                })?,
+            })
+            .map_err(|error| {
+                AgentError::Guest(format!("encode network report request: {error}"))
+            })?;
+            guest_io(
+                "send network report request",
+                cancellation,
+                self.writer.send_control(Message::Request(Request {
+                    request_id: NETWORK_REPORT_REQUEST_ID,
+                    operation: NETWORK_REPORT_OPERATION.to_owned(),
+                    payload,
+                })),
+            )
+            .await?;
+            let message = protocol_io(
+                "receive network report",
+                cancellation,
+                self.reader.receive(),
+            )
+            .await?;
+            let Message::Response(response) = message else {
+                return Err(AgentError::Guest(
+                    "unexpected network report message".to_owned(),
+                ));
+            };
+            if response.request_id != NETWORK_REPORT_REQUEST_ID
+                || response.status != ResponseStatus::Ok
+            {
+                return Err(AgentError::Guest(
+                    "guest rejected or mismatched network report".to_owned(),
+                ));
+            }
+            let chunk: NetworkReportChunkV1 =
+                serde_json::from_slice(&response.payload).map_err(|error| {
+                    AgentError::Guest(format!("decode network report chunk: {error}"))
+                })?;
+            let decoded = chunk
+                .decode()
+                .map_err(|error| AgentError::Guest(error.to_owned()))?;
+            if chunk.offset as usize != bytes.len() {
+                return Err(AgentError::Guest(
+                    "network report offset mismatch".to_owned(),
+                ));
+            }
+            let current_identity = (chunk.total_bytes, chunk.sha256.clone());
+            if identity
+                .as_ref()
+                .is_some_and(|previous| previous != &current_identity)
+            {
+                return Err(AgentError::Guest(
+                    "network report changed between chunks".to_owned(),
+                ));
+            }
+            identity = Some(current_identity);
+            bytes.extend_from_slice(&decoded);
+            if bytes.len() == chunk.total_bytes as usize {
+                let digest = sendbox_boundary::sha256_hex(&bytes);
+                if digest != chunk.sha256 {
+                    return Err(AgentError::Guest(
+                        "network report SHA-256 mismatch".to_owned(),
+                    ));
+                }
+                let report: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        AgentError::Guest(format!("decode network report: {error}"))
+                    })?;
+                if report
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(u64::from(NETWORK_REPORT_SCHEMA_VERSION))
+                    || !report
+                        .get("gateways")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|gateways| {
+                            !gateways.is_empty()
+                                && gateways.len() <= 2
+                                && gateways
+                                    .keys()
+                                    .all(|role| matches!(role.as_str(), "workload" | "registry"))
+                        })
+                {
+                    return Err(AgentError::Guest(
+                        "invalid network report envelope".to_owned(),
+                    ));
+                }
+                return Ok(crate::GuestNetworkReport {
+                    sha256: format!("sha256:{digest}"),
+                    report,
+                });
+            }
+        }
+    }
+
     async fn fetch_json_report(
         &mut self,
         request_id: u64,

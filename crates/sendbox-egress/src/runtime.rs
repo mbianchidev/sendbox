@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::policy::{PolicyEngine, PolicyError};
 
-pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 4;
+pub const RUNTIME_POLICY_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_CONNECT_PORT: u16 = 15_080;
 pub const DEFAULT_HTTP_PROXY_PORT: u16 = 15_083;
 pub const DEFAULT_DNS_PORT: u16 = 53;
@@ -221,6 +221,19 @@ impl RuntimePolicyDocument {
         }
         PolicyEngine::compile(&self.network_policy)?;
         Ok(())
+    }
+
+    pub fn github_meta_enabled(&self) -> Result<bool, PolicyError> {
+        for network in std::iter::once(&self.network_policy).chain(
+            self.registry
+                .as_ref()
+                .map(|registry| &registry.upstream_network_policy),
+        ) {
+            if PolicyEngine::compile(network)?.github_meta().is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[must_use]

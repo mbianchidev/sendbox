@@ -135,6 +135,27 @@ pub struct PersistentHostRunReport {
     agent: AgentReport,
     package_report: Option<PersistedPackageReport>,
     syscall_report: Option<PersistedSyscallReport>,
+    network_report: Option<Box<PersistedNetworkReport>>,
+}
+
+pub const NETWORK_EGRESS_REPORT_FILE: &str = "network-egress-report.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersistedNetworkReport {
+    path: PathBuf,
+    sha256: String,
+}
+
+impl PersistedNetworkReport {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -264,6 +285,14 @@ impl HostRunReport {
     pub fn package_report(&self) -> Option<&PersistedPackageReport> {
         match self {
             Self::Persistent(report) => report.package_report.as_ref(),
+            Self::OneShot(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn network_report(&self) -> Option<&PersistedNetworkReport> {
+        match self {
+            Self::Persistent(report) => report.network_report.as_deref(),
             Self::OneShot(_) => None,
         }
     }
@@ -897,6 +926,7 @@ async fn execute_runtime(
                 agent,
                 package_report: None,
                 syscall_report: None,
+                network_report: None,
             }))
         }
         HostExecution::Hyperlight(execution) => {
@@ -2001,6 +2031,20 @@ fn boundary_features(
                 mechanism: mechanism.clone(),
             },
         );
+        if policy
+            .github_meta_enabled()
+            .map_err(|error| HostError::Invalid(error.to_string()))?
+        {
+            features.insert(
+                "network_github_meta".to_owned(),
+                FeatureAdmission {
+                    decision: FeatureDecision::Enforced,
+                    mechanism: format!(
+                        "official_https_meta_v1+authenticated_network_report_v1:{mechanism}"
+                    ),
+                },
+            );
+        }
         if policy.dns_port.is_some() {
             features.insert(
                 "network_dns_broker".to_owned(),

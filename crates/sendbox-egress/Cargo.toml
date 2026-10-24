@@ -19,12 +19,18 @@ path = "src/bin/harness.rs"
 sendbox-core = { path = "../sendbox-core" }
 sendbox-policy = { path = "../sendbox-policy" }
 async-trait.workspace = true
+bytes.workspace = true
 clap.workspace = true
 hickory-proto.workspace = true
 http.workspace = true
+http-body-util.workspace = true
 httparse.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 ipnet.workspace = true
 libc.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 sha2.workspace = true
@@ -39,12 +45,14 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 tokio-util.workspace = true
+tokio-rustls.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cap-std.workspace = true
 socket2.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 tempfile.workspace = true
 hickory-proto.workspace = true
 serde_json.workspace = true

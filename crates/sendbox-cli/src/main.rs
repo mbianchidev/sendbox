@@ -579,6 +579,7 @@ async fn run(arguments: RunArgs) -> ExitCode {
                         "quarantined": package.quarantined(),
                     })),
                     "syscall_report": report.syscall_report(),
+                    "network_report": report.network_report(),
                 });
                 if let Some(message) = report.failure_message() {
                     result["message"] = Value::String(message.to_owned());
@@ -587,6 +588,9 @@ async fn run(arguments: RunArgs) -> ExitCode {
             } else {
                 if let Some(message) = report.failure_message() {
                     eprintln!("sendbox run: {message}");
+                }
+                if let Some(network) = report.network_report() {
+                    eprintln!("network report: {}", network.path().display());
                 }
                 if let Some(trace) = report.syscall_report() {
                     eprintln!("syscall report: {}", trace.path().display());

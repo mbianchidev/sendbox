@@ -139,9 +139,11 @@ mod tests {
                 safe_outputs: None,
                 package_report: None,
                 syscall_report: None,
+                network_report: None,
             },
             package_report: None,
             syscall_report: None,
+            network_report: None,
         });
         let masked = mask_report(&masker, report).unwrap();
         assert_eq!(

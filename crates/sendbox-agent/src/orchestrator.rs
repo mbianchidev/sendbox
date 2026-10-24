@@ -76,6 +76,7 @@ pub struct AgentReport {
     pub safe_outputs: Option<crate::CollectedSafeOutputs>,
     pub package_report: Option<GuestPackageReport>,
     pub syscall_report: Option<crate::GuestSyscallReport>,
+    pub network_report: Option<Box<crate::GuestNetworkReport>>,
 }
 
 enum WorkloadStep {
@@ -164,6 +165,7 @@ impl AgentOrchestrator {
                     safe_outputs,
                     package_report: context.package_report,
                     syscall_report: context.syscall_report,
+                    network_report: context.network_report,
                 })
             }
             Ok(_) => Err(RunFailure {
@@ -356,6 +358,16 @@ impl AgentOrchestrator {
         let terminal = self
             .monitor(plan.package_report_maximum_bytes(), cancellation, context)
             .await?;
+        if plan.network_report() {
+            context.network_report = Some(Box::new(
+                context
+                    .execution
+                    .as_mut()
+                    .expect("execution was stored")
+                    .fetch_network_report(cancellation)
+                    .await?,
+            ));
+        }
         if plan.syscall_tracing() {
             context.syscall_report = Some(
                 context
@@ -540,6 +552,7 @@ struct RunContext {
     execution: Option<Box<dyn GuestExecution>>,
     package_report: Option<GuestPackageReport>,
     syscall_report: Option<crate::GuestSyscallReport>,
+    network_report: Option<Box<crate::GuestNetworkReport>>,
 }
 
 impl RunContext {
@@ -555,6 +568,7 @@ impl RunContext {
             execution: None,
             package_report: None,
             syscall_report: None,
+            network_report: None,
         }
     }
 

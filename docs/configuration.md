@@ -157,6 +157,89 @@ Safe Outputs human text are credential-masked by default, without a disable
 switch. Authentication traffic is not modified. See
 [credential masking](cli-agents.md#credential-masking) for coverage and limits.
 
+## Network grants
+
+Apple and Kata enforce exact hostnames, explicit wildcard patterns, IPv4/IPv6
+network grants, and deny-first restrictions through DNS, HTTP CONNECT, SOCKS5,
+and the native CONNECT protocol:
+
+```yaml
+policy:
+  network:
+    default_action: deny
+    allow_dns: true
+    allowed_domains: [github.com, "*.tools.example"]
+    blocked_domains: [blocked.tools.example]
+    blocked_networks: ["203.0.113.9/32"]
+```
+
+`*.tools.example` matches `one.tools.example` and `nested.one.tools.example`,
+not the apex `tools.example`, `nottools.example`, or `tools.example.evil`.
+Add the apex separately when needed. Ordinary exact hosts remain exact; they
+do not implicitly grant subdomains. All CNAME hops must also be admitted.
+
+**`github.com` is an explicit delegation to the official GitHub Meta feed**, not
+an apex-only grant. SendBox fetches the fixed anonymous HTTPS endpoint
+<https://api.github.com/meta> before gateway readiness, then checks it hourly
+using ETags. Only an effective exact apex grant triggers this behavior:
+`api.github.com`, `*.github.com`, and permissive defaults alone do not.
+The reviewed network fields and domain/endpoint fields, including their
+published wildcard patterns, become additional grants. SSH keys, commit keys,
+fingerprints, and the artifact-attestation trust-domain identity are not
+destinations. Unknown fields, malformed entries, default routes, and oversized
+documents are rejected as a whole.
+
+**The feed includes shared-cloud CIDRs and wildcard services.** This intentionally
+grants more than GitHub-owned web servers, including published Actions ranges.
+It is not unlimited Internet access, authentication, or approval to perform
+GitHub writes. Unlisted hostnames still fail a default-deny domain check even
+when their address falls in a published range; direct-IP TCP access to that
+range is allowed, subject to port and explicit-network restrictions.
+Explicit deny rules, private/link-local/metadata address protections, DNS
+budgets, reserved MCP origins, package-proxy isolation, and UDP/QUIC denial
+still apply. Published CIDRs never count as explicit private-address grants.
+
+Initial HTTPS/TLS/DNS, policy-denial, rate-limit, or validation failure blocks
+readiness rather than silently reverting to apex-only behavior. Later failures
+are reported as `degraded` and preserve the previous validated snapshot for at
+most 24 hours since its last successful fetch or conditional revalidation.
+After that monotonic deadline, derived grants expire independently of the
+refresh task; configured exact hosts and explicit networks are unchanged.
+Blocking the Meta API, disabling DNS, excluding TCP/443, or omitting guest CA
+certificates can therefore prevent a `github.com`-enabled session from starting.
+Each request has a ten-second deadline, no redirects, environment proxy, or
+credentials. Separate workload/registry gateways each own their refresh; many
+short sessions can encounter GitHub's unauthenticated rate limit.
+
+Refresh affects **new connections in the current guest**, not just future
+launches. Removed grants and CNAME permissions cannot survive through old DNS
+pins. Already-open tunnels are not forcibly revoked and retain their existing
+maximum 300-second lifetime. Cancellation stops the fetch/timer with the
+gateway; a restart fetches again and never restores an authorization or
+metadata cache from disk.
+
+With `sendbox run --json`, the final `network_report: {path, sha256}` references
+a private host-side `network-egress-report.json`, following the package-report
+artifact pattern instead of inflating every consumer's result frame. Its digest
+is recorded in the signed session provenance. The file contains each gateway's
+configured policy plus latest published
+scope, body SHA-256, ETag, source/API version, revision, attempt/success/expiry
+timestamps, freshness, and last failure. The scope is combined with the
+configured deny/address/port controls; it is not a standalone allow-all policy.
+The report captures the latest refresh attempt, not a complete transition
+history or proof that an expired lease is still live. It is available after a
+normal terminal response, not guaranteed after forced cancellation.
+`policy show --json` remains an offline view of configured rules and does not
+pretend to resolve this live scope.
+
+This requires a matching updated host and signed guest bundle. The boundary
+plan remains version 3, with a signed `network_github_meta` admission; the
+internal egress runtime document is version 5 and `network.report` is
+independently versioned at 1. Older guest bundles are rejected, not silently
+accepted with narrower behavior. Hyperlight has no authenticated production
+Meta-refresh gateway. No release or consumer activation is implied by a source
+build.
+
 ## GitHub and MCP boundaries
 
 GitHub repository forwarding currently supports `github.com`. Ordinary HTTPS

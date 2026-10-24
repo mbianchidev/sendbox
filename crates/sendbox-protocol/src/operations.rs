@@ -28,6 +28,79 @@ pub const SYSCALL_REPORT_OPERATION: &str = "syscall.report";
 pub const MAX_SYSCALL_REPORT_BYTES: usize = 96 * 1024;
 pub type SyscallReportRequestV1 = PackageReportRequestV1;
 pub type SyscallReportResponseV1 = PackageReportResponseV1;
+pub const NETWORK_REPORT_OPERATION: &str = "network.report";
+pub const NETWORK_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const NETWORK_REPORT_CHUNK_BYTES: usize = 32 * 1024;
+pub const MAX_NETWORK_REPORT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkReportRequestV1 {
+    pub schema_version: u32,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkReportChunkV1 {
+    pub schema_version: u32,
+    pub offset: u32,
+    pub total_bytes: u32,
+    pub sha256: String,
+    pub chunk_base64: String,
+}
+
+impl NetworkReportChunkV1 {
+    pub fn new(
+        offset: usize,
+        total_bytes: usize,
+        sha256: String,
+        report: &[u8],
+    ) -> Result<Self, &'static str> {
+        if total_bytes == 0
+            || total_bytes > MAX_NETWORK_REPORT_BYTES
+            || report.len() != total_bytes
+            || offset >= total_bytes
+            || !offset.is_multiple_of(NETWORK_REPORT_CHUNK_BYTES)
+        {
+            return Err("invalid network report range");
+        }
+        let end = (offset + NETWORK_REPORT_CHUNK_BYTES).min(total_bytes);
+        Ok(Self {
+            schema_version: NETWORK_REPORT_SCHEMA_VERSION,
+            offset: u32::try_from(offset).map_err(|_| "invalid network report offset")?,
+            total_bytes: u32::try_from(total_bytes).map_err(|_| "invalid network report size")?,
+            sha256,
+            chunk_base64: base64::engine::general_purpose::STANDARD.encode(&report[offset..end]),
+        })
+    }
+
+    pub fn decode(&self) -> Result<Vec<u8>, &'static str> {
+        let total = self.total_bytes as usize;
+        let offset = self.offset as usize;
+        if self.schema_version != NETWORK_REPORT_SCHEMA_VERSION
+            || total == 0
+            || total > MAX_NETWORK_REPORT_BYTES
+            || offset >= total
+            || !offset.is_multiple_of(NETWORK_REPORT_CHUNK_BYTES)
+            || self.chunk_base64.len() > NETWORK_REPORT_CHUNK_BYTES.div_ceil(3) * 4
+            || self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("invalid network report chunk");
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.chunk_base64)
+            .map_err(|_| "invalid network report chunk encoding")?;
+        if bytes.len() != (total - offset).min(NETWORK_REPORT_CHUNK_BYTES) {
+            return Err("invalid network report chunk length");
+        }
+        Ok(bytes)
+    }
+}
 
 /// Longest accepted `TERM` value; real terminfo names are far shorter.
 const MAX_TERM_BYTES: usize = 64;
@@ -411,6 +484,31 @@ impl PackageReportResponseV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_report_chunks_are_bounded_and_preserve_exact_bytes() {
+        let bytes = vec![b'x'; NETWORK_REPORT_CHUNK_BYTES + 17];
+        let response = NetworkReportChunkV1::new(0, bytes.len(), "a".repeat(64), &bytes).unwrap();
+        assert_eq!(response.decode().unwrap().len(), NETWORK_REPORT_CHUNK_BYTES);
+        assert_eq!(response.total_bytes as usize, bytes.len());
+        assert!(
+            NetworkReportChunkV1::new(0, MAX_NETWORK_REPORT_BYTES + 1, "a".repeat(64), &bytes)
+                .is_err()
+        );
+        assert!(serde_json::to_vec(&response).unwrap().len() < crate::DEFAULT_MAX_FRAME_BYTES);
+        let mut malformed = response.clone();
+        malformed.total_bytes = MAX_NETWORK_REPORT_BYTES as u32 + 1;
+        assert!(malformed.decode().is_err());
+        malformed = response.clone();
+        malformed.offset = 1;
+        assert!(malformed.decode().is_err());
+        malformed = response.clone();
+        malformed.chunk_base64.clear();
+        assert!(malformed.decode().is_err());
+        malformed = response;
+        malformed.sha256 = "not-a-digest".to_owned();
+        assert!(malformed.decode().is_err());
+    }
 
     #[test]
     fn launch_schema_preserves_exact_argv_boundaries() {

@@ -11,6 +11,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::net::{TcpListener, UdpSocket};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,8 @@ use crate::connect_broker::{
 use crate::dialer::Dialer;
 use crate::dns_broker::{DnsBroker, DnsBrokerConfig};
 use crate::dns_budget::DnsGuard;
+use crate::github_meta::{self, GitHubMetaClient};
+use crate::github_meta_client::OfficialGitHubMetaClient;
 use crate::origin::OriginReservations;
 use crate::policy::PolicyEngine;
 use crate::resolver::UpstreamResolver;
@@ -157,6 +160,26 @@ pub struct Gateway<R: UpstreamResolver> {
     authorizations: Arc<AuthorizationCache>,
     guard: Arc<DnsGuard>,
     config: GatewayConfig,
+    metadata_client: Option<Arc<dyn GitHubMetaClient>>,
+    metadata_prepared: AtomicBool,
+}
+
+struct GatewayRunGuard<'a> {
+    engine: &'a PolicyEngine,
+    authorizations: &'a AuthorizationCache,
+    metadata_prepared: &'a AtomicBool,
+    cancel: CancellationToken,
+}
+
+impl Drop for GatewayRunGuard<'_> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.authorizations.clear();
+        if let Some(metadata) = self.engine.github_meta() {
+            metadata.clear();
+        }
+        self.metadata_prepared.store(false, Ordering::Release);
+    }
 }
 
 impl<R: UpstreamResolver + 'static> Gateway<R> {
@@ -180,7 +203,45 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
             authorizations: Arc::new(AuthorizationCache::with_capacity(capacity)),
             guard,
             config,
+            metadata_client: None,
+            metadata_prepared: AtomicBool::new(false),
         }
+    }
+
+    #[must_use]
+    pub fn with_github_meta_client(mut self, client: Arc<dyn GitHubMetaClient>) -> Self {
+        self.metadata_client = Some(client);
+        self
+    }
+
+    fn metadata_client(&self) -> Arc<dyn GitHubMetaClient> {
+        self.metadata_client.clone().unwrap_or_else(|| {
+            Arc::new(OfficialGitHubMetaClient::new(
+                Arc::clone(&self.resolver),
+                Arc::clone(&self.dialer),
+            ))
+        })
+    }
+
+    /// Production calls this after cgroup/mark enforcement is armed and before
+    /// publishing service readiness. A missing initial snapshot is an error.
+    pub async fn prepare_github_meta(&self, cancel: &CancellationToken) -> io::Result<()> {
+        let Some(metadata) = self.engine.github_meta() else {
+            return Ok(());
+        };
+        if self.metadata_prepared.load(Ordering::Acquire) && metadata.view().1.is_some() {
+            return Ok(());
+        }
+        let client = self.metadata_client();
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "GitHub Meta bootstrap cancelled")),
+            result = metadata.refresh_once(client.as_ref(), &self.engine, self.audit.as_ref()) => {
+                result.map_err(io::Error::other)?;
+            }
+        }
+        self.metadata_prepared.store(true, Ordering::Release);
+        Ok(())
     }
 
     #[must_use]
@@ -196,6 +257,19 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
         listeners: GatewayListeners,
         cancel: CancellationToken,
     ) -> io::Result<()> {
+        if let Err(error) = self.prepare_github_meta(&cancel).await {
+            return if cancel.is_cancelled() {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        let _guard = GatewayRunGuard {
+            engine: &self.engine,
+            authorizations: &self.authorizations,
+            metadata_prepared: &self.metadata_prepared,
+            cancel: cancel.clone(),
+        };
         let connect_broker = ConnectBroker::new_with_authorization_state(
             Arc::clone(&self.engine),
             Arc::clone(&self.resolver),
@@ -209,16 +283,22 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
             self.config.connect.clone(),
         );
 
-        let mut tasks = Vec::new();
-        tasks.push(tokio::spawn(
-            Arc::clone(&connect_broker).run(listeners.connect, cancel.clone()),
-        ));
+        let mut tasks = tokio::task::JoinSet::new();
+        if self.engine.github_meta().is_some() {
+            tasks.spawn(github_meta::run_refresh(
+                Arc::clone(&self.engine),
+                self.metadata_client(),
+                Arc::clone(&self.audit),
+                cancel.clone(),
+            ));
+        }
+        tasks.spawn(Arc::clone(&connect_broker).run(listeners.connect, cancel.clone()));
         if let Some(http_proxy) = listeners.http_proxy {
-            tasks.push(tokio::spawn(connect_broker.run_with_frontend(
+            tasks.spawn(connect_broker.run_with_frontend(
                 http_proxy,
                 cancel.clone(),
                 ConnectFrontend::Http,
-            )));
+            ));
         }
 
         if self.engine.allow_dns()
@@ -232,56 +312,33 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
                 Arc::clone(&self.audit),
                 self.config.dns.clone(),
             );
-            tasks.push(tokio::spawn(
-                Arc::clone(&dns_broker).run_udp(udp, cancel.clone()),
-            ));
-            tasks.push(tokio::spawn(dns_broker.run_tcp(tcp, cancel.clone())));
+            tasks.spawn(Arc::clone(&dns_broker).run_udp(udp, cancel.clone()));
+            tasks.spawn(dns_broker.run_tcp(tcp, cancel.clone()));
         }
 
         // Wait for the first task to finish (an error, or a clean stop after
         // cancellation), then cancel the rest and drain them.
-        let mut result = Ok(());
-        if !tasks.is_empty() {
-            let (first, _index, rest) = futures_select_all(tasks).await;
-            result = match first {
-                Ok(inner) => inner,
-                Err(join_err) => Err(io::Error::other(format!(
-                    "broker task panicked: {join_err}"
-                ))),
-            };
-            cancel.cancel();
-            for task in rest {
-                let _ = task.await;
+        let first = tasks
+            .join_next()
+            .await
+            .expect("CONNECT broker is mandatory");
+        let mut result = joined_broker(first);
+        cancel.cancel();
+        while let Some(joined) = tasks.join_next().await {
+            if let Err(error) = joined_broker(joined) {
+                if result.is_ok() {
+                    result = Err(error);
+                } else {
+                    eprintln!("sendbox: additional egress task failure during shutdown: {error}");
+                }
             }
         }
         result
     }
 }
 
-/// Minimal `select_all` over join handles without pulling in the `futures`
-/// crate: polls each handle once per wakeup and returns the first ready one
-/// with the remaining handles. Kept tiny and dependency-free.
-async fn futures_select_all<T>(
-    mut handles: Vec<tokio::task::JoinHandle<T>>,
-) -> (
-    Result<T, tokio::task::JoinError>,
-    usize,
-    Vec<tokio::task::JoinHandle<T>>,
-) {
-    use std::future::poll_fn;
-    use std::task::Poll;
-
-    let (result, index) = poll_fn(|cx| {
-        for (index, handle) in handles.iter_mut().enumerate() {
-            if let Poll::Ready(result) = std::pin::Pin::new(handle).poll(cx) {
-                return Poll::Ready((result, index));
-            }
-        }
-        Poll::Pending
-    })
-    .await;
-    handles.remove(index);
-    (result, index, handles)
+fn joined_broker(result: Result<io::Result<()>, tokio::task::JoinError>) -> io::Result<()> {
+    result.map_err(|error| io::Error::other(format!("egress task failed: {error}")))?
 }
 
 #[cfg(test)]

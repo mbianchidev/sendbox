@@ -18,8 +18,9 @@
 //!   control is verified.
 //!
 //! Existing `sendbox_policy::NetworkPolicy` fields remain the single source of
-//! truth. [`policy::PolicyEngine`] compiles that type into deterministic,
-//! side-effect-free egress decisions; nothing here mutates policy.
+//! truth. [`policy::PolicyEngine`] compiles immutable configured rules. An exact
+//! `github.com` grant additionally delegates to validated, expiring Meta
+//! snapshots owned by the gateway; each decision uses one immutable view.
 //!
 //! The whole crate forbids `unsafe` Rust.
 
@@ -35,6 +36,8 @@ pub mod domain;
 pub mod fixture_resolver;
 pub mod forwarding_resolver;
 pub mod gateway;
+pub mod github_meta;
+pub mod github_meta_client;
 mod http_proxy;
 pub mod origin;
 pub mod policy;

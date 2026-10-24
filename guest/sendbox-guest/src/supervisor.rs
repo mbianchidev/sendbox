@@ -158,6 +158,8 @@ pub async fn run<P: PlatformControls>(
         .map(|policy| policy.proxy_environment.clone())
         .unwrap_or_default();
     let registry_proxy = bootstrap.registry_proxy.take();
+    let network_reports =
+        egress::metadata_report_sources(runtime.session_dir(), bootstrap.egress_policy.as_ref())?;
     let package_report = registry_proxy
         .as_ref()
         .map(|registry| {
@@ -396,6 +398,7 @@ pub async fn run<P: PlatformControls>(
                         secret_decryptor,
                     )
                     .with_package_report(package_report)
+                    .with_network_reports(network_reports)
                     .with_syscall_tracing(tracing_requested)
                     .with_safe_outputs(safe_outputs.clone()),
                 ) => protocol,

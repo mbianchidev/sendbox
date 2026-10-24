@@ -167,7 +167,7 @@ fn validate_directory(
     Ok(())
 }
 
-fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), GuestError> {
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), GuestError> {
     let parent = path
         .parent()
         .ok_or_else(|| GuestError::Runtime("state path has no parent".to_owned()))?;
