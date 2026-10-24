@@ -2473,7 +2473,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sendbox-agent"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "proptest",
  "sendbox-boundary",
@@ -2496,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-bootstrap"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "getrandom 0.4.3",
  "sendbox-core",
@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-boundary"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sendbox-config",
  "sendbox-core",
@@ -2526,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-bpf"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "libbpf-rs",
  "libc",
@@ -2539,7 +2539,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-bundle"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "clap",
  "ed25519-dalek",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-config"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "proptest",
  "rustix",
@@ -2596,14 +2596,14 @@ dependencies = [
 
 [[package]]
 name = "sendbox-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "sendbox-credentials"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "http",
@@ -2624,7 +2624,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-egress"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2656,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-exec"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "caps",
  "getrandom 0.4.3",
@@ -2675,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-git"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "proptest",
  "rustix",
@@ -2689,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-guest"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "clap",
@@ -2722,7 +2722,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-host"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "getrandom 0.3.4",
  "reqwest",
@@ -2759,7 +2759,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-mcp"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -2800,7 +2800,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-policy"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sendbox-core",
  "serde",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-project"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "jsonc-parser",
  "proptest",
@@ -2825,7 +2825,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-protocol"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-registry"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -2882,7 +2882,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-runtime"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "nix",
  "proptest",
@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-runtime-apple"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sendbox-bootstrap",
  "sendbox-bundle",
@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-runtime-hyperlight"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cap-std",
  "ed25519-dalek",
@@ -2936,7 +2936,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-runtime-kata"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "ed25519-dalek",
  "sendbox-bootstrap",
@@ -2958,7 +2958,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-secrets"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cap-std",
  "chacha20poly1305",
@@ -2986,7 +2986,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-security"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3004,7 +3004,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-session-security"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "proptest",
  "sendbox-core",
@@ -3019,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-testkit"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "nix",
  "proptest",
