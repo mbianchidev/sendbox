@@ -392,6 +392,7 @@ fn init_writes_a_private_valid_config_and_json_result() {
 #[test]
 fn init_selects_cli_agents_without_unrelated_copilot_credentials() {
     for (agent, executable, endpoint) in [
+        ("moguri", "moguri", "api.githubcopilot.com"),
         ("opencode", "opencode", "opencode.ai"),
         ("open-code", "opencode", "opencode.ai"),
         ("claude", "claude", "api.anthropic.com"),
@@ -412,6 +413,8 @@ fn init_selects_cli_agents_without_unrelated_copilot_credentials() {
             project.path(),
         );
         assert!(output.status.success(), "{agent}: {output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["agent"], executable);
         let configuration =
             SandboxConfiguration::load(project.path().join(".sendbox.yaml")).unwrap();
         configuration.validate().unwrap();

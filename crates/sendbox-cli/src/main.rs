@@ -155,6 +155,7 @@ struct InitArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum InitAgent {
+    Moguri,
     Copilot,
     #[value(name = "opencode", alias = "open-code")]
     OpenCode,
@@ -167,6 +168,7 @@ enum InitAgent {
 impl InitAgent {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Moguri => "moguri",
             Self::Copilot => "copilot",
             Self::OpenCode => "opencode",
             Self::Claude => "claude",
@@ -194,7 +196,7 @@ impl InitAgent {
                 .push(self.as_str().to_owned());
         }
         let domains: &[&str] = match self {
-            Self::Copilot => &["api.githubcopilot.com", "*.githubcopilot.com"],
+            Self::Moguri | Self::Copilot => &["api.githubcopilot.com", "*.githubcopilot.com"],
             Self::OpenCode => &["opencode.ai", "models.dev"],
             Self::Claude => &["api.anthropic.com"],
             Self::Codex => &["api.openai.com", "chatgpt.com", "auth.openai.com"],

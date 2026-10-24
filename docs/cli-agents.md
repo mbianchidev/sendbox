@@ -1,15 +1,15 @@
 # CLI agents and workspace isolation
 
-SendBox launches an exact guest argv, not a host-side agent wrapper. OpenCode,
-Claude Code, Codex, Copilot, Gemini, and other CLI programs use the same signed
-plan, execution broker, terminal transport, MCP services, egress firewall,
+SendBox launches an exact guest argv, not a host-side agent wrapper. Moguri,
+OpenCode, Claude Code, Codex, Copilot, Gemini, and other CLI programs use the same
+signed plan, execution broker, terminal transport, MCP services, egress firewall,
 snapshots, Git guard, and optional package analysis.
 
 ## Select an agent
 
 ```bash
-sendbox init --project /projects/my-repo --agent opencode
-# Also accepted: --agent open-code, claude, codex, copilot, gemini, custom.
+sendbox init --project /projects/my-repo --agent moguri
+# Also accepted: --agent opencode, open-code, claude, codex, copilot, gemini, custom.
 ```
 
 An explicit profile admits the selected entry program and its usual inference
@@ -20,6 +20,7 @@ configuration defaults.
 
 | Profile | Initially admitted inference hosts |
 |---|---|
+| `moguri` | `api.githubcopilot.com`, `*.githubcopilot.com` |
 | `opencode` | `opencode.ai`, `models.dev` |
 | `claude` | `api.anthropic.com` |
 | `codex` | `api.openai.com`, `chatgpt.com`, `auth.openai.com` |
@@ -45,14 +46,21 @@ sendbox run --interactive \
   --image registry.example/agent-tools@sha256:<digest> \
   --bundle /usr/local/share/sendbox/guest/<architecture>/bundle \
   --trust-root /usr/local/share/sendbox/guest/<architecture>/release-public.key \
-  -- /usr/local/bin/opencode
+  -- /usr/local/bin/moguri --project /workspace
 ```
 
-Replace the final argv with the actual guest path to `claude`, `codex`,
-`copilot`, `gemini`, or another admitted executable. Drop `--interactive` for
-headless operation. No executable lookup or shell evaluation happens on the
-host. An unavailable provider or guest primitive is an error, not permission to
-run the command on the host.
+Moguri's `moguri` executable opens its TUI by default; `moguri tui` is equivalent.
+`--project /workspace` selects the shared guest project. The workload image
+needs the full CLI, its supported Node.js runtime, native dependencies, and a
+Linux Secret Service for Moguri's OS-keyring authentication. Sign in inside the
+guest; the `moguri` profile does not enable SendBox's Copilot CLI token forwarding.
+For another model provider, explicitly allow its endpoints.
+
+For another agent, replace the final argv with its actual guest executable and
+arguments. For headless operation, drop `--interactive` and use the agent's
+noninteractive arguments. No executable lookup or shell evaluation happens on
+the host. An unavailable provider or guest primitive is an error, not permission
+to run the command on the host.
 
 Native agent sandboxes may need adjustment for an already-contained VM.
 For example, Codex can be run with `--sandbox danger-full-access` to avoid a
