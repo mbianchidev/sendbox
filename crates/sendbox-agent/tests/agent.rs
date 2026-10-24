@@ -709,13 +709,26 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
         .as_mut()
         .unwrap()
         .syscall_tracing = true;
-    let plan = RunPlan::compile(
-        &configuration,
-        request_for_configuration(&resources, session_id, &configuration),
-        &capabilities,
-        plan_time(),
-    )
-    .expect("package and tracing run plan");
+    let mut request = request_for_configuration(&resources, session_id, &configuration);
+    let mut boundary = request.boundary_plan.plan().clone();
+    boundary.features.insert(
+        "network_github_meta".to_owned(),
+        sendbox_boundary::FeatureAdmission {
+            decision: sendbox_boundary::FeatureDecision::Enforced,
+            mechanism: "generated-network-report-fixture".to_owned(),
+        },
+    );
+    let signing_key = SigningKeyMaterial::generate().unwrap();
+    let fingerprint = signing_key
+        .identity("test", None, 0, None)
+        .fingerprint
+        .clone();
+    request.boundary_plan = SignedBoundaryPlan::sign(boundary, &signing_key, plan_time())
+        .unwrap()
+        .verify(&fingerprint, plan_time())
+        .unwrap();
+    let plan = RunPlan::compile(&configuration, request, &capabilities, plan_time())
+        .expect("package and tracing run plan");
     let expected_policy_digest = plan.policy_digest();
     let expected_boundary_digest = plan.boundary_plan_digest();
     let (host, guest) = tokio::io::duplex(16 * 1024);
@@ -833,6 +846,43 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
             }))
             .await
             .expect("package report response");
+        let network_report = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "gateways": {"workload": {"github_meta": {
+                "source": "https://api.github.com/meta",
+                "published_scope": {"domains": (0..3000).map(|i| format!("service{i}.fixture.test")).collect::<Vec<_>>()}
+            }}}
+        })).unwrap();
+        let digest = sha256_hex(&network_report);
+        for offset in
+            (0..network_report.len()).step_by(sendbox_protocol::NETWORK_REPORT_CHUNK_BYTES)
+        {
+            let Message::Request(request) = reader.receive().await.unwrap() else {
+                panic!("expected network report request")
+            };
+            assert_eq!(
+                request.operation,
+                sendbox_protocol::NETWORK_REPORT_OPERATION
+            );
+            let range: sendbox_protocol::NetworkReportRequestV1 =
+                serde_json::from_slice(&request.payload).unwrap();
+            assert_eq!(range.offset as usize, offset);
+            let response = sendbox_protocol::NetworkReportChunkV1::new(
+                offset,
+                network_report.len(),
+                digest.clone(),
+                &network_report,
+            )
+            .unwrap();
+            writer
+                .send(&Message::Response(Response {
+                    request_id: request.request_id,
+                    status: ResponseStatus::Ok,
+                    payload: serde_json::to_vec(&response).unwrap(),
+                }))
+                .await
+                .unwrap();
+        }
         let Message::Request(request) = reader.receive().await.expect("syscall report request")
         else {
             panic!("expected syscall report request");
@@ -878,6 +928,7 @@ async fn authenticated_vertical_slice_launches_through_guest_and_cleans_up() {
     guest_task.await.expect("guest task");
 
     assert_eq!(report.terminal, GuestTerminal::Exited { code: 0 });
+    assert_eq!(report.network_report.as_ref().unwrap().report["gateways"]["workload"]["github_meta"]["published_scope"]["domains"].as_array().unwrap().len(), 3000);
     assert_eq!(
         report.syscall_report.expect("syscall report").json,
         br#"{"synthetic_trace":true}"#

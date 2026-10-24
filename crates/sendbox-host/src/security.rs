@@ -262,12 +262,80 @@ where
             if let Err(error) = persist_syscall_report(&mut report, &context) {
                 return finalize_runtime_error(session, &clock, error, &context.credential_masker);
             }
+            if let Err(error) = persist_network_report(&mut report, &context) {
+                return finalize_runtime_error(session, &clock, error, &context.credential_masker);
+            }
             finalize_report(session, &clock, report)
         }
         Err(runtime_error) => {
             finalize_runtime_error(session, &clock, runtime_error, &context.credential_masker)
         }
     }
+}
+
+fn persist_network_report(
+    report: &mut HostRunReport,
+    context: &HostSecurityContext,
+) -> Result<(), HostError> {
+    let requested = context
+        .verified_plan
+        .plan()
+        .features
+        .get("network_github_meta")
+        .is_some_and(|feature| feature.decision == sendbox_boundary::FeatureDecision::Enforced);
+    let raw = match report {
+        HostRunReport::Persistent(report) => report.agent.network_report.take(),
+        HostRunReport::OneShot(_) => None,
+    };
+    if !requested {
+        if raw.is_some() {
+            return Err(HostError::Invalid(
+                "guest returned unexpected network evidence".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let raw = raw
+        .ok_or_else(|| HostError::Invalid("guest omitted required network evidence".to_owned()))?;
+    let bytes = serde_json::to_vec(&raw.report)
+        .map_err(|error| HostError::Invalid(format!("encode network evidence: {error}")))?;
+    if bytes.len() > sendbox_agent::GuestNetworkReport::MAX_BYTES
+        || raw.sha256 != format!("sha256:{}", sha256_hex(&bytes))
+        || raw
+            .report
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        || raw
+            .report
+            .get("gateways")
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|gateways| {
+                gateways.is_empty()
+                    || gateways.len() > 2
+                    || gateways
+                        .keys()
+                        .any(|role| !matches!(role.as_str(), "workload" | "registry"))
+            })
+    {
+        return Err(HostError::Invalid(
+            "network evidence has an invalid schema, size or digest".to_owned(),
+        ));
+    }
+    let path = context
+        .state_directory
+        .join(super::NETWORK_EGRESS_REPORT_FILE);
+    atomic_write(&path, &bytes, 0o600)?;
+    let HostRunReport::Persistent(report) = report else {
+        return Err(HostError::Invalid(
+            "one-shot runs cannot return network evidence".to_owned(),
+        ));
+    };
+    report.network_report = Some(Box::new(super::PersistedNetworkReport {
+        path,
+        sha256: raw.sha256,
+    }));
+    Ok(())
 }
 
 fn persist_syscall_report(
@@ -404,6 +472,20 @@ fn finalize_report(
     clock: &dyn LifecycleClock,
     report: HostRunReport,
 ) -> Result<HostRunReport, HostError> {
+    if let Some(network) = report.network_report() {
+        record_or_abort(
+            &mut session,
+            clock,
+            AuditCategory::Provenance,
+            "network_egress_report_persisted",
+            network.sha256().to_owned(),
+            AuditResult::Success,
+            BTreeMap::from([(
+                "file".to_owned(),
+                super::NETWORK_EGRESS_REPORT_FILE.to_owned(),
+            )]),
+        )?;
+    }
     if let Some(trace) = report.syscall_report() {
         record_or_abort(
             &mut session,
@@ -1224,10 +1306,12 @@ mod tests {
                 states: Vec::new(),
                 package_report: Some(GuestPackageReport { json, sha256 }),
                 syscall_report: None,
+                network_report: None,
                 safe_outputs: None,
             },
             package_report: None,
             syscall_report: None,
+            network_report: None,
         })
     }
 
@@ -1259,6 +1343,57 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn network_report_is_digest_checked_and_persisted_without_bulking_up_cli_results() {
+        let temp = TempDir::new().unwrap();
+        let (mut context, _) = context(&temp, 10, 100);
+        let mut plan = context.verified_plan.plan().clone();
+        plan.features.insert(
+            "network_github_meta".to_owned(),
+            sendbox_boundary::FeatureAdmission {
+                decision: sendbox_boundary::FeatureDecision::Enforced,
+                mechanism: "generated-network-evidence".to_owned(),
+            },
+        );
+        let key = sendbox_security::provenance::SigningKeyMaterial::generate().unwrap();
+        let fingerprint = key.identity("test", None, 0, None).fingerprint.clone();
+        context.verified_plan = SignedBoundaryPlan::sign(plan, &key, 10)
+            .unwrap()
+            .verify(&fingerprint, 10)
+            .unwrap();
+        let session_id = context.verified_plan.plan().session_id;
+        let mut report = persistent_report(session_id, Vec::new(), String::new());
+        let raw = serde_json::json!({"schema_version": 1, "gateways": {"workload": {
+            "github_meta": {"source": "https://api.github.com/meta"}
+        }}});
+        let bytes = serde_json::to_vec(&raw).unwrap();
+        let digest = format!("sha256:{}", sha256_hex(&bytes));
+        let HostRunReport::Persistent(persistent) = &mut report else {
+            unreachable!()
+        };
+        persistent.agent.network_report = Some(Box::new(sendbox_agent::GuestNetworkReport {
+            sha256: digest.clone(),
+            report: raw.clone(),
+        }));
+        persist_network_report(&mut report, &context).unwrap();
+        let persisted = report.network_report().unwrap();
+        assert_eq!(persisted.sha256(), digest);
+        assert_eq!(fs::read(persisted.path()).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(persisted.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(serde_json::to_vec(persisted).unwrap().len() < 1024);
+        let HostRunReport::Persistent(persistent) = &mut report else {
+            unreachable!()
+        };
+        persistent.agent.network_report = Some(Box::new(sendbox_agent::GuestNetworkReport {
+            sha256: format!("sha256:{}", "00".repeat(32)),
+            report: raw,
+        }));
+        assert!(persist_network_report(&mut report, &context).is_err());
     }
 
     #[test]

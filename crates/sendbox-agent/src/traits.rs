@@ -143,6 +143,16 @@ pub struct GuestPackageReport {
 
 pub type GuestSyscallReport = GuestPackageReport;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GuestNetworkReport {
+    pub sha256: String,
+    pub report: serde_json::Value,
+}
+
+impl GuestNetworkReport {
+    pub const MAX_BYTES: usize = sendbox_protocol::MAX_NETWORK_REPORT_BYTES;
+}
+
 impl fmt::Debug for GuestPackageReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -236,6 +246,18 @@ pub trait GuestExecution: Send {
         Box::pin(async {
             Err(AgentError::Guest(
                 "this execution does not support package report retrieval".to_owned(),
+            ))
+        })
+    }
+
+    fn fetch_network_report<'a>(
+        &'a mut self,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<GuestNetworkReport, AgentError>> {
+        let _ = cancellation;
+        Box::pin(async {
+            Err(AgentError::Guest(
+                "this execution does not support network report retrieval".to_owned(),
             ))
         })
     }

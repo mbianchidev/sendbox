@@ -246,7 +246,10 @@ network:
   # ── Allowed Domains ────────────────────────────────────────────────────
   # Domains the agent can connect to. Supports wildcard subdomains:
   #   "*.github.com" matches "api.github.com", "raw.github.com", etc.
-  #   "github.com"   matches only the apex domain.
+  #   "example.com" matches only the apex domain.
+  # An exact "github.com" grant also delegates to GitHub's official Meta API.
+  # Apple/Kata fetch its domains and IPv4/IPv6 CIDRs before readiness, then hourly.
+  # This includes shared-cloud ranges. See docs/configuration.md#network-grants.
   allowed_domains:
     # ── GitHub ─────────────────────────────────────────────────────────────
     - "github.com"

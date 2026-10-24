@@ -16,8 +16,13 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_CAPACITY: usize = 4096;
 
 pub struct AuthorizationCache {
-    entries: Mutex<HashMap<(String, IpAddr), Instant>>,
+    entries: Mutex<HashMap<(String, IpAddr), Authorization>>,
     capacity: usize,
+}
+
+struct Authorization {
+    expires_at: Instant,
+    revision: u64,
 }
 
 impl Default for AuthorizationCache {
@@ -67,24 +72,36 @@ impl AuthorizationCache {
     /// with the earliest expiry, ties broken by key order) makes room, so the
     /// cache never exceeds [`AuthorizationCache::capacity`].
     pub fn authorize(&self, name: &str, ip: IpAddr, ttl: Duration) {
+        self.authorize_for_revision(name, ip, ttl, 0);
+    }
+
+    pub fn authorize_for_revision(&self, name: &str, ip: IpAddr, ttl: Duration, revision: u64) {
         let now = Instant::now();
         let expires_at = now + ttl;
         let mut entries = self
             .entries
             .lock()
             .expect("authorization cache mutex poisoned");
-        entries.retain(|_, exp| *exp > now);
+        entries.retain(|_, entry| entry.expires_at > now);
         let key = (name.to_owned(), ip);
         if !entries.contains_key(&key)
             && entries.len() >= self.capacity
             && let Some(evict) = entries
                 .iter()
-                .min_by(|(ka, ea), (kb, eb)| ea.cmp(eb).then_with(|| ka.cmp(kb)))
+                .min_by(|(ka, ea), (kb, eb)| {
+                    ea.expires_at.cmp(&eb.expires_at).then_with(|| ka.cmp(kb))
+                })
                 .map(|(k, _)| k.clone())
         {
             entries.remove(&evict);
         }
-        entries.insert(key, expires_at);
+        entries.insert(
+            key,
+            Authorization {
+                expires_at,
+                revision,
+            },
+        );
     }
 
     /// Returns true if `(name, ip)` has a live, unexpired authorization.
@@ -96,7 +113,7 @@ impl AuthorizationCache {
             .expect("authorization cache mutex poisoned");
         let key = (name.to_owned(), ip);
         match entries.get(&key) {
-            Some(expires_at) if *expires_at > Instant::now() => true,
+            Some(entry) if entry.expires_at > Instant::now() => entry.revision == 0,
             Some(_) => {
                 entries.remove(&key);
                 false
@@ -112,19 +129,30 @@ impl AuthorizationCache {
     /// addresses, and, absent that, to pick a pinned IP deterministically
     /// rather than relying on hash-map/resolver iteration order.
     pub fn authorized_addresses(&self, name: &str) -> Vec<IpAddr> {
+        self.authorized_addresses_for_revision(name, 0)
+    }
+
+    pub fn authorized_addresses_for_revision(&self, name: &str, revision: u64) -> Vec<IpAddr> {
         let mut entries = self
             .entries
             .lock()
             .expect("authorization cache mutex poisoned");
         let now = Instant::now();
-        entries.retain(|_, expires_at| *expires_at > now);
+        entries.retain(|_, entry| entry.expires_at > now);
         let mut addresses: Vec<IpAddr> = entries
-            .keys()
-            .filter(|(n, _)| n == name)
-            .map(|(_, ip)| *ip)
+            .iter()
+            .filter(|((n, _), entry)| n == name && entry.revision == revision)
+            .map(|((_, ip), _)| *ip)
             .collect();
         addresses.sort();
         addresses
+    }
+
+    pub fn clear(&self) {
+        self.entries
+            .lock()
+            .expect("authorization cache mutex poisoned")
+            .clear();
     }
 
     /// The current number of live entries (may include not-yet-pruned expired
@@ -148,6 +176,23 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::thread::sleep;
+
+    #[test]
+    fn revision_change_does_not_reuse_a_prior_dns_pin() {
+        let cache = AuthorizationCache::new();
+        let ip = "203.0.113.1".parse().unwrap();
+        cache.authorize_for_revision("allowed.test", ip, Duration::from_secs(60), 1);
+        assert_eq!(
+            cache.authorized_addresses_for_revision("allowed.test", 1),
+            [ip]
+        );
+        assert!(
+            cache
+                .authorized_addresses_for_revision("allowed.test", 2)
+                .is_empty()
+        );
+        assert!(cache.authorized_addresses("allowed.test").is_empty());
+    }
 
     #[test]
     fn authorizes_and_expires() {

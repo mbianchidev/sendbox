@@ -84,6 +84,7 @@ pub(crate) struct ProtocolServices {
     readiness: ReadinessSnapshot,
     broker: Option<BrokerClientConfiguration>,
     package_report: Option<PackageReportSource>,
+    network_reports: Vec<NetworkReportSource>,
     secret_decryptor: GuestSecretDecryptor,
     safe_outputs: Option<SafeOutputsHandle>,
     syscall_tracing: bool,
@@ -95,6 +96,19 @@ pub(crate) struct PackageReportSource {
     expected_uid: u32,
     expected_gid: u32,
     maximum_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NetworkReportSource {
+    pub(crate) role: &'static str,
+    pub(crate) configured_policy: sendbox_policy::NetworkPolicy,
+    pub(crate) report: PackageReportSource,
+}
+
+struct NetworkReportTransfer {
+    bytes: Vec<u8>,
+    sha256: String,
+    next_offset: usize,
 }
 
 impl PackageReportSource {
@@ -132,6 +146,7 @@ impl ProtocolServices {
             readiness,
             broker,
             package_report: None,
+            network_reports: Vec::new(),
             secret_decryptor,
             safe_outputs: None,
             syscall_tracing: false,
@@ -144,6 +159,11 @@ impl ProtocolServices {
         package_report: Option<PackageReportSource>,
     ) -> Self {
         self.package_report = package_report;
+        self
+    }
+
+    pub(crate) fn with_network_reports(mut self, reports: Vec<NetworkReportSource>) -> Self {
+        self.network_reports = reports;
         self
     }
 
@@ -202,6 +222,7 @@ where
     let mut terminal_response_sent = false;
     let mut package_report_served = false;
     let mut syscall_report_served = false;
+    let mut network_transfer = None;
     loop {
         match reader.receive().await? {
             Message::Request(request) if request.operation == AGENT_LAUNCH_OPERATION => {
@@ -236,6 +257,17 @@ where
                 )
                 .await?;
                 terminal_response_sent = true;
+            }
+            Message::Request(request)
+                if request.operation == sendbox_protocol::NETWORK_REPORT_OPERATION =>
+            {
+                let response = handle_network_report_request(
+                    request,
+                    &services.network_reports,
+                    terminal_response_sent,
+                    &mut network_transfer,
+                );
+                writer.send(&Message::Response(response)).await?;
             }
             Message::Request(request) if request.operation == PACKAGE_REPORT_OPERATION => {
                 let response = handle_package_report_request(
@@ -368,6 +400,100 @@ async fn handle_syscall_report_request(
         status: ResponseStatus::Ok,
         payload,
     })
+}
+
+fn handle_network_report_request(
+    request: Request,
+    sources: &[NetworkReportSource],
+    terminal: bool,
+    transfer: &mut Option<NetworkReportTransfer>,
+) -> Response {
+    use sendbox_protocol::{
+        NETWORK_REPORT_SCHEMA_VERSION, NetworkReportChunkV1, NetworkReportRequestV1,
+    };
+    let result = (|| -> Result<Vec<u8>, GuestError> {
+        if !terminal || sources.is_empty() {
+            return Err(GuestError::Protocol(
+                "network report requires a terminal workload and configured metadata".to_owned(),
+            ));
+        }
+        let chunk_request: NetworkReportRequestV1 = serde_json::from_slice(&request.payload)
+            .map_err(|error| {
+                GuestError::Protocol(format!("invalid network report request: {error}"))
+            })?;
+        if chunk_request.schema_version != NETWORK_REPORT_SCHEMA_VERSION
+            || chunk_request.offset as usize
+                != transfer.as_ref().map_or(0, |transfer| transfer.next_offset)
+        {
+            return Err(GuestError::Protocol(
+                "invalid network report offset or schema".to_owned(),
+            ));
+        }
+        if transfer.is_none() {
+            let mut gateways = serde_json::Map::new();
+            for source in sources {
+                let json = read_package_report(&source.report, source.report.maximum_bytes)?;
+                let status: serde_json::Value = serde_json::from_str(&json).map_err(|error| {
+                    GuestError::Protocol(format!("invalid network status JSON: {error}"))
+                })?;
+                gateways.insert(
+                    source.role.to_owned(),
+                    serde_json::json!({
+                        "configured_policy": source.configured_policy,
+                        "github_meta": status,
+                    }),
+                );
+            }
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schema_version": NETWORK_REPORT_SCHEMA_VERSION,
+                "gateways": gateways,
+            }))
+            .map_err(|error| GuestError::Protocol(format!("encode network report: {error}")))?;
+            if bytes.len() > sendbox_protocol::MAX_NETWORK_REPORT_BYTES {
+                return Err(GuestError::Protocol(
+                    "network report exceeds its byte limit".to_owned(),
+                ));
+            }
+            let sha256 = sha256_label(&bytes)
+                .trim_start_matches("sha256:")
+                .to_owned();
+            *transfer = Some(NetworkReportTransfer {
+                bytes,
+                sha256,
+                next_offset: 0,
+            });
+        }
+        let transfer = transfer.as_mut().expect("network transfer initialized");
+        let response = NetworkReportChunkV1::new(
+            transfer.next_offset,
+            transfer.bytes.len(),
+            transfer.sha256.clone(),
+            &transfer.bytes,
+        )
+        .map_err(|error| GuestError::Protocol(error.to_owned()))?;
+        let payload = serde_json::to_vec(&response).map_err(|error| {
+            GuestError::Protocol(format!("encode network report chunk: {error}"))
+        })?;
+        transfer.next_offset = (transfer.next_offset
+            + sendbox_protocol::NETWORK_REPORT_CHUNK_BYTES)
+            .min(transfer.bytes.len());
+        Ok(payload)
+    })();
+    match result {
+        Ok(payload) => Response {
+            request_id: request.request_id,
+            status: ResponseStatus::Ok,
+            payload,
+        },
+        Err(error) => {
+            eprintln!("sendbox-guest: network report retrieval failed: {error}");
+            Response {
+                request_id: request.request_id,
+                status: ResponseStatus::Rejected,
+                payload: br#"{"reason":"network-report-unavailable"}"#.to_vec(),
+            }
+        }
+    }
 }
 
 fn handle_package_report_request(
@@ -1315,6 +1441,93 @@ mod tests {
             })
             .expect("request"),
         }
+    }
+
+    fn network_request(offset: usize) -> Request {
+        Request {
+            request_id: 5,
+            operation: sendbox_protocol::NETWORK_REPORT_OPERATION.to_owned(),
+            payload: serde_json::to_vec(&sendbox_protocol::NetworkReportRequestV1 {
+                schema_version: sendbox_protocol::NETWORK_REPORT_SCHEMA_VERSION,
+                offset: u32::try_from(offset).unwrap(),
+            })
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn network_report_is_private_terminal_only_and_immutable_across_chunks() {
+        let temporary = crate::secure_fs::secure_tempdir();
+        let path = temporary.path().join("metadata.json");
+        let status = serde_json::json!({
+            "source": "https://api.github.com/meta",
+            "published_scope": {"domains": (0..3000).map(|i| format!("service{i}.fixture.test")).collect::<Vec<_>>()}
+        });
+        crate::runtime::atomic_json(&path, &status).unwrap();
+        let sources = vec![NetworkReportSource {
+            role: "workload",
+            configured_policy: serde_json::from_value(serde_json::json!({
+                "default_action": "deny", "allowed_domains": ["github.com"],
+                "blocked_domains": ["blocked.fixture.test"], "allow_dns": true
+            }))
+            .unwrap(),
+            report: PackageReportSource::new(
+                path.clone(),
+                getuid().as_raw(),
+                getgid().as_raw(),
+                128 * 1024,
+            )
+            .unwrap(),
+        }];
+        let mut transfer = None;
+        assert_eq!(
+            handle_network_report_request(network_request(0), &sources, false, &mut transfer)
+                .status,
+            ResponseStatus::Rejected
+        );
+        let mut bytes = Vec::new();
+        let mut expected_digest = None;
+        loop {
+            let response = handle_network_report_request(
+                network_request(bytes.len()),
+                &sources,
+                true,
+                &mut transfer,
+            );
+            assert_eq!(response.status, ResponseStatus::Ok);
+            assert!(response.payload.len() < sendbox_protocol::DEFAULT_MAX_FRAME_BYTES);
+            let chunk: sendbox_protocol::NetworkReportChunkV1 =
+                serde_json::from_slice(&response.payload).unwrap();
+            expected_digest.get_or_insert_with(|| chunk.sha256.clone());
+            assert_eq!(expected_digest.as_ref().unwrap(), &chunk.sha256);
+            bytes.extend_from_slice(&chunk.decode().unwrap());
+            crate::runtime::atomic_json(&path, &serde_json::json!({"replaced": true})).unwrap();
+            if bytes.len() == chunk.total_bytes as usize {
+                break;
+            }
+        }
+        assert_eq!(
+            sha256_label(&bytes),
+            format!("sha256:{}", expected_digest.unwrap())
+        );
+        let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["gateways"]["workload"]["github_meta"], status);
+        assert_eq!(
+            report["gateways"]["workload"]["configured_policy"]["blocked_domains"][0],
+            "blocked.fixture.test"
+        );
+        assert_eq!(
+            handle_network_report_request(network_request(0), &sources, true, &mut transfer).status,
+            ResponseStatus::Rejected
+        );
+        fs::remove_file(&path).unwrap();
+        let target = temporary.path().join("target.json");
+        crate::runtime::atomic_json(&target, &status).unwrap();
+        symlink(target, path).unwrap();
+        assert_eq!(
+            handle_network_report_request(network_request(0), &sources, true, &mut None).status,
+            ResponseStatus::Rejected
+        );
     }
 
     #[test]

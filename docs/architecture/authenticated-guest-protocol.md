@@ -109,6 +109,25 @@ capability.
 
 Safe Outputs uses request ID `3`, distinct from launch and package reporting.
 
+`network.report` is an independently versioned schema-v1 operation using request
+ID `5`. A signed `network_github_meta` admission requires its collection and the
+existing `Audit` capability. After the launch terminal response, the guest
+captures the latest root-owned workload/registry Meta status files once,
+together with the authenticated configured policies. Reads use the same
+descriptor-relative regular-file, owner, mode and link checks as package
+reports.
+
+The report is bounded to 4 MiB and transferred as sequential 32-KiB base64
+chunks under the existing frame limit. Every response repeats the total,
+offset and whole-report SHA-256. The host rejects unexpected offsets, changing
+identities, malformed or oversized chunks, unsupported schemas, and digest
+mismatches; the entire retrieval has a 30-second deadline. Source refreshes
+cannot mix two snapshots during transfer. There is no new wire capability
+discriminant or protocol-version change; an older peer rejects the distinct
+operation. The host atomically persists the validated JSON with mode `0600`,
+records its digest in signed session provenance, and includes a compact
+`network_report: {path, sha256}` reference in `run --json`.
+
 ## Terminal post-processing ordering
 
 The launch request remains request ID `1`. If package analysis is configured,
@@ -117,10 +136,12 @@ or Safe Outputs is enabled, the host follows this exact sequence:
 1. receive the launch terminal response and all preceding output;
 2. if configured, send one `package.report` request with request ID `2` and
    validate response status, schema, byte limit, and digest;
-3. if configured, send one `safe_outputs.collect` request with request ID `3`
+3. if configured, collect `network.report` with request ID `5`, then the syscall
+   report with request ID `4`;
+4. if configured, send one `safe_outputs.collect` request with request ID `3`
    and validate the authenticated artifact and seal;
-4. send graceful close; and
-5. independently revalidate and persist or apply the collected host-side
+5. send graceful close; and
+6. independently revalidate and persist or apply the collected host-side
    reports and operations.
 
 The guest rejects a report request before the terminal response, after a

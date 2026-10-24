@@ -37,7 +37,7 @@ use crate::dns_budget::DnsGuard;
 use crate::domain;
 use crate::http_proxy;
 use crate::origin::OriginReservations;
-use crate::policy::PolicyEngine;
+use crate::policy::{PolicyEngine, PolicySnapshot};
 use crate::resolver::{ResolveFailure, ResolveFailureKind, UpstreamResolver};
 use crate::socks5;
 use sendbox_policy::{DnsRecordType, Protocol};
@@ -515,6 +515,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         port: u16,
         expected_ip: Option<IpAddr>,
     ) -> Result<AuthorizedDial, ConnectFailure> {
+        let policy = self.policy.snapshot();
         let reserved = match target {
             ConnectTarget::Hostname(host) => self.reservations.denies_hostname(host, port),
             ConnectTarget::Ip(address) => self.reservations.denies_direct_ip(*address, port),
@@ -524,10 +525,12 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
             return Err(ConnectStatus::PolicyDenied.into());
         }
         let (target_ip, hostname_for_decision) = match target {
-            ConnectTarget::Hostname(host) => match self.resolve_pinned(host, expected_ip).await {
-                Ok((normalized, ip)) => (ip, Some(normalized)),
-                Err(status) => return Err(status),
-            },
+            ConnectTarget::Hostname(host) => {
+                match self.resolve_pinned(&policy, host, expected_ip).await {
+                    Ok((normalized, ip)) => (ip, Some(normalized)),
+                    Err(status) => return Err(status),
+                }
+            }
             ConnectTarget::Ip(ip) => {
                 if let Some(expected) = expected_ip
                     && expected != *ip
@@ -539,12 +542,10 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         };
 
         let decision = match &hostname_for_decision {
-            Some(name) => self
-                .policy
-                .decide_hostname(name, target_ip, port, Protocol::Tcp),
-            None => self.policy.decide_direct_ip(target_ip, port, Protocol::Tcp),
+            Some(name) => policy.decide_hostname(name, target_ip, port, Protocol::Tcp),
+            None => policy.decide_direct_ip(target_ip, port, Protocol::Tcp),
         };
-        if !decision.allowed {
+        if !decision.allowed || !policy.is_current() {
             return Err(ConnectStatus::PolicyDenied.into());
         }
 
@@ -554,10 +555,11 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
             .dial(dial_addr, self.config.connect_timeout)
             .await
         {
-            Ok(upstream) => Ok(AuthorizedDial {
+            Ok(upstream) if policy.is_current() => Ok(AuthorizedDial {
                 upstream,
                 target_ip,
             }),
+            Ok(_) => Err(ConnectStatus::PolicyDenied.into()),
             Err(error) => {
                 self.audit.record(AuditEvent::ConnectDialFailed {
                     target: target_label(target),
@@ -595,6 +597,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
     /// controls.
     async fn resolve_pinned(
         &self,
+        policy: &PolicySnapshot<'_>,
         host: &str,
         expected_ip: Option<std::net::IpAddr>,
     ) -> Result<(String, std::net::IpAddr), ConnectFailure> {
@@ -609,13 +612,15 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
             return Err(ConnectStatus::PolicyDenied.into());
         }
 
-        match self.policy.evaluate_domain_name(&normalized) {
+        match policy.evaluate_domain_name(&normalized) {
             Ok(true) => {}
             Ok(false) => return Err(ConnectStatus::PolicyDenied.into()),
             Err(_) => return Err(ConnectStatus::Malformed.into()),
         }
 
-        let mut candidates = self.authorizations.authorized_addresses(&normalized);
+        let mut candidates = self
+            .authorizations
+            .authorized_addresses_for_revision(&normalized, policy.revision());
         let expected_already_cached = expected_ip.is_some_and(|ip| candidates.contains(&ip));
         let need_fresh =
             candidates.is_empty() || (expected_ip.is_some() && !expected_already_cached);
@@ -628,7 +633,8 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
                     return Err(ConnectStatus::ResolutionFailed.into());
                 }
             } else {
-                self.fresh_resolve(&normalized, &mut candidates).await?;
+                self.fresh_resolve(policy, &normalized, &mut candidates)
+                    .await?;
             }
         }
 
@@ -649,6 +655,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
     /// the number of authorized addresses to the response-record limit.
     async fn fresh_resolve(
         &self,
+        policy: &PolicySnapshot<'_>,
         normalized: &str,
         candidates: &mut Vec<std::net::IpAddr>,
     ) -> Result<(), ConnectFailure> {
@@ -690,7 +697,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
 
         for hop in resolved.names_to_validate() {
             let hop_str = hop.to_utf8();
-            match self.policy.evaluate_domain_name(&hop_str) {
+            match policy.evaluate_domain_name(&hop_str) {
                 Ok(true) => {}
                 _ => return Err(ConnectStatus::PolicyDenied.into()),
             }
@@ -710,7 +717,7 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
             if !self.guard.record_type_allowed(record_type) {
                 continue;
             }
-            if !self.policy.address_permitted(ip).allowed {
+            if !policy.address_permitted(ip).allowed {
                 continue;
             }
             validated.push((ip, addr.ttl_secs));
@@ -719,10 +726,17 @@ impl<R: UpstreamResolver + 'static> ConnectBroker<R> {
         validated.dedup_by(|(a, _), (b, _)| a == b);
         validated.truncate(self.guard.max_response_records());
 
+        if !policy.is_current() {
+            return Err(ConnectStatus::PolicyDenied.into());
+        }
         for (ip, ttl_secs) in validated {
             let ttl = self.policy.cap_ttl(ttl_secs);
-            self.authorizations
-                .authorize(normalized, ip, Duration::from_secs(u64::from(ttl)));
+            self.authorizations.authorize_for_revision(
+                normalized,
+                ip,
+                Duration::from_secs(u64::from(ttl)),
+                policy.revision(),
+            );
             candidates.push(ip);
         }
         candidates.sort();

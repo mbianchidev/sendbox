@@ -29,7 +29,8 @@ pub enum DomainError {
 /// internal hyphens). Returns the canonical form used for all policy
 /// comparisons.
 pub fn normalize_domain(raw: &str) -> Result<String, DomainError> {
-    let trimmed = raw.trim().trim_end_matches('.');
+    let trimmed = raw.trim();
+    let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
     if trimmed.is_empty() {
         return Err(DomainError::Empty);
     }
@@ -58,10 +59,14 @@ pub fn normalize_domain(raw: &str) -> Result<String, DomainError> {
 /// The wildcard label itself is not subject to label validation; the
 /// remainder of the pattern is normalized as a domain name.
 pub fn normalize_pattern(raw: &str) -> Result<String, DomainError> {
-    let trimmed = raw.trim().trim_end_matches('.');
+    let trimmed = raw.trim();
     if let Some(rest) = trimmed.strip_prefix("*.") {
         let normalized_rest = normalize_domain(rest)?;
-        Ok(format!("*.{normalized_rest}"))
+        let pattern = format!("*.{normalized_rest}");
+        if pattern.len() > MAX_DOMAIN_OCTETS {
+            return Err(DomainError::TooLong);
+        }
+        Ok(pattern)
     } else {
         normalize_domain(trimmed)
     }
@@ -147,6 +152,12 @@ mod tests {
         let pattern = normalize_pattern("example.com").unwrap();
         assert!(pattern_matches(&pattern, "example.com"));
         assert!(!pattern_matches(&pattern, "sub.example.com"));
+    }
+
+    #[test]
+    fn rejects_multiple_root_dots_in_names_and_wildcards() {
+        assert!(normalize_domain("example.com..").is_err());
+        assert!(normalize_pattern("*.example.com..").is_err());
     }
 
     #[test]
