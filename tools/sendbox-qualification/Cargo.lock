@@ -514,7 +514,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sendbox-config"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rustix",
  "sendbox-core",
@@ -528,14 +528,14 @@ dependencies = [
 
 [[package]]
 name = "sendbox-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "sendbox-git"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rustix",
  "sendbox-core",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-policy"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sendbox-core",
  "serde",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-protocol"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "getrandom",
