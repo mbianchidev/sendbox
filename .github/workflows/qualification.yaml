@@ -38,6 +38,9 @@ jobs:
   validate:
     name: Validate qualification data
     runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: "4"
+      RUST_TEST_THREADS: "4"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -56,6 +59,13 @@ jobs:
             make \
             pkg-config \
             zlib1g-dev
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            tools/sendbox-qualification -> target
 
       - name: Check formatting
         run: cargo fmt --manifest-path tools/sendbox-qualification/Cargo.toml --all -- --check

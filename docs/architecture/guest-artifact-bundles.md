@@ -146,16 +146,19 @@ their outputs before transfer to retain the original file modes. Verification
 jobs compare every reproducibility proof and check the installed bundle as an
 unprivileged user before uploading the final artifacts. OCI export reuses the
 first build's local layers instead of performing a third clean compilation.
-CI sets `CARGO_BUILD_JOBS=2`; local and release builds retain the Dockerfile's
-default of one Cargo job unless explicitly overridden with a build argument.
+CI and tag-triggered release builds set `CARGO_BUILD_JOBS=2`; local builds retain
+the Dockerfile's default of one Cargo job unless explicitly overridden.
+The quality, clean-build and verification wrappers use `ubuntu-latest` for
+x86_64, while native arm64 retains `ubuntu-24.04-arm`.
 
 The [production guest workflow](../../.github/workflows/guest-artifacts.yaml)
 automatically runs the privileged live BPF smoke test on relevant pull requests
 to `main` and pushes to `main`, using the workflow's existing path filters.
 Manual dispatch runs the same test without an additional `live` input.
 
-The matrix uses native `ubuntu-24.04` (`x86_64`) and `ubuntu-24.04-arm`
-(`aarch64`) runners. Each job builds its architecture-specific CO-RE object,
+The live-event matrix keeps native `ubuntu-24.04` (`x86_64`) and
+`ubuntu-24.04-arm` (`aarch64`) runners to preserve the qualified kernel proof.
+Each job builds its architecture-specific CO-RE object,
 exports it through the Dockerfile's `bpf-artifact` target, mounts tracefs if
 needed, and runs the live test with `SENDBOX_BPF_LIVE=1` under `sudo`. The test
 loads and attaches the programs, executes `/bin/true`, and requires both exec
