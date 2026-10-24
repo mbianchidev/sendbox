@@ -206,3 +206,10 @@ for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. The CI job bui
 each architecture twice without cache, compares same-architecture binaries, and
 uses `file`, `readelf`, and `ldd` evidence to reject an ELF interpreter or shared
 dependency.
+
+Guest Supervisor CI passes `--build-arg CARGO_BUILD_JOBS=2` to the quality build
+and both clean builds on each native architecture, matching production bundle
+CI's compiler budget. The Dockerfile still defaults to one Cargo build worker
+for local builds. Only compilation concurrency changes: locked dependencies,
+quality checks, dependency audits, static-link checks, and both uncached
+reproducibility builds remain unchanged.
