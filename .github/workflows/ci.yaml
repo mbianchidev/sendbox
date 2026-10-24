@@ -20,7 +20,7 @@ env:
 jobs:
   homebrew:
     name: Homebrew updater
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -32,13 +32,18 @@ jobs:
 
   build-and-test:
     name: ${{ matrix.task == 'checks' && 'Rust' || 'Build and install' }} (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: true
       matrix:
         os: [macos-15, ubuntu-24.04]
         task: [checks, build]
+        include:
+          - os: macos-15
+            runner: macos-latest
+          - os: ubuntu-24.04
+            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -147,7 +152,7 @@ jobs:
 
   dependency-audit:
     name: Rust dependency audit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 

@@ -50,6 +50,16 @@ Run all formatting, clippy, unit, audit, and strict CO-RE compile checks:
 docker build --no-cache --target quality spikes/guest-bpf
 ```
 
+The pinned Rust/Alpine image, compiler versions and BTF inputs remain fixed.
+Its OpenSSL, curl, musl, xz and zlib package patches are pinned to the compatible
+repository versions, including explicit OpenSSL/zlib runtime-library pins so
+the base image's older installed libraries cannot conflict with the headers.
+Cargo defaults to four workers, matching the standard public x64 CI runner.
+For a memory-constrained local engine, pass `--build-arg CARGO_BUILD_JOBS=1`
+to the build commands; this does not skip any checks or enable caching.
+Generic CI wrappers use `ubuntu-latest`; the architecture-specific container
+inputs and the existing x86_64/arm64 static proofs remain fixed.
+
 Export either static artifact:
 
 ```bash

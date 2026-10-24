@@ -213,3 +213,8 @@ CI's compiler budget. The Dockerfile still defaults to one Cargo build worker
 for local builds. Only compilation concurrency changes: locked dependencies,
 quality checks, dependency audits, static-link checks, and both uncached
 reproducibility builds remain unchanged.
+
+The x86_64 build wrappers follow `ubuntu-latest`. Native arm64 retains
+`ubuntu-24.04-arm`, because GitHub has no supported floating arm64 Ubuntu alias.
+The digest-pinned container and compiler inputs remain independent of the
+wrapper image; the two-worker budget and both clean proofs are unchanged.

@@ -249,6 +249,23 @@ which publishes GitHub assets and GHCR artifacts, including macOS installers,
 Linux archives, and signed guest bundles. The required release-signing secret
 is already configured; no local signing key is needed.
 
+Native macOS arm64 and Linux x86_64/aarch64 CLI tests and builds run in parallel
+with the signed guest builds. Each packaging job waits for both producers and
+verifies the checksum and executable mode of its matching, commit-specific CLI
+archive before combining those exact tested bytes with the signed guest payload.
+The internal CLI archives retain the default Actions artifact lifetime and are
+excluded from published assets. Signing, clean guest builds, package checksums,
+release provenance, GHCR publication, and stable Homebrew verification are
+unchanged.
+
+Generic build and packaging hosts follow `ubuntu-latest` and `macos-latest`
+where compatible. Linux CLI producers retain Ubuntu 24.04 to avoid raising
+their glibc baseline when the alias advances; native arm64 jobs retain
+`ubuntu-24.04-arm` because no supported floating arm64 Ubuntu alias exists.
+The macOS producer pins and verifies the existing arm64 binary deployment
+floor at macOS 11.0 independently of the build image. The Apple runtime still
+requires macOS 26 or newer.
+
 On failure, the script stops and preserves any branch, PR, or tag already
 created. Resolve the underlying failure, then run the **same command with the
 same version** to resume. It reuses a committed `release/vX.Y.Z` branch and its

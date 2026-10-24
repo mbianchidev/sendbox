@@ -62,6 +62,32 @@ mocked GitHub commands. These tests never publish a release or contact GitHub:
 cargo test --locked -p sendbox-cli --test release_script
 ```
 
+Hosted Apple, Hyperlight, and qualification checks also cache Rust dependencies;
+qualification caches both its standalone workspace and the root CLI workspace.
+These caches restore on pull requests but save only on `main`, avoiding another
+set of large target caches for every PR.
+These jobs explicitly budget three workers on macOS and four on Linux, matching
+the standard public runners without reducing their existing CPU parallelism or
+changing the prepared self-hosted live gates. The Apple adapter spike, egress
+spike, production egress, and production exec workflows share CI's platform-
+and version-keyed `cargo-audit` executable cache. Cache hits skip only installing
+the audit tool, never the dependency audit or advisory database refresh.
+
+Generic hosted x64 Linux jobs use `ubuntu-latest`; generic Apple-silicon jobs
+use `macos-latest`. Matrix `os` values and existing job names remain stable
+status-check identifiers; the separate `runner` field selects the current
+image. Version strings in those check names are not runner pins.
+Native Linux arm64 jobs retain `ubuntu-24.04-arm`, because GitHub has no
+documented `ubuntu-latest-arm` alias. Kernel-specific BPF, exec and egress live
+proofs keep their qualified Ubuntu 24.04 hosts, and prepared self-hosted gates
+keep their hardware labels.
+
+Release CLI builds retain Ubuntu 24.04 for their glibc-linked Linux binaries.
+The macOS producer uses `macos-latest` but explicitly retains the existing
+`MACOSX_DEPLOYMENT_TARGET=11.0` binary floor and verifies arm64/Mach-O metadata.
+This does not change the Apple runtime's macOS 26+ requirement. Packaging and
+publication jobs can follow the hosted aliases without relinking these bytes.
+
 Guest artifact CI runs the two clean builds for each architecture in separate
 parallel jobs and compares their outputs before publishing the verified bundle.
 See [guest artifact CI](architecture/guest-artifact-bundles.md#continuous-integration)
@@ -91,6 +117,12 @@ Stable releases reuse the published archives to prepare a Homebrew formula
 update in the existing tap; they do not compile a separate Homebrew binary.
 Release builds cache Rust dependencies by toolchain/platform/lockfile and
 reuse each signed guest artifact for the host packages and publication.
+Native CLI tests and release builds run alongside the independent signed guest
+builds. Packaging waits for both and restores the tested CLI from a same-run,
+commit- and platform-specific archive, verifying its checksum and executable
+mode rather than compiling it again. These internal CLI archives keep the
+repository's default artifact retention for failed-job retries and are not
+included in the public `release-*` asset set.
 Clean guest-container builds and the existing macOS/Linux checks remain in
 place. See [stable Homebrew updates](installation.md#stable-homebrew-updates)
 for deploy-key scope, draft PR review, activation, and retry procedures.

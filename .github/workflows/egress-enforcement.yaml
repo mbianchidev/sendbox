@@ -54,7 +54,7 @@ env:
 jobs:
   checks:
     name: Format, clippy, tests, release, audit (ubuntu-24.04)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -85,7 +85,15 @@ jobs:
       - name: Build release
         run: cargo +${{ env.RUST_VERSION }} build -p sendbox-egress --release
 
+      - name: Cache cargo-audit executable
+        id: audit-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_AUDIT_VERSION }}
+
       - name: Install pinned cargo-audit
+        if: steps.audit-cache.outputs.cache-hit != 'true'
         run: cargo +${{ env.RUST_VERSION }} install cargo-audit --version ${{ env.CARGO_AUDIT_VERSION }} --locked
 
       - name: Audit dependencies
@@ -93,7 +101,7 @@ jobs:
 
   aarch64-compile:
     name: aarch64 cross compile check (ubuntu-24.04)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 

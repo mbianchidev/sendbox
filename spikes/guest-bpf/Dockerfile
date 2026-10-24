@@ -2,24 +2,30 @@
 FROM rust:1.93.1-alpine3.23@sha256:4fec02de605563c297c78a31064c8335bc004fa2b0bf406b1b99441da64e2d2d AS toolchain
 
 ARG TARGETARCH
+ARG CARGO_BUILD_JOBS=4
+
+ENV CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS
 
 RUN apk add --no-cache \
         binutils=2.45.1-r0 \
         bpftool=6.19.14-r0 \
         clang21=21.1.2-r2 \
-        curl=8.20.0-r0 \
+        curl=8.22.0-r0 \
         elfutils-dev=0.194-r0 \
         file=5.46-r2 \
         libbpf-dev=1.6.2-r0 \
+        libcrypto3=3.5.9-r0 \
+        libssl3=3.5.9-r0 \
         linux-headers=6.16.12-r0 \
         llvm21=21.1.2-r1 \
         make=4.4.1-r3 \
-        musl-dev=1.2.5-r23 \
-        openssl-dev=3.5.7-r0 \
+        musl-dev=1.2.5-r24 \
+        openssl-dev=3.5.9-r0 \
         pkgconf=2.5.1-r0 \
-        xz=5.8.3-r0 \
-        zlib-dev=1.3.2-r0 \
-        zlib-static=1.3.2-r0 \
+        xz=5.8.4-r0 \
+        zlib=1.3.2-r1 \
+        zlib-dev=1.3.2-r1 \
+        zlib-static=1.3.2-r1 \
         zstd-dev=1.5.7-r2 \
         zstd-static=1.5.7-r2
 
