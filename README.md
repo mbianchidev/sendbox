@@ -55,7 +55,11 @@ domains and IPv4/IPv6 CIDRs, including shared-cloud ranges. See
 | **GitHub Copilot CLI** | `--agent copilot` | `/usr/local/bin/copilot` |
 | **Gemini CLI** | `--agent gemini` | `/usr/local/bin/gemini` |
 | **OpenCode** | `--agent opencode` | `/usr/local/bin/opencode` |
+| **Moguri** | `--agent custom` | `/usr/local/bin/moguri` |
 | **Custom CLI agents and programs** | `--agent custom` | Your explicitly allowed absolute path |
+
+For Moguri, use the `custom` profile and explicitly configure its entry command
+and required provider endpoints.
 
 Profiles configure the agent's entry command and initial inference hosts; they
 **do not install the agent or log you in**. Your workload image must contain the
