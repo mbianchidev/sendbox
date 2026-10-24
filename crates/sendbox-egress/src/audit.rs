@@ -12,12 +12,17 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 use crate::dns_budget::DnsLimit;
+use crate::github_meta::GitHubMetaStatus;
 use crate::resolver::ResolveFailure;
 
 /// A single, self-describing egress decision record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AuditEvent {
+    /// Full published scope, digest, provenance, freshness and failure state.
+    /// The enclosing configured policy's deny/restricted controls still apply.
+    #[serde(rename = "github_meta")]
+    GitHubMeta { status: Box<GitHubMetaStatus> },
     /// A DNS query was answered with validated addresses.
     DnsAllowed {
         name: String,
@@ -87,6 +92,13 @@ impl AuditEvent {
 /// non-blocking; the brokers call [`AuditSink::record`] on their hot path.
 pub trait AuditSink: Send + Sync {
     fn record(&self, event: AuditEvent);
+
+    fn record_github_meta(&self, status: GitHubMetaStatus) -> std::io::Result<()> {
+        self.record(AuditEvent::GitHubMeta {
+            status: Box::new(status),
+        });
+        Ok(())
+    }
 }
 
 /// Discards every event. Used when auditing is disabled.

@@ -102,6 +102,12 @@ jobs:
           rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --component clippy
           rustup target add aarch64-unknown-linux-gnu --toolchain ${{ env.RUST_VERSION }}
 
+      - name: Install TLS crypto cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
       # Compile-check (no link/run) the whole crate — library, harness bin, and
       # the cfg(linux) enforcement layer + gated live test — for aarch64 Linux.
       # This gives reliable arm64 compile coverage on a GitHub-hosted x86 runner.

@@ -51,6 +51,15 @@ credential-masked terminal diagnostic in the result's `message` field and keeps
 the existing nonzero exit code. Text mode prints that diagnostic to stderr.
 Successful result objects do not add a failure message.
 
+For an exact `github.com` grant, the final JSON result includes
+`network_report: {path, sha256}`. The private JSON artifact contains the configured policy
+and latest GitHub Meta scope/provenance for each active gateway role. Read its
+freshness, failure and expiry fields before interpreting the published grants;
+explicit deny and restricted-address rules still apply. It is authenticated
+guest evidence whose digest is recorded in session provenance, not a separately
+GitHub-signed feed or a complete refresh log.
+See [network grants](configuration.md#network-grants).
+
 ## Examples
 
 ```bash
@@ -70,7 +79,7 @@ sendbox analyze --project . --output .devcontainer/
 # Validate a sandbox configuration's policy
 sendbox policy validate --config sendbox.yaml
 
-# Show the effective policy as deterministic JSON
+# Show configured policy as deterministic JSON (no live metadata retrieval)
 sendbox policy show --config sendbox.yaml --json
 
 # Show the latest package-enabled run and its complete report

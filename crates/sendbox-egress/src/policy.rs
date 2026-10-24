@@ -2,7 +2,8 @@
 //! canonically from [`sendbox_policy::NetworkPolicy`].
 //!
 //! `sendbox_policy::NetworkPolicy` is the single source of truth. This module
-//! compiles it once into a [`PolicyEngine`] and never mutates it. Precedence
+//! compiles its configured rules once. An explicit `github.com` grant adds an
+//! expiring GitHub Meta scope without rewriting those rules. Precedence
 //! rules, in order:
 //! 1. An explicit blocked IP/CIDR entry always denies.
 //! 2. A restricted [`AddressClass`] (loopback, link-local, multicast,
@@ -11,12 +12,13 @@
 //!    can never unlock a restricted address class by itself.
 //! 3. A blocked domain pattern always denies (hostname connections only).
 //! 4. Port/protocol constraints, when configured, must match.
-//! 5. Remaining decisions fall back to an allowed-domain match or the
+//! 5. Remaining decisions fall back to a configured/published domain match or the
 //!    policy's `default_action` (hostname connections), or to an explicit
-//!    network grant or `default_action` (direct-IP connections, which never
+//!    configured/published network grant or `default_action` (direct-IP connections, which never
 //!    consult domain rules).
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use ipnet::IpNet;
 use sendbox_policy::{Action, DnsPolicy, NetworkPolicy, PortRule, Protocol};
@@ -25,6 +27,7 @@ use thiserror::Error;
 
 use crate::address::{AddressClass, classify};
 use crate::domain::{self, DomainError};
+use crate::github_meta::{GitHubMeta, GitHubMetaScope};
 
 /// Default concurrent-connection cap applied when `max_connections` is unset
 /// (or non-positive). Chosen to match the shipped default policy comment.
@@ -182,6 +185,16 @@ pub struct PolicyEngine {
     allowed_ports: Vec<PortRule>,
     max_concurrent_connections: u32,
     dns: DnsPolicy,
+    github_meta: Option<GitHubMeta>,
+}
+
+/// One immutable view of both configured rules and a whole, unexpired Meta
+/// response. Brokers keep this view across resolution and reject its cache
+/// writes if a concurrent refresh or expiry changes the revision.
+pub struct PolicySnapshot<'a> {
+    engine: &'a PolicyEngine,
+    github_scope: Option<Arc<GitHubMetaScope>>,
+    revision: u64,
 }
 
 impl PolicyEngine {
@@ -196,6 +209,11 @@ impl PolicyEngine {
 
         validate_dns_controls(&policy.dns)?;
         let max_concurrent_connections = resolve_max_connections(policy.max_connections)?;
+        let github_meta = (allowed_domains.iter().any(|name| name == "github.com")
+            && !blocked_domains
+                .iter()
+                .any(|pattern| domain::pattern_matches(pattern, "github.com")))
+        .then(GitHubMeta::default);
 
         Ok(Self {
             default_action: policy.default_action,
@@ -207,6 +225,7 @@ impl PolicyEngine {
             allowed_ports: policy.allowed_ports.clone(),
             max_concurrent_connections,
             dns: policy.dns.clone(),
+            github_meta,
         })
     }
 
@@ -239,6 +258,76 @@ impl PolicyEngine {
         ttl_secs.min(self.dns.max_ttl_secs)
     }
 
+    #[must_use]
+    pub fn github_meta(&self) -> Option<&GitHubMeta> {
+        self.github_meta.as_ref()
+    }
+
+    pub(crate) fn github_meta_name_permitted(&self, name: &str) -> bool {
+        self.github_meta.is_some()
+            && self.allow_dns
+            && !self
+                .blocked_domains
+                .iter()
+                .any(|pattern| domain::pattern_matches(pattern, name))
+            && (self.allowed_ports.is_empty()
+                || self
+                    .allowed_ports
+                    .iter()
+                    .any(|rule| rule.protocol == Protocol::Tcp && rule.port == 443))
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> PolicySnapshot<'_> {
+        let (revision, github_scope) = self
+            .github_meta
+            .as_ref()
+            .map(GitHubMeta::view)
+            .unwrap_or((0, None));
+        PolicySnapshot {
+            engine: self,
+            github_scope,
+            revision,
+        }
+    }
+
+    pub fn evaluate_domain_name(&self, name: &str) -> Result<bool, DomainError> {
+        self.snapshot().evaluate_domain_name(name)
+    }
+
+    #[must_use]
+    pub fn address_permitted(&self, ip: IpAddr) -> Decision {
+        self.snapshot().address_permitted(ip)
+    }
+
+    #[must_use]
+    pub fn decide_hostname(
+        &self,
+        name: &str,
+        ip: IpAddr,
+        port: u16,
+        protocol: Protocol,
+    ) -> Decision {
+        self.snapshot().decide_hostname(name, ip, port, protocol)
+    }
+
+    #[must_use]
+    pub fn decide_direct_ip(&self, ip: IpAddr, port: u16, protocol: Protocol) -> Decision {
+        self.snapshot().decide_direct_ip(ip, port, protocol)
+    }
+}
+
+impl PolicySnapshot<'_> {
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.engine.snapshot().revision == self.revision
+    }
+
     /// Evaluates a domain name in isolation (used by the DNS broker to
     /// validate every CNAME hop and the final owner name before any address
     /// is considered).
@@ -249,6 +338,7 @@ impl PolicyEngine {
 
     fn evaluate_domain(&self, normalized: &str) -> DomainDecision {
         if let Some(pattern) = self
+            .engine
             .blocked_domains
             .iter()
             .find(|p| domain::pattern_matches(p, normalized))
@@ -259,6 +349,7 @@ impl PolicyEngine {
             };
         }
         if let Some(pattern) = self
+            .engine
             .allowed_domains
             .iter()
             .find(|p| domain::pattern_matches(p, normalized))
@@ -268,7 +359,18 @@ impl PolicyEngine {
                 reason: format!("domain '{normalized}' matches allowed pattern '{pattern}'"),
             };
         }
-        match self.default_action {
+        if let Some(pattern) = self.github_scope.as_ref().and_then(|scope| {
+            scope
+                .domains
+                .iter()
+                .find(|pattern| domain::pattern_matches(pattern, normalized))
+        }) {
+            return DomainDecision {
+                allowed: true,
+                reason: format!("domain '{normalized}' matches GitHub Meta pattern '{pattern}'"),
+            };
+        }
+        match self.engine.default_action {
             Action::Allow => DomainDecision {
                 allowed: true,
                 reason: format!("domain '{normalized}' allowed by default action"),
@@ -281,16 +383,23 @@ impl PolicyEngine {
     }
 
     fn network_blocked(&self, ip: IpAddr) -> bool {
-        self.blocked_networks.iter().any(|net| net.contains(&ip))
+        self.engine
+            .blocked_networks
+            .iter()
+            .any(|net| net.contains(&ip))
     }
 
     fn network_allowed(&self, ip: IpAddr) -> bool {
-        self.allowed_networks.iter().any(|net| net.contains(&ip))
+        self.engine
+            .allowed_networks
+            .iter()
+            .any(|net| net.contains(&ip))
     }
 
     fn port_allowed(&self, protocol: Protocol, port: u16) -> bool {
-        self.allowed_ports.is_empty()
+        self.engine.allowed_ports.is_empty()
             || self
+                .engine
                 .allowed_ports
                 .iter()
                 .any(|rule| rule.protocol == protocol && rule.port == port)
@@ -399,7 +508,17 @@ impl PolicyEngine {
                 class,
             );
         }
-        match self.default_action {
+        if self
+            .github_scope
+            .as_ref()
+            .is_some_and(|scope| scope.networks.iter().any(|network| network.contains(&ip)))
+        {
+            return Decision::allow(
+                format!("ip '{ip}' matches a published GitHub Meta network"),
+                class,
+            );
+        }
+        match self.engine.default_action {
             Action::Allow => Decision::allow(format!("ip '{ip}' allowed by default action"), class),
             Action::Deny => Decision::deny(format!("ip '{ip}' denied by default action"), class),
         }
@@ -439,6 +558,70 @@ mod tests {
     use super::*;
     use sendbox_policy::DnsPolicy;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn only_an_effective_exact_github_apex_grant_triggers_metadata() {
+        for domains in [
+            vec!["api.github.com"],
+            vec!["*.github.com"],
+            vec!["notgithub.com"],
+        ] {
+            let mut raw = policy(Action::Allow);
+            raw.allowed_domains = domains.into_iter().map(str::to_owned).collect();
+            assert!(PolicyEngine::compile(&raw).unwrap().github_meta().is_none());
+        }
+        let mut raw = policy(Action::Deny);
+        raw.allowed_domains = vec!["github.com".to_owned()];
+        raw.blocked_domains = vec!["github.com".to_owned()];
+        assert!(PolicyEngine::compile(&raw).unwrap().github_meta().is_none());
+    }
+
+    #[test]
+    fn explicit_github_grant_adds_published_destinations_without_overriding_denies() {
+        let mut raw = policy(Action::Deny);
+        raw.allowed_domains = vec!["GitHub.COM.".to_owned()];
+        raw.blocked_domains = vec!["denied.github.test".to_owned()];
+        raw.blocked_networks = vec!["203.0.113.9/32".to_owned()];
+        let engine = PolicyEngine::compile(&raw).unwrap();
+        assert!(!engine.evaluate_domain_name("api.github.test").unwrap());
+        engine
+            .github_meta()
+            .unwrap()
+            .install_response(crate::github_meta::GitHubMetaResponse::Modified {
+                body: serde_json::to_vec(&serde_json::json!({
+                    "verifiable_password_authentication": false,
+                    "web": ["203.0.113.0/24"],
+                    "api": ["2001:db8:1234::/48"],
+                    "git": ["10.0.0.0/8"],
+                    "domains": {"website": ["*.github.test"]}
+                }))
+                .unwrap(),
+                etag: Some("\"fixture-v1\"".to_owned()),
+            })
+            .unwrap();
+        assert!(engine.evaluate_domain_name("api.github.test").unwrap());
+        assert!(!engine.evaluate_domain_name("denied.github.test").unwrap());
+        assert!(!engine.evaluate_domain_name("google.test").unwrap());
+        for ip in ["203.0.113.1", "2001:db8:1234::1"] {
+            assert!(
+                engine
+                    .decide_direct_ip(ip.parse().unwrap(), 443, Protocol::Tcp)
+                    .allowed
+            );
+        }
+        for ip in [
+            "203.0.113.9",
+            "10.0.0.1",
+            "169.254.169.254",
+            "2001:db8:9999::1",
+        ] {
+            assert!(
+                !engine
+                    .decide_direct_ip(ip.parse().unwrap(), 443, Protocol::Tcp)
+                    .allowed
+            );
+        }
+    }
 
     fn policy(default_action: Action) -> NetworkPolicy {
         NetworkPolicy {

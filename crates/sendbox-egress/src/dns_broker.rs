@@ -180,6 +180,7 @@ impl<R: UpstreamResolver + 'static> DnsBroker<R> {
     }
 
     async fn resolve_and_validate(&self, name: &Name, qtype: DnsRecordType) -> QueryOutcome {
+        let policy = self.policy.snapshot();
         let original = match crate::domain::normalize_domain(&name.to_utf8()) {
             Ok(normalized) => normalized,
             Err(_) => {
@@ -203,7 +204,7 @@ impl<R: UpstreamResolver + 'static> DnsBroker<R> {
             };
         }
 
-        match self.policy.evaluate_domain_name(&original) {
+        match policy.evaluate_domain_name(&original) {
             Ok(true) => {}
             Ok(false) => {
                 return QueryOutcome::Denied {
@@ -270,7 +271,7 @@ impl<R: UpstreamResolver + 'static> DnsBroker<R> {
 
         for hop in resolved.names_to_validate() {
             let hop_str = hop.to_utf8();
-            match self.policy.evaluate_domain_name(&hop_str) {
+            match policy.evaluate_domain_name(&hop_str) {
                 Ok(true) => {}
                 Ok(false) => {
                     return QueryOutcome::Denied {
@@ -306,7 +307,7 @@ impl<R: UpstreamResolver + 'static> DnsBroker<R> {
             .collect();
 
         for addr in &matching_addresses {
-            if !self.policy.address_permitted(addr.ip).allowed {
+            if !policy.address_permitted(addr.ip).allowed {
                 return QueryOutcome::Denied {
                     code: ResponseCode::Refused,
                     reason: "resolved address is restricted by policy",
@@ -327,11 +328,18 @@ impl<R: UpstreamResolver + 'static> DnsBroker<R> {
             .unwrap_or(0);
         let capped_ttl = self.policy.cap_ttl(ttl);
 
+        if !policy.is_current() {
+            return QueryOutcome::Denied {
+                code: ResponseCode::ServFail,
+                reason: "network scope changed during resolution",
+            };
+        }
         for addr in &matching_addresses {
-            self.authorizations.authorize(
+            self.authorizations.authorize_for_revision(
                 &original,
                 addr.ip,
                 Duration::from_secs(u64::from(capped_ttl)),
+                policy.revision(),
             );
         }
 

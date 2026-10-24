@@ -217,6 +217,8 @@ policy:
     # Domains the agent can reach. Apple and Kata support wildcard subdomains.
     # Hyperlight requires concrete hostnames because its host CLI resolves each
     # entry before launching the micro-VM.
+    # On Apple/Kata, github.com also grants the official Meta domains and CIDRs,
+    # including shared-cloud ranges. Initial HTTPS retrieval is required.
     allowed_domains:
       - "github.com"
       - "*.github.com"

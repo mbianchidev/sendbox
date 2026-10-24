@@ -47,6 +47,8 @@ permits, and do so with a mechanism that:
 | `dns_broker` | Loopback DNS broker: decodes/validates/authorizes, applies budgets, emits audit events. |
 | `connect_broker` | Loopback CONNECT broker: selectable front end, pins the validated address, re-checks the port-aware decision, dials via a `Dialer`, proxies bytes. |
 | `gateway` | Colocates both brokers so they share one `AuthorizationCache`, engine, guard, and audit sink. |
+| `github_meta` | Validates whole official Meta documents; owns single-flight, expiring immutable snapshots, conditional refresh and provenance. |
+| `github_meta_client` | Anonymous fixed-origin HTTPS using the shared resolver and exact-IP marked dialer, verified TLS, bounded bodies and no redirects or environment proxy. |
 | `audit` | Typed, deterministic, serializable audit events and sinks. |
 | `dialer` | The `Dialer` abstraction and `SO_MARK`-aware socket helpers. |
 | `runtime` | Session-derived authenticated runtime policy, stable instance/table/mark identity, execution-cgroup parent, and exact proxy environment. |
@@ -216,7 +218,7 @@ everything down.
 
 ## Authenticated production composition
 
-The host derives a schema-v4 `RuntimePolicyDocument` from the authenticated
+The host derives a schema-v5 `RuntimePolicyDocument` from the authenticated
 session ID, configured `NetworkPolicy`, any remote MCP origins, and any package
 registry isolation. Apple and Kata bind that exact document into guest bootstrap
 together with the matching execution broker cgroup parent. The guest rejects
@@ -254,6 +256,55 @@ policy and is reachable only from the registry cgroup.
 Shutdown runs in reverse dependency order: Exec is fully stopped before Egress
 restores resolver state and attempts cgroup-then-nftables teardown. All service
 shutdown failures are aggregated rather than abandoning later cleanup.
+
+### GitHub Meta delegation and refresh
+
+An effective exact `github.com` grant delegates to the fixed official Meta API.
+Compilation stays offline and immutable for configured rules. The gateway must
+successfully prepare a validated snapshot **after** its marked identity is
+armed and **before** readiness. Its owned refresh task checks hourly with a
+ten-second request deadline and conditional ETags. It is cancelled and drained
+alongside the brokers, not detached or shared with unrelated sessions.
+
+The parser explicitly reviews the documented CIDR fields plus the live
+`shared_ingress` field, the arrays under `domains`, the full/wildcard inbound
+Actions domains, and artifact-attestation `services`. SSH/commit keys and
+`trust_domain` identities never become routes. Unknown fields or any invalid
+destination reject the complete candidate. Limits are 2 MiB, 16,384 network
+entries and 4,096 domain entries before deduplication; default routes are
+rejected. The source is API version `2022-11-28`, not a caller-supplied URL.
+
+Each request evaluates one immutable scope view. DNS pins carry its revision;
+every successful refresh/revalidation changes that revision, and an expiry
+produces a scope-less view. New CONNECTs therefore cannot reuse authorizations
+for removed CNAMEs. In-flight resolutions and dials recheck their revision.
+Explicit domain/network denies, restricted-address checks, ports, DNS controls,
+MCP reservations and trusted-registry separation remain authoritative.
+Published networks only add public direct-IP reachability; they never unlock a
+restricted address class or authorize an unlisted hostname.
+
+An invalid initial response is fatal. A later failed refresh retains the
+last-good scope only until 24 hours after successful validation, checked with a
+monotonic clock on every new view. The status distinguishes pending, fresh,
+degraded, unavailable and expired. The previous digest/scope remains diagnostic
+after expiry, but has no granting power. No persistent authorization/feed cache
+is loaded at restart. Existing tunnels retain their original 300-second bound;
+refresh is not retroactive application-layer revocation.
+
+Before activating a candidate, production atomically publishes its full status
+to a root-owned `0600` file under the existing private session directory.
+Publication failure revokes derived scope and is fatal to the gateway.
+`AuditSink::record_github_meta` is fallible; the normal typed JSON event is also
+emitted. Unlike ordinary captured stderr counts, these files feed the bounded
+authenticated `network.report` operation and final CLI JSON evidence. The
+report includes the configured policy next to the latest published scope and
+its URL, API version, digest, ETag, revision, timestamps and failure state.
+It is a latest-attempt snapshot, not an append-only audit history.
+
+The boundary-plan format remains v3. Its `network_github_meta` feature binds
+the schema-v5 egress document digest and requires authenticated report
+collection. Matching updated host/guest artifacts are necessary; release
+v0.2.3 consumers do not acquire these semantics merely by changing settings.
 
 ## Atomic apply / update / rollback and fail-closed teardown
 

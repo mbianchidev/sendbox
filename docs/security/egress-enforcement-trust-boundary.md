@@ -79,6 +79,18 @@ nftables default-drop denies every other cgroup/destination combination
   QTYPE allowlist, a response-record cap, and per-window query-count, query-octet,
   distinct-name, and distinct-dynamic-label budgets with bounded state. Every
   structural/budget field is range-validated (fail closed) at compile time.
+- An exact `github.com` grant delegates to validated, expiring public
+  destinations from the fixed official HTTPS Meta API. Every broker uses the
+  same snapshot revision; refresh/expiry retires DNS pins and rechecks
+  in-flight resolution/dial decisions. Meta CIDRs cannot unlock private,
+  link-local, metadata or other restricted classes.
+
+The trusted gateway retrieves Meta through its marked dialer, without
+credentials, redirects or environment proxies, and verifies TLS for
+`api.github.com`. It publishes provenance before activating a candidate.
+Initial fetch or provenance-publication failure prevents readiness; refresh
+outages retain only a bounded last-good lease. See
+[refresh and evidence](../configuration.md#network-grants) for exact limits.
 
 ## Threat model and mitigations
 
@@ -103,6 +115,15 @@ nftables default-drop denies every other cgroup/destination combination
 
 ## Residual risks (explicitly not closed)
 
+- **Shared-cloud delegation.** The requested Meta scope includes Actions
+  CIDRs and wildcard cloud/storage services that can host unrelated tenants.
+  A direct-IP grant is network reachability, not GitHub ownership,
+  authentication or operation approval. Existing deny/private/MCP/package
+  boundaries remain necessary. The feed is authenticated by HTTPS, not a
+  separately signed GitHub artifact.
+- **Snapshot transitions.** Removing a grant affects new connections; existing
+  tunnels are bounded to 300 seconds, not forcibly revoked. Exported evidence
+  contains the latest refresh attempt and expiry, not every transition.
 - **Metadata by hostname over an uncovered address.** The metadata address list
   (`address::METADATA_V4_ADDRESSES` / `METADATA_V6_ADDRESSES`) is deterministic
   but not exhaustive. A provider that serves metadata purely by a hostname

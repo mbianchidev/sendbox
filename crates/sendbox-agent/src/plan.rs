@@ -108,6 +108,7 @@ pub struct RunPlan {
     interactive: bool,
     safe_outputs: bool,
     syscall_tracing: bool,
+    network_report: bool,
 }
 
 impl RunPlan {
@@ -181,7 +182,11 @@ impl RunPlan {
             .iter()
             .collect::<Vec<_>>();
         let syscall_tracing = configuration.syscall_tracing_enabled();
-        if package_report_maximum_bytes.is_some() || syscall_tracing {
+        let network_report = boundary
+            .features
+            .get("network_github_meta")
+            .is_some_and(|feature| feature.decision == sendbox_boundary::FeatureDecision::Enforced);
+        if package_report_maximum_bytes.is_some() || syscall_tracing || network_report {
             required_guest_capabilities.push(Capability::Audit);
         }
         let container_id = ContainerId::new(format!(
@@ -234,6 +239,7 @@ impl RunPlan {
             interactive: request.interactive,
             safe_outputs,
             syscall_tracing,
+            network_report,
         })
     }
 
@@ -251,6 +257,11 @@ impl RunPlan {
     #[must_use]
     pub const fn syscall_tracing(&self) -> bool {
         self.syscall_tracing
+    }
+
+    #[must_use]
+    pub const fn network_report(&self) -> bool {
+        self.network_report
     }
 
     #[must_use]
