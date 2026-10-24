@@ -259,7 +259,14 @@ fn native_cli_agents_preserve_signed_workspace_scope_and_project_cwd() {
     let resources = TempResource::new().expect("resources");
     let mut configuration = configuration(resources.path().join("repo-one"));
     configuration.workspace_path = Some(resources.path().to_path_buf());
-    for agent in ["opencode", "claude", "codex", "copilot", "custom-agent"] {
+    for agent in [
+        "moguri",
+        "opencode",
+        "claude",
+        "codex",
+        "copilot",
+        "custom-agent",
+    ] {
         let session_id = SessionId::from_bytes([14; 16]);
         let mut request = request_for_configuration(&resources, session_id, &configuration);
         request.command.program = format!("/usr/local/bin/{agent}");

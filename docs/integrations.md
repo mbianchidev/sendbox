@@ -13,10 +13,10 @@ Select a profile when creating project configuration:
 sendbox init --project . --agent codex
 ```
 
-Profiles exist for Claude Code, Codex CLI, GitHub Copilot CLI, Gemini CLI, and
-OpenCode. Custom CLI programs use `--agent custom` and explicit command/network
-rules. Install the agent in your digest-pinned Linux workload image, then pass
-its absolute guest executable path after `sendbox run ... --`.
+Profiles exist for Moguri, Claude Code, Codex CLI, GitHub Copilot CLI, Gemini CLI,
+and OpenCode. Custom CLI programs use `--agent custom` and explicit
+command/network rules. Install the agent in your digest-pinned Linux workload
+image, then pass its absolute guest executable path after `sendbox run ... --`.
 
 Profiles admit initial inference endpoints, not every possible provider or
 plugin. For example, an OpenCode session using a separate model provider needs

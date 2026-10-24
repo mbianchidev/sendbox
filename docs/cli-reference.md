@@ -23,7 +23,7 @@ the installed version.
 
 ## Init profiles and workspace scope
 
-`sendbox init --agent opencode|claude|codex|copilot|gemini|custom` selects the
+`sendbox init --agent moguri|opencode|claude|codex|copilot|gemini|custom` selects the
 entry program and initial inference endpoints; `open-code` is an alias for
 `opencode`. Omit `--agent` to preserve the existing defaults.
 `--workspace PATH` explicitly shares an enclosing multi-repository root while

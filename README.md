@@ -50,16 +50,13 @@ domains and IPv4/IPv6 CIDRs, including shared-cloud ranges. See
 
 | Agent | Init profile | Example guest executable |
 |---|---|---|
+| **Moguri** | `--agent moguri` | `/usr/local/bin/moguri` |
 | **Claude Code** | `--agent claude` | `/usr/local/bin/claude` |
 | **OpenAI Codex CLI** | `--agent codex` | `/usr/local/bin/codex` |
 | **GitHub Copilot CLI** | `--agent copilot` | `/usr/local/bin/copilot` |
 | **Gemini CLI** | `--agent gemini` | `/usr/local/bin/gemini` |
 | **OpenCode** | `--agent opencode` | `/usr/local/bin/opencode` |
-| **Moguri** | `--agent custom` | `/usr/local/bin/moguri` |
 | **Custom CLI agents and programs** | `--agent custom` | Your explicitly allowed absolute path |
-
-For Moguri, use the `custom` profile and explicitly configure its entry command
-and required provider endpoints.
 
 Profiles configure the agent's entry command and initial inference hosts; they
 **do not install the agent or log you in**. Your workload image must contain the
@@ -68,8 +65,9 @@ for mandatory guest egress enforcement. Use the agent's actual installed
 executable path when launching; entrypoint and working-directory paths must not
 traverse symlinks.
 
-Non-Copilot profiles do not require Copilot credentials. Add any extra model
-provider, authentication, package, or plugin endpoints you need explicitly.
+Only the Copilot profile enables SendBox's Copilot credential forwarding.
+Other agents, including Moguri, manage their own authentication. Add any extra
+model provider, authentication, package, or plugin endpoints you need explicitly.
 The [agent guide](docs/cli-agents.md) covers credentials, native MCP formats,
 multi-repo workspaces, and nested agent sandbox settings.
 
