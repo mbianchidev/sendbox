@@ -46,8 +46,15 @@ harness's Python standard-library tests. Live VM qualification remains an
 explicit prepared-host check; see [cold-start DNS diagnostics](dns-cold-start.md).
 The separate Homebrew updater check uses Python standard-library tests for
 stable-release gating, checksum/provenance failures, atomic formula updates,
-and preservation of other tap packages. Run it locally without installing or
-starting SendBox:
+and preservation of other tap packages. Both Python test suites and the stable
+Homebrew update workflow explicitly select Python **3.15.1**, rather than the
+runner's preinstalled `python3`. No third-party Python packages are required.
+This host-side selection does not change the standalone diagnostic workload
+image or add Python to production Rust guest images.
+
+Run the updater tests locally without installing or starting SendBox. Python
+3.11 or newer remains supported for the updater and release helper; substitute
+`python3.15` for `python3` to reproduce CI's selected minor version:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \

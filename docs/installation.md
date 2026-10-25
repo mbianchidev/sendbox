@@ -295,6 +295,10 @@ recomputes SHA-256, checks GitHub's asset digests, and verifies provenance from
 this repository's tag-triggered Release workflow on GitHub-hosted runners.
 It does not rebuild the CLI or guest bundles.
 
+The workflow and updater tests select Python **3.15.1** explicitly. Manual
+updater runs continue to support Python 3.11 or newer, using only the standard
+library.
+
 Only a published, non-draft, non-prerelease `vX.Y.Z` matching GitHub's latest
 stable release at or above the patched-release floor v0.2.3 can update the
 formula. The floor prevents known-affected existing releases from activating.
