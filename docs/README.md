@@ -13,7 +13,7 @@ to a first run. Use this index for setup, operation, and implementation details.
 | [Interactive sessions](interactive-sessions.md) | Terminal requirements, behavior, and troubleshooting |
 | [CLI agents](cli-agents.md) | Agent profiles, native MCP formats, multi-repo scope, HTTP proxies, and syscall tracing |
 | [Integrations](integrations.md) | MCP, GitHub, model providers, private registries, devcontainers, and CI workflows |
-| [Alternatives](alternatives.md) | Choosing between SendBox, Docker Sandboxes, dev containers, E2B, and Daytona |
+| [Similar tools](alternatives.md) | SendBox compared with Agent Substrate, Chainguard Workspaces, Docker Sandboxes, E2B, Daytona, microsandbox, and dev containers |
 | [Contributing](contributing.md) | Source setup, checks, documentation conventions, and release procedures |
 
 ## Runtime and operations

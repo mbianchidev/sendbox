@@ -11,7 +11,7 @@ RUN apk add --no-cache \
         binutils=2.45.1-r0 \
         bpftool=6.19.14-r0 \
         clang21=21.1.2-r2 \
-        curl=8.22.0-r0 \
+        curl=8.23.0-r0 \
         elfutils-dev=0.194-r0 \
         file=5.46-r2 \
         g++=15.2.0-r2 \
