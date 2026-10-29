@@ -14,7 +14,7 @@ environment.
 [Supported agents](#supported-coding-agents) |
 [Configuration and commands](#configuration-and-commands) |
 [Integrations](#integrations) |
-[Alternatives](#how-does-it-compare) |
+[Similar tools](#similar-tools) |
 [Documentation](docs/README.md)
 
 ## Why SendBox?
@@ -265,21 +265,37 @@ options supported by your installed version.
 See [integration recipes and boundaries](docs/integrations.md) for configuration
 examples and the distinction between built-in support and workflows you compose.
 
-## How does it compare?
+<a id="how-does-it-compare"></a>
+
+## Similar tools
 
 **Choose SendBox when you want to run CLI agents on infrastructure you control,
 with VM isolation and explicit policies across agents.** It is not a hosted
 sandbox service or a turnkey fleet scheduler.
 
-Docker Sandboxes is another agent-focused option with local microVMs and a
-separate cloud offering. Dev containers focus on reproducible development
-environments. E2B and Daytona offer API-first sandbox platforms for applications
-and agent workflows.
+| Tool | Deployment and isolation | Strengths and tradeoffs |
+|---|---|---|
+| [Agent Substrate](https://github.com/agent-substrate/substrate) | Kubernetes; gVisor or Cloud Hypervisor microVMs | Stateful agent fleets, suspend/resume, and credentials injected outside actors. Requires operating a cluster; gVisor and microVMs are different boundaries. |
+| [Chainguard Workspaces](https://edu.chainguard.dev/chainguard/workspaces/overview/) | Chainguard-hosted Linux microVMs | Terminal sessions, external credentials, and full-state resume. Currently beta; default sessions reach the public internet unless opened with an egress allowlist. |
+| [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) | Local microVMs or a separate managed cloud offering | Local sandboxes include their own Docker Engine and optional private-clone workflow. Local and cloud policies and lifecycles differ. |
+| [E2B](https://docs.e2b.dev/) | API/SDK-driven cloud Linux VMs; self-hosting also documented | Code execution, templates, and pause/resume for applications. A platform to integrate, rather than a local CLI session policy wrapper. |
+| [Daytona](https://www.daytona.io/docs/en/sandboxes/) | API-first remote platform with container and VM sandbox classes | Programmatic environments, snapshots, and multiple OS options. Select the sandbox class explicitly; do not assume every sandbox is a VM. |
+| [microsandbox](https://github.com/superradcompany/microsandbox) | Local microVMs on macOS, Linux, and Windows | Embeddable SDKs, OCI images, and fork/snapshot workflows. Beta, general-purpose execution infrastructure rather than SendBox's integrated session controls. |
+| [Dev containers](https://containers.dev/overview) | Environment specification; boundary depends on its runtime and mounts | Reproducible tooling and editor setup. The specification itself is not an agent security boundary. |
+| **SendBox** | Self-managed macOS/Apple and Linux/Kata VMs | One policy across CLI agents, with the optional controls below. You prepare the runtime, tooling image, and verified guest bundle; no Windows runtime or fleet scheduler. |
 
-The [alternatives guide](docs/alternatives.md) compares where each fits, deployment
-tradeoffs, and isolation considerations, with links to the projects' own
-documentation. There is no universal winner: choose for your trust boundary,
-tooling needs, and operational model.
+Two distinctive SendBox built-ins, rather than claims of exclusive invention:
+
+| Workflow | SendBox implementation | Comparison |
+|---|---|---|
+| **Gate npm bytes before delivery** | An opt-in [registry proxy](docs/package-supply-chain.md) quarantines tarballs, verifies integrity and configured signature/provenance requirements, and statically inspects content before allowing delivery. | An equivalent built-in pipeline was not established in the reviewed sources. Chainguard advertises lockfile verification, which is not the same guarantee. |
+| **Bound GitHub writes after VM teardown** | A native, partial-conformance [Safe Outputs gateway](docs/architecture/safe-outputs.md) validates bounded requests and stages them or applies them on the host without giving the agent a write token. | Docker Sandboxes can also run under GitHub Agentic Workflows, which supplies Safe Outputs through the external workflow. SendBox integrates this subset into local sessions. |
+
+Both SendBox controls are opt-in and supported on Apple/Kata, not Hyperlight.
+VMs, credential mediation, and snapshots are **not unique to SendBox**.
+This comparison uses official sources reviewed on October 29, 2026; missing
+documentation means unknown, not unsupported. See the
+[comparison guide and sources](docs/alternatives.md) for scope and limitations.
 
 ## Limitations and security expectations
 
