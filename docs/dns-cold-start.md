@@ -122,6 +122,16 @@ complete native/application integration still need their own qualification;
 the official 0.2.4 guest bytes have not acquired this behavior merely because
 the source tests pass. Historical results below remain distinct.
 
+With pinned Rust 1.93.1, the complete local workspace reports 936 passing tests,
+two explicitly ignored environment-gated cases (live Meta HTTPS and interactive
+signing/Keychain ACL) and no failures. All ten locked fuzz
+workspaces, formatting, deny-warning Clippy and the release workspace build
+pass. A fresh strict JSON audit reports zero vulnerabilities and no warnings
+against 1,409 advisories. An earlier audit's registry/yank lookup timed out
+despite exit zero; it remains incomplete, not the successful audit receipt.
+Guest artifact CI now includes egress changes in its transitive input filter.
+No new dependency, public policy grant, schema or protocol is introduced.
+
 ## Historical qualification results
 
 The official 0.2.1 host was also used with a separately signed development
