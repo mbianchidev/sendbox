@@ -11,6 +11,8 @@
 //!   set it is retried once over TCP.
 //! * A missing UDP reply is retransmitted once on the same socket, halfway
 //!   through the query budget. Retransmission never restarts that budget.
+//! * At that same boundary, TCP recovery starts on the same upstream while
+//!   UDP remains live. Neither transport gains another deadline.
 //! * The CNAME chain is followed only within the single returned message, to a
 //!   bounded depth, with loop detection.
 //! * The number of address records is capped.
@@ -32,7 +34,7 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use sendbox_policy::DnsRecordType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 use crate::resolver::{
     DnsOperation, DnsTransport, ResolveError, ResolvedAddress, ResolvedChain, UpstreamResolver,
@@ -52,7 +54,7 @@ pub const MAX_TCP_RESPONSE_BYTES: usize = 65535;
 pub struct ForwardingResolverConfig {
     /// Fixed upstream resolver address. Dialed directly; never re-resolved.
     pub upstream: SocketAddr,
-    /// Total budget per QTYPE, including one UDP retransmission and TCP fallback.
+    /// Total budget per QTYPE, including UDP retransmission and one TCP recovery.
     pub query_timeout: Duration,
     /// Optional `SO_MARK` applied to every upstream socket. In a Linux
     /// enforcement topology this is the broker mark, so the DNS broker's own
@@ -135,8 +137,7 @@ impl ForwardingResolver {
         })
     }
 
-    /// Performs a bounded UDP exchange, retrying over TCP if the response is
-    /// truncated. Both transports share one absolute deadline.
+    /// UDP retransmission and TCP recovery share one absolute deadline.
     async fn exchange(
         &self,
         query_bytes: &[u8],
@@ -145,17 +146,44 @@ impl ForwardingResolver {
         record_type: RecordType,
     ) -> Result<Message, ResolveError> {
         let deadline = Instant::now() + self.config.query_timeout;
-        let udp = self.exchange_udp(query_bytes, deadline).await?;
-        validate_response(&udp, id, name, record_type)?;
-        if udp.metadata.truncation {
-            let tcp = self.exchange_tcp(query_bytes, deadline).await?;
-            validate_response(&tcp, id, name, record_type)?;
-            if tcp.metadata.truncation {
-                return Err(ResolveError::InvalidResponse("truncated_tcp"));
+        let udp = self.exchange_udp(query_bytes, deadline);
+        tokio::pin!(udp);
+        tokio::select! {
+            biased;
+            response = &mut udp => {
+                let response = response?;
+                validate_response(&response, id, name, record_type)?;
+                if !response.metadata.truncation {
+                    return Ok(response);
+                }
+                return validate_tcp_response(
+                    self.exchange_tcp(query_bytes, deadline).await?, id, name, record_type,
+                );
             }
-            return Ok(tcp);
+            () = sleep_until(deadline - self.config.query_timeout / 2) => {}
         }
-        Ok(udp)
+
+        let tcp = self.exchange_tcp(query_bytes, deadline);
+        tokio::pin!(tcp);
+        let (response, tcp_failure) = tokio::select! {
+            biased;
+            response = &mut udp => (response?, None),
+            response = &mut tcp => match response {
+                Ok(response) => return validate_tcp_response(response, id, name, record_type),
+                Err(error) if matches!(error, ResolveError::Transport { .. } | ResolveError::ExchangeTimeout { .. }) => {
+                    (udp.await?, Some(error))
+                }
+                Err(error) => return Err(error),
+            },
+        };
+        validate_response(&response, id, name, record_type)?;
+        if !response.metadata.truncation {
+            return Ok(response);
+        }
+        if let Some(error) = tcp_failure {
+            return Err(error);
+        }
+        validate_tcp_response(tcp.await?, id, name, record_type)
     }
 
     async fn exchange_udp(
@@ -305,6 +333,19 @@ enum SingleResult {
         final_name: Name,
         addresses: Vec<ResolvedAddress>,
     },
+}
+
+fn validate_tcp_response(
+    response: Message,
+    id: u16,
+    name: &Name,
+    record_type: RecordType,
+) -> Result<Message, ResolveError> {
+    validate_response(&response, id, name, record_type)?;
+    if response.metadata.truncation {
+        return Err(ResolveError::InvalidResponse("truncated_tcp"));
+    }
+    Ok(response)
 }
 
 fn validate_response(
@@ -699,6 +740,22 @@ mod tests {
         }
     }
 
+    async fn receive_tcp_query(stream: &mut TcpStream) -> Vec<u8> {
+        let length = stream.read_u16().await.unwrap();
+        let mut query = vec![0; usize::from(length)];
+        stream.read_exact(&mut query).await.unwrap();
+        query
+    }
+
+    async fn send_tcp_response(stream: &mut TcpStream, response: &Message) {
+        let bytes = response.to_vec().unwrap();
+        stream
+            .write_u16(u16::try_from(bytes.len()).unwrap())
+            .await
+            .unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn retransmits_a_lost_first_datagram_without_restarting_the_deadline() {
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -752,6 +809,269 @@ mod tests {
                 .is_err_and(|error| { error.kind() == std::io::ErrorKind::WouldBlock }),
             "unexpected DNS retransmission"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_silence_recovers_on_the_same_upstream_tcp_within_the_original_budget() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let tcp = TcpListener::bind(address).await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
+        let began = Instant::now();
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        let (original, original_peer) = receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        let (retransmission, peer) = receive_query(&upstream).await;
+        assert_eq!(retransmission, original);
+        assert_eq!(peer, original_peer);
+        let (mut stream, _) =
+            finish(tokio::spawn(async move { tcp.accept().await.unwrap() })).await;
+        let query = receive_tcp_query(&mut stream).await;
+        assert_eq!(query, original);
+        let response = answer_for(
+            &Message::from_vec(&query).unwrap(),
+            vec![Record::from_rdata(
+                Name::from_ascii("cold.example.").unwrap(),
+                60,
+                RData::A(A(Ipv4Addr::new(198, 51, 100, 77))),
+            )],
+        );
+        send_tcp_response(&mut stream, &response).await;
+        let SingleResult::Answer { addresses, .. } = finish(task).await.unwrap() else {
+            panic!("The validated original TCP question must produce its actual answer");
+        };
+        assert_eq!(addresses[0].ip, "198.51.100.77".parse::<IpAddr>().unwrap());
+        assert!(Instant::now() - began < Duration::from_secs(3));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_udp_and_incomplete_tcp_keep_one_deadline_and_close_both_transports() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let tcp = TcpListener::bind(address).await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        receive_query(&upstream).await;
+        let (mut stream, _) =
+            finish(tokio::spawn(async move { tcp.accept().await.unwrap() })).await;
+        receive_tcp_query(&mut stream).await;
+        stream.write_u16(100).await.unwrap();
+        flush_io().await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        let failure = finish(task).await.unwrap_err().diagnostic();
+        assert_eq!(failure.kind, crate::resolver::ResolveFailureKind::Timeout);
+        assert_eq!(failure.transport, Some(DnsTransport::Udp));
+        finish(tokio::spawn(async move {
+            let mut remaining = Vec::new();
+            stream.read_to_end(&mut remaining).await.unwrap();
+            assert!(remaining.is_empty());
+        }))
+        .await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_tcp_recovery_does_not_discard_a_later_valid_udp_reply() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let tcp = TcpListener::bind(address).await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        let (original, peer) = receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        receive_query(&upstream).await;
+        let (mut stream, _) =
+            finish(tokio::spawn(async move { tcp.accept().await.unwrap() })).await;
+        receive_tcp_query(&mut stream).await;
+        drop(stream);
+        flush_io().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let response = answer_for(&Message::from_vec(&original).unwrap(), vec![]);
+        upstream
+            .send_to(&response.to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+        assert!(finish(task).await.is_ok());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_udp_never_starts_tcp_or_a_later_recovery_task() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let tcp = TcpListener::bind(address).await.unwrap();
+        let accepted = tokio::spawn(async move { tcp.accept().await });
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        let (original, peer) = receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let response = answer_for(&Message::from_vec(&original).unwrap(), vec![]);
+        upstream
+            .send_to(&response.to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+        assert!(finish(task).await.is_ok());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        flush_io().await;
+        assert!(!accepted.is_finished());
+        accepted.abort();
+        assert!(accepted.await.unwrap_err().is_cancelled());
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_silent_udp_tcp_recovery_drops_both_without_more_sends() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let tcp = TcpListener::bind(address).await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        receive_query(&upstream).await;
+        let (mut stream, _) =
+            finish(tokio::spawn(async move { tcp.accept().await.unwrap() })).await;
+        receive_tcp_query(&mut stream).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        finish(tokio::spawn(async move {
+            let mut remaining = Vec::new();
+            stream.read_to_end(&mut remaining).await.unwrap();
+            assert!(remaining.is_empty());
+        }))
+        .await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_silence_recovery_tcp_cannot_be_replaced_by_a_later_udp_answer() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let tcp = TcpListener::bind(address).await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
+        let task = tokio::spawn(async move {
+            resolver
+                .query_type(
+                    &Name::from_ascii("cold.example.").unwrap(),
+                    DnsRecordType::A,
+                )
+                .await
+        });
+        let (original, peer) = receive_query(&upstream).await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        receive_query(&upstream).await;
+        let (mut stream, _) =
+            finish(tokio::spawn(async move { tcp.accept().await.unwrap() })).await;
+        let query = Message::from_vec(&receive_tcp_query(&mut stream).await).unwrap();
+        let mut response = answer_for(&query, vec![]);
+        response.metadata.id = response.metadata.id.wrapping_add(1);
+        send_tcp_response(&mut stream, &response).await;
+        let failure = finish(task).await.unwrap_err().diagnostic();
+        assert_eq!(failure.detail, Some("id_mismatch"));
+        let valid = answer_for(&Message::from_vec(&original).unwrap(), vec![]);
+        upstream
+            .send_to(&valid.to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&upstream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn both_families_require_their_original_validated_tcp_answers_after_udp_silence() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let tcp = TcpListener::bind(address).await.unwrap();
+        let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
+        let task = tokio::spawn(async move {
+            resolver
+                .resolve(&Name::from_ascii("cold.example.").unwrap())
+                .await
+        });
+        let mut originals = Vec::new();
+        for _ in 0..2 {
+            originals.push(receive_query(&upstream).await.0);
+        }
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        for _ in 0..2 {
+            let retransmission = receive_query(&upstream).await.0;
+            assert!(originals.contains(&retransmission));
+        }
+        let server = tokio::spawn(async move {
+            let mut types = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = tcp.accept().await.unwrap();
+                let bytes = receive_tcp_query(&mut stream).await;
+                assert!(originals.contains(&bytes));
+                let query = Message::from_vec(&bytes).unwrap();
+                let qtype = query.queries[0].query_type();
+                types.push(qtype);
+                let records = if qtype == RecordType::A {
+                    vec![Record::from_rdata(
+                        Name::from_ascii("cold.example.").unwrap(),
+                        60,
+                        RData::A(A(Ipv4Addr::new(198, 51, 100, 77))),
+                    )]
+                } else {
+                    vec![]
+                };
+                send_tcp_response(&mut stream, &answer_for(&query, records)).await;
+            }
+            assert!(types.contains(&RecordType::A));
+            assert!(types.contains(&RecordType::AAAA));
+        });
+        finish(server).await;
+        let result = finish(task).await.unwrap();
+        assert_eq!(result.addresses.len(), 1);
+        assert_eq!(
+            result.final_name,
+            Name::from_ascii("cold.example.").unwrap()
+        );
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_no_query(&upstream);
     }
 
     #[tokio::test(start_paused = true)]

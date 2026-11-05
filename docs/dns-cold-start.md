@@ -60,11 +60,16 @@ packet loss.
 ## Bounded mitigation
 
 Each A/AAAA query now has one absolute three-second budget covering socket
-setup, UDP transmission/receive and any truncated-response TCP fallback.
+setup, UDP transmission/receive and TCP recovery.
 If the first UDP reply is still missing halfway through that budget, the same
 question and ID are sent **once** on the same connected, marked socket to the
 same selected upstream. Neither the deadline nor the application request is
-restarted. The brokers retain their independent five-second resolution bound.
+restarted. TCP recovery starts once at that same halfway boundary if UDP is
+still pending, against the same selected numeric upstream and port with the
+same question/ID and socket mark. UDP remains live until completion, cancellation
+or the original deadline. A TCP transport failure does not discard a later
+valid UDP reply. Validated UDP truncation still starts TCP immediately.
+The brokers retain their independent five-second resolution bound.
 
 There is no new public resolver, readiness lookup, sleep, background warm-up,
 unsandboxed fallback, or hostname/CNAME/IP grant. Permanent DNS errors, malformed
@@ -72,8 +77,9 @@ responses and policy denials are not retried. Both completed family results
 still undergo the existing CNAME agreement, address-class, QTYPE, budget and
 authorization checks. A TCP response that is still truncated is rejected.
 
-This only mitigates a single missing UDP exchange per QTYPE within the budget.
-Persistent loss or a genuinely unavailable resolver still fails closed.
+UDP retransmission mitigates a single missing exchange; the same-upstream TCP
+path can also recover persistent UDP silence when that resolver supports TCP.
+Unavailable transports still fail closed at the original deadline.
 Gateway readiness continues to mean that authenticated local services and
 mandatory controls are ready, not that an external DNS server has been probed.
 
@@ -85,7 +91,38 @@ a bounded JSON diagnostic. Free-form resolver messages, DNS packet contents,
 credentials, bootstrap files and gateway control tokens are never included.
 SOCKS and native CONNECT reply codes remain compatible.
 
-## Qualification results
+## Meta startup follow-up
+
+A credential-free, zero-model startup using the official 0.2.4 guest reproduced
+an egress service exit before its ready socket. An independently instrumented
+host kept the signed guest unchanged and authenticated each generated
+root/image/command/plan before observation. Both initial A/AAAA UDP requests
+for the fixed public Meta endpoint and their same-ID retransmissions sent
+successfully, but the failed case received no reply within three seconds.
+Meta published `unavailable` with no active grants, the gateway exited, its
+parent observed control EOF, and the outer caller eventually reported guest
+readiness timeout. A successful case received both validated family replies
+after retransmission. All observed cgroup controller writes succeeded.
+
+That establishes a missing-UDP-reply boundary, not the location of packet loss
+outside the guest. The selected upstream's TCP DNS returned a validated answer
+in 2.36 ms in a separate fresh generated VM. No alternate resolver, cache flush,
+application replay, credential forwarding or personal runtime restart was used.
+
+The new generated regression first fails because no TCP connection is admitted
+after UDP silence, then passes with same-question recovery within the unchanged
+budget. Coverage also checks both families, strict TCP response validation,
+an incomplete TCP body at the original deadline, simultaneous-transport
+cancellation, no recovery after completed UDP, and preservation of a late UDP
+answer after a failed TCP attempt. Existing policy/CNAME/address and partial-
+family refusal tests remain in place.
+
+These are source and primitive observations. A changed signed guest and its
+complete native/application integration still need their own qualification;
+the official 0.2.4 guest bytes have not acquired this behavior merely because
+the source tests pass. Historical results below remain distinct.
+
+## Historical qualification results
 
 The official 0.2.1 host was also used with a separately signed development
 guest built from this change. The test trust root was

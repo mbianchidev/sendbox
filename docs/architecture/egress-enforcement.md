@@ -40,7 +40,7 @@ permits, and do so with a mechanism that:
 | `policy` | Compiles `sendbox_policy::NetworkPolicy` into a `PolicyEngine` of deterministic, side-effect-free decisions. |
 | `authorization` | Bounded, expiring `(name, ip)` authorization cache — the anti-rebinding pin. Prunes expired entries on insert and enforces a deterministic hard capacity derived from the DNS budget. |
 | `resolver` | The injectable `UpstreamResolver` trait and `ResolvedChain`. |
-| `forwarding_resolver` | Bounded, fixed-upstream forwarding resolver: connects its UDP socket to the exact upstream so a reply must match the full address **and** port (not just IP), validates response id/question, bounds records/CNAME depth, retries over TCP on truncation, and merges A/AAAA only when their CNAME chain and final owner agree. |
+| `forwarding_resolver` | Bounded, fixed-upstream forwarding resolver: connects UDP to the exact upstream address **and** port, validates response id/question, bounds records/CNAME depth, recovers over the same upstream's TCP on truncation or UDP silence within the original deadline, and merges A/AAAA only when their CNAME chain and final owner agree. |
 | `dns_budget` | Deterministic, bounded DNS exfiltration controls (structural limits, QTYPE allowlist, response cap, per-window budgets). |
 | `connect_proto` | The small, versioned, bounded CONNECT framing protocol. |
 | `socks5` | A bounded SOCKS5 (RFC 1928) front end: no-auth negotiation, CONNECT only. |
@@ -144,9 +144,14 @@ resolution path.
 The forwarding resolver gives each concurrent A/AAAA query one absolute
 three-second deadline. A missing UDP reply is retransmitted once halfway
 through that budget, preserving the connected socket, upstream, socket mark,
-question and ID. Socket setup and TCP fallback on a validated truncation flag
-consume that same budget; no read, retransmission or TCP phase restarts it.
-Permanent response errors and invalid replies are not retried.
+question and ID. If UDP is still pending at that halfway boundary, one TCP
+exchange also starts against the same numeric upstream and port, with the same
+question/ID and socket mark. UDP remains live; a TCP transport failure cannot
+discard its later valid reply. A validated UDP truncation flag starts TCP
+immediately instead. Socket setup, both UDP sends and that one TCP exchange
+consume the original budget; no phase restarts it. Complete TCP responses still
+require exact header/question validation and a clear truncation bit. Permanent
+response errors and invalid replies fail closed, not a later-answer fallback.
 
 Both family results must complete before CNAME agreement and policy validation
 can authorize any address. A timeout, cancellation, or denied CNAME does not
