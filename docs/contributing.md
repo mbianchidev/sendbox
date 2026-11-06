@@ -97,6 +97,8 @@ publication jobs can follow the hosted aliases without relinking these bytes.
 
 Guest artifact CI runs the two clean builds for each architecture in separate
 parallel jobs and compares their outputs before publishing the verified bundle.
+Changes to the shared egress crate also select this workflow because its DNS
+resolver is linked into the guest, even when no guest entrypoint changes.
 See [guest artifact CI](architecture/guest-artifact-bundles.md#continuous-integration)
 for cache boundaries and the automatic privileged BPF smoke tests.
 
