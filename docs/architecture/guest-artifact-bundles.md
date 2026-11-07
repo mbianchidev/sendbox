@@ -106,7 +106,7 @@ Runtime requirements:
 Build inputs:
 
 - Rust 1.93.1 and Alpine 3.23;
-- pinned curl 8.22.0, OpenSSL 3.5.9, musl-dev 1.2.5-r24, and zlib 1.3.2-r1
+- pinned curl 8.23.0, OpenSSL 3.5.9, musl-dev 1.2.5-r24, and zlib 1.4-r0
   build dependencies;
 - clang/LLVM 21.1.2 and bpftool 6.19.14;
 - libbpf-rs 0.26.2 / libbpf 1.7.0;
@@ -116,10 +116,10 @@ Build inputs:
   SHA-256 verification;
 - libseccomp 2.6.0 source archive with SHA-256 verification.
 
-The production bundle and standalone supervisor Dockerfiles use the same
-`musl-dev` revision, available for both Alpine 3.23 architectures. The base image
-digest does not freeze APK repositories; refresh these pins together when
-Alpine replaces a package revision.
+The production bundle, standalone supervisor, and BPF spike Dockerfiles use the
+same `musl-dev`, `zlib`, `zlib-dev`, and `zlib-static` revisions, available for both
+Alpine 3.23 architectures. The base image digest does not freeze APK repositories;
+refresh these pins together when Alpine replaces a package revision.
 
 Generated `vmlinux.h` and BPF objects are build outputs, not checked-in source.
 Configuration YAML uses the maintained YAML Organization `yaml_serde` 0.10.7
