@@ -16,6 +16,7 @@ permissions:
 env:
   CARGO_BUILD_JOBS: "2"
   RUST_TEST_THREADS: "2"
+  PYTHON_VERSION: "3.15.1"
 
 jobs:
   homebrew:
@@ -28,7 +29,7 @@ jobs:
       - name: Set up stable Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.15.1"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Test stable release verification and formula updates
         env:
@@ -52,11 +53,35 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Preload pinned macOS Python
+        if: matrix.task == 'checks' && runner.os == 'macOS' && runner.arch == 'ARM64'
+        run: |
+          set -euo pipefail
+          cache="$RUNNER_TOOL_CACHE/Python/$PYTHON_VERSION/arm64"
+          if [[ -f "$cache.complete" ]]; then
+            echo "Python $PYTHON_VERSION (arm64) is already cached"
+            exit 0
+          fi
+          directory="$(mktemp -d "$RUNNER_TEMP/python-api.XXXXXX")"
+          trap 'rm -rf "$directory"' EXIT
+          archive="$directory/python.tar.gz"
+          curl -fsSL --retry 5 --retry-max-time 600 --connect-timeout 10 --max-time 600 \
+            --header 'Accept: application/octet-stream' \
+            https://api.github.com/repos/actions/python-versions/releases/assets/662872898 \
+            --output "$archive"
+          echo "e1a49acab28b4a180ee9819663f9e01d0e56ed49f78b1e370dedea8863301a3a  $archive" \
+            | shasum -a 256 --check
+          tar -xzf "$archive" -C "$directory"
+          rm "$archive"
+          cd "$directory"
+          AGENT_TOOLSDIRECTORY="$RUNNER_TOOL_CACHE" bash ./setup.sh
+          "$cache/bin/python3" --version
+
       - name: Set up stable Python
         if: matrix.task == 'checks'
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.15.1"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
