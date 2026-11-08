@@ -284,6 +284,11 @@ The script waits for the new attempt before watching it; active runs are only
 watched, and successful runs are not restarted. Retries remain subject to
 GitHub's rerun window and artifact retention.
 
+Reruns use the original tag's commit and workflow definition, not newer changes
+on `main`. If a fix changes source or workflow code, publish a new version from
+the fixed commit. Recovering a failed, unpublished tag instead requires an
+explicit maintainer decision outside this script; never move a published tag.
+
 A local tag not yet pushed is published unchanged. Existing tags are never
 replaced, and conflicting local and remote tags or release branches require
 manual inspection. Check registration, merge completion, release run discovery,
