@@ -52,10 +52,12 @@ runner's preinstalled `python3`. No third-party Python packages are required.
 This host-side selection does not change the standalone diagnostic workload
 image or add Python to production Rust guest images.
 
-CI's macOS arm64 checks preload the exact Python release asset through GitHub's
-release-asset API with SHA-256 verification and bounded retries before the normal
-`setup-python` action selects it. Update the CI version, asset ID, and checksum
-together when updating Python.
+CI and stable Homebrew updates preload the exact Python release asset through
+GitHub's release-asset API using `scripts/setup-ci-python.sh`, with SHA-256
+verification and bounded retries before the normal `setup-python` action selects
+it. The helper supports macOS arm64 and Ubuntu x64, including matching packages
+for Ubuntu 22.04, 24.04, and 26.04. Update the workflow version, helper version,
+asset IDs, and checksums together when updating Python.
 
 Run the updater tests locally without installing or starting SendBox. Python
 3.11 or newer remains supported for the updater and release helper; substitute
