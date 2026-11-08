@@ -116,10 +116,10 @@ Build inputs:
   SHA-256 verification;
 - libseccomp 2.6.0 source archive with SHA-256 verification.
 
-Supervisor and production bundle builds retry transient libseccomp download
-failures with bounded connection, transfer, and retry timeouts. The pinned
-version and SHA-256 verification remain mandatory; exhausted retries fail the
-build.
+Supervisor and production bundle builds download the pinned libseccomp source
+through GitHub's release-asset API using its immutable asset ID. Requests use
+bounded connection, transfer, and retry timeouts. The pinned version and SHA-256
+verification remain mandatory; exhausted retries fail the build.
 
 The production bundle, standalone supervisor, and BPF spike Dockerfiles use the
 same `musl-dev`, `zlib`, `zlib-dev`, and `zlib-static` revisions, available for both

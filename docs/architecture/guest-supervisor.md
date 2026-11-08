@@ -207,7 +207,8 @@ each architecture twice without cache, compares same-architecture binaries, and
 uses `file`, `readelf`, and `ldd` evidence to reject an ELF interpreter or shared
 dependency.
 
-The pinned libseccomp source download uses bounded retries and network timeouts.
+The pinned libseccomp source is downloaded through GitHub's release-asset API
+using its immutable asset ID, with bounded retries and network timeouts.
 SHA-256 verification remains mandatory before extraction.
 
 Guest Supervisor CI passes `--build-arg CARGO_BUILD_JOBS=2` to the quality build
