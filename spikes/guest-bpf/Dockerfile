@@ -23,9 +23,9 @@ RUN apk add --no-cache \
         openssl-dev=3.5.9-r0 \
         pkgconf=2.5.1-r0 \
         xz=5.8.4-r0 \
-        zlib=1.3.2-r1 \
-        zlib-dev=1.3.2-r1 \
-        zlib-static=1.3.2-r1 \
+        zlib=1.4-r0 \
+        zlib-dev=1.4-r0 \
+        zlib-static=1.4-r0 \
         zstd-dev=1.5.7-r2 \
         zstd-static=1.5.7-r2
 
