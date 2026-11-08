@@ -16,6 +16,7 @@ permissions:
 env:
   CARGO_BUILD_JOBS: "2"
   RUST_TEST_THREADS: "2"
+  PYTHON_VERSION: "3.15.1"
 
 jobs:
   homebrew:
@@ -25,10 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Preload pinned Python
+        run: ./scripts/setup-ci-python.sh "$PYTHON_VERSION"
+
       - name: Set up stable Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.15.1"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Test stable release verification and formula updates
         env:
@@ -52,11 +56,15 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Preload pinned Python
+        if: matrix.task == 'checks'
+        run: ./scripts/setup-ci-python.sh "$PYTHON_VERSION"
+
       - name: Set up stable Python
         if: matrix.task == 'checks'
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.15.1"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'

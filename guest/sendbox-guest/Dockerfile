@@ -36,8 +36,9 @@ RUN case "$TARGETARCH" in \
     && printf '%s\n' "$target" >/opt/target-triple
 
 FROM toolchain AS libseccomp
-RUN curl -fsSL \
-        https://github.com/seccomp/libseccomp/releases/download/v2.6.0/libseccomp-2.6.0.tar.gz \
+RUN curl -fsSL --retry 5 --retry-max-time 120 --connect-timeout 10 --max-time 60 \
+        --header 'Accept: application/octet-stream' \
+        https://api.github.com/repos/seccomp/libseccomp/releases/assets/222948192 \
         -o /tmp/libseccomp.tar.gz \
     && echo "83b6085232d1588c379dc9b9cae47bb37407cf262e6e74993c61ba72d2a784dc  /tmp/libseccomp.tar.gz" \
         | sha256sum -c - \
