@@ -68,7 +68,7 @@ RUN case "$TARGETARCH" in \
     && rm -f /tmp/vmlinux.btf.tar.xz /tmp/5.8.0-63-generic.btf
 
 FROM toolchain AS libseccomp
-RUN curl -fsSL \
+RUN curl -fsSL --retry 5 --retry-max-time 120 --connect-timeout 10 --max-time 60 \
         https://github.com/seccomp/libseccomp/releases/download/v2.6.0/libseccomp-2.6.0.tar.gz \
         -o /tmp/libseccomp.tar.gz \
     && echo "83b6085232d1588c379dc9b9cae47bb37407cf262e6e74993c61ba72d2a784dc  /tmp/libseccomp.tar.gz" \

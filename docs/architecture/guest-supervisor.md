@@ -207,6 +207,9 @@ each architecture twice without cache, compares same-architecture binaries, and
 uses `file`, `readelf`, and `ldd` evidence to reject an ELF interpreter or shared
 dependency.
 
+The pinned libseccomp source download uses bounded retries and network timeouts.
+SHA-256 verification remains mandatory before extraction.
+
 Guest Supervisor CI passes `--build-arg CARGO_BUILD_JOBS=2` to the quality build
 and both clean builds on each native architecture, matching production bundle
 CI's compiler budget. The Dockerfile still defaults to one Cargo build worker

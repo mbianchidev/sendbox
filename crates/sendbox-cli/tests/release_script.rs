@@ -340,12 +340,16 @@ exec "$RELEASE_TEST_CARGO" "$@"
     }
 
     fn run(&self, arguments: &[&str], scenario: &str) -> Output {
+        self.run_command(Command::new("/bin/bash"), arguments, scenario)
+    }
+
+    fn run_command(&self, mut command: Command, arguments: &[&str], scenario: &str) -> Output {
         let path = std::env::join_paths(
             std::iter::once(self.bin.clone())
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
         )
         .unwrap();
-        Command::new("/bin/bash")
+        command
             .arg(self.checkout.join("scripts/release.sh"))
             .args(arguments)
             .current_dir(self.checkout.join("crates/sendbox-cli"))
@@ -479,6 +483,39 @@ fn switches_to_updated_main_before_releasing_and_refreshing_every_lockfile() {
     assert!(trace.find("gh pr checks").unwrap() < trace.find("gh pr merge").unwrap());
     assert!(trace.find("gh pr merge").unwrap() < trace.find("gh run watch").unwrap());
     assert!(trace.contains("gh release view v0.2.0"));
+}
+
+#[test]
+fn disables_configured_git_pagers_when_releasing_in_a_terminal() {
+    let repository = ReleaseRepository::new();
+    executable(
+        repository.bin.join("pager"),
+        "#!/bin/sh\nprintf 'pager invoked\\n' >>\"$RELEASE_TEST_TRACE\"\ncat\n",
+    );
+    git(&repository.checkout, &["config", "core.pager", "pager"]);
+    git(&repository.checkout, &["config", "pager.switch", "true"]);
+    git(&repository.checkout, &["config", "pager.pull", "true"]);
+    git(&repository.checkout, &["config", "pager.diff", "true"]);
+
+    for version in ["0.2.0", "v0.2.0"] {
+        let mut command = Command::new("python3");
+        command
+            .args([
+                "-c",
+                "import os, pty, sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))",
+                "/bin/bash",
+            ])
+            .env("GIT_PAGER", "pager")
+            .env("PAGER", "pager");
+        let result = repository.run_command(command, &[version], "success");
+        repository.assert_succeeded(&result);
+    }
+
+    let trace = repository.trace();
+    assert!(
+        !trace.contains("pager invoked"),
+        "release invoked the configured Git pager:\n{trace}"
+    );
 }
 
 #[test]
