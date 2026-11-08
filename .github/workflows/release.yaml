@@ -72,7 +72,7 @@ jobs:
       - name: Verify macOS architecture and deployment floor
         if: runner.os == 'macOS'
         run: |
-          lipo -verify_arch arm64 ./target/release/sendbox
+          lipo ./target/release/sendbox -verify_arch arm64
           minimum="$(
             otool -l ./target/release/sendbox \
               | awk '$1 == "minos" { print $2 }'
