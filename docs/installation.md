@@ -63,19 +63,17 @@ provenance before trusting it.
 The existing [mbianchidev/tap](https://github.com/mbianchidev/homebrew-tap)
 uses a **formula**, not a GUI cask.
 
-**Activation is blocked pending an approved patched stable release.** The
-bootstrap PR verifies the immutable v0.2.2 artifacts for isolated lifecycle
-qualification, but those binaries predate
+Before installing, confirm the formula uses a patched stable release
+**v0.2.3 or newer**. Published v0.2.2 and earlier binaries predate
 [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382) and
 [RUSTSEC-2026-0383](https://rustsec.org/advisories/RUSTSEC-2026-0383).
-The source lockfiles update `rustls-webpki` to 0.103.16 and
-`webpki-root-certs` to 1.0.10; published binaries cannot inherit source fixes.
-Do not merge or activate that formula until a newly approved patched stable
-release replaces its URLs/checksums and passes tap CI. The updater rejects
-published releases older than v0.2.3. No replacement release is published by
-this packaging work.
+Published binaries cannot inherit source fixes. The planned central updater
+keeps this patched-release floor and verifies the artifacts before updating
+the formula. **Central automation is pending review and activation in the
+tap**; see [stable Homebrew updates](#stable-homebrew-updates). This source
+change does not publish a replacement release or activate that automation.
 
-After activation:
+Install with:
 
 ```bash
 brew install mbianchidev/tap/sendbox
@@ -258,8 +256,8 @@ verifies the checksum and executable mode of its matching, commit-specific CLI
 archive before combining those exact tested bytes with the signed guest payload.
 The internal CLI archives retain the default Actions artifact lifetime and are
 excluded from published assets. Signing, clean guest builds, package checksums,
-release provenance, GHCR publication, and stable Homebrew verification are
-unchanged.
+release provenance, and GHCR publication are unchanged. Homebrew verification
+and formula updates are owned by the tap, as described below.
 
 Generic build and packaging hosts follow `ubuntu-latest` and `macos-latest`
 where compatible. Linux CLI producers retain Ubuntu 24.04 to avoid raising
@@ -296,78 +294,44 @@ and retry registration each have a ten-minute timeout.
 
 ### Stable Homebrew updates
 
-After the Release workflow publishes and attests its existing build outputs,
-it calls `homebrew.yaml`. A human-published stable release also triggers this
-workflow. It downloads the three host archives and their checksum files,
-recomputes SHA-256, checks GitHub's asset digests, and verifies provenance from
-this repository's tag-triggered Release workflow on GitHub-hosted runners.
-It does not rebuild the CLI or guest bundles.
+Homebrew updates are owned by
+[mbianchidev/homebrew-tap](https://github.com/mbianchidev/homebrew-tap), not the
+SendBox Release workflow. SendBox continues to publish its host archives,
+signed guest bundles, adjacent SHA-256 files, and tag-bound release-workflow
+attestations. It does not push tap branches or create tap PRs, and requires no
+tap-write secret, cross-repository token, or new credential.
 
-The workflow and updater tests select Python **3.15.1** explicitly. Manual
-updater runs continue to support Python 3.11 or newer, using only the standard
-library.
+**The central updater is pending review and activation in the tap.** Once
+enabled, it checks included projects' stable releases hourly and downloads the
+existing SendBox archives for macOS arm64, Linux x86_64, and Linux aarch64, plus
+their checksum files. It recomputes SHA-256 against GitHub's asset digests and
+the adjacent published checksums, and verifies attestations from
+`mbianchidev/sendbox/.github/workflows/release.yaml` bound to `refs/tags/vX.Y.Z`
+on GitHub-hosted runners. It does not rebuild the CLI or guest bundles.
 
 Only a published, non-draft, non-prerelease `vX.Y.Z` matching GitHub's latest
-stable release at or above the patched-release floor v0.2.3 can update the
-formula. The floor prevents known-affected existing releases from activating.
-Older releases, a newer formula, and a
-stable release that supersedes an in-flight verification cannot downgrade it.
-Prereleases do not update the stable formula, GitHub's latest release, or the
-GHCR `latest` tag.
+stable release at or above the patched-release floor v0.2.3 is eligible.
+Older releases, a newer formula, and a stable release that supersedes an
+in-flight verification cannot downgrade it. Prereleases do not update the
+stable formula, GitHub's latest release, or the GHCR `latest` tag.
 
-The dedicated write-enabled SSH deploy key is registered **only** on
-`mbianchidev/homebrew-tap`; its private half is stored **only** as the SendBox
-Actions secret `SENDBOX_HOMEBREW_TAP_SSH_KEY`. It is separate from other
-projects' keys. The workflow authenticates with that identity alone, obtains
-GitHub SSH host keys over the authenticated HTTPS API, and removes its
-temporary SSH files on exit. Signing keys and SSH credentials are never cached.
-Rotate by generating a new key pair, registering its public key on the existing
-tap, replacing this secret, verifying access, and then revoking the old deploy
-key. Never copy another project's key.
+The tap prepares one verified release-only batch PR and explicitly runs its
+complete native CI. A separate trusted-default-branch workflow automatically
+merges eligible release-only bot updates only after CI and review guards pass.
+Updates normally become available within an hour of artifact publication,
+subject to those gates. Implementation PRs still require human review and
+merge; source changes alone do not enable central automation.
 
-The updater changes only `Formula/sendbox.rb` and pushes
-`automation/sendbox-vX.Y.Z`, **never `main`**. Tap CI validates the checked-out
-branch and prepares a draft PR. A human must approve and merge it before
-`brew update` offers the release. Existing branches are not force-pushed:
-identical retries are a no-op, conflicting content requires inspection.
+After the source and tap implementation PRs are approved and merged and the
+central updater is enabled, revoke the retired SendBox tap SSH deploy key and
+remove its old Actions secret. Older tag reruns retain their original workflow
+definition; retiring that credential prevents them from writing to the tap.
+Keep the release-signing secret configured.
 
-Activation after reviewing the two draft PRs:
-
-1. With human approval, merge the SendBox source/security changes. This does not
-   publish a release or activate the tap.
-2. Separately approve and publish a patched stable release newer than v0.2.2.
-   Do not reuse existing v0.2.2 tags, assets, or checksums.
-3. Update the still-draft tap bootstrap branch from that release's verified
-   artifacts, rerun its isolated CI, then approve and merge it. For example,
-   **only after an approved v0.2.3 exists**, run the updater from a SendBox
-   checkout against the bootstrap tap checkout:
-
-   ```bash
-   python3 packaging/homebrew/update.py --tag v0.2.3 \
-     --tap /path/to/bootstrap-tap-checkout
-   ```
-
-   Commit/push only that tap feature branch, never `main`. The normal release
-   hook requires a formula already on tap `main`, so the first bootstrap update
-   is deliberately explicit rather than trusting an unmerged branch.
-4. In the tap's Actions settings, enable **Allow GitHub Actions to create and
-   approve pull requests** so its scoped workflow token can create update
-   drafts. The workflow creates drafts only; it never approves or merges.
-
-To retry a failed update after the patched release and formula are available
-on `main`, dispatch **Homebrew stable update** with that published latest
-stable tag, for example after v0.2.3 has been approved and published:
-
-```bash
-gh workflow run homebrew.yaml --repo mbianchidev/sendbox \
-  --ref main -f tag=v0.2.3
-```
-
-If the formula already matches that verified release, the workflow is a no-op.
-If a branch already exists, inspect its tap CI and draft PR; rerun the failed
-tap job after fixing permissions rather than replacing the branch. This retry
-path never runs `scripts/release.sh`, merges a PR, creates a tag, or republishes
-assets.
+If an update is blocked, inspect the central updater's Actions run and update
+PR in the tap, resolve the verification, CI, or review failure, then rerun the
+applicable tap workflow. Do not run `scripts/release.sh`, create another tag,
+move an existing tag, or republish artifacts just to retry a formula update.
 
 ## Build from source
 

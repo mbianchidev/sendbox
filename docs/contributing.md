@@ -44,28 +44,26 @@ executable is cached, but every run refreshes and checks the advisory database.
 The portable-check jobs also run the credential-free cold-start diagnostic
 harness's Python standard-library tests. Live VM qualification remains an
 explicit prepared-host check; see [cold-start DNS diagnostics](dns-cold-start.md).
-The separate Homebrew updater check uses Python standard-library tests for
-stable-release gating, checksum/provenance failures, atomic formula updates,
-and preservation of other tap packages. Both Python test suites and the stable
-Homebrew update workflow explicitly select Python **3.15.1**, rather than the
+The diagnostic tests explicitly select Python **3.15.1**, rather than the
 runner's preinstalled `python3`. No third-party Python packages are required.
 This host-side selection does not change the standalone diagnostic workload
-image or add Python to production Rust guest images.
+image or add Python to production Rust guest images. Homebrew updater tests
+belong to the tap that owns formula updates, not this source repository.
 
-CI and stable Homebrew updates preload the exact Python release asset through
+CI preloads the exact Python release asset through
 GitHub's release-asset API using `scripts/setup-ci-python.sh`, with SHA-256
 verification and bounded retries before the normal `setup-python` action selects
 it. The helper supports macOS arm64 and Ubuntu x64, including matching packages
 for Ubuntu 22.04, 24.04, and 26.04. Update the workflow version, helper version,
 asset IDs, and checksums together when updating Python.
 
-Run the updater tests locally without installing or starting SendBox. Python
-3.11 or newer remains supported for the updater and release helper; substitute
-`python3.15` for `python3` to reproduce CI's selected minor version:
+Run the diagnostic harness tests locally without installing or starting
+SendBox; substitute `python3.15` for `python3` to reproduce CI's selected minor
+version. The release helper separately requires Python 3.11 or newer:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
-  -s packaging/homebrew -p 'test_*.py'
+  -s test-fixtures/dns-cold-start -p 'test_*.py'
 ```
 
 The CLI integration suite also exercises release creation and same-version
@@ -129,8 +127,8 @@ script switches to `main` and pulls fast-forward-only before release operations.
 Retry a failed attempt with the same command and version; existing release tags
 are not moved or replaced.
 
-Stable releases reuse the published archives to prepare a Homebrew formula
-update in the existing tap; they do not compile a separate Homebrew binary.
+Homebrew updates reuse the published archives and are owned by the existing
+tap; SendBox does not compile a separate Homebrew binary or write tap branches.
 Release builds cache Rust dependencies by toolchain/platform/lockfile and
 reuse each signed guest artifact for the host packages and publication.
 Native CLI tests and release builds run alongside the independent signed guest
@@ -141,4 +139,4 @@ repository's default artifact retention for failed-job retries and are not
 included in the public `release-*` asset set.
 Clean guest-container builds and the existing macOS/Linux checks remain in
 place. See [stable Homebrew updates](installation.md#stable-homebrew-updates)
-for deploy-key scope, draft PR review, activation, and retry procedures.
+for the pending central updater, native CI/review gates, activation, and recovery.

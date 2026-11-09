@@ -75,9 +75,10 @@ multi-repo workspaces, and nested agent sandbox settings.
 
 ### 1. Install SendBox and a runtime
 
-**Homebrew activation is pending an approved patched stable release.** Published
-v0.2.2 predates the TLS fixes for RUSTSEC-2026-0382/0383. The tap bootstrap stays
-draft until its formula references verified patched artifacts.
+**Central Homebrew automation is pending review and activation in the tap.**
+It will use verified patched stable releases v0.2.3 or newer; older artifacts
+predate the TLS fixes for RUSTSEC-2026-0382/0383. See
+[stable Homebrew updates](docs/installation.md#stable-homebrew-updates).
 
 Install the CLI from the existing Homebrew tap:
 

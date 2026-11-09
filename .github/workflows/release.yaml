@@ -524,9 +524,13 @@ jobs:
             brew install mbianchidev/tap/sendbox
             ```
 
-            The stable tap formula update is prepared after publication and
-            requires human review and merge. Follow the installation guide for
-            runtime setup and root-owned guest-bundle staging.
+            Stable formula updates are owned by mbianchidev/homebrew-tap.
+            Its central automation is pending review and activation. Once
+            enabled, it verifies published artifacts and auto-merges eligible
+            release-only updates after native tap CI and review guards pass,
+            normally within an hour of publication. Prereleases do not update
+            the stable formula. Follow the installation guide for runtime
+            setup and root-owned guest-bundle staging.
 
             Host archives are published for macOS arm64, Linux x86_64, and
             Linux aarch64. Each host archive includes the matching signed guest
@@ -553,16 +557,3 @@ jobs:
             that manage host and guest artifacts separately.
           files: dist/*
           fail_on_unmatched_files: true
-
-  homebrew:
-    name: Update Homebrew
-    needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
-    permissions:
-      contents: read
-      attestations: read
-    uses: ./.github/workflows/homebrew.yaml
-    with:
-      tag: ${{ github.ref_name }}
-    secrets:
-      SENDBOX_HOMEBREW_TAP_SSH_KEY: ${{ secrets.SENDBOX_HOMEBREW_TAP_SSH_KEY }}

@@ -19,26 +19,6 @@ env:
   PYTHON_VERSION: "3.15.1"
 
 jobs:
-  homebrew:
-    name: Homebrew updater
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Preload pinned Python
-        run: ./scripts/setup-ci-python.sh "$PYTHON_VERSION"
-
-      - name: Set up stable Python
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Test stable release verification and formula updates
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
-        run: python3 -m unittest discover -s packaging/homebrew -p 'test_*.py'
-
   build-and-test:
     name: ${{ matrix.task == 'checks' && 'Rust' || 'Build and install' }} (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
