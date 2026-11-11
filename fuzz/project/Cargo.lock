@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "sendbox-project"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "jsonc-parser",
  "roxmltree",
