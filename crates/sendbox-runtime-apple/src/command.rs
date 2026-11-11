@@ -260,6 +260,11 @@ impl AppleContainerCommands {
         ])
     }
 
+    #[must_use]
+    pub(crate) fn builtin_network_inspect(&self) -> CommandSpec {
+        self.spec(["network", "inspect", "default"])
+    }
+
     pub fn create(
         &self,
         id: &ContainerId,

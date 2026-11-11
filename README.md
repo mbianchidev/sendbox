@@ -99,12 +99,15 @@ need that bundle separately.
 
 | Your host | Session runtime and prerequisites | Setup |
 |---|---|---|
-| macOS 26+ on Apple silicon | Apple Containerization, Xcode 26, and official `container` CLI **0.10.0** with its service registered and running | [Apple runtime](docs/apple-runtime.md) |
+| macOS 26+ on Apple silicon | Apple Containerization, Xcode 26, and an exact matching official `container` CLI/service pair: **0.10.0** or **1.7.1**, with the service registered and running | [Apple runtime and qualification status](docs/apple-runtime.md) |
 | Linux x86_64 or aarch64 with hardware or nested virtualization | Kata Containers **3.28+**, containerd **1.7+**, nerdctl, CNI plugins, and user access to `/dev/kvm` and containerd | [Kata runtime](docs/kata-containers.md) |
 
 Linux host binaries also need libseccomp, libelf, zlib, and zstd runtime libraries
 (on Debian/Ubuntu: `libseccomp2 libelf1 zlib1g libzstd1`). Rust is only required
 when building from source.
+
+Apple 1.7.1 compatibility is currently source-only, not part of released
+SendBox v0.2.5. See the [release and physical qualification gates](docs/apple-runtime.md#qualification).
 
 Run the installed `setup.sh` as your normal user for runtime preflight and
 configuration assistance, not `sudo sendbox`. For macOS package/DMG installs,

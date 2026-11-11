@@ -11,7 +11,8 @@ inside the VM.
 ## Requirements
 
 - macOS on arm64
-- official `container` CLI **0.10.0**
+- official `container` CLI and API server with exactly matching versions:
+  **0.10.0 / 0.10.0** or **1.7.1 / 1.7.1**
 - a root-owned executable, root-owned/non-writable bundle and optional kernel,
   and a root-owned mode `0444` Ed25519 public key
 - the `container` service already registered and running
@@ -28,14 +29,75 @@ A plain Alpine base image does not include `nftables`.
 Entrypoint and working-directory paths must also be symlink-free; see the
 [workload image requirements](installation.md#workload-image-versus-guest-bundle).
 
-`setup.sh` installs only the qualified 0.10.0 signed package and verifies its
-pinned SHA-256 digest plus package signature before invoking the installer.
-Already-installed later versions fail preflight rather than being accepted
-optimistically.
+The 1.7.1 adapter changes are source compatibility, not a new SendBox release
+or completed consumer qualification. Released SendBox v0.2.5 does not contain
+them. Keep using independently verified, compatible released host/guest bytes
+for production; a source build or portable fixture pass is not equivalent.
+
+`setup.sh` still installs only the pinned 0.10.0 signed package and verifies its
+SHA-256 digest plus package signature. This compatibility change does not
+update the installer, install 1.7.1, or change the registered service. All
+other versions, prereleases, and mixed CLI/server pairs fail closed.
 
 Preflight is non-mutating. It queries version, complete command help, and
-`container system status --format json`. It never runs `container system
-start`, `stop`, or registration commands.
+`container system status --format json`. It checks the API server's version and
+`container-apiserver` identity, not just `status: running`. The 1.7.1 payload
+must also identify the client as `container` at the selected CLI version.
+Creation repeats preflight before inspecting/pulling an image or creating a
+container, including when a library caller omitted a separate preflight.
+It never runs `container system start`, `stop`, or registration commands.
+
+### Executable and service selection
+
+The production host resolves `container` in this fixed order, independently of
+the caller's `PATH`: `/usr/local/bin`, `/opt/homebrew/bin`, `/usr/bin`, `/bin`.
+It does not skip an older installed executable to find a newer one. Diagnostics
+identify the selected absolute path and observed CLI/server versions. A
+user-owned Homebrew CLI or writable ancestor is still rejected.
+
+`AppleRuntimeConfiguration.executable` is an explicit library API override.
+`SENDBOX_APPLE_CONTAINER_EXECUTABLE` configures only the live test below; it is
+not an override for `sendbox run`. The production CLI currently has no Apple
+executable override. Do not copy an unsigned Homebrew binary into a trusted
+location or relax ownership checks to make preflight pass.
+
+Apple 1.7.1 discovers plugins from the **running server's** `installRoot`:
+`libexec/container-plugins` first, then `libexec/container/plugins` beneath that
+root. The official signed package installs `bin/container`,
+`bin/container-apiserver`, and `libexec/container/plugins/<plugin>/` under
+`/usr/local`; each plugin has its own `bin/` executable and `config.toml`.
+Apple's `--install-root` option belongs to `container system start`, not a
+per-container command. SendBox clears inherited `CONTAINER_*` variables and
+does not offer a plugin-root override or restart services.
+
+In the compatibility investigation, `/usr/local/bin/container` was 0.10.0
+while the API server and Homebrew CLI were 1.7.1. The old CLI returned an empty
+network list and failed creation with `builtin network is not present`; the
+matching 1.7.1 CLI could see the existing built-in `default` NAT network. That
+error was not evidence that a network should be created or reconfigured.
+An operator must review and provision a matching trusted CLI explicitly.
+
+### Reviewed JSON contracts
+
+The 1.7.1 contracts were reviewed against upstream
+[`a15b46097aa4c2325da13c1fb5192b9274aab083`](https://github.com/apple/container/tree/a15b46097aa4c2325da13c1fb5192b9274aab083):
+
+- Image inspection accepts the 0.10.0 top-level `name`/`index.digest` layout
+  and the 1.7.1 `configuration.name`/`configuration.descriptor.digest` layout.
+  Exactly one image is required. The 1.7.1 raw-hex `id` must agree with the
+  canonical SHA-256 descriptor. A requested digest must match that descriptor,
+  never a tag, display name, annotation, or platform-variant digest. Inspection
+  is repeated after a pull; malformed or truncated output fails.
+- Container inspection requires exactly one record bound to the owned
+  `configuration.id`. It reads the 0.10.0 top-level status string or the
+  1.7.1 `status.state` plus matching top-level `id`. Missing, unknown, or
+  ambiguous state is an error, never cached `running` health or a recursively
+  discovered label.
+- With the default network on 1.7.1, non-mutating
+  `network inspect default` must identify `id` and `configuration.name` as
+  `default`, mode `nat`, plugin `container-network-vmnet`, and label
+  `com.apple.container.resource.role=builtin`. This is a prerequisite check,
+  not network creation, migration, or an egress-policy exception.
 
 ## Lifecycle and control transport
 
@@ -51,10 +113,9 @@ environment, mounts, DNS servers, CPU, memory, working directory, and labels
 override or extend adapter defaults. Memory must be expressed in whole MiB, and
 conflicting no-DNS/DNS settings fail before the CLI is invoked.
 
-Apple 0.10.0 advertises `--publish-socket`, but the available development host
-reported an unregistered service, so no live VM evidence established its
-replacement, ownership, cancellation, or bidirectional semantics. The
-production adapter therefore **does not advertise published Unix sockets**.
+Both reviewed versions advertise `--publish-socket`, but no live VM evidence
+establishes its replacement, ownership, cancellation, or bidirectional semantics.
+The production adapter therefore **does not advertise published Unix sockets**.
 It uses another official CLI surface:
 
 1. The provider combines the per-session secret with the signed trust metadata,
@@ -92,22 +153,35 @@ export SENDBOX_APPLE_CONTAINER_PUBLIC_KEY=/absolute/path/to/root.pub
 export SENDBOX_APPLE_CONTAINER_TRUST_ROOT_ID=release-root-v1
 export SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE=1
 export SENDBOX_APPLE_CONTAINER_LIVE_IMAGE=ghcr.io/example/sendbox-base@sha256:...
+# Optional explicit trusted CLI path, for this test only:
+export SENDBOX_APPLE_CONTAINER_EXECUTABLE=/usr/local/bin/container
 cargo test -p sendbox-runtime-apple --test live -- --nocapture
 ```
 
 When `SENDBOX_APPLE_CONTAINER_LIVE=1`, missing configuration, a stopped service,
 transport failure, authentication failure, or cleanup failure fails the test;
-it is not converted to a skip. The test uses unique container and session/socket
-identities and always attempts channel cleanup, stop, and targeted delete.
+it is not converted to a skip. The image must already exist locally at its exact
+index digest; the test never pulls it. It mounts only generated fixture data,
+separate from host runtime state, uses unique container and session/socket
+identities, and checks running and stopped inspect states. The primary live
+operation has a 90-second deadline, followed by channel cleanup, stop, and
+targeted delete even after failure. An ordinary test run without the live flag
+does not provide physical qualification evidence.
+
+The mixed-version physical host was verified to fail at preflight, before
+creating a VM. A positive 1.7.1 live gate still requires an operator-provisioned
+trusted matching CLI. Compatible SendBox release packaging and each consumer's
+exact-image execution, cancellation, recovery, accounting, and checkpoint
+qualification remain separate gates.
 
 ## Limitations
 
-- Only CLI 0.10.0 is qualified; later versions fail preflight until their help
-  and lifecycle schemas are reviewed.
+- Only exact matching 0.10.0 and 1.7.1 CLI/server pairs are supported by this
+  source. No other version is accepted based on ordering or help similarity.
 - The adapter does not start/register/stop the Apple service.
 - `--publish-socket`, Rosetta, virtualization passthrough, SSH forwarding, TTY
   mode, and arbitrary workload exec are not advertised.
-- Apple CLI 0.10.0 has no hostname option. Container identity remains the
+- Neither reviewed CLI has a hostname option. Container identity remains the
   session-unique container name rather than claiming a separately configured
   kernel hostname.
 - Runtime `Network` capability covers Apple network/DNS provisioning.
@@ -147,9 +221,10 @@ In one retained failed run, Apple reported `vmexec ... read ack pipe` while
 starting the control relay; the guest was locally ready but the relay never
 reached the handshake. Apple 0.10.0 can also wait indefinitely after such a start
 failure. The upstream [waiter fix](https://github.com/apple/container/pull/1289)
-is included in 0.11.0, but later Apple versions remain unqualified by this
-adapter. Do not infer that a later successful retry repaired an earlier failed
-run or upgrade the host service as an implicit workaround.
+is included in 0.11.0. That does not qualify 0.11.0 or every later version;
+this adapter separately reviews exact supported pairs. Do not infer that a
+later successful retry repaired an earlier failed run or upgrade the host
+service as an implicit workaround.
 
 Replacing only the host CLI cannot correct that guest defect: rebuild and sign
 the guest bundle as well. Host/guest manifest versions must match the binaries,

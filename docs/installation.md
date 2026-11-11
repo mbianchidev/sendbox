@@ -16,7 +16,7 @@ narrower capability set.
 | Apple runtime | macOS | 26 (Tahoe) or newer |
 | Apple runtime | Hardware | Apple silicon |
 | Apple runtime | Xcode | 26 |
-| Apple runtime | Official `container` CLI | Exactly 0.10.0; service already registered and running |
+| Apple runtime | Official `container` CLI and API server | Exact matching 0.10.0 or 1.7.1 pair; service already registered and running; see [source/release qualification status](apple-runtime.md#requirements) |
 | Kata runtime | Linux | Bare metal or nested virtualization |
 | Kata runtime | Kata Containers | 3.28 or newer |
 | Kata runtime | containerd | 1.7 or newer |
