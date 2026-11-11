@@ -99,6 +99,18 @@ The 1.7.1 contracts were reviewed against upstream
   `com.apple.container.resource.role=builtin`. This is a prerequisite check,
   not network creation, migration, or an egress-policy exception.
 
+Apple 1.7.1 also restricts the default Linux capability set. A root UID alone
+cannot program nftables: the reviewed default mask lacks `CAP_NET_ADMIN`.
+The adapter explicitly grants that capability to the signed trusted guest
+containment services. Only when syscall tracing is explicitly enabled does it
+also grant guest-only `CAP_SYS_ADMIN`, needed by the reviewed guest to mount
+tracefs and attach BPF programs. That broader trusted-service capability is
+absent when tracing is disabled. It never requests `ALL` or a privileged
+container. The non-root workload still runs through the signed
+launcher with empty capability sets, seccomp and deny-first command/network
+policy; these supervisor grants are not workload grants. The 0.10.0 argv is
+unchanged because that CLI does not offer `--cap-add`.
+
 ## Lifecycle and control transport
 
 The adapter checks or pulls the image according to policy, creates a named
@@ -168,11 +180,30 @@ operation has a 90-second deadline, followed by channel cleanup, stop, and
 targeted delete even after failure. An ordinary test run without the live flag
 does not provide physical qualification evidence.
 
-The mixed-version physical host was verified to fail at preflight, before
-creating a VM. A positive 1.7.1 live gate still requires an operator-provisioned
-trusted matching CLI. Compatible SendBox release packaging and each consumer's
-exact-image execution, cancellation, recovery, accounting, and checkpoint
-qualification remain separate gates.
+The November 11, 2026 investigation first verified mixed-version and
+user-owned-CLI rejection before VM creation. After the operator provisioned the
+official root-owned Apple 1.7.1 CLI, the live gate passed with the already-running
+1.7.1 service and existing default network. A generated production-host Node
+workload also exited successfully with non-root UID, empty workload capability
+sets and `NoNewPrivs=1`. A separate generated cancellation returned exit 130,
+rolled back its transient write, preserved prior successful output, and removed
+the exact owned VM. No model credentials or live checkout were used.
+
+These runs used the source-built, dependency-patched host with the unchanged
+reviewed v0.2.5 guest bundle, release sequence 10. They are backend evidence,
+not patched guest or release qualification. New independently reviewed
+compatible host/guest release artifacts and each consumer's exact-image
+execution, cancellation, recovery, accounting, and checkpoint qualification
+remain separate gates.
+
+Optional syscall tracing remains **unqualified on the inspected default guest
+environment**: guest kernel 6.18.5 exposed neither
+`/sys/kernel/tracing` nor `/sys/kernel/btf/vmlinux`. The reviewed tracer failed
+with `mounting guest tracefs: No such file or directory`, even with the
+explicitly opted-in guest-only `CAP_SYS_ADMIN`. Prepare a trusted guest/kernel
+exposing tracefs, BTF and the required tracepoints before qualifying this mode.
+Do not silently skip tracing or claim readiness when it was requested. SendBox
+does not install a kernel or restart/reconfigure shared services to fix it.
 
 ## Limitations
 

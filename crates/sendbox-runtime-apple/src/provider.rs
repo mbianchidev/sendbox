@@ -228,7 +228,10 @@ impl AppleRuntime {
         ])
     }
 
-    async fn check_preflight(&self, cancellation: &CancellationToken) -> Result<(), RuntimeError> {
+    async fn check_preflight(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<&'static str, RuntimeError> {
         self.configuration.validate()?;
         if !self.configuration.allow_non_apple_host
             && (std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64")
@@ -255,8 +258,10 @@ impl AppleRuntime {
             .await?;
         ensure_complete_output(&version, "Apple container version")?;
         let version = String::from_utf8_lossy(&version.stdout.bytes);
-        let Some(cli_version) = parse_container_cli_version(&version)
-            .filter(|version| SUPPORTED_VERSIONS.contains(version))
+        let parsed = parse_container_cli_version(&version);
+        let Some(cli_version) = SUPPORTED_VERSIONS
+            .into_iter()
+            .find(|supported| parsed == Some(*supported))
         else {
             return Err(RuntimeError::Unavailable {
                 runtime: self.runtime_id.clone(),
@@ -311,11 +316,14 @@ impl AppleRuntime {
                 .await?;
             ensure_complete_output(&output, &format!("Apple container {command} help"))?;
             let help = String::from_utf8_lossy(&output.stdout.bytes);
-            let missing = tokens
+            let mut missing = tokens
                 .iter()
                 .filter(|token| !help.contains(**token))
                 .copied()
                 .collect::<Vec<_>>();
+            if cli_version == "1.7.1" && command == "create" && !help.contains("--cap-add") {
+                missing.push("--cap-add");
+            }
             if !missing.is_empty() {
                 return Err(RuntimeError::Unavailable {
                     runtime: self.runtime_id.clone(),
@@ -341,7 +349,7 @@ impl AppleRuntime {
             ensure_complete_output(&network, "Apple built-in network inspect")?;
             validate_builtin_network(&network.stdout.bytes)?;
         }
-        Ok(())
+        Ok(cli_version)
     }
 
     fn verify_bundle(&self) -> Result<(), RuntimeError> {
@@ -683,7 +691,7 @@ impl RuntimeProvider for AppleRuntime {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .clone()
                 .ok_or_else(|| provider_error("Apple runtime is not initialized"))?;
-            self.check_preflight(cancellation).await?;
+            let cli_version = self.check_preflight(cancellation).await?;
             self.ensure_image(&request.image, cancellation).await?;
             let launch = self.configuration.launch.merge_create_request(&request)?;
             if self
@@ -701,12 +709,22 @@ impl RuntimeProvider for AppleRuntime {
             prepare_state_directory(&container_state)?;
             let staged_public_key =
                 stage_public_key(&self.configuration.public_key, &container_state)?;
-            let command = match self.commands.create(
+            let capabilities: &[&str] = if cli_version == "1.7.1" {
+                if self.configuration.syscall_tracing {
+                    &["CAP_NET_ADMIN", "CAP_SYS_ADMIN"]
+                } else {
+                    &["CAP_NET_ADMIN"]
+                }
+            } else {
+                &[]
+            };
+            let command = match self.commands.create_with_capabilities(
                 &request.container_id,
                 &request.image,
                 &launch,
                 &self.configuration.bundle_root,
                 &staged_public_key,
+                capabilities,
             ) {
                 Ok(command) => command,
                 Err(error) => {
@@ -1690,7 +1708,10 @@ case "$1" in
   create|start|exec|logs|kill|stop|delete|inspect)
     if [ "${{2:-}}" = "--help" ]; then
       case "$1" in
-        create) echo 'container create --mount --env --network --dns --cpus --memory --kernel --workdir --label' ;;
+        create)
+          echo 'container create --mount --env --network --dns --cpus --memory --kernel --workdir --label'
+          if [ -f "$state/modern" ]; then echo '--cap-add'; fi
+          ;;
         start) echo 'container start' ;;
         exec) echo 'container exec --interactive --detach --workdir' ;;
         logs) echo 'container logs --follow' ;;
@@ -2160,6 +2181,52 @@ esac
                                 .expect("post-pull inspection")
                     );
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_guest_capabilities_cover_enforcement_and_only_opt_in_tracing() {
+        for version in ["0.10.0", "1.7.1"] {
+            for tracing in [false, true] {
+                let (temporary, mut runtime) = fixture_runtime_for_version(version);
+                runtime.configuration.syscall_tracing = tracing;
+                let cancellation = CancellationToken::new();
+                runtime
+                    .initialize(
+                        InitializeRequest {
+                            state_directory: temporary.path().join("state"),
+                        },
+                        &cancellation,
+                    )
+                    .await
+                    .expect("initialize");
+                runtime
+                    .create(
+                        create_request("apple-capabilities", "fixture:image"),
+                        &cancellation,
+                    )
+                    .await
+                    .expect("create");
+                let commands = fs::read_to_string(temporary.path().join("fake-state/commands"))
+                    .expect("commands");
+                let create = commands
+                    .lines()
+                    .find(|line| line.starts_with("create --name "))
+                    .expect("create command")
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                let capabilities = create
+                    .windows(2)
+                    .filter(|pair| pair[0] == "--cap-add")
+                    .map(|pair| pair[1])
+                    .collect::<Vec<_>>();
+                let expected = match (version, tracing) {
+                    ("1.7.1", true) => vec!["CAP_NET_ADMIN", "CAP_SYS_ADMIN"],
+                    ("1.7.1", false) => vec!["CAP_NET_ADMIN"],
+                    _ => Vec::new(),
+                };
+                assert_eq!(capabilities, expected, "{version}, tracing={tracing}");
             }
         }
     }

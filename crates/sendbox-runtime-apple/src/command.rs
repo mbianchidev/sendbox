@@ -273,6 +273,18 @@ impl AppleContainerCommands {
         bundle_root: &Path,
         public_key: &Path,
     ) -> Result<CommandSpec, RuntimeError> {
+        self.create_with_capabilities(id, image, launch, bundle_root, public_key, &[])
+    }
+
+    pub(crate) fn create_with_capabilities(
+        &self,
+        id: &ContainerId,
+        image: &str,
+        launch: &AppleLaunchConfiguration,
+        bundle_root: &Path,
+        public_key: &Path,
+        capabilities: &[&str],
+    ) -> Result<CommandSpec, RuntimeError> {
         validate_image(image)?;
         launch.validate()?;
         validate_mapping_path(bundle_root, "bundle root")?;
@@ -303,6 +315,9 @@ impl AppleContainerCommands {
                 display_path(public_key_parent)
             )),
         ];
+        for capability in capabilities {
+            arguments.extend([plain("--cap-add"), plain(*capability)]);
+        }
         append_environment(&mut arguments, &launch.environment);
         append_mounts(&mut arguments, &launch.mounts)?;
         append_network(&mut arguments, &launch.network)?;

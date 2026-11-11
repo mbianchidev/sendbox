@@ -41,6 +41,16 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
     let minimum_release_sequence = required("SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE")
         .parse()
         .expect("minimum release sequence must be an integer");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let container_id =
+        ContainerId::new(format!("sendbox-apple-live-{}-{nonce}", std::process::id()))
+            .expect("container id");
+    let mut session_bytes = nonce.to_le_bytes();
+    session_bytes[..4].copy_from_slice(&std::process::id().to_le_bytes());
+    let session_id = SessionId::from_bytes(session_bytes);
     let mut configuration = AppleRuntimeConfiguration::new(
         bundle,
         public_key,
@@ -53,6 +63,21 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
         configuration.executable = Some(PathBuf::from(executable));
     }
     configuration.launch.pull_policy = ImagePullPolicy::Never;
+    configuration.egress_policy =
+        Some(sendbox_egress::runtime::RuntimePolicyDocument::for_session(
+            session_id,
+            sendbox_policy::NetworkPolicy {
+                default_action: sendbox_policy::Action::Deny,
+                allowed_domains: Vec::new(),
+                blocked_domains: Vec::new(),
+                allow_dns: false,
+                max_connections: None,
+                allowed_networks: Vec::new(),
+                blocked_networks: Vec::new(),
+                allowed_ports: Vec::new(),
+                dns: sendbox_policy::DnsPolicy::default(),
+            },
+        ));
     let runtime = AppleRuntime::new(configuration).expect("runtime configuration");
     let cancellation = CancellationToken::new();
     runtime
@@ -84,17 +109,7 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
         .await
         .expect("initialize");
 
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let container_id =
-        ContainerId::new(format!("sendbox-apple-live-{}-{nonce}", std::process::id()))
-            .expect("container id");
     eprintln!("owned live container: {container_id}");
-    let mut session_bytes = nonce.to_le_bytes();
-    session_bytes[..4].copy_from_slice(&std::process::id().to_le_bytes());
-    let session_id = SessionId::from_bytes(session_bytes);
     let boundary_plan_digest = BoundaryPlanDigest::from_bytes([0x84; 32]);
     let secret = [0x6d_u8; 32];
 
