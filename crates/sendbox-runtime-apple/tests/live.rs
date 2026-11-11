@@ -12,10 +12,10 @@ use sendbox_protocol::{
 use sendbox_runtime::{
     BootstrapDelivery, BootstrapMaterial, CancellationToken, ChannelLifetime, ChannelOwnership,
     ContainerId, ControlChannelRequest, ControlEndpointKind, CreateRequest, InitializeRequest,
-    PreflightRequest, RUNTIME_INJECTED_BOOTSTRAP_TARGET, RuntimeMount, RuntimeProvider,
-    StartRequest, StopRequest,
+    LifecycleState, PreflightRequest, RUNTIME_INJECTED_BOOTSTRAP_TARGET, RuntimeMount,
+    RuntimeProvider, StartRequest, StopRequest,
 };
-use sendbox_runtime_apple::{AppleRuntime, AppleRuntimeConfiguration};
+use sendbox_runtime_apple::{AppleRuntime, AppleRuntimeConfiguration, ImagePullPolicy};
 
 #[tokio::test]
 async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup() {
@@ -28,9 +28,29 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
     let public_key = required_path("SENDBOX_APPLE_CONTAINER_PUBLIC_KEY");
     let trust_root_id = required("SENDBOX_APPLE_CONTAINER_TRUST_ROOT_ID");
     let image = required("SENDBOX_APPLE_CONTAINER_LIVE_IMAGE");
+    let (_, digest) = image
+        .rsplit_once("@sha256:")
+        .expect("live image must be pinned by its OCI index SHA-256 digest");
+    assert!(
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "live image digest must be canonical SHA-256"
+    );
     let minimum_release_sequence = required("SENDBOX_APPLE_CONTAINER_MIN_RELEASE_SEQUENCE")
         .parse()
         .expect("minimum release sequence must be an integer");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let container_id =
+        ContainerId::new(format!("sendbox-apple-live-{}-{nonce}", std::process::id()))
+            .expect("container id");
+    let mut session_bytes = nonce.to_le_bytes();
+    session_bytes[..4].copy_from_slice(&std::process::id().to_le_bytes());
+    let session_id = SessionId::from_bytes(session_bytes);
     let mut configuration = AppleRuntimeConfiguration::new(
         bundle,
         public_key,
@@ -42,6 +62,22 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
     if let Ok(executable) = std::env::var("SENDBOX_APPLE_CONTAINER_EXECUTABLE") {
         configuration.executable = Some(PathBuf::from(executable));
     }
+    configuration.launch.pull_policy = ImagePullPolicy::Never;
+    configuration.egress_policy =
+        Some(sendbox_egress::runtime::RuntimePolicyDocument::for_session(
+            session_id,
+            sendbox_policy::NetworkPolicy {
+                default_action: sendbox_policy::Action::Deny,
+                allowed_domains: Vec::new(),
+                blocked_domains: Vec::new(),
+                allow_dns: false,
+                max_connections: None,
+                allowed_networks: Vec::new(),
+                blocked_networks: Vec::new(),
+                allowed_ports: Vec::new(),
+                dns: sendbox_policy::DnsPolicy::default(),
+            },
+        ));
     let runtime = AppleRuntime::new(configuration).expect("runtime configuration");
     let cancellation = CancellationToken::new();
     runtime
@@ -56,6 +92,13 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
 
     let temporary = tempfile::tempdir_in(std::env::current_dir().expect("current directory"))
         .expect("runtime state");
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("generated workspace");
+    std::fs::write(
+        workspace.join("fixture.txt"),
+        b"generated live qualification\n",
+    )
+    .expect("generated fixture");
     runtime
         .initialize(
             InitializeRequest {
@@ -66,22 +109,13 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
         .await
         .expect("initialize");
 
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let container_id =
-        ContainerId::new(format!("sendbox-apple-live-{}-{nonce}", std::process::id()))
-            .expect("container id");
-    let mut session_bytes = nonce.to_le_bytes();
-    session_bytes[..4].copy_from_slice(&std::process::id().to_le_bytes());
-    let session_id = SessionId::from_bytes(session_bytes);
+    eprintln!("owned live container: {container_id}");
     let boundary_plan_digest = BoundaryPlanDigest::from_bytes([0x84; 32]);
     let secret = [0x6d_u8; 32];
 
     let mut created = false;
     let mut channel = None;
-    let primary = async {
+    let primary = tokio::time::timeout(Duration::from_secs(90), async {
         runtime
             .create(
                 CreateRequest {
@@ -95,7 +129,7 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
                         memory_bytes: 512 * 1024 * 1024,
                     },
                     mounts: vec![RuntimeMount {
-                        source: temporary.path().to_path_buf(),
+                        source: workspace,
                         destination: PathBuf::from("/workspace"),
                         writable: true,
                     }],
@@ -111,6 +145,16 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
         runtime
             .start(&container_id, StartRequest::default(), &cancellation)
             .await?;
+        if runtime
+            .status(&container_id, &cancellation)
+            .await?
+            .lifecycle
+            != LifecycleState::Running
+        {
+            return Err(sendbox_runtime::RuntimeError::Provider(
+                "live container inspect did not report running".to_owned(),
+            ));
+        }
         let provisioned = runtime
             .provision_control_channel(
                 ControlChannelRequest {
@@ -172,8 +216,9 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
             .await
             .map_err(protocol_error)?;
         Ok::<(), sendbox_runtime::RuntimeError>(())
-    }
-    .await;
+    })
+    .await
+    .unwrap_or(Err(sendbox_runtime::RuntimeError::TimedOut));
 
     let channel_cleanup = if let Some(channel) = channel.as_mut() {
         channel.cleanup(&cancellation).await
@@ -187,11 +232,28 @@ async fn configured_live_runtime_proves_authenticated_stdio_channel_and_cleanup(
     } else {
         Ok(())
     };
+    let stopped_status = if created && stop.is_ok() {
+        runtime
+            .status(&container_id, &cancellation)
+            .await
+            .and_then(|status| {
+                if status.lifecycle == LifecycleState::Stopped {
+                    Ok(())
+                } else {
+                    Err(sendbox_runtime::RuntimeError::Provider(
+                        "live container inspect did not report stopped".to_owned(),
+                    ))
+                }
+            })
+    } else {
+        Ok(())
+    };
     let cleanup = runtime.cleanup(&container_id, &cancellation).await;
 
     primary.expect("live lifecycle and authenticated channel");
     channel_cleanup.expect("live channel cleanup");
     stop.expect("live stop");
+    stopped_status.expect("live stopped inspect");
     assert!(cleanup.expect("live cleanup").is_complete());
 }
 

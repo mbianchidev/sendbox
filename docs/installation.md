@@ -16,7 +16,7 @@ narrower capability set.
 | Apple runtime | macOS | 26 (Tahoe) or newer |
 | Apple runtime | Hardware | Apple silicon |
 | Apple runtime | Xcode | 26 |
-| Apple runtime | Official `container` CLI | Exactly 0.10.0; service already registered and running |
+| Apple runtime | Official `container` CLI and API server | Exact matching 0.10.0 or 1.7.1 pair; service already registered and running; see [source/release qualification status](apple-runtime.md#requirements) |
 | Kata runtime | Linux | Bare metal or nested virtualization |
 | Kata runtime | Kata Containers | 3.28 or newer |
 | Kata runtime | containerd | 1.7 or newer |
@@ -63,8 +63,9 @@ provenance before trusting it.
 The existing [mbianchidev/tap](https://github.com/mbianchidev/homebrew-tap)
 uses a **formula**, not a GUI cask.
 
-Before installing, confirm the formula uses a patched stable release
-**v0.2.3 or newer**. Published v0.2.2 and earlier binaries predate
+Before installing, check the [dependency security status](#dependency-security-status).
+The **v0.2.3 TLS-fix floor is necessary but no longer sufficient**.
+Published v0.2.2 and earlier binaries predate
 [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382) and
 [RUSTSEC-2026-0383](https://rustsec.org/advisories/RUSTSEC-2026-0383).
 Published binaries cannot inherit source fixes. The planned central updater
@@ -72,6 +73,32 @@ keeps this patched-release floor and verifies the artifacts before updating
 the formula. **Central automation is pending review and activation in the
 tap**; see [stable Homebrew updates](#stable-homebrew-updates). This source
 change does not publish a replacement release or activate that automation.
+
+### Dependency security status
+
+The November 11, 2026 CI audit identified additional advisories in the unchanged
+v0.2.5 source/release lockfile. Source now requires at least
+`cap-std`/`cap-primitives` 4.0.3, `hickory-proto` 0.26.2, and `rustix` 1.1.6;
+the lockfiles resolve `hickory-proto` 0.26.3:
+
+- [RUSTSEC-2026-0482](https://rustsec.org/advisories/RUSTSEC-2026-0482):
+  capability filesystem sandbox escape, fixed by `cap-primitives` 4.0.3.
+- [RUSTSEC-2026-0491](https://rustsec.org/advisories/RUSTSEC-2026-0491),
+  [0487](https://rustsec.org/advisories/RUSTSEC-2026-0487),
+  [0488](https://rustsec.org/advisories/RUSTSEC-2026-0488),
+  [0490](https://rustsec.org/advisories/RUSTSEC-2026-0490), and
+  [0489](https://rustsec.org/advisories/RUSTSEC-2026-0489):
+  DNS allocation/panic defects fixed by `hickory-proto` 0.26.2.
+- [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486):
+  an extended-attribute buffer unsoundness warning fixed by `rustix` 1.1.6.
+
+These are source fixes, not newly published artifacts. Rebuild and independently
+review both the host and signed guest bundle in a new release; an installed
+v0.2.5 binary or guest bundle does not inherit dependency updates or Apple 1.7.1
+compatibility. Do not treat an older release as patched merely because it
+passes signature/digest verification or the historical TLS version floor.
+
+### Formula installation
 
 Install with:
 

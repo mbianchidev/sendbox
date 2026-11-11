@@ -76,8 +76,10 @@ multi-repo workspaces, and nested agent sandbox settings.
 ### 1. Install SendBox and a runtime
 
 **Central Homebrew automation is pending review and activation in the tap.**
-It will use verified patched stable releases v0.2.3 or newer; older artifacts
-predate the TLS fixes for RUSTSEC-2026-0382/0383. See
+The v0.2.3 TLS-fix floor alone is no longer sufficient: v0.2.5 also predates
+the dependency fixes identified by the November 11, 2026 audit. New reviewed
+host/guest release artifacts are still required. See the
+[dependency security status](docs/installation.md#dependency-security-status) and
 [stable Homebrew updates](docs/installation.md#stable-homebrew-updates).
 
 Install the CLI from the existing Homebrew tap:
@@ -99,12 +101,15 @@ need that bundle separately.
 
 | Your host | Session runtime and prerequisites | Setup |
 |---|---|---|
-| macOS 26+ on Apple silicon | Apple Containerization, Xcode 26, and official `container` CLI **0.10.0** with its service registered and running | [Apple runtime](docs/apple-runtime.md) |
+| macOS 26+ on Apple silicon | Apple Containerization, Xcode 26, and an exact matching official `container` CLI/service pair: **0.10.0** or **1.7.1**, with the service registered and running | [Apple runtime and qualification status](docs/apple-runtime.md) |
 | Linux x86_64 or aarch64 with hardware or nested virtualization | Kata Containers **3.28+**, containerd **1.7+**, nerdctl, CNI plugins, and user access to `/dev/kvm` and containerd | [Kata runtime](docs/kata-containers.md) |
 
 Linux host binaries also need libseccomp, libelf, zlib, and zstd runtime libraries
 (on Debian/Ubuntu: `libseccomp2 libelf1 zlib1g libzstd1`). Rust is only required
 when building from source.
+
+Apple 1.7.1 compatibility is currently source-only, not part of released
+SendBox v0.2.5. See the [release and physical qualification gates](docs/apple-runtime.md#qualification).
 
 Run the installed `setup.sh` as your normal user for runtime preflight and
 configuration assistance, not `sudo sendbox`. For macOS package/DMG installs,

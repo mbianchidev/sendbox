@@ -43,7 +43,7 @@ use crate::{
 };
 
 pub const APPLE_RUNTIME_ID: &str = "apple-container";
-const SUPPORTED_VERSION: &str = "0.10.0";
+const SUPPORTED_VERSIONS: [&str; 2] = ["0.10.0", "1.7.1"];
 const BOOTSTRAP_TARGET: &str = RUNTIME_INJECTED_BOOTSTRAP_TARGET;
 const BUNDLE_LAUNCHER: &str = "bin/sendbox-exec-launcher";
 const GUEST_BUNDLE_ROOT: &str = "/opt/sendbox";
@@ -228,7 +228,10 @@ impl AppleRuntime {
         ])
     }
 
-    async fn check_preflight(&self, cancellation: &CancellationToken) -> Result<(), RuntimeError> {
+    async fn check_preflight(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<&'static str, RuntimeError> {
         self.configuration.validate()?;
         if !self.configuration.allow_non_apple_host
             && (std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64")
@@ -255,41 +258,30 @@ impl AppleRuntime {
             .await?;
         ensure_complete_output(&version, "Apple container version")?;
         let version = String::from_utf8_lossy(&version.stdout.bytes);
-        if parse_container_cli_version(&version) != Some(SUPPORTED_VERSION) {
+        let parsed = parse_container_cli_version(&version);
+        let Some(cli_version) = SUPPORTED_VERSIONS
+            .into_iter()
+            .find(|supported| parsed == Some(*supported))
+        else {
             return Err(RuntimeError::Unavailable {
                 runtime: self.runtime_id.clone(),
                 reason: format!(
-                    "requires official Apple container CLI {SUPPORTED_VERSION}; observed `{}`",
+                    "requires official Apple container CLI {}; selected {} reports `{}`",
+                    SUPPORTED_VERSIONS.join(" or "),
+                    self.commands.executable().display(),
                     version.trim()
                 ),
             });
-        }
-
-        for (command, tokens) in required_help_tokens() {
-            let output = self
-                .run_checked(self.commands.help(command), cancellation)
-                .await?;
-            ensure_complete_output(&output, &format!("Apple container {command} help"))?;
-            let help = String::from_utf8_lossy(&output.stdout.bytes);
-            let missing = tokens
-                .iter()
-                .filter(|token| !help.contains(**token))
-                .copied()
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                return Err(RuntimeError::Unavailable {
-                    runtime: self.runtime_id.clone(),
-                    reason: format!(
-                        "`container {command} --help` is missing required capability tokens: {}",
-                        missing.join(", ")
-                    ),
-                });
-            }
-        }
+        };
 
         let service = self
             .run_raw(self.commands.service_status(), cancellation)
             .await?;
+        match service.termination {
+            TerminationReason::Cancelled => return Err(RuntimeError::Cancelled),
+            TerminationReason::TimedOut => return Err(RuntimeError::TimedOut),
+            TerminationReason::Exited => {}
+        }
         ensure_complete_output(&service, "Apple container service status")?;
         let service_status: ServiceStatus =
             serde_json::from_slice(&service.stdout.bytes).map_err(|error| {
@@ -307,7 +299,57 @@ impl AppleRuntime {
                 ),
             });
         }
-        Ok(())
+        checked_outcome(service)?;
+        service_status
+            .validate_identity(cli_version)
+            .map_err(|error| RuntimeError::Unavailable {
+                runtime: self.runtime_id.clone(),
+                reason: format!(
+                    "selected Apple container CLI {} ({cli_version}): {error}; SendBox never changes the executable or service automatically",
+                    self.commands.executable().display()
+                ),
+            })?;
+
+        for (command, tokens) in required_help_tokens() {
+            let output = self
+                .run_checked(self.commands.help(command), cancellation)
+                .await?;
+            ensure_complete_output(&output, &format!("Apple container {command} help"))?;
+            let help = String::from_utf8_lossy(&output.stdout.bytes);
+            let mut missing = tokens
+                .iter()
+                .filter(|token| !help.contains(**token))
+                .copied()
+                .collect::<Vec<_>>();
+            if cli_version == "1.7.1" && command == "create" && !help.contains("--cap-add") {
+                missing.push("--cap-add");
+            }
+            if !missing.is_empty() {
+                return Err(RuntimeError::Unavailable {
+                    runtime: self.runtime_id.clone(),
+                    reason: format!(
+                        "`container {command} --help` is missing required capability tokens: {}",
+                        missing.join(", ")
+                    ),
+                });
+            }
+        }
+        if cli_version == "1.7.1"
+            && self
+                .configuration
+                .launch
+                .network
+                .network
+                .as_deref()
+                .is_none_or(|network| network == "default")
+        {
+            let network = self
+                .run_checked(self.commands.builtin_network_inspect(), cancellation)
+                .await?;
+            ensure_complete_output(&network, "Apple built-in network inspect")?;
+            validate_builtin_network(&network.stdout.bytes)?;
+        }
+        Ok(cli_version)
     }
 
     fn verify_bundle(&self) -> Result<(), RuntimeError> {
@@ -403,26 +445,38 @@ impl AppleRuntime {
         image: &str,
         cancellation: &CancellationToken,
     ) -> Result<(), RuntimeError> {
-        match self.configuration.launch.pull_policy {
+        let inspection = match self.configuration.launch.pull_policy {
             ImagePullPolicy::Always => {
                 self.run_checked(self.commands.image_pull(image), cancellation)
                     .await?;
+                self.run_checked(self.commands.image_inspect(image), cancellation)
+                    .await?
             }
             ImagePullPolicy::Missing => {
                 let inspection = self
                     .run_raw(self.commands.image_inspect(image), cancellation)
                     .await?;
-                if !inspection.status.success {
+                match inspection.termination {
+                    TerminationReason::Cancelled => return Err(RuntimeError::Cancelled),
+                    TerminationReason::TimedOut => return Err(RuntimeError::TimedOut),
+                    TerminationReason::Exited => {}
+                }
+                if inspection.status.success {
+                    inspection
+                } else {
                     self.run_checked(self.commands.image_pull(image), cancellation)
                         .await?;
+                    self.run_checked(self.commands.image_inspect(image), cancellation)
+                        .await?
                 }
             }
             ImagePullPolicy::Never => {
                 self.run_checked(self.commands.image_inspect(image), cancellation)
-                    .await?;
+                    .await?
             }
-        }
-        Ok(())
+        };
+        ensure_complete_output(&inspection, "Apple image inspect")?;
+        validate_image_inspection(&inspection.stdout.bytes, image)
     }
 
     async fn inject_bootstrap(
@@ -637,7 +691,7 @@ impl RuntimeProvider for AppleRuntime {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .clone()
                 .ok_or_else(|| provider_error("Apple runtime is not initialized"))?;
-            self.verify_launch_artifacts()?;
+            let cli_version = self.check_preflight(cancellation).await?;
             self.ensure_image(&request.image, cancellation).await?;
             let launch = self.configuration.launch.merge_create_request(&request)?;
             if self
@@ -655,12 +709,22 @@ impl RuntimeProvider for AppleRuntime {
             prepare_state_directory(&container_state)?;
             let staged_public_key =
                 stage_public_key(&self.configuration.public_key, &container_state)?;
-            let command = match self.commands.create(
+            let capabilities: &[&str] = if cli_version == "1.7.1" {
+                if self.configuration.syscall_tracing {
+                    &["CAP_NET_ADMIN", "CAP_SYS_ADMIN"]
+                } else {
+                    &["CAP_NET_ADMIN"]
+                }
+            } else {
+                &[]
+            };
+            let command = match self.commands.create_with_capabilities(
                 &request.container_id,
                 &request.image,
                 &launch,
                 &self.configuration.bundle_root,
                 &staged_public_key,
+                capabilities,
             ) {
                 Ok(command) => command,
                 Err(error) => {
@@ -822,7 +886,7 @@ impl RuntimeProvider for AppleRuntime {
                 .run_checked(self.commands.inspect(container), cancellation)
                 .await?;
             ensure_complete_output(&outcome, "Apple container inspect")?;
-            let observed = parse_lifecycle(&outcome.stdout.bytes).unwrap_or(lifecycle);
+            let observed = parse_lifecycle(&outcome.stdout.bytes, container)?;
             Ok(RuntimeStatus {
                 lifecycle: observed,
                 health: if observed == LifecycleState::Running {
@@ -1031,6 +1095,101 @@ impl RuntimeProvider for AppleRuntime {
 #[derive(Deserialize)]
 struct ServiceStatus {
     status: String,
+    #[serde(rename = "apiServerAppName")]
+    api_server_app_name: Option<String>,
+    #[serde(rename = "apiServerVersion")]
+    api_server_version: Option<String>,
+    client: Option<ServiceIdentity>,
+    server: Option<ServiceIdentity>,
+}
+
+#[derive(Deserialize)]
+struct ServiceIdentity {
+    #[serde(rename = "appName")]
+    app_name: String,
+    version: String,
+}
+
+impl ServiceStatus {
+    fn validate_identity(&self, cli_version: &str) -> Result<(), RuntimeError> {
+        let (app_name, server_version) = match cli_version {
+            "0.10.0" if self.client.is_none() && self.server.is_none() => (
+                self.api_server_app_name.as_deref(),
+                self.api_server_version.as_deref(),
+            ),
+            "1.7.1" if self.api_server_app_name.is_none() && self.api_server_version.is_none() => {
+                let client = self.client.as_ref().ok_or_else(|| {
+                    provider_error("service status is missing the CLI client identity")
+                })?;
+                if client.app_name != "container" || client.version != cli_version {
+                    return Err(provider_error(format!(
+                        "service status client identity is {} {}, expected container {cli_version}",
+                        client.app_name, client.version
+                    )));
+                }
+                let server = self.server.as_ref().ok_or_else(|| {
+                    provider_error("service status is missing the API server identity")
+                })?;
+                (
+                    Some(server.app_name.as_str()),
+                    Some(server.version.as_str()),
+                )
+            }
+            _ => return Err(provider_error("unrecognized Apple service identity schema")),
+        };
+        if app_name != Some("container-apiserver") || server_version != Some(cli_version) {
+            return Err(provider_error(format!(
+                "API server identity is {} {}, expected container-apiserver {cli_version}; mixed CLI/server versions are unsupported",
+                app_name.unwrap_or("<missing>"),
+                server_version.unwrap_or("<missing>")
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct ManagedNetworkConfiguration {
+    name: String,
+    mode: String,
+    plugin: String,
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct ManagedNetworkInspection {
+    id: String,
+    configuration: ManagedNetworkConfiguration,
+}
+
+fn validate_builtin_network(bytes: &[u8]) -> Result<(), RuntimeError> {
+    let records: Vec<ManagedNetworkInspection> =
+        serde_json::from_slice(bytes).map_err(|error| {
+            provider_error(format!(
+                "invalid Apple built-in network inspect JSON: {error}"
+            ))
+        })?;
+    let [record] = records.as_slice() else {
+        return Err(provider_error(
+            "Apple built-in network inspect must return exactly one default network; SendBox never creates or reconfigures networks",
+        ));
+    };
+    let configuration = &record.configuration;
+    if record.id != "default"
+        || configuration.name != "default"
+        || configuration.mode != "nat"
+        || configuration.plugin != "container-network-vmnet"
+        || configuration
+            .labels
+            .get("com.apple.container.resource.role")
+            .map(String::as_str)
+            != Some("builtin")
+    {
+        return Err(provider_error(
+            "Apple default network identity must be the built-in container-network-vmnet NAT network; SendBox never creates or reconfigures networks",
+        ));
+    }
+    Ok(())
 }
 
 fn required_help_tokens() -> [(&'static str, &'static [&'static str]); 8] {
@@ -1298,28 +1457,122 @@ fn outcome_error(outcome: &ProcessOutcome) -> RuntimeError {
     ))
 }
 
-fn parse_lifecycle(bytes: &[u8]) -> Option<LifecycleState> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    find_status(&value).and_then(|status| match status.to_ascii_lowercase().as_str() {
-        "running" => Some(LifecycleState::Running),
-        "stopped" | "exited" => Some(LifecycleState::Stopped),
-        "created" => Some(LifecycleState::Created),
-        _ => None,
-    })
+#[derive(Deserialize)]
+struct OciDescriptor {
+    digest: String,
 }
 
-fn find_status(value: &serde_json::Value) -> Option<&str> {
-    match value {
-        serde_json::Value::Object(object) => object
-            .iter()
-            .find_map(|(key, value)| {
-                key.eq_ignore_ascii_case("status")
-                    .then(|| value.as_str())
-                    .flatten()
-            })
-            .or_else(|| object.values().find_map(find_status)),
-        serde_json::Value::Array(values) => values.iter().find_map(find_status),
-        _ => None,
+#[derive(Deserialize)]
+struct ImageConfiguration {
+    name: String,
+    descriptor: OciDescriptor,
+}
+
+#[derive(Deserialize)]
+struct ImageInspection {
+    name: Option<String>,
+    index: Option<OciDescriptor>,
+    id: Option<String>,
+    configuration: Option<ImageConfiguration>,
+}
+
+fn validate_image_inspection(bytes: &[u8], image: &str) -> Result<(), RuntimeError> {
+    let records: Vec<ImageInspection> = serde_json::from_slice(bytes)
+        .map_err(|error| provider_error(format!("invalid Apple image inspect JSON: {error}")))?;
+    let [record] = records.as_slice() else {
+        return Err(provider_error(
+            "Apple image inspect must return exactly one image",
+        ));
+    };
+    let (name, digest) = match (
+        &record.name,
+        &record.index,
+        &record.id,
+        &record.configuration,
+    ) {
+        (Some(name), Some(index), None, None) => (name, &index.digest),
+        (None, None, Some(id), Some(configuration)) => {
+            if configuration.descriptor.digest.strip_prefix("sha256:") != Some(id.as_str()) {
+                return Err(provider_error(
+                    "Apple image ID does not match its OCI index descriptor",
+                ));
+            }
+            (&configuration.name, &configuration.descriptor.digest)
+        }
+        _ => return Err(provider_error("unrecognized Apple image inspect schema")),
+    };
+    if name.is_empty()
+        || !digest.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err(provider_error(
+            "Apple image inspect must include a name and canonical SHA-256 index digest",
+        ));
+    }
+    if let Some((_, requested_digest)) = image.rsplit_once('@')
+        && requested_digest != digest
+    {
+        return Err(provider_error(format!(
+            "Apple image index digest {digest} does not match requested {requested_digest}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ContainerIdentity {
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InspectedStatus {
+    Legacy(String),
+    Managed { state: String },
+}
+
+#[derive(Deserialize)]
+struct ContainerInspection {
+    id: Option<String>,
+    configuration: ContainerIdentity,
+    status: InspectedStatus,
+}
+
+fn parse_lifecycle(bytes: &[u8], container: &ContainerId) -> Result<LifecycleState, RuntimeError> {
+    let records: Vec<ContainerInspection> = serde_json::from_slice(bytes).map_err(|error| {
+        provider_error(format!("invalid Apple container inspect JSON: {error}"))
+    })?;
+    let [record] = records.as_slice() else {
+        return Err(provider_error(
+            "Apple container inspect must return exactly one owned container",
+        ));
+    };
+    if record.configuration.id != container.as_str() {
+        return Err(provider_error(
+            "Apple container inspect configuration does not match the owned container",
+        ));
+    }
+    let state = match (&record.status, &record.id) {
+        (InspectedStatus::Legacy(state), None) => state,
+        (InspectedStatus::Managed { state }, Some(id)) if id == container.as_str() => state,
+        _ => {
+            return Err(provider_error(
+                "Apple container inspect identity or status schema does not match the owned container",
+            ));
+        }
+    };
+    match state.as_str() {
+        "running" => Ok(LifecycleState::Running),
+        "stopped" | "exited" => Ok(LifecycleState::Stopped),
+        "stopping" => Ok(LifecycleState::Stopping),
+        "created" => Ok(LifecycleState::Created),
+        _ => Err(provider_error(format!(
+            "unrecognized Apple container lifecycle state `{state}`"
+        ))),
     }
 }
 
@@ -1360,11 +1613,13 @@ mod tests {
             ),
             Some("0.10.0")
         );
-        assert_ne!(
-            parse_container_cli_version(
-                "container CLI version 0.10.0-rc.1 (build: release, commit: fixture)"
-            ),
-            Some(SUPPORTED_VERSION)
+        assert!(
+            !SUPPORTED_VERSIONS.contains(
+                &parse_container_cli_version(
+                    "container CLI version 0.10.0-rc.1 (build: release, commit: fixture)"
+                )
+                .expect("version token")
+            )
         );
         assert_eq!(
             parse_container_cli_version("wrapper container CLI version 0.10.0"),
@@ -1373,10 +1628,64 @@ mod tests {
     }
 
     fn fixture_runtime() -> (tempfile::TempDir, AppleRuntime) {
+        fixture_runtime_for_version("0.10.0")
+    }
+
+    fn fixture_runtime_for_version(version: &str) -> (tempfile::TempDir, AppleRuntime) {
         let temporary = tempfile::tempdir_in(std::env::current_dir().expect("current directory"))
             .expect("temporary");
         let fake_state = temporary.path().join("fake-state");
         fs::create_dir(&fake_state).expect("fake state");
+        fs::write(
+            fake_state.join("version"),
+            format!("container CLI version {version} (build: release, commit: fixture)\n"),
+        )
+        .expect("version");
+        let service = if version == "0.10.0" {
+            serde_json::json!({
+                "status": "running",
+                "apiServerAppName": "container-apiserver",
+                "apiServerVersion": version
+            })
+        } else {
+            serde_json::json!({
+                "status": "running",
+                "client": {"appName": "container", "version": version},
+                "server": {"appName": "container-apiserver", "version": version}
+            })
+        };
+        fs::write(fake_state.join("service.json"), service.to_string()).expect("service");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let image = if version == "0.10.0" {
+            serde_json::json!([{
+                "name": "fixture:image",
+                "index": {"digest": digest},
+                "variants": []
+            }])
+        } else {
+            serde_json::json!([{
+                "id": "a".repeat(64),
+                "configuration": {"name": "fixture:image", "descriptor": {"digest": digest}},
+                "variants": []
+            }])
+        };
+        fs::write(fake_state.join("image.json"), image.to_string()).expect("image");
+        fs::write(
+            fake_state.join("network.json"),
+            serde_json::json!([{
+                "id": "default",
+                "configuration": {
+                    "name": "default", "mode": "nat", "plugin": "container-network-vmnet",
+                    "labels": {"com.apple.container.resource.role": "builtin"}
+                },
+                "status": {"ipv4Gateway": "192.0.2.1", "ipv4Subnet": "192.0.2.0/24"}
+            }])
+            .to_string(),
+        )
+        .expect("network");
+        if version != "0.10.0" {
+            fs::write(fake_state.join("modern"), b"").expect("modern schema");
+        }
         let executable = temporary.path().join("container");
         let script = format!(
             r#"#!/bin/sh
@@ -1387,12 +1696,22 @@ printf '%s\n' "$*" >> "$commands"
 last=''
 for arg in "$@"; do last="$arg"; done
 case "$1" in
-  --version) echo 'container CLI version 0.10.0 (build: release, commit: fixture)' ;;
-  system) echo '{{"status":"running"}}' ;;
+  --version) cat "$state/version" ;;
+  system)
+    if [ -f "$state/slow-service" ]; then touch "$state/service-inspect-started"; sleep 5; fi
+    cat "$state/service.json"
+    ;;
+  network)
+    if [ "$2" != "inspect" ] || [ "$last" != "default" ]; then exit 64; fi
+    cat "$state/network.json"
+    ;;
   create|start|exec|logs|kill|stop|delete|inspect)
     if [ "${{2:-}}" = "--help" ]; then
       case "$1" in
-        create) echo 'container create --mount --env --network --dns --cpus --memory --kernel --workdir --label' ;;
+        create)
+          echo 'container create --mount --env --network --dns --cpus --memory --kernel --workdir --label'
+          if [ -f "$state/modern" ]; then echo '--cap-add'; fi
+          ;;
         start) echo 'container start' ;;
         exec) echo 'container exec --interactive --detach --workdir' ;;
         logs) echo 'container logs --follow' ;;
@@ -1406,7 +1725,19 @@ case "$1" in
     case "$1" in
       create) touch "$state/created" ;;
       start) touch "$state/running" ;;
-      inspect) if [ -f "$state/running" ]; then echo '{{"status":"running"}}'; else echo '{{"status":"stopped"}}'; fi ;;
+      inspect)
+        if [ -f "$state/inspect.json" ]; then
+          cat "$state/inspect.json"
+        else
+          status=stopped
+          if [ -f "$state/running" ]; then status=running; fi
+          if [ -f "$state/modern" ]; then
+            printf '[{{"id":"%s","configuration":{{"id":"%s"}},"status":{{"state":"%s","networks":[]}}}}]\n' "$last" "$last" "$status"
+          else
+            printf '[{{"configuration":{{"id":"%s"}},"status":"%s"}}]\n' "$last" "$status"
+          fi
+        fi
+        ;;
       exec) if [ "$last" = "noisy" ]; then printf '0123456789abcdef'; else echo 'exec-ok'; fi ;;
       logs) echo 'log-line' ;;
       stop) rm -f "$state/running" ;;
@@ -1414,8 +1745,9 @@ case "$1" in
     esac
     ;;
   image)
-    if [ "$last" = "slow:image" ]; then sleep 5; fi
+    if [ "$last" = "slow:image" ]; then touch "$state/image-inspect-started"; sleep 5; fi
     if [ "$last" = "fail:image" ]; then echo 'intentional image failure' >&2; exit 23; fi
+    if [ "$2" = "inspect" ]; then cat "$state/image.json"; fi
     if [ "$2" = "inspect" ] || [ "$2" = "pull" ]; then exit 0; fi
     ;;
   *) echo "unexpected: $*" >&2; exit 64 ;;
@@ -1589,26 +1921,361 @@ esac
 
     #[tokio::test]
     async fn fake_cli_passes_shared_runtime_conformance() {
-        let (temporary, runtime) = fixture_runtime();
-        let state = temporary.path().join("runtime-state");
-        let scenario = RuntimeConformanceScenario {
-            initialize: InitializeRequest {
-                state_directory: state,
-            },
-            create: create_request("apple-conformance", "fixture:image"),
-            start: StartRequest::default(),
-            exec: ExecRequest {
-                command: CommandSpec {
-                    arguments: vec![CommandArgument::plain("ok")],
-                    ..CommandSpec::new(Program::Absolute(PathBuf::from("/bin/echo")))
+        for version in ["0.10.0", "1.7.1"] {
+            let (temporary, runtime) = fixture_runtime_for_version(version);
+            let state = temporary.path().join("runtime-state");
+            let scenario = RuntimeConformanceScenario {
+                initialize: InitializeRequest {
+                    state_directory: state,
                 },
-                purpose: ExecPurpose::BootstrapControl,
-            },
-            signal: Some(RuntimeSignal::Interrupt),
-        };
-        run_runtime_conformance(&runtime, scenario)
+                create: create_request("apple-conformance", "fixture:image"),
+                start: StartRequest::default(),
+                exec: ExecRequest {
+                    command: CommandSpec {
+                        arguments: vec![CommandArgument::plain("ok")],
+                        ..CommandSpec::new(Program::Absolute(PathBuf::from("/bin/echo")))
+                    },
+                    purpose: ExecPurpose::BootstrapControl,
+                },
+                signal: Some(RuntimeSignal::Interrupt),
+            };
+            run_runtime_conformance(&runtime, scenario)
+                .await
+                .unwrap_or_else(|error| panic!("{version} conformance: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_or_unidentified_services_fail_before_image_or_container_mutation() {
+        for (version, service) in [
+            (
+                "0.10.0",
+                serde_json::json!({
+                    "status": "running",
+                    "apiServerAppName": "container-apiserver",
+                    "apiServerVersion": "1.7.1"
+                }),
+            ),
+            ("0.10.0", serde_json::json!({"status": "running"})),
+            (
+                "1.7.1",
+                serde_json::json!({
+                    "status": "running",
+                    "client": {"appName": "container", "version": "1.7.1"},
+                    "server": {"appName": "container-apiserver", "version": "0.10.0"}
+                }),
+            ),
+            (
+                "1.7.1",
+                serde_json::json!({
+                    "status": "running",
+                    "client": {"appName": "wrapper", "version": "1.7.1"},
+                    "server": {"appName": "container-apiserver", "version": "1.7.1"}
+                }),
+            ),
+            (
+                "1.7.1",
+                serde_json::json!({
+                    "status": "running",
+                    "client": {"appName": "container", "version": "1.7.1"},
+                    "server": {"appName": "unreviewed-server", "version": "1.7.1"}
+                }),
+            ),
+            ("1.7.2", serde_json::json!({"status": "running"})),
+            ("1.7.1-rc.1", serde_json::json!({"status": "running"})),
+        ] {
+            let (temporary, runtime) = fixture_runtime_for_version(version);
+            fs::write(
+                temporary.path().join("fake-state/service.json"),
+                service.to_string(),
+            )
+            .expect("service");
+            let cancellation = CancellationToken::new();
+            assert!(
+                runtime
+                    .preflight(PreflightRequest::default(), &cancellation)
+                    .await
+                    .is_err(),
+                "{version}: {service}"
+            );
+            runtime
+                .initialize(
+                    InitializeRequest {
+                        state_directory: temporary.path().join("state"),
+                    },
+                    &cancellation,
+                )
+                .await
+                .expect("initialize");
+            assert!(
+                runtime
+                    .create(
+                        create_request("apple-mixed", "fixture:image"),
+                        &cancellation
+                    )
+                    .await
+                    .is_err(),
+                "create must independently reject {version}: {service}"
+            );
+            let commands =
+                fs::read_to_string(temporary.path().join("fake-state/commands")).expect("commands");
+            assert!(!commands.lines().any(|line| {
+                line.starts_with("image ")
+                    || line.starts_with("create ")
+                    || line.starts_with("delete ")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_uses_owned_modern_state_and_never_falls_back_to_cached_running() {
+        let (temporary, runtime) = fixture_runtime();
+        let cancellation = CancellationToken::new();
+        runtime
+            .initialize(
+                InitializeRequest {
+                    state_directory: temporary.path().join("state"),
+                },
+                &cancellation,
+            )
             .await
-            .expect("conformance");
+            .expect("initialize");
+        let id = runtime
+            .create(
+                create_request("apple-inspect", "fixture:image"),
+                &cancellation,
+            )
+            .await
+            .expect("create");
+        runtime
+            .start(&id, StartRequest::default(), &cancellation)
+            .await
+            .expect("start");
+        let inspection = temporary.path().join("fake-state/inspect.json");
+        fs::write(
+            &inspection,
+            serde_json::json!([{
+                "id": id.as_str(),
+                "configuration": {"id": id.as_str(), "labels": {"status": "running"}},
+                "status": {"state": "stopped", "networks": []}
+            }])
+            .to_string(),
+        )
+        .expect("inspect");
+        assert_eq!(
+            runtime
+                .status(&id, &cancellation)
+                .await
+                .expect("status")
+                .lifecycle,
+            LifecycleState::Stopped
+        );
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!([{"configuration": {"id": "not-owned"}, "status": "running"}]),
+            serde_json::json!([{
+                "id": "not-owned", "configuration": {"id": id.as_str()}, "status": {"state": "running"}
+            }]),
+            serde_json::json!([{"configuration": {"id": id.as_str()}, "status": {"state": "new-state"}}]),
+            serde_json::json!([{"configuration": {"id": id.as_str(), "status": "running"}}]),
+            serde_json::json!([
+                {"configuration": {"id": id.as_str()}, "status": "running"},
+                {"configuration": {"id": id.as_str()}, "status": "running"}
+            ]),
+        ] {
+            fs::write(&inspection, invalid.to_string()).expect("invalid inspection");
+            assert!(
+                runtime.status(&id, &cancellation).await.is_err(),
+                "unrecognized inspection must not look healthy: {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn image_index_must_match_the_pin_not_a_variant_or_display_name() {
+        let pinned = format!("sha256:{}", "b".repeat(64));
+        let image = format!("example.test/fixture@{pinned}");
+        for inspection in [
+            serde_json::json!([{
+                "name": image, "index": {"digest": format!("sha256:{}", "a".repeat(64))},
+                "variants": [{"digest": pinned}]
+            }]),
+            serde_json::json!([{
+                "id": "a".repeat(64),
+                "configuration": {"name": image, "descriptor": {"digest": format!("sha256:{}", "a".repeat(64))}},
+                "variants": [{"digest": pinned}]
+            }]),
+            serde_json::json!([{
+                "id": "a".repeat(64),
+                "configuration": {"name": image, "descriptor": {"digest": pinned}},
+                "variants": []
+            }]),
+            serde_json::json!([]),
+        ] {
+            let (temporary, runtime) = fixture_runtime();
+            fs::write(
+                temporary.path().join("fake-state/image.json"),
+                inspection.to_string(),
+            )
+            .expect("image inspection");
+            let cancellation = CancellationToken::new();
+            runtime
+                .initialize(
+                    InitializeRequest {
+                        state_directory: temporary.path().join("state"),
+                    },
+                    &cancellation,
+                )
+                .await
+                .expect("initialize");
+            assert!(
+                runtime
+                    .create(create_request("apple-index", &image), &cancellation)
+                    .await
+                    .is_err(),
+                "must reject mismatched index: {inspection}"
+            );
+            let commands =
+                fs::read_to_string(temporary.path().join("fake-state/commands")).expect("commands");
+            assert!(
+                !commands
+                    .lines()
+                    .any(|line| line.starts_with("create --name "))
+            );
+            assert!(!commands.lines().any(|line| line.starts_with("image pull ")));
+        }
+    }
+
+    #[tokio::test]
+    async fn both_image_schemas_preserve_pins_and_validate_post_pull_inspection() {
+        let image = format!("example.test/fixture@sha256:{}", "a".repeat(64));
+        for version in ["0.10.0", "1.7.1"] {
+            for pull_policy in [ImagePullPolicy::Always, ImagePullPolicy::Never] {
+                let (temporary, mut runtime) = fixture_runtime_for_version(version);
+                runtime.configuration.launch.pull_policy = pull_policy;
+                let cancellation = CancellationToken::new();
+                runtime
+                    .initialize(
+                        InitializeRequest {
+                            state_directory: temporary.path().join("state"),
+                        },
+                        &cancellation,
+                    )
+                    .await
+                    .expect("initialize");
+                runtime
+                    .create(create_request("apple-pinned", &image), &cancellation)
+                    .await
+                    .expect("pinned image");
+                let commands = fs::read_to_string(temporary.path().join("fake-state/commands"))
+                    .expect("commands");
+                assert!(commands.lines().any(|line| {
+                    line.starts_with("create --name ")
+                        && line.ends_with(&format!("{image} container-init"))
+                }));
+                if pull_policy == ImagePullPolicy::Always {
+                    assert!(
+                        commands.find("image pull ").expect("pull")
+                            < commands
+                                .find("image inspect ")
+                                .expect("post-pull inspection")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_guest_capabilities_cover_enforcement_and_only_opt_in_tracing() {
+        for version in ["0.10.0", "1.7.1"] {
+            for tracing in [false, true] {
+                let (temporary, mut runtime) = fixture_runtime_for_version(version);
+                runtime.configuration.syscall_tracing = tracing;
+                let cancellation = CancellationToken::new();
+                runtime
+                    .initialize(
+                        InitializeRequest {
+                            state_directory: temporary.path().join("state"),
+                        },
+                        &cancellation,
+                    )
+                    .await
+                    .expect("initialize");
+                runtime
+                    .create(
+                        create_request("apple-capabilities", "fixture:image"),
+                        &cancellation,
+                    )
+                    .await
+                    .expect("create");
+                let commands = fs::read_to_string(temporary.path().join("fake-state/commands"))
+                    .expect("commands");
+                let create = commands
+                    .lines()
+                    .find(|line| line.starts_with("create --name "))
+                    .expect("create command")
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                let capabilities = create
+                    .windows(2)
+                    .filter(|pair| pair[0] == "--cap-add")
+                    .map(|pair| pair[1])
+                    .collect::<Vec<_>>();
+                let expected = match (version, tracing) {
+                    ("1.7.1", true) => vec!["CAP_NET_ADMIN", "CAP_SYS_ADMIN"],
+                    ("1.7.1", false) => vec!["CAP_NET_ADMIN"],
+                    _ => Vec::new(),
+                };
+                assert_eq!(capabilities, expected, "{version}, tracing={tracing}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_builtin_network_must_be_identified_without_reconfiguration() {
+        for network in [
+            serde_json::json!([]),
+            serde_json::json!([{
+                "id": "default",
+                "configuration": {
+                    "name": "default", "mode": "nat", "plugin": "unreviewed-plugin",
+                    "labels": {"com.apple.container.resource.role": "builtin"}
+                }
+            }]),
+            serde_json::json!([{
+                "id": "default",
+                "configuration": {
+                    "name": "default", "mode": "nat", "plugin": "container-network-vmnet",
+                    "labels": {}
+                }
+            }]),
+        ] {
+            let (temporary, runtime) = fixture_runtime_for_version("1.7.1");
+            fs::write(
+                temporary.path().join("fake-state/network.json"),
+                network.to_string(),
+            )
+            .expect("network");
+            assert!(
+                runtime
+                    .preflight(PreflightRequest::default(), &CancellationToken::new())
+                    .await
+                    .is_err(),
+                "must reject unidentified built-in network: {network}"
+            );
+            let commands =
+                fs::read_to_string(temporary.path().join("fake-state/commands")).expect("commands");
+            assert!(
+                commands
+                    .lines()
+                    .any(|line| line == "network inspect default")
+            );
+            assert!(!commands.lines().any(|line| {
+                line.starts_with("network create ")
+                    || line.starts_with("network delete ")
+                    || line.starts_with("system start")
+            }));
+        }
     }
 
     #[tokio::test]
@@ -1665,7 +2332,7 @@ esac
             fs::read_to_string(temporary.path().join("fake-state/commands")).expect("commands");
         let create = commands
             .lines()
-            .find(|line| line.starts_with("create "))
+            .find(|line| line.starts_with("create --name "))
             .expect("create command");
         assert!(create.contains("--cpus 3"));
         assert!(create.contains("--memory 768M"));
@@ -1748,40 +2415,57 @@ esac
 
     #[tokio::test]
     async fn fake_cli_cancellation_terminates_the_inflight_operation() {
-        let (temporary, runtime) = fixture_runtime();
-        let runtime = Arc::new(runtime);
-        let cancellation = CancellationToken::new();
-        runtime
-            .initialize(
-                InitializeRequest {
-                    state_directory: temporary.path().join("state"),
-                },
-                &cancellation,
-            )
-            .await
-            .expect("initialize");
-        let task_runtime = Arc::clone(&runtime);
-        let task_cancellation = cancellation.clone();
-        let task = tokio::spawn(async move {
-            task_runtime
-                .create(
-                    create_request("apple-cancel", "slow:image"),
-                    &task_cancellation,
+        for phase in ["service", "image"] {
+            let (temporary, runtime) = fixture_runtime();
+            if phase == "service" {
+                fs::write(temporary.path().join("fake-state/slow-service"), b"")
+                    .expect("slow service");
+            }
+            let runtime = Arc::new(runtime);
+            let cancellation = CancellationToken::new();
+            runtime
+                .initialize(
+                    InitializeRequest {
+                        state_directory: temporary.path().join("state"),
+                    },
+                    &cancellation,
                 )
                 .await
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        cancellation.cancel();
-        assert!(matches!(
-            task.await.expect("task"),
-            Err(RuntimeError::Cancelled)
-        ));
+                .expect("initialize");
+            let task_runtime = Arc::clone(&runtime);
+            let task_cancellation = cancellation.clone();
+            let task = tokio::spawn(async move {
+                task_runtime
+                    .create(
+                        create_request("apple-cancel", "slow:image"),
+                        &task_cancellation,
+                    )
+                    .await
+            });
+            let marker = temporary
+                .path()
+                .join(format!("fake-state/{phase}-inspect-started"));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("inspection must actually be in flight");
+            cancellation.cancel();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(3), task)
+                    .await
+                    .expect("cancellation must interrupt the five-second operation")
+                    .expect("task"),
+                Err(RuntimeError::Cancelled)
+            ));
+        }
     }
 
     #[tokio::test]
     async fn fake_cli_failures_are_reported_and_output_is_capped() {
         let (temporary, mut runtime) = fixture_runtime();
-        runtime.configuration.output_limit_bytes = 8;
         let cancellation = CancellationToken::new();
         runtime
             .initialize(
@@ -1809,6 +2493,7 @@ esac
             .start(&id, StartRequest::default(), &cancellation)
             .await
             .expect("start");
+        runtime.configuration.output_limit_bytes = 8;
         let outcome = runtime
             .exec(
                 &id,
