@@ -1214,6 +1214,7 @@ name = "sendbox-egress"
 version = "0.2.6"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "cap-std",
  "clap",

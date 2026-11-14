@@ -140,6 +140,7 @@ jobs:
       - name: Build signed reproducible guest bundle
         shell: bash
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -162,6 +163,7 @@ jobs:
           fi
 
           docker buildx build \
+            --secret "id=github_token,env=GITHUB_TOKEN" \
             --no-cache \
             --platform "linux/${{ matrix.platform }}" \
             --target artifact \

@@ -24,8 +24,7 @@ use crate::connect_broker::{
 use crate::dialer::Dialer;
 use crate::dns_broker::{DnsBroker, DnsBrokerConfig};
 use crate::dns_budget::DnsGuard;
-use crate::github_meta::{self, GitHubMetaClient};
-use crate::github_meta_client::OfficialGitHubMetaClient;
+use crate::github_meta::{GitHubMetaError, GitHubMetaSeed};
 use crate::origin::OriginReservations;
 use crate::policy::PolicyEngine;
 use crate::resolver::UpstreamResolver;
@@ -160,7 +159,7 @@ pub struct Gateway<R: UpstreamResolver> {
     authorizations: Arc<AuthorizationCache>,
     guard: Arc<DnsGuard>,
     config: GatewayConfig,
-    metadata_client: Option<Arc<dyn GitHubMetaClient>>,
+    github_meta_seed: Option<GitHubMetaSeed>,
     metadata_prepared: AtomicBool,
 }
 
@@ -203,43 +202,35 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
             authorizations: Arc::new(AuthorizationCache::with_capacity(capacity)),
             guard,
             config,
-            metadata_client: None,
+            github_meta_seed: None,
             metadata_prepared: AtomicBool::new(false),
         }
     }
 
+    /// Supplies the host-validated Meta response a `github.com` grant needs.
     #[must_use]
-    pub fn with_github_meta_client(mut self, client: Arc<dyn GitHubMetaClient>) -> Self {
-        self.metadata_client = Some(client);
+    pub fn with_github_meta_seed(mut self, seed: GitHubMetaSeed) -> Self {
+        self.github_meta_seed = Some(seed);
         self
     }
 
-    fn metadata_client(&self) -> Arc<dyn GitHubMetaClient> {
-        self.metadata_client.clone().unwrap_or_else(|| {
-            Arc::new(OfficialGitHubMetaClient::new(
-                Arc::clone(&self.resolver),
-                Arc::clone(&self.dialer),
-            ))
-        })
-    }
-
     /// Production calls this after cgroup/mark enforcement is armed and before
-    /// publishing service readiness. A missing initial snapshot is an error.
-    pub async fn prepare_github_meta(&self, cancel: &CancellationToken) -> io::Result<()> {
+    /// publishing service readiness. It performs no network I/O; a missing or
+    /// invalid seed is an error rather than an exact-host fallback.
+    pub fn prepare_github_meta(&self) -> io::Result<()> {
         let Some(metadata) = self.engine.github_meta() else {
             return Ok(());
         };
         if self.metadata_prepared.load(Ordering::Acquire) && metadata.view().1.is_some() {
             return Ok(());
         }
-        let client = self.metadata_client();
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "GitHub Meta bootstrap cancelled")),
-            result = metadata.refresh_once(client.as_ref(), &self.engine, self.audit.as_ref()) => {
-                result.map_err(io::Error::other)?;
-            }
-        }
+        let seed = self
+            .github_meta_seed
+            .as_ref()
+            .ok_or_else(|| io::Error::other(GitHubMetaError::MissingSeed))?;
+        metadata
+            .install_seed(seed, self.audit.as_ref())
+            .map_err(io::Error::other)?;
         self.metadata_prepared.store(true, Ordering::Release);
         Ok(())
     }
@@ -257,13 +248,7 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
         listeners: GatewayListeners,
         cancel: CancellationToken,
     ) -> io::Result<()> {
-        if let Err(error) = self.prepare_github_meta(&cancel).await {
-            return if cancel.is_cancelled() {
-                Ok(())
-            } else {
-                Err(error)
-            };
-        }
+        self.prepare_github_meta()?;
         let _guard = GatewayRunGuard {
             engine: &self.engine,
             authorizations: &self.authorizations,
@@ -284,14 +269,6 @@ impl<R: UpstreamResolver + 'static> Gateway<R> {
         );
 
         let mut tasks = tokio::task::JoinSet::new();
-        if self.engine.github_meta().is_some() {
-            tasks.spawn(github_meta::run_refresh(
-                Arc::clone(&self.engine),
-                self.metadata_client(),
-                Arc::clone(&self.audit),
-                cancel.clone(),
-            ));
-        }
         tasks.spawn(Arc::clone(&connect_broker).run(listeners.connect, cancel.clone()));
         if let Some(http_proxy) = listeners.http_proxy {
             tasks.spawn(connect_broker.run_with_frontend(

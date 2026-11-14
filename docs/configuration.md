@@ -179,9 +179,13 @@ Add the apex separately when needed. Ordinary exact hosts remain exact; they
 do not implicitly grant subdomains. All CNAME hops must also be admitted.
 
 **`github.com` is an explicit delegation to the official GitHub Meta feed**, not
-an apex-only grant. SendBox fetches the fixed anonymous HTTPS endpoint
-<https://api.github.com/meta> before gateway readiness, then checks it hourly
-using ETags. Only an effective exact apex grant triggers this behavior:
+an apex-only grant. The host fetches the fixed anonymous HTTPS endpoint
+<https://api.github.com/meta> into one cache shared by every session on the
+machine (`~/.sendbox/run/github-meta.json`). It reuses that response for up to
+an hour, then revalidates it with its ETag, so SendBox makes at most about one
+request per hour per machine. Each session's gateways receive the validated
+response before readiness and never contact GitHub themselves. Only an
+effective exact apex grant triggers this behavior:
 `api.github.com`, `*.github.com`, and permissive defaults alone do not.
 The reviewed network fields and domain/endpoint fields, including their
 published wildcard patterns, become additional grants. SSH keys, commit keys,
@@ -199,24 +203,26 @@ Explicit deny rules, private/link-local/metadata address protections, DNS
 budgets, reserved MCP origins, package-proxy isolation, and UDP/QUIC denial
 still apply. Published CIDRs never count as explicit private-address grants.
 
-Initial HTTPS/TLS/DNS, policy-denial, rate-limit, or validation failure blocks
-readiness rather than silently reverting to apex-only behavior. Later failures
-are reported as `degraded` and preserve the previous validated snapshot for at
-most 24 hours since its last successful fetch or conditional revalidation.
-After that monotonic deadline, derived grants expire independently of the
-refresh task; configured exact hosts and explicit networks are unchanged.
-Blocking the Meta API, disabling DNS, excluding TCP/443, or omitting guest CA
-certificates can therefore prevent a `github.com`-enabled session from starting.
-Each request has a ten-second deadline, no redirects, environment proxy, or
-credentials. Separate workload/registry gateways each own their refresh; many
-short sessions can encounter GitHub's unauthenticated rate limit.
+GitHub allows 60 anonymous API requests per hour per IP address, shared with
+every other unauthenticated client behind that address. When a refresh fails,
+including a 403/429 rate limit, the host records the error and waits 60 seconds
+or until GitHub's published reset before retrying. Meanwhile it keeps using the
+previous validated response while at least 15 minutes remain of its 24-hour
+lifetime, and the session's network report shows `degraded` with the error.
+Without such a response, the session fails before launch with the typed error
+and the reset time. It never silently reverts to apex-only behavior.
+Derived grants expire 24 hours after the host's last successful fetch or
+conditional revalidation; configured exact hosts and explicit networks are
+unchanged. An explicit `api.github.com` deny, disabled DNS, or a TCP/443
+exclusion makes a `github.com`-enabled session fail with an invalid
+configuration error. Each request has a ten-second deadline, no redirects,
+environment proxy, or credentials. The cached copy is revalidated with the
+strict parser on every read, and a corrupt cache is discarded.
 
-Refresh affects **new connections in the current guest**, not just future
-launches. Removed grants and CNAME permissions cannot survive through old DNS
-pins. Already-open tunnels are not forcibly revoked and retain their existing
-maximum 300-second lifetime. Cancellation stops the fetch/timer with the
-gateway; a restart fetches again and never restores an authorization or
-metadata cache from disk.
+A guest receives one validated response at boot and does not refresh it; guest
+executions are capped at 300 seconds. Already-open tunnels retain their
+existing maximum 300-second lifetime. A restart installs the same host-supplied
+response again and cannot reuse earlier DNS pins.
 
 With `sendbox run --json`, the final `network_report: {path, sha256}` references
 a private host-side `network-egress-report.json`, following the package-report
@@ -233,10 +239,11 @@ normal terminal response, not guaranteed after forced cancellation.
 pretend to resolve this live scope.
 
 This requires a matching updated host and signed guest bundle. The boundary
-plan remains version 3, with a signed `network_github_meta` admission; the
-internal egress runtime document is version 5 and `network.report` is
-independently versioned at 1. Older guest bundles are rejected, not silently
-accepted with narrower behavior. Hyperlight has no authenticated production
+plan remains version 3, with a signed `network_github_meta` admission that
+binds the response's SHA-256; the internal egress runtime document is version
+5, the guest bootstrap is version 5, and `network.report` is independently
+versioned at 1. Older guest bundles are rejected, not silently accepted with
+narrower behavior. Hyperlight has no authenticated production
 Meta-refresh gateway. No release or consumer activation is implied by a source
 build.
 

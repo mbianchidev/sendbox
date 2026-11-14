@@ -23,6 +23,7 @@ use sendbox_bootstrap::{GatewayCredential, RegistryProxyConfiguration};
 use sendbox_core::SessionId;
 #[cfg(any(target_os = "linux", test))]
 use sendbox_egress::address::{AddressClass, classify};
+use sendbox_egress::github_meta::GitHubMetaSeed;
 use sendbox_egress::runtime::RuntimePolicyDocument;
 use sendbox_mcp::runtime::RuntimePolicyDocument as McpRuntimePolicyDocument;
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,8 @@ impl sendbox_egress::audit::AuditSink for MetadataFileAuditSink {
         Ok(())
     }
 }
+
+const GITHUB_META_SEED_FILE: &str = "egress-github-meta-seed.json";
 
 fn metadata_status_path(session_dir: &Path, registry: bool) -> PathBuf {
     session_dir.join(if registry {
@@ -118,6 +121,7 @@ struct SupervisorProcessConfiguration {
     mcp_policy: Option<McpRuntimePolicyDocument>,
     gateway_credentials: Vec<GatewayCredential>,
     registry: Option<RegistryProxyConfiguration>,
+    github_meta_seed: Option<PathBuf>,
     readiness_socket: PathBuf,
     workload_control_socket: PathBuf,
     trusted_control_socket: Option<PathBuf>,
@@ -132,6 +136,7 @@ struct GatewayProcessConfiguration {
     role: GatewayRole,
     mcp_policy: Option<McpRuntimePolicyDocument>,
     gateway_credentials: Vec<GatewayCredential>,
+    github_meta_seed: Option<PathBuf>,
     upstream: SocketAddr,
     control_socket: PathBuf,
     control_token: String,
@@ -189,10 +194,19 @@ pub fn prepare(
     mcp_policy: Option<McpRuntimePolicyDocument>,
     gateway_credentials: Vec<GatewayCredential>,
     registry: Option<RegistryProxyConfiguration>,
+    github_meta: Option<GitHubMetaSeed>,
 ) -> Result<ServiceSpec, GuestError> {
     policy
         .validate()
         .map_err(|error| GuestError::Runtime(format!("invalid egress policy: {error}")))?;
+    let delegated = policy
+        .github_meta_enabled()
+        .map_err(|error| GuestError::Runtime(format!("invalid egress policy: {error}")))?;
+    if delegated != github_meta.is_some() {
+        return Err(GuestError::Runtime(
+            "a GitHub Meta seed must accompany exactly a github.com delegation".to_owned(),
+        ));
+    }
     let mcp_policy = mcp_policy.filter(|policy| policy.tool_policy.has_remote_servers());
     validate_mcp_gateway_configuration(&policy, mcp_policy.as_ref(), &gateway_credentials)?;
     let readiness_socket = session_dir.join("egress-ready.sock");
@@ -204,6 +218,14 @@ pub fn prepare(
         .as_ref()
         .map(|_| session_dir.join("registry-proxy-control.sock"));
     let config_path = session_dir.join("egress-supervisor.json");
+    // Both gateway processes read this one host-validated response; it is too
+    // large for their bounded configuration files.
+    let github_meta_seed = github_meta
+        .map(|seed| {
+            let path = session_dir.join(GITHUB_META_SEED_FILE);
+            write_root_config(&path, &seed).map(|()| path)
+        })
+        .transpose()?;
     write_root_config(
         &config_path,
         &SupervisorProcessConfiguration {
@@ -212,6 +234,7 @@ pub fn prepare(
             mcp_policy,
             gateway_credentials,
             registry,
+            github_meta_seed,
             readiness_socket: readiness_socket.clone(),
             workload_control_socket,
             trusted_control_socket,
@@ -280,7 +303,17 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
         &config.workload_control_socket,
         config.trusted_control_socket.as_deref(),
         config.registry_control_socket.as_deref(),
+        config.github_meta_seed.as_deref(),
     )?;
+    let delegated = config
+        .policy
+        .github_meta_enabled()
+        .map_err(|error| GuestError::Runtime(format!("invalid egress policy: {error}")))?;
+    if delegated != config.github_meta_seed.is_some() {
+        return Err(GuestError::Runtime(
+            "a GitHub Meta seed must accompany exactly a github.com delegation".to_owned(),
+        ));
+    }
     if config.registry.is_some() != config.policy.registry.is_some()
         || config.registry.is_some() != config.trusted_control_socket.is_some()
         || config.registry.is_some() != config.registry_control_socket.is_some()
@@ -316,6 +349,7 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
             role: GatewayRole::Workload,
             mcp_policy: config.mcp_policy.clone(),
             gateway_credentials: config.gateway_credentials.clone(),
+            github_meta_seed: config.github_meta_seed.clone(),
             upstream: resolver.upstream,
             control_socket: config.workload_control_socket.clone(),
             control_token: workload_token.clone(),
@@ -342,6 +376,7 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
                 role: GatewayRole::Registry,
                 mcp_policy: None,
                 gateway_credentials: Vec::new(),
+                github_meta_seed: config.github_meta_seed.clone(),
                 upstream: resolver.upstream,
                 control_socket: trusted_control_socket.clone(),
                 control_token: trusted_token.clone(),
@@ -917,7 +952,11 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
         OriginReservations::new(reserved_origins)
             .map_err(|error| GuestError::Runtime(format!("reserve MCP origins: {error}")))?,
     );
-    let gateway = Gateway::new(
+    let github_meta_seed = match &config.github_meta_seed {
+        Some(path) if engine.github_meta().is_some() => Some(read_github_meta_seed(path)?),
+        _ => None,
+    };
+    let mut gateway = Gateway::new(
         engine,
         resolver,
         Arc::new(MarkDialer::new(config.policy.broker_mark)),
@@ -938,6 +977,9 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
             ..GatewayConfig::default()
         },
     );
+    if let Some(seed) = github_meta_seed {
+        gateway = gateway.with_github_meta_seed(seed);
+    }
     let http_gateway = match (config.mcp_policy, mcp_listener) {
         (Some(policy), Some(listener)) => {
             struct ReservationAdapter {
@@ -1008,11 +1050,10 @@ pub async fn run_gateway(config_path: PathBuf) -> Result<(), GuestError> {
             ));
         }
     };
-    let cancellation = CancellationToken::new();
     gateway
-        .prepare_github_meta(&cancellation)
-        .await
+        .prepare_github_meta()
         .map_err(|error| GuestError::io("preparing GitHub Meta egress scope", error))?;
+    let cancellation = CancellationToken::new();
     let gateway_cancellation = cancellation.clone();
     let mut gateway_task =
         tokio::spawn(async move { gateway.serve(listeners, gateway_cancellation).await });
@@ -1653,6 +1694,18 @@ fn read_root_config<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Gues
 }
 
 #[cfg(target_os = "linux")]
+fn read_github_meta_seed(path: &Path) -> Result<GitHubMetaSeed, GuestError> {
+    validate_root_file(path, 0o400)?;
+    let bytes = read_bounded(
+        path,
+        sendbox_egress::github_meta::MAX_SEED_BYTES,
+        "reading GitHub Meta seed",
+    )?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| GuestError::Runtime(format!("decode GitHub Meta seed: {error}")))
+}
+
+#[cfg(target_os = "linux")]
 fn validate_root_file(path: &Path, mode: u32) -> Result<(), GuestError> {
     validate_owned_file(path, mode, 0, 0)
 }
@@ -1688,6 +1741,7 @@ fn validate_runtime_paths(
     workload_control: &Path,
     trusted_control: Option<&Path>,
     registry_control: Option<&Path>,
+    github_meta_seed: Option<&Path>,
 ) -> Result<(), GuestError> {
     let parent = config_path
         .parent()
@@ -1709,6 +1763,10 @@ fn validate_runtime_paths(
                     != Some("registry-proxy-control.sock")
         })
         || trusted_control.is_some() != registry_control.is_some()
+        || github_meta_seed.is_some_and(|path| {
+            path.parent() != Some(parent)
+                || path.file_name().and_then(|name| name.to_str()) != Some(GITHUB_META_SEED_FILE)
+        })
     {
         return Err(GuestError::Runtime(
             "egress runtime paths must be fixed files beneath the authenticated session directory"

@@ -1,4 +1,9 @@
 //! Validated, expiring destination grants from GitHub's official Meta API.
+//!
+//! The host owns the only network fetch (see [`crate::github_meta_client`])
+//! and shares one cached response across sessions. Gateways install that
+//! host-supplied [`GitHubMetaSeed`] after re-validating it and never contact
+//! GitHub themselves.
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -6,23 +11,26 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ipnet::IpNet;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
 
 use crate::audit::{AuditEvent, AuditSink};
 use crate::domain;
-use crate::policy::PolicyEngine;
 
 pub const GITHUB_META_URL: &str = "https://api.github.com/meta";
 pub const GITHUB_META_API_VERSION: &str = "2022-11-28";
 pub const MAX_META_BYTES: usize = 2 * 1024 * 1024;
+/// Upper bound for one serialized seed: the base64 body plus small metadata.
+pub const MAX_SEED_BYTES: usize = 3 * 1024 * 1024;
+/// How long the host reuses a validated response before revalidating it.
 pub const META_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub const META_MAX_STALENESS: Duration = Duration::from_secs(24 * 60 * 60);
 pub const META_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Tolerated host/guest clock disagreement for a seed's validation time.
+pub const META_MAX_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
 const MAX_NETWORK_ENTRIES: usize = 16_384;
 const MAX_DOMAIN_ENTRIES: usize = 4096;
 
@@ -54,13 +62,13 @@ const DOMAIN_FIELDS: &[&str] = &[
     "actions",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum GitHubMetaError {
     #[error("GitHub Meta response exceeds its byte or entry limit")]
     LimitExceeded,
     #[error("invalid GitHub Meta document: {0}")]
-    InvalidDocument(&'static str),
+    InvalidDocument(String),
     #[error("GitHub Meta contains an invalid or unrestricted IP/CIDR")]
     InvalidNetwork,
     #[error("GitHub Meta contains an invalid domain pattern")]
@@ -71,6 +79,11 @@ pub enum GitHubMetaError {
     Clock,
     #[error("GitHub Meta HTTP request failed with status {0}")]
     HttpStatus(u16),
+    #[error(
+        "GitHub Meta request hit GitHub's anonymous API rate limit (60 requests per hour per IP address){}",
+        rate_limit_reset(.reset_unix_seconds)
+    )]
+    RateLimited { reset_unix_seconds: Option<u64> },
     #[error("GitHub Meta refresh timed out")]
     Timeout,
     #[error("GitHub Meta refresh is denied by network policy")]
@@ -78,15 +91,23 @@ pub enum GitHubMetaError {
     #[error("GitHub Meta DNS resolution failed")]
     Resolution,
     #[error("GitHub Meta transport failed during {0}")]
-    Transport(&'static str),
+    Transport(String),
     #[error("GitHub Meta TLS roots are unavailable or invalid")]
     TlsRoots,
     #[error("GitHub Meta response has invalid headers or framing")]
     InvalidResponse,
     #[error("GitHub Meta provenance publication failed")]
     Publication,
-    #[error("GitHub Meta refresh is already in progress")]
-    RefreshInProgress,
+    #[error("GitHub Meta delegation requires a host-validated seed")]
+    MissingSeed,
+    #[error("GitHub Meta seed is expired or validated in the future")]
+    ExpiredSeed,
+}
+
+fn rate_limit_reset(reset_unix_seconds: &Option<u64>) -> String {
+    reset_unix_seconds.map_or_else(String::new, |reset| {
+        format!("; it resets at Unix time {reset}")
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -102,16 +123,16 @@ impl GitHubMetaScope {
             return Err(GitHubMetaError::LimitExceeded);
         }
         let document: Value = serde_json::from_slice(bytes)
-            .map_err(|_| GitHubMetaError::InvalidDocument("expected JSON"))?;
+            .map_err(|_| GitHubMetaError::InvalidDocument("expected JSON".to_owned()))?;
         let object = document
             .as_object()
-            .ok_or(GitHubMetaError::InvalidDocument("expected an object"))?;
+            .ok_or_else(|| GitHubMetaError::InvalidDocument("expected an object".to_owned()))?;
         if !object
             .get("verifiable_password_authentication")
             .is_some_and(Value::is_boolean)
         {
             return Err(GitHubMetaError::InvalidDocument(
-                "missing authentication metadata",
+                "missing authentication metadata".to_owned(),
             ));
         }
         let mut networks = BTreeSet::new();
@@ -141,7 +162,7 @@ impl GitHubMetaScope {
                     | "commit_signing_keys"
             ) {
                 return Err(GitHubMetaError::InvalidDocument(
-                    "unrecognized top-level field",
+                    "unrecognized top-level field".to_owned(),
                 ));
             }
         }
@@ -152,14 +173,14 @@ impl GitHubMetaScope {
                 .is_none_or(|values| values.is_empty())
             {
                 return Err(GitHubMetaError::InvalidDocument(
-                    "missing core network field",
+                    "missing core network field".to_owned(),
                 ));
             }
         }
         let published_domains = object
             .get("domains")
             .and_then(Value::as_object)
-            .ok_or(GitHubMetaError::InvalidDocument("missing domains object"))?;
+            .ok_or_else(|| GitHubMetaError::InvalidDocument("missing domains object".to_owned()))?;
         let mut domains = BTreeSet::new();
         let mut domain_count = 0;
         let mut add_domains = |value: &Value| -> Result<(), GitHubMetaError> {
@@ -183,12 +204,12 @@ impl GitHubMetaScope {
             } else {
                 if !matches!(field.as_str(), "actions_inbound" | "artifact_attestations") {
                     return Err(GitHubMetaError::InvalidDocument(
-                        "unrecognized domain field",
+                        "unrecognized domain field".to_owned(),
                     ));
                 }
-                let nested = value.as_object().ok_or(GitHubMetaError::InvalidDocument(
-                    "expected a nested domain object",
-                ))?;
+                let nested = value.as_object().ok_or_else(|| {
+                    GitHubMetaError::InvalidDocument("expected a nested domain object".to_owned())
+                })?;
                 for (key, value) in nested {
                     match (field.as_str(), key.as_str()) {
                         ("actions_inbound", "full_domains" | "wildcard_domains")
@@ -196,7 +217,7 @@ impl GitHubMetaScope {
                         ("artifact_attestations", "trust_domain") if value.is_string() => {}
                         _ => {
                             return Err(GitHubMetaError::InvalidDocument(
-                                "unrecognized domain field",
+                                "unrecognized domain field".to_owned(),
                             ));
                         }
                     }
@@ -204,32 +225,31 @@ impl GitHubMetaScope {
             }
         }
         if networks.is_empty() || domains.is_empty() {
-            return Err(GitHubMetaError::InvalidDocument("empty destination scope"));
+            return Err(GitHubMetaError::InvalidDocument(
+                "empty destination scope".to_owned(),
+            ));
         }
         Ok(Self {
             domains: domains.into_iter().collect(),
             networks: networks.into_iter().collect(),
-            sha256: Sha256::digest(bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
+            sha256: hex_sha256(bytes),
         })
     }
 }
 
 fn strings(value: &Value) -> Result<Vec<&str>, GitHubMetaError> {
-    let values = value.as_array().ok_or(GitHubMetaError::InvalidDocument(
-        "expected a destination array",
-    ))?;
+    let values = value.as_array().ok_or_else(|| {
+        GitHubMetaError::InvalidDocument("expected a destination array".to_owned())
+    })?;
     if values.len() > MAX_NETWORK_ENTRIES {
         return Err(GitHubMetaError::LimitExceeded);
     }
     values
         .iter()
         .map(|value| {
-            value.as_str().ok_or(GitHubMetaError::InvalidDocument(
-                "destination entries must be strings",
-            ))
+            value.as_str().ok_or_else(|| {
+                GitHubMetaError::InvalidDocument("destination entries must be strings".to_owned())
+            })
         })
         .collect()
 }
@@ -239,16 +259,84 @@ pub enum GitHubMetaResponse {
     NotModified,
 }
 
-/// Trusted control-plane transport. Production always uses the fixed official
-/// HTTPS client; injection lets embedders and tests keep the same owner and
-/// refresh semantics without doing network I/O in policy compilation.
-#[async_trait::async_trait]
-pub trait GitHubMetaClient: Send + Sync {
-    async fn fetch(
-        &self,
-        policy: &PolicyEngine,
-        etag: Option<&str>,
-    ) -> Result<GitHubMetaResponse, GitHubMetaError>;
+/// One whole official Meta response validated by the host's shared cache.
+/// The guest re-validates every field before any grant becomes effective.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubMetaSeed {
+    #[serde(with = "base64_body")]
+    pub body: Vec<u8>,
+    pub etag: Option<String>,
+    /// Last successful fetch or conditional revalidation, in host Unix time.
+    pub validated_unix_seconds: u64,
+    pub last_attempt_unix_seconds: u64,
+    /// Set when the host's latest revalidation failed and this is last-good.
+    pub last_error: Option<GitHubMetaError>,
+}
+
+impl GitHubMetaSeed {
+    /// Checks the validator, freshness bound and complete document.
+    pub fn validate(&self, now_unix_seconds: u64) -> Result<GitHubMetaScope, GitHubMetaError> {
+        if self.etag.as_deref().is_some_and(|etag| !valid_etag(etag)) {
+            return Err(GitHubMetaError::InvalidResponse);
+        }
+        self.remaining_validity(now_unix_seconds)?;
+        GitHubMetaScope::parse(&self.body)
+    }
+
+    /// Time left before the 24-hour staleness bound, measured from the host's
+    /// validation time. Future validation times are tolerated within skew.
+    pub fn remaining_validity(&self, now_unix_seconds: u64) -> Result<Duration, GitHubMetaError> {
+        if self.validated_unix_seconds
+            > now_unix_seconds.saturating_add(META_MAX_CLOCK_SKEW.as_secs())
+        {
+            return Err(GitHubMetaError::ExpiredSeed);
+        }
+        META_MAX_STALENESS
+            .checked_sub(Duration::from_secs(
+                now_unix_seconds.saturating_sub(self.validated_unix_seconds),
+            ))
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(GitHubMetaError::ExpiredSeed)
+    }
+
+    #[must_use]
+    pub fn sha256_hex(&self) -> String {
+        hex_sha256(&self.body)
+    }
+}
+
+mod base64_body {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(body: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(body))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        if encoded.len() > super::MAX_SEED_BYTES {
+            return Err(D::Error::custom("GitHub Meta seed body exceeds its limit"));
+        }
+        STANDARD.decode(encoded).map_err(D::Error::custom)
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn unix_now() -> Result<u64, GitHubMetaError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_secs())
+        .map_err(|_| GitHubMetaError::Clock)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -291,7 +379,8 @@ pub struct GitHubMetaStatus {
 #[derive(Clone)]
 struct Snapshot {
     scope: Arc<GitHubMetaScope>,
-    validated_at: Instant,
+    // Absolute deadline: a freshly booted guest cannot backdate an Instant.
+    expires_at: Instant,
     validated_unix_seconds: u64,
     etag: Option<String>,
 }
@@ -307,7 +396,6 @@ struct State {
 #[derive(Default)]
 pub struct GitHubMeta {
     state: RwLock<State>,
-    refresh: tokio::sync::Mutex<()>,
 }
 
 impl GitHubMeta {
@@ -318,43 +406,29 @@ impl GitHubMeta {
         state.last_error = None;
     }
 
-    pub async fn refresh_once(
+    /// Validates a host-supplied seed and atomically publishes its status
+    /// before it can authorize anything. An invalid seed leaves any previous
+    /// snapshot untouched until its own expiry.
+    pub fn install_seed(
         &self,
-        client: &dyn GitHubMetaClient,
-        policy: &PolicyEngine,
+        seed: &GitHubMetaSeed,
         audit: &dyn AuditSink,
     ) -> Result<(), GitHubMetaError> {
-        let _refresh = self
-            .refresh
-            .try_lock()
-            .map_err(|_| GitHubMetaError::RefreshInProgress)?;
-        let etag = self
-            .state
-            .read()
-            .expect("GitHub Meta state poisoned")
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.etag.clone());
-        let response =
-            tokio::time::timeout(META_REQUEST_TIMEOUT, client.fetch(policy, etag.as_deref()))
-                .await
-                .map_err(|_| GitHubMetaError::Timeout)
-                .and_then(|response| response)
-                .and_then(|response| self.prepare_response(response));
-        if let Err(error) = &response {
+        let candidate = self.prepare_seed(seed);
+        if let Err(error) = &candidate {
             let mut state = self.state.write().expect("GitHub Meta state poisoned");
-            match SystemTime::now().duration_since(UNIX_EPOCH) {
-                Ok(time) => {
-                    state.last_attempt_unix_seconds = Some(time.as_secs());
+            match unix_now() {
+                Ok(now) => {
+                    state.last_attempt_unix_seconds = Some(now);
                     state.last_error = Some(error.clone());
                 }
-                Err(_) => {
+                Err(clock) => {
                     state.last_attempt_unix_seconds = None;
-                    state.last_error = Some(GitHubMetaError::Clock);
+                    state.last_error = Some(clock);
                 }
             }
         }
-        let status = match &response {
+        let status = match &candidate {
             Ok(candidate) => Self::describe(candidate),
             Err(_) => self.status(),
         };
@@ -370,7 +444,7 @@ impl GitHubMeta {
             });
             return Err(GitHubMetaError::Publication);
         }
-        let candidate = response?;
+        let candidate = candidate?;
         *self.state.write().expect("GitHub Meta state poisoned") = candidate;
         Ok(())
     }
@@ -384,7 +458,7 @@ impl GitHubMeta {
         let active = state
             .snapshot
             .as_ref()
-            .is_some_and(|snapshot| snapshot.validated_at.elapsed() < META_MAX_STALENESS);
+            .is_some_and(|snapshot| Instant::now() < snapshot.expires_at);
         let health = match (&state.snapshot, active, state.last_error.is_some()) {
             (None, _, false) => GitHubMetaState::Pending,
             (None, _, true) => GitHubMetaState::Unavailable,
@@ -419,66 +493,34 @@ impl GitHubMeta {
     pub(crate) fn view(&self) -> (u64, Option<Arc<GitHubMetaScope>>) {
         let state = self.state.read().expect("GitHub Meta state poisoned");
         match &state.snapshot {
-            Some(snapshot) if snapshot.validated_at.elapsed() < META_MAX_STALENESS => {
+            Some(snapshot) if Instant::now() < snapshot.expires_at => {
                 (state.revision, Some(Arc::clone(&snapshot.scope)))
             }
             _ => (0, None),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_response(
-        &self,
-        response: GitHubMetaResponse,
-    ) -> Result<(), GitHubMetaError> {
-        let candidate = self.prepare_response(response)?;
-        *self.state.write().expect("GitHub Meta state poisoned") = candidate;
-        Ok(())
-    }
-
-    fn prepare_response(&self, response: GitHubMetaResponse) -> Result<State, GitHubMetaError> {
-        let parsed = match response {
-            GitHubMetaResponse::Modified { body, etag } => {
-                if etag.as_ref().is_some_and(|etag| !valid_etag(etag)) {
-                    return Err(GitHubMetaError::InvalidResponse);
-                }
-                Some((Arc::new(GitHubMetaScope::parse(&body)?), etag))
-            }
-            GitHubMetaResponse::NotModified => None,
-        };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| GitHubMetaError::Clock)?
-            .as_secs();
+    fn prepare_seed(&self, seed: &GitHubMetaSeed) -> Result<State, GitHubMetaError> {
+        let now = unix_now()?;
+        let scope = Arc::new(seed.validate(now)?);
+        let remaining = seed.remaining_validity(now)?;
         let mut state = self
             .state
             .read()
             .expect("GitHub Meta state poisoned")
             .clone();
-        let revision = state
+        state.revision = state
             .revision
             .checked_add(1)
             .ok_or(GitHubMetaError::LimitExceeded)?;
-        let (scope, etag) = match parsed {
-            Some(parsed) => parsed,
-            None => {
-                let previous = state
-                    .snapshot
-                    .as_ref()
-                    .filter(|snapshot| snapshot.etag.is_some())
-                    .ok_or(GitHubMetaError::UnexpectedNotModified)?;
-                (Arc::clone(&previous.scope), previous.etag.clone())
-            }
-        };
         state.snapshot = Some(Snapshot {
             scope,
-            validated_at: Instant::now(),
-            validated_unix_seconds: now,
-            etag,
+            expires_at: Instant::now() + remaining,
+            validated_unix_seconds: seed.validated_unix_seconds,
+            etag: seed.etag.clone(),
         });
-        state.revision = revision;
-        state.last_attempt_unix_seconds = Some(now);
-        state.last_error = None;
+        state.last_attempt_unix_seconds = Some(seed.last_attempt_unix_seconds);
+        state.last_error = seed.last_error.clone();
         Ok(state)
     }
 }
@@ -496,45 +538,10 @@ pub(crate) fn valid_etag(etag: &str) -> bool {
             })
 }
 
-/// Owned by the gateway alongside its brokers, with no detached task or disk
-/// cache. Expiry is also checked on every policy view, not just on this timer.
-pub(crate) async fn run_refresh(
-    engine: Arc<PolicyEngine>,
-    client: Arc<dyn GitHubMetaClient>,
-    audit: Arc<dyn AuditSink>,
-    cancel: CancellationToken,
-) -> std::io::Result<()> {
-    let metadata = engine
-        .github_meta()
-        .expect("refresh requires a GitHub grant");
-    let mut timer = tokio::time::interval_at(
-        Instant::now() + META_REFRESH_INTERVAL,
-        META_REFRESH_INTERVAL,
-    );
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Ok(()),
-            _ = timer.tick() => {
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => return Ok(()),
-                    result = metadata.refresh_once(client.as_ref(), &engine, audit.as_ref()) => {
-                        if result == Err(GitHubMetaError::Publication) {
-                            return Err(std::io::Error::other(GitHubMetaError::Publication));
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::policy::PolicyEngine;
 
     fn fixture() -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -590,21 +597,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_conditional_validator_without_installing_a_scope() {
-        let metadata = GitHubMeta::default();
-        for etag in ["", "unquoted", "\"embedded\"quote\"", "\"line\r\nbreak\""] {
-            assert_eq!(
-                metadata.install_response(GitHubMetaResponse::Modified {
-                    body: fixture(),
-                    etag: Some(etag.to_owned()),
-                }),
-                Err(GitHubMetaError::InvalidResponse)
-            );
-            assert!(!metadata.status().grants_active);
-        }
-    }
-
-    #[test]
     fn rejects_malformed_unbounded_and_incomplete_destination_scopes() {
         for (path, value) in [
             ("/web", serde_json::json!(["0.0.0.0/0"])),
@@ -645,136 +637,112 @@ mod tests {
         ));
     }
 
-    fn engine() -> Arc<PolicyEngine> {
-        Arc::new(
-            PolicyEngine::compile(
-                &serde_json::from_value(serde_json::json!({
-                    "default_action": "deny", "allowed_domains": ["github.com"],
-                    "blocked_domains": [], "allow_dns": true
-                }))
-                .unwrap(),
-            )
+    fn seed(validated_unix_seconds: u64) -> GitHubMetaSeed {
+        GitHubMetaSeed {
+            body: fixture(),
+            etag: Some("\"fixture\"".to_owned()),
+            validated_unix_seconds,
+            last_attempt_unix_seconds: validated_unix_seconds,
+            last_error: None,
+        }
+    }
+
+    fn engine() -> PolicyEngine {
+        PolicyEngine::compile(
+            &serde_json::from_value(serde_json::json!({
+                "default_action": "deny", "allowed_domains": ["github.com"],
+                "blocked_domains": [], "allow_dns": true
+            }))
             .unwrap(),
         )
+        .unwrap()
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn conditional_revalidation_renews_only_a_previously_valid_snapshot() {
-        let engine = engine();
-        let metadata = engine.github_meta().unwrap();
-        assert_eq!(
-            metadata.install_response(GitHubMetaResponse::NotModified),
-            Err(GitHubMetaError::UnexpectedNotModified)
-        );
-        metadata
-            .install_response(GitHubMetaResponse::Modified {
-                body: fixture(),
-                etag: Some("\"fixture\"".to_owned()),
-            })
-            .unwrap();
-        let previous = metadata.status();
-        tokio::time::advance(META_MAX_STALENESS / 2).await;
-        metadata
-            .install_response(GitHubMetaResponse::NotModified)
-            .unwrap();
-        tokio::time::advance(META_MAX_STALENESS / 2).await;
-        assert!(metadata.status().grants_active);
-        assert_eq!(metadata.status().published_scope, previous.published_scope);
-        assert_ne!(metadata.status().revision, previous.revision);
+    #[test]
+    fn seed_body_round_trips_exactly_through_its_wire_encoding() {
+        let mut original = seed(unix_now().unwrap());
+        original.body.extend_from_slice(b" \n");
+        let encoded = serde_json::to_vec(&original).unwrap();
+        let decoded: GitHubMetaSeed = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.sha256_hex(), original.sha256_hex());
     }
 
-    struct BlockingClient {
-        calls: AtomicUsize,
-        dropped: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait]
-    impl GitHubMetaClient for BlockingClient {
-        async fn fetch(
-            &self,
-            _policy: &PolicyEngine,
-            _etag: Option<&str>,
-        ) -> Result<GitHubMetaResponse, GitHubMetaError> {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Ok(GitHubMetaResponse::Modified {
-                    body: fixture(),
-                    etag: Some("\"fixture\"".to_owned()),
-                });
-            }
-            struct DropProbe(Arc<AtomicUsize>);
-            impl Drop for DropProbe {
-                fn drop(&mut self) {
-                    self.0.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            let _probe = DropProbe(Arc::clone(&self.dropped));
-            std::future::pending().await
+    #[test]
+    fn rejects_invalid_validators_stale_and_future_seeds_without_installing_a_scope() {
+        let now = unix_now().unwrap();
+        let mut invalid = Vec::new();
+        for etag in ["", "unquoted", "\"embedded\"quote\"", "\"line\r\nbreak\""] {
+            let mut candidate = seed(now);
+            candidate.etag = Some(etag.to_owned());
+            invalid.push((candidate, GitHubMetaError::InvalidResponse));
+        }
+        invalid.push((
+            seed(now - META_MAX_STALENESS.as_secs()),
+            GitHubMetaError::ExpiredSeed,
+        ));
+        invalid.push((
+            seed(now + META_MAX_CLOCK_SKEW.as_secs() + 60),
+            GitHubMetaError::ExpiredSeed,
+        ));
+        for (candidate, expected) in invalid {
+            let metadata = GitHubMeta::default();
+            let audit = crate::audit::CollectingAuditSink::new();
+            assert_eq!(metadata.install_seed(&candidate, &audit), Err(expected));
+            assert!(!metadata.status().grants_active);
+            assert_eq!(metadata.status().state, GitHubMetaState::Unavailable);
+            assert_eq!(audit.len(), 1);
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn periodic_refresh_is_hourly_bounded_and_cancelled_without_orphans() {
+    async fn seed_expires_from_host_validation_time_not_guest_install_time() {
         let engine = engine();
-        let client = Arc::new(BlockingClient {
-            calls: AtomicUsize::new(0),
-            dropped: Arc::new(AtomicUsize::new(0)),
-        });
-        let audit = Arc::new(crate::audit::CollectingAuditSink::new());
-        engine
-            .github_meta()
-            .unwrap()
-            .refresh_once(client.as_ref(), &engine, audit.as_ref())
-            .await
+        let metadata = engine.github_meta().unwrap();
+        let validated =
+            unix_now().unwrap() - (META_MAX_STALENESS - META_REFRESH_INTERVAL).as_secs();
+        metadata
+            .install_seed(&seed(validated), &crate::audit::NullAuditSink)
             .unwrap();
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(run_refresh(
-            Arc::clone(&engine),
-            Arc::clone(&client) as Arc<_>,
-            audit,
-            cancel.clone(),
-        ));
-        tokio::task::yield_now().await;
-        tokio::time::advance(META_REFRESH_INTERVAL - Duration::from_secs(1)).await;
-        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
-        cancel.cancel();
-        task.await.unwrap().unwrap();
-        assert_eq!(client.dropped.load(Ordering::SeqCst), 1);
-        tokio::time::advance(META_REFRESH_INTERVAL).await;
-        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        let installed = engine.snapshot();
+        assert_eq!(metadata.status().state, GitHubMetaState::Fresh);
+        assert_eq!(
+            metadata.status().expires_unix_seconds,
+            Some(validated + META_MAX_STALENESS.as_secs())
+        );
+        assert!(engine.evaluate_domain_name("assets.github.test").unwrap());
+        tokio::time::advance(META_REFRESH_INTERVAL - Duration::from_secs(5)).await;
+        assert!(installed.is_current());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(metadata.status().state, GitHubMetaState::Expired);
+        assert!(!installed.is_current());
+        assert!(!engine.evaluate_domain_name("assets.github.test").unwrap());
+        assert!(engine.evaluate_domain_name("github.com").unwrap());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn hung_refresh_reports_timeout_without_extending_its_lease() {
+    #[test]
+    fn last_good_seed_reports_the_hosts_failed_revalidation() {
         let engine = engine();
-        let client = BlockingClient {
-            calls: AtomicUsize::new(0),
-            dropped: Arc::new(AtomicUsize::new(0)),
-        };
-        let audit = crate::audit::CollectingAuditSink::new();
+        let now = unix_now().unwrap();
+        let mut candidate = seed(now - 7200);
+        candidate.last_attempt_unix_seconds = now;
+        candidate.last_error = Some(GitHubMetaError::RateLimited {
+            reset_unix_seconds: Some(now + 600),
+        });
         let metadata = engine.github_meta().unwrap();
         metadata
-            .refresh_once(&client, &engine, &audit)
-            .await
+            .install_seed(&candidate, &crate::audit::NullAuditSink)
             .unwrap();
-        let before = metadata.status();
-        assert_eq!(
-            metadata.refresh_once(&client, &engine, &audit).await,
-            Err(GitHubMetaError::Timeout)
-        );
-        assert_eq!(
-            metadata.status().last_success_unix_seconds,
-            before.last_success_unix_seconds
-        );
-        assert_eq!(metadata.status().revision, before.revision);
-        assert_eq!(metadata.status().state, GitHubMetaState::Degraded);
-        assert_eq!(client.dropped.load(Ordering::SeqCst), 1);
+        let status = metadata.status();
+        assert_eq!(status.state, GitHubMetaState::Degraded);
+        assert!(status.grants_active);
+        assert_eq!(status.last_attempt_unix_seconds, Some(now));
+        assert_eq!(status.last_error, candidate.last_error);
+        assert!(engine.evaluate_domain_name("assets.github.test").unwrap());
     }
 
-    #[tokio::test]
-    async fn failed_provenance_publication_revokes_the_derived_scope() {
+    #[test]
+    fn failed_provenance_publication_revokes_the_derived_scope() {
         struct BrokenAudit;
         impl AuditSink for BrokenAudit {
             fn record(&self, _event: AuditEvent) {}
@@ -783,21 +751,17 @@ mod tests {
             }
         }
         let engine = engine();
-        let client = BlockingClient {
-            calls: AtomicUsize::new(0),
-            dropped: Arc::new(AtomicUsize::new(0)),
-        };
         let metadata = engine.github_meta().unwrap();
         assert_eq!(
-            metadata.refresh_once(&client, &engine, &BrokenAudit).await,
+            metadata.install_seed(&seed(unix_now().unwrap()), &BrokenAudit),
             Err(GitHubMetaError::Publication)
         );
         assert!(!metadata.status().grants_active);
         assert!(!engine.evaluate_domain_name("assets.github.test").unwrap());
     }
 
-    #[tokio::test]
-    async fn scope_is_published_before_it_can_authorize_a_connection() {
+    #[test]
+    fn scope_is_published_before_it_can_authorize_a_connection() {
         struct PublicationCheck<'a>(&'a PolicyEngine);
         impl AuditSink for PublicationCheck<'_> {
             fn record(&self, _event: AuditEvent) {}
@@ -808,98 +772,11 @@ mod tests {
             }
         }
         let engine = engine();
-        let client = BlockingClient {
-            calls: AtomicUsize::new(0),
-            dropped: Arc::new(AtomicUsize::new(0)),
-        };
         engine
             .github_meta()
             .unwrap()
-            .refresh_once(&client, &engine, &PublicationCheck(&engine))
-            .await
+            .install_seed(&seed(unix_now().unwrap()), &PublicationCheck(&engine))
             .unwrap();
         assert!(engine.evaluate_domain_name("assets.github.test").unwrap());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn concurrent_refreshes_cannot_overwrite_a_newer_snapshot() {
-        let engine = engine();
-        let client = Arc::new(BlockingClient {
-            calls: AtomicUsize::new(1),
-            dropped: Arc::new(AtomicUsize::new(0)),
-        });
-        let task_engine = Arc::clone(&engine);
-        let task_client = Arc::clone(&client);
-        let task = tokio::spawn(async move {
-            task_engine
-                .github_meta()
-                .unwrap()
-                .refresh_once(
-                    task_client.as_ref(),
-                    &task_engine,
-                    &crate::audit::NullAuditSink,
-                )
-                .await
-        });
-        tokio::task::yield_now().await;
-        assert_eq!(
-            engine
-                .github_meta()
-                .unwrap()
-                .refresh_once(client.as_ref(), &engine, &crate::audit::NullAuditSink,)
-                .await,
-            Err(GitHubMetaError::RefreshInProgress)
-        );
-        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert_eq!(client.dropped.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn failed_refresh_retains_last_good_only_until_its_monotonic_expiry() {
-        struct FailingClient;
-        #[async_trait::async_trait]
-        impl GitHubMetaClient for FailingClient {
-            async fn fetch(
-                &self,
-                _policy: &crate::policy::PolicyEngine,
-                _etag: Option<&str>,
-            ) -> Result<GitHubMetaResponse, GitHubMetaError> {
-                Err(GitHubMetaError::HttpStatus(503))
-            }
-        }
-        let raw = serde_json::from_value(serde_json::json!({
-            "default_action": "deny",
-            "allowed_domains": ["github.com"],
-            "blocked_domains": [],
-            "allow_dns": true
-        }))
-        .unwrap();
-        let engine = crate::policy::PolicyEngine::compile(&raw).unwrap();
-        let metadata = engine.github_meta().unwrap();
-        metadata
-            .install_response(GitHubMetaResponse::Modified {
-                body: fixture(),
-                etag: Some("\"fixture\"".to_owned()),
-            })
-            .unwrap();
-        let previous = engine.snapshot();
-        let audit = crate::audit::CollectingAuditSink::new();
-        assert!(
-            metadata
-                .refresh_once(&FailingClient, &engine, &audit)
-                .await
-                .is_err()
-        );
-        assert_eq!(metadata.status().state, GitHubMetaState::Degraded);
-        assert!(previous.is_current());
-        tokio::time::advance(META_MAX_STALENESS).await;
-        assert_eq!(metadata.status().state, GitHubMetaState::Expired);
-        assert!(!metadata.status().grants_active);
-        assert!(!previous.is_current());
-        assert!(!engine.evaluate_domain_name("api.github.test").unwrap());
-        assert!(engine.evaluate_domain_name("github.com").unwrap());
-        assert_eq!(audit.len(), 1);
     }
 }

@@ -53,7 +53,8 @@ belong to the tap that owns formula updates, not this source repository.
 CI preloads the exact Python release asset through
 GitHub's release-asset API using `scripts/setup-ci-python.sh`, with SHA-256
 verification and bounded retries before the normal `setup-python` action selects
-it. The helper supports macOS arm64 and Ubuntu x64, including matching packages
+it. The workflow passes its `GITHUB_TOKEN` so the request is not subject to the
+anonymous 60-requests-per-hour limit shared by runner IP addresses. The helper supports macOS arm64 and Ubuntu x64, including matching packages
 for Ubuntu 22.04, 24.04, and 26.04. Update the workflow version, helper version,
 asset IDs, and checksums together when updating Python.
 

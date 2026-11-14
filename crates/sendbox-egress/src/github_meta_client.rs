@@ -1,14 +1,15 @@
-//! Fixed-origin HTTPS transport using the gateway's marked, exact-IP dialer.
-//! No environment proxy, OS re-resolution, redirects, or credentials.
+//! Host-side fixed-origin HTTPS transport for the official Meta document.
+//! System DNS, direct exact-IP dials and verified TLS; no environment proxy,
+//! redirects, or credentials. Guests never call this: they install the
+//! host's validated response.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use hickory_proto::rr::Name;
-use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, ETAG, IF_NONE_MATCH};
-use http::{Request, StatusCode};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, ETAG, IF_NONE_MATCH, RETRY_AFTER};
+use http::{HeaderMap, Request, StatusCode};
 use http_body_util::{BodyExt, Empty, Limited};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -18,113 +19,74 @@ use tokio_rustls::TlsConnector;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::address::{canonicalize, classify};
-use crate::dialer::Dialer;
-use crate::dns_budget::DnsGuard;
+use crate::dialer::{Dialer, DirectDialer};
 use crate::github_meta::{
-    GITHUB_META_API_VERSION, GitHubMetaClient, GitHubMetaError, GitHubMetaResponse, MAX_META_BYTES,
+    GITHUB_META_API_VERSION, GitHubMetaError, GitHubMetaResponse, MAX_META_BYTES,
     META_REQUEST_TIMEOUT,
 };
-use crate::policy::PolicyEngine;
-use crate::resolver::UpstreamResolver;
-use sendbox_policy::DnsRecordType;
 
-const META_HOST: &str = "api.github.com";
+pub const META_HOST: &str = "api.github.com";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+// GitHub publishes resets at most an hour ahead; ignore implausible values.
+const MAX_RATE_LIMIT_WAIT_SECS: u64 = 60 * 60;
 
-pub struct OfficialGitHubMetaClient<R: UpstreamResolver> {
-    resolver: Arc<R>,
-    dialer: Arc<dyn Dialer>,
+/// Fetches the official Meta document once, conditionally when `etag` is set.
+/// Restricted resolutions (private, link-local, metadata) are refused.
+pub async fn fetch_official_github_meta(
+    etag: Option<&str>,
+) -> Result<GitHubMetaResponse, GitHubMetaError> {
+    tokio::time::timeout(META_REQUEST_TIMEOUT, async {
+        let tls = tls_config()?;
+        let addresses = resolve_meta_host().await?;
+        fetch_via(&addresses, &DirectDialer, tls, etag).await
+    })
+    .await
+    .map_err(|_| GitHubMetaError::Timeout)?
 }
 
-impl<R: UpstreamResolver> OfficialGitHubMetaClient<R> {
-    #[must_use]
-    pub fn new(resolver: Arc<R>, dialer: Arc<dyn Dialer>) -> Self {
-        Self { resolver, dialer }
-    }
-
-    async fn fetch_inner(
-        &self,
-        policy: &PolicyEngine,
-        etag: Option<&str>,
-        tls: Arc<ClientConfig>,
-    ) -> Result<GitHubMetaResponse, GitHubMetaError> {
-        if !policy.github_meta_name_permitted(META_HOST) {
+async fn resolve_meta_host() -> Result<Vec<IpAddr>, GitHubMetaError> {
+    let mut addresses = Vec::new();
+    for address in tokio::net::lookup_host((META_HOST, 443))
+        .await
+        .map_err(|_| GitHubMetaError::Resolution)?
+    {
+        let ip = canonicalize(address.ip());
+        if classify(ip).is_restricted() {
             return Err(GitHubMetaError::PolicyDenied);
         }
-        let name = Name::from_ascii("api.github.com.").expect("fixed Meta hostname");
-        let resolved = self
-            .resolver
-            .resolve(&name)
-            .await
-            .map_err(|_| GitHubMetaError::Resolution)?;
-        let guard = DnsGuard::from_policy(policy.dns_policy());
-        for name in resolved.names_to_validate() {
-            let name = crate::domain::normalize_domain(&name.to_ascii())
-                .map_err(|_| GitHubMetaError::Resolution)?;
-            if !policy.github_meta_name_permitted(&name) || guard.check_structure(&name).is_err() {
-                return Err(GitHubMetaError::PolicyDenied);
-            }
-        }
-        let mut addresses = Vec::new();
-        for address in resolved.addresses {
-            let ip = canonicalize(address.ip);
-            if classify(ip).is_restricted() || !policy.address_permitted(ip).allowed {
-                return Err(GitHubMetaError::PolicyDenied);
-            }
-            let qtype = if ip.is_ipv4() {
-                DnsRecordType::A
-            } else {
-                DnsRecordType::Aaaa
-            };
-            if guard.record_type_allowed(qtype) {
-                addresses.push(ip);
-            }
-        }
-        addresses.sort();
-        addresses.dedup();
-        addresses.truncate(guard.max_response_records());
-        if addresses.is_empty() {
-            return Err(GitHubMetaError::Resolution);
-        }
-        let mut last_error = GitHubMetaError::Transport("connect");
-        for ip in addresses {
-            let stream = match self
-                .dialer
-                .dial(SocketAddr::new(ip, 443), CONNECT_TIMEOUT)
-                .await
-            {
-                Ok(stream) => stream,
-                Err(_) => {
-                    last_error = GitHubMetaError::Transport("connect");
-                    continue;
-                }
-            };
-            let tls = TlsConnector::from(Arc::clone(&tls))
-                .connect(
-                    ServerName::try_from(META_HOST).expect("fixed TLS name"),
-                    stream,
-                )
-                .await
-                .map_err(|_| GitHubMetaError::Transport("TLS verification"))?;
-            return fetch_http(tls, etag).await;
-        }
-        Err(last_error)
+        addresses.push(ip);
     }
+    addresses.sort();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(GitHubMetaError::Resolution);
+    }
+    Ok(addresses)
 }
 
-#[async_trait::async_trait]
-impl<R: UpstreamResolver + 'static> GitHubMetaClient for OfficialGitHubMetaClient<R> {
-    async fn fetch(
-        &self,
-        policy: &PolicyEngine,
-        etag: Option<&str>,
-    ) -> Result<GitHubMetaResponse, GitHubMetaError> {
-        tokio::time::timeout(META_REQUEST_TIMEOUT, async {
-            self.fetch_inner(policy, etag, tls_config()?).await
-        })
-        .await
-        .map_err(|_| GitHubMetaError::Timeout)?
+async fn fetch_via(
+    addresses: &[IpAddr],
+    dialer: &dyn Dialer,
+    tls: Arc<ClientConfig>,
+    etag: Option<&str>,
+) -> Result<GitHubMetaResponse, GitHubMetaError> {
+    for ip in addresses {
+        let Ok(stream) = dialer
+            .dial(SocketAddr::new(*ip, 443), CONNECT_TIMEOUT)
+            .await
+        else {
+            continue;
+        };
+        let tls = TlsConnector::from(Arc::clone(&tls))
+            .connect(
+                ServerName::try_from(META_HOST).expect("fixed TLS name"),
+                stream,
+            )
+            .await
+            .map_err(|_| GitHubMetaError::Transport("TLS verification".to_owned()))?;
+        return fetch_http(tls, etag).await;
     }
+    Err(GitHubMetaError::Transport("connect".to_owned()))
 }
 
 fn tls_config() -> Result<Arc<ClientConfig>, GitHubMetaError> {
@@ -169,12 +131,12 @@ where
         .map_err(|_| GitHubMetaError::InvalidResponse)?;
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
-        .map_err(|_| GitHubMetaError::Transport("HTTP handshake"))?;
+        .map_err(|_| GitHubMetaError::Transport("HTTP handshake".to_owned()))?;
     let _driver = AbortOnDropHandle::new(tokio::spawn(connection));
     let response = sender
         .send_request(request)
         .await
-        .map_err(|_| GitHubMetaError::Transport("HTTP response"))?;
+        .map_err(|_| GitHubMetaError::Transport("HTTP response".to_owned()))?;
     if response.status() == StatusCode::NOT_MODIFIED {
         return if etag.is_some() {
             Ok(GitHubMetaResponse::NotModified)
@@ -183,7 +145,7 @@ where
         };
     }
     if response.status() != StatusCode::OK {
-        return Err(GitHubMetaError::HttpStatus(response.status().as_u16()));
+        return Err(status_error(response.status(), response.headers()));
     }
     if response
         .headers()
@@ -225,11 +187,35 @@ where
     Ok(GitHubMetaResponse::Modified { body, etag })
 }
 
+/// GitHub signals primary limits with `x-ratelimit-remaining: 0` and secondary
+/// limits with `retry-after`, on either 403 or 429.
+fn status_error(status: StatusCode, headers: &HeaderMap) -> GitHubMetaError {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    };
+    let exhausted = header("x-ratelimit-remaining") == Some(0);
+    let retry_after = header(RETRY_AFTER.as_str());
+    if !(status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN && (exhausted || retry_after.is_some())))
+    {
+        return GitHubMetaError::HttpStatus(status.as_u16());
+    }
+    let now = crate::github_meta::unix_now().ok();
+    let reset_unix_seconds = retry_after
+        .and_then(|seconds| now.map(|now| now.saturating_add(seconds)))
+        .or_else(|| header("x-ratelimit-reset").filter(|_| exhausted))
+        .filter(|reset| {
+            now.is_none_or(|now| *reset <= now.saturating_add(MAX_RATE_LIMIT_WAIT_SECS))
+        });
+    GitHubMetaError::RateLimited { reset_unix_seconds }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture_resolver::StaticResolver;
-    use crate::resolver::{ResolvedAddress, ResolvedChain};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -238,26 +224,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "explicit anonymous HTTPS qualification against the official Meta API"]
     async fn live_official_meta_contract() {
-        let addresses = tokio::net::lookup_host((META_HOST, 443))
-            .await
-            .unwrap()
-            .map(|address| ResolvedAddress {
-                ip: address.ip(),
-                ttl_secs: 60,
-            })
-            .collect();
-        let resolver = Arc::new(StaticResolver::new());
-        resolver.set(
-            Name::from_ascii("api.github.com.").unwrap(),
-            ResolvedChain {
-                cname_chain: Vec::new(),
-                final_name: Name::from_ascii("api.github.com.").unwrap(),
-                addresses,
-            },
-        );
-        let client = OfficialGitHubMetaClient::new(resolver, Arc::new(crate::dialer::DirectDialer));
         let GitHubMetaResponse::Modified { body, etag } =
-            client.fetch(&policy(false), None).await.unwrap()
+            fetch_official_github_meta(None).await.unwrap()
         else {
             panic!("an unconditional request must return a complete document")
         };
@@ -330,6 +298,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn primary_and_secondary_rate_limits_carry_their_reset_time() {
+        let now = crate::github_meta::unix_now().unwrap();
+        let reset = now + 900;
+        let (primary, _) = exchange(
+            format!(
+                "HTTP/1.1 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .as_bytes(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            primary.err(),
+            Some(GitHubMetaError::RateLimited {
+                reset_unix_seconds: Some(reset)
+            })
+        );
+        let (secondary, _) = exchange(
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 0\r\n\r\n",
+            None,
+        )
+        .await;
+        assert!(matches!(
+            secondary,
+            Err(GitHubMetaError::RateLimited { reset_unix_seconds: Some(reset) })
+                if (now + 60..=now + 61).contains(&reset)
+        ));
+        let (implausible, _) = exchange(
+            b"HTTP/1.1 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 99999999999\r\nContent-Length: 0\r\n\r\n",
+            None,
+        )
+        .await;
+        assert_eq!(
+            implausible.err(),
+            Some(GitHubMetaError::RateLimited {
+                reset_unix_seconds: None
+            })
+        );
+        let (forbidden, _) = exchange(
+            b"HTTP/1.1 403 Forbidden\r\nX-RateLimit-Remaining: 12\r\nContent-Length: 0\r\n\r\n",
+            None,
+        )
+        .await;
+        assert_eq!(forbidden.err(), Some(GitHubMetaError::HttpStatus(403)));
+    }
+
+    #[tokio::test]
     async fn oversized_and_encoded_responses_are_rejected() {
         for headers in [
             format!("Content-Length: {}\r\n", MAX_META_BYTES + 1),
@@ -354,21 +369,8 @@ mod tests {
         }
     }
 
-    fn policy(blocked: bool) -> PolicyEngine {
-        PolicyEngine::compile(
-            &serde_json::from_value(serde_json::json!({
-                "default_action": "deny",
-                "allowed_domains": ["github.com"],
-                "blocked_domains": if blocked { vec!["api.github.com"] } else { Vec::new() },
-                "allow_dns": true
-            }))
-            .unwrap(),
-        )
-        .unwrap()
-    }
-
     #[tokio::test]
-    async fn official_client_pins_dns_and_verifies_the_fixed_tls_identity() {
+    async fn exact_ip_dial_verifies_the_fixed_tls_identity() {
         for certificate_name in ["api.github.com", "lookalike.test"] {
             let rcgen::CertifiedKey { cert, signing_key } =
                 rcgen::generate_simple_self_signed(vec![certificate_name.to_owned()]).unwrap();
@@ -390,7 +392,7 @@ mod tests {
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let dialer = Arc::new(LocalDialer(listener.local_addr().unwrap()));
+            let dialer = LocalDialer(listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let accepted = TlsAcceptor::from(Arc::new(server)).accept(stream).await;
@@ -410,45 +412,15 @@ mod tests {
                     .unwrap();
                 stream.shutdown().await.unwrap();
             });
-            let resolver = Arc::new(StaticResolver::new());
-            resolver.set(
-                Name::from_ascii("api.github.com.").unwrap(),
-                ResolvedChain {
-                    cname_chain: Vec::new(),
-                    final_name: Name::from_ascii("api.github.com.").unwrap(),
-                    addresses: vec![ResolvedAddress {
-                        ip: "203.0.113.10".parse().unwrap(),
-                        ttl_secs: 300,
-                    }],
-                },
-            );
-            let client = OfficialGitHubMetaClient::new(resolver, dialer);
-            let result = client
-                .fetch_inner(&policy(false), None, Arc::new(client_tls))
-                .await;
+            let result = fetch_via(
+                &["203.0.113.10".parse().unwrap()],
+                &dialer,
+                Arc::new(client_tls),
+                None,
+            )
+            .await;
             assert_eq!(result.is_ok(), certificate_name == META_HOST);
             server.await.unwrap();
         }
-    }
-
-    #[tokio::test]
-    async fn explicit_api_deny_prevents_the_control_plane_request() {
-        let client = OfficialGitHubMetaClient::new(
-            Arc::new(StaticResolver::new()),
-            Arc::new(crate::dialer::DirectDialer),
-        );
-        let roots = RootCertStore::empty();
-        let config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-        assert!(matches!(
-            client
-                .fetch_inner(&policy(true), None, Arc::new(config))
-                .await,
-            Err(GitHubMetaError::PolicyDenied)
-        ));
     }
 }

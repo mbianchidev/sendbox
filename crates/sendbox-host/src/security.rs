@@ -1274,6 +1274,7 @@ impl HostError {
             Self::SafeOutputs(_) => "safe_outputs",
             Self::Io { .. } => "io",
             Self::Bundle(_) => "bundle",
+            Self::GitHubMeta(_) => "github_meta",
         }
     }
 }

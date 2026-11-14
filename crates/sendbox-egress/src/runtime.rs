@@ -236,6 +236,22 @@ impl RuntimePolicyDocument {
         Ok(false)
     }
 
+    /// Whether every role that delegates to GitHub Meta still admits its fixed
+    /// source host. The host refuses to seed a session when this is `false`.
+    pub fn github_meta_source_permitted(&self) -> Result<bool, PolicyError> {
+        for network in std::iter::once(&self.network_policy).chain(
+            self.registry
+                .as_ref()
+                .map(|registry| &registry.upstream_network_policy),
+        ) {
+            let engine = PolicyEngine::compile(network)?;
+            if engine.github_meta().is_some() && !engine.github_meta_source_permitted() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     #[must_use]
     pub fn execution_cgroup_parent(&self, cgroup_root: &Path) -> PathBuf {
         cgroup_root

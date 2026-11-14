@@ -38,6 +38,8 @@ jobs:
 
       - name: Preload pinned Python
         if: matrix.task == 'checks'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./scripts/setup-ci-python.sh "$PYTHON_VERSION"
 
       - name: Set up stable Python

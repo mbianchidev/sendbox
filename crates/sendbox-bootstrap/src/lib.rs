@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use sendbox_core::{BoundaryPlanDigest, SessionId};
+use sendbox_egress::github_meta::{GitHubMetaSeed, MAX_META_BYTES, MAX_SEED_BYTES};
 use sendbox_egress::runtime::{
     DEFAULT_CGROUP_ROOT, RuntimePolicyDocument as EgressRuntimePolicyDocument,
 };
@@ -18,8 +19,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 4;
-pub const MAX_BOOTSTRAP_BYTES: usize = 2 * 1024 * 1024;
+pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 5;
+/// Session configuration budget plus room for one host-validated Meta seed.
+pub const MAX_BOOTSTRAP_BYTES: usize = 2 * 1024 * 1024 + MAX_SEED_BYTES;
+/// Base64 bootstrap plus a 32-byte trust root and fixed JSON framing.
+pub const MAX_INJECTION_ENVELOPE_BYTES: usize = MAX_BOOTSTRAP_BYTES.div_ceil(3) * 4 + 1024;
+const TRUST_ROOT_BYTES: usize = 32;
 const MAX_GATEWAY_CREDENTIALS: usize = 64;
 const MAX_GATEWAY_CREDENTIAL_BYTES: usize = 64 * 1024;
 pub const MAX_REGISTRY_CREDENTIALS: usize = 16;
@@ -320,6 +325,7 @@ pub struct BootstrapDocumentConfiguration {
     pub services: Vec<ServiceSpec>,
     pub execution_broker: Option<ExecutionBrokerConfiguration>,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
+    pub github_meta: Option<GitHubMetaSeed>,
     pub gateway_credentials: Vec<GatewayCredential>,
     pub registry_proxy: Option<RegistryProxyConfiguration>,
 }
@@ -338,6 +344,7 @@ pub struct BootstrapDocument {
     pub services: Vec<ServiceSpec>,
     pub execution_broker: Option<ExecutionBrokerBootstrap>,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
+    pub github_meta: Option<GitHubMetaSeed>,
     pub gateway_credentials: Vec<GatewayCredential>,
     pub registry_proxy: Option<RegistryProxyConfiguration>,
 }
@@ -376,6 +383,8 @@ struct BootstrapWire {
     execution_broker: Option<ExecutionBrokerBootstrap>,
     #[serde(default)]
     egress_policy: Option<EgressRuntimePolicyDocument>,
+    #[serde(default)]
+    github_meta: Option<GitHubMetaSeed>,
     #[serde(default)]
     gateway_credentials: Vec<GatewayCredential>,
     #[serde(default)]
@@ -481,6 +490,7 @@ pub fn encode_bootstrap_document(
         services: configuration.services,
         execution_broker,
         egress_policy: configuration.egress_policy,
+        github_meta: configuration.github_meta,
         gateway_credentials: configuration.gateway_credentials,
         registry_proxy: configuration.registry_proxy,
     };
@@ -491,6 +501,74 @@ pub fn encode_bootstrap_document(
         )));
     }
     Ok(Zeroizing::new(encoded))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InjectionEnvelope {
+    bootstrap: String,
+    trust_root: String,
+}
+
+impl Drop for InjectionEnvelope {
+    fn drop(&mut self) {
+        self.bootstrap.zeroize();
+        self.trust_root.zeroize();
+    }
+}
+
+/// Frames a bootstrap and its trust root for runtimes that inject both through
+/// one stdin stream, such as Kata's `inject-bootstrap`.
+pub fn encode_injection_envelope(
+    bootstrap: &[u8],
+    trust_root: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, BootstrapError> {
+    use base64::Engine as _;
+    if bootstrap.len() > MAX_BOOTSTRAP_BYTES || trust_root.len() != TRUST_ROOT_BYTES {
+        return Err(BootstrapError::Invalid(
+            "injection envelope inputs exceed their bounds".to_owned(),
+        ));
+    }
+    let encoded = serde_json::to_vec(&InjectionEnvelope {
+        bootstrap: base64::engine::general_purpose::STANDARD.encode(bootstrap),
+        trust_root: base64::engine::general_purpose::STANDARD.encode(trust_root),
+    })
+    .map_err(BootstrapError::Encode)?;
+    Ok(Zeroizing::new(encoded))
+}
+
+pub struct InjectedBootstrap {
+    pub bootstrap: Zeroizing<Vec<u8>>,
+    pub trust_root: Zeroizing<Vec<u8>>,
+}
+
+/// Reverses [`encode_injection_envelope`] within its bounds.
+pub fn decode_injection_envelope(bytes: &[u8]) -> Result<InjectedBootstrap, BootstrapError> {
+    use base64::Engine as _;
+    if bytes.len() > MAX_INJECTION_ENVELOPE_BYTES {
+        return Err(BootstrapError::Invalid(format!(
+            "injection envelope exceeds {MAX_INJECTION_ENVELOPE_BYTES} bytes"
+        )));
+    }
+    let envelope: InjectionEnvelope =
+        serde_json::from_slice(bytes).map_err(BootstrapError::Decode)?;
+    let decode = |value: &str| {
+        base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .map(Zeroizing::new)
+            .map_err(|_| BootstrapError::Invalid("injection envelope is not base64".to_owned()))
+    };
+    let bootstrap = decode(&envelope.bootstrap)?;
+    let trust_root = decode(&envelope.trust_root)?;
+    if bootstrap.len() > MAX_BOOTSTRAP_BYTES || trust_root.len() != TRUST_ROOT_BYTES {
+        return Err(BootstrapError::Invalid(
+            "injected bootstrap or trust root has an invalid size".to_owned(),
+        ));
+    }
+    Ok(InjectedBootstrap {
+        bootstrap,
+        trust_root,
+    })
 }
 
 pub fn decode_bootstrap_document(bytes: &[u8]) -> Result<BootstrapDocument, BootstrapError> {
@@ -538,6 +616,10 @@ fn validate_configuration(
             .execution_broker
             .as_ref()
             .map(|broker| &broker.cgroup_parent),
+    )?;
+    validate_github_meta(
+        configuration.egress_policy.as_ref(),
+        configuration.github_meta.as_ref(),
     )?;
     validate_gateway_credentials(
         &configuration.gateway_credentials,
@@ -611,6 +693,7 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
             .as_ref()
             .map(|broker| &broker.cgroup_parent),
     )?;
+    validate_github_meta(wire.egress_policy.as_ref(), wire.github_meta.as_ref())?;
     validate_gateway_credentials(
         &wire.gateway_credentials,
         wire.execution_broker
@@ -651,6 +734,7 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         services: wire.services,
         execution_broker: wire.execution_broker,
         egress_policy: wire.egress_policy,
+        github_meta: wire.github_meta,
         gateway_credentials: wire.gateway_credentials,
         registry_proxy: wire.registry_proxy,
     })
@@ -781,6 +865,30 @@ fn validate_registry_credential(credential: &RegistryCredential) -> Result<(), B
         return Err(BootstrapError::Invalid(format!(
             "registry credential must contain 1-{MAX_REGISTRY_CREDENTIAL_BYTES} bytes"
         )));
+    }
+    Ok(())
+}
+
+/// The guest never fetches Meta itself, so a `github.com` delegation needs
+/// exactly one host seed; gateways perform the complete document validation.
+fn validate_github_meta(
+    egress: Option<&EgressRuntimePolicyDocument>,
+    seed: Option<&GitHubMetaSeed>,
+) -> Result<(), BootstrapError> {
+    let delegated = egress
+        .map(EgressRuntimePolicyDocument::github_meta_enabled)
+        .transpose()
+        .map_err(|error| BootstrapError::Invalid(error.to_string()))?
+        .unwrap_or(false);
+    if delegated != seed.is_some() {
+        return Err(BootstrapError::Invalid(
+            "a GitHub Meta seed must accompany exactly a github.com delegation".to_owned(),
+        ));
+    }
+    if seed.is_some_and(|seed| seed.body.len() > MAX_META_BYTES) {
+        return Err(BootstrapError::Invalid(
+            "GitHub Meta seed exceeds its byte limit".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1076,6 +1184,7 @@ mod tests {
                 syscall_tracing: false,
             }),
             egress_policy: None,
+            github_meta: None,
             gateway_credentials: Vec::new(),
             registry_proxy: None,
         }
@@ -1287,6 +1396,71 @@ mod tests {
             .cgroup_parent = drifted.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
         config.egress_policy = Some(drifted);
         assert!(encode_bootstrap_document(config, &[5; 32]).is_err());
+    }
+
+    #[test]
+    fn github_delegation_carries_exactly_one_seed_through_the_bootstrap() {
+        let github = sendbox_policy::NetworkPolicy {
+            default_action: Action::Deny,
+            allowed_domains: vec!["github.com".to_owned()],
+            blocked_domains: Vec::new(),
+            allow_dns: true,
+            max_connections: None,
+            allowed_networks: Vec::new(),
+            blocked_networks: Vec::new(),
+            allowed_ports: Vec::new(),
+            dns: sendbox_policy::DnsPolicy::default(),
+        };
+        let seed = GitHubMetaSeed {
+            body: br#"{"web":["203.0.113.0/24"]}"#.to_vec(),
+            etag: Some("\"fixture\"".to_owned()),
+            validated_unix_seconds: 1_800_000_000,
+            last_attempt_unix_seconds: 1_800_000_000,
+            last_error: None,
+        };
+        let configured = |network: sendbox_policy::NetworkPolicy, seed: Option<GitHubMetaSeed>| {
+            let mut config = configuration();
+            let policy = EgressRuntimePolicyDocument::for_session(config.session_id, network);
+            config
+                .execution_broker
+                .as_mut()
+                .expect("execution broker")
+                .cgroup_parent = policy.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT));
+            config.egress_policy = Some(policy);
+            config.github_meta = seed;
+            config
+        };
+        let encoded =
+            encode_bootstrap_document(configured(github.clone(), Some(seed.clone())), &[5; 32])
+                .expect("encode seeded bootstrap");
+        let decoded = decode_bootstrap_document(&encoded).expect("decode seeded bootstrap");
+        assert_eq!(decoded.github_meta, Some(seed.clone()));
+
+        assert!(encode_bootstrap_document(configured(github.clone(), None), &[5; 32]).is_err());
+        let mut exact_host = github.clone();
+        exact_host.allowed_domains = vec!["api.github.com".to_owned()];
+        assert!(
+            encode_bootstrap_document(configured(exact_host, Some(seed.clone())), &[5; 32])
+                .is_err()
+        );
+        let mut oversized = seed;
+        oversized.body = vec![b' '; MAX_META_BYTES + 1];
+        assert!(encode_bootstrap_document(configured(github, Some(oversized)), &[5; 32]).is_err());
+    }
+
+    #[test]
+    fn injection_envelope_round_trips_within_its_bound() {
+        let bootstrap = vec![0xa5; MAX_BOOTSTRAP_BYTES];
+        let encoded = encode_injection_envelope(&bootstrap, &[7; 32]).expect("encode envelope");
+        assert!(encoded.len() <= MAX_INJECTION_ENVELOPE_BYTES);
+        let decoded = decode_injection_envelope(&encoded).expect("decode envelope");
+        assert_eq!(decoded.bootstrap.as_slice(), bootstrap.as_slice());
+        assert_eq!(decoded.trust_root.as_slice(), [7; 32]);
+
+        assert!(encode_injection_envelope(&bootstrap, &[7; 31]).is_err());
+        assert!(encode_injection_envelope(&vec![0; MAX_BOOTSTRAP_BYTES + 1], &[7; 32]).is_err());
+        assert!(decode_injection_envelope(&vec![b' '; MAX_INJECTION_ENVELOPE_BYTES + 1]).is_err());
+        assert!(decode_injection_envelope(br#"{"bootstrap":"AA==","trust_root":"AA=="}"#).is_err());
     }
 
     #[test]

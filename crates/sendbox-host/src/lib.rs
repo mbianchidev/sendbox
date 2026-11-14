@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod github_meta;
 mod masking;
 mod safe_outputs;
 mod security;
@@ -39,6 +40,7 @@ use sendbox_credentials::{
     CredentialBrokerError, GhMetadataClient, GhProcessConfiguration, GitHubSessionCredentials,
     RepositoryIdentity as CredentialRepositoryIdentity, authorize_github,
 };
+use sendbox_egress::github_meta::GitHubMetaSeed;
 use sendbox_egress::runtime::{
     DEFAULT_REGISTRY_PROXY_PORT, DEFAULT_TRUSTED_REGISTRY_PORT,
     RuntimePolicyDocument as EgressRuntimePolicyDocument, requires_enforcement,
@@ -359,9 +361,20 @@ pub enum HostError {
     },
     #[error("bundle verification: {0}")]
     Bundle(String),
+    #[error("GitHub Meta: {0}")]
+    GitHubMeta(#[from] sendbox_egress::github_meta::GitHubMetaError),
 }
 
 impl HostError {
+    /// A configured deny of the fixed Meta source, as opposed to a fetch failure.
+    #[must_use]
+    pub fn is_github_meta_policy_denial(&self) -> bool {
+        matches!(
+            self,
+            Self::GitHubMeta(sendbox_egress::github_meta::GitHubMetaError::PolicyDenied)
+        )
+    }
+
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         match self {
@@ -566,6 +579,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         workload_identity,
     )?;
     let egress_policy = make_egress_policy(selected_runtime, &request.configuration, session_id)?;
+    let github_meta = github_meta::session_seed(egress_policy.as_ref(), &state_root).await?;
     let git_guard_policy = make_git_guard_policy(
         selected_runtime,
         &request.configuration,
@@ -589,6 +603,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         git_guard_policy.as_ref(),
         mcp_policy.as_ref(),
         egress_policy.as_ref(),
+        github_meta.as_ref(),
         &credentials,
     )?;
     validate_security_composition(SecurityComposition {
@@ -602,6 +617,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         git_guard_policy: git_guard_policy.as_ref(),
         mcp_policy: mcp_policy.as_ref(),
         egress_policy: egress_policy.as_ref(),
+        github_meta: github_meta.as_ref(),
         credentials: &credentials,
         features: &features,
     })?;
@@ -662,6 +678,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         git_guard_policy.as_ref(),
         mcp_policy.as_ref(),
         egress_policy.as_ref(),
+        github_meta.as_ref(),
         &gateway_credentials,
         registry_proxy.as_ref(),
     )?;
@@ -966,6 +983,7 @@ fn build_runtime(
     git_guard_policy: Option<&GuardPolicyDocument>,
     mcp_policy: Option<&RuntimePolicyDocument>,
     egress_policy: Option<&EgressRuntimePolicyDocument>,
+    github_meta: Option<&GitHubMetaSeed>,
     gateway_credentials: &[GatewayCredential],
     registry_proxy: Option<&PreparedRegistryProxy>,
 ) -> Result<RuntimeBuild, HostError> {
@@ -1006,6 +1024,7 @@ fn build_runtime(
             configuration.mcp_policy = mcp_policy.cloned();
             configuration.syscall_tracing = request.configuration.syscall_tracing_enabled();
             configuration.egress_policy = egress_policy.cloned();
+            configuration.github_meta = github_meta.cloned();
             configuration.gateway_credentials = gateway_credentials.to_vec();
             configuration.registry_proxy =
                 registry_proxy.map(|prepared| prepared.bootstrap.clone());
@@ -1074,6 +1093,7 @@ fn build_runtime(
                 mcp_policy: mcp_policy.cloned(),
                 syscall_tracing: request.configuration.syscall_tracing_enabled(),
                 egress_policy: egress_policy.cloned(),
+                github_meta: github_meta.cloned(),
                 gateway_credentials: gateway_credentials.to_vec(),
                 registry_proxy: registry_proxy.map(|prepared| prepared.bootstrap.clone()),
                 workload_uid,
@@ -1935,6 +1955,7 @@ fn boundary_features(
     git_guard_policy: Option<&GuardPolicyDocument>,
     mcp_policy: Option<&RuntimePolicyDocument>,
     egress_policy: Option<&EgressRuntimePolicyDocument>,
+    github_meta: Option<&GitHubMetaSeed>,
     credentials: &EffectiveCredentialSet,
 ) -> Result<BTreeMap<String, FeatureAdmission>, HostError> {
     let mut features = BTreeMap::new();
@@ -2031,19 +2052,28 @@ fn boundary_features(
                 mechanism: mechanism.clone(),
             },
         );
-        if policy
+        let delegated = policy
             .github_meta_enabled()
-            .map_err(|error| HostError::Invalid(error.to_string()))?
-        {
-            features.insert(
-                "network_github_meta".to_owned(),
-                FeatureAdmission {
-                    decision: FeatureDecision::Enforced,
-                    mechanism: format!(
-                        "official_https_meta_v1+authenticated_network_report_v1:{mechanism}"
-                    ),
-                },
-            );
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        match (delegated, github_meta) {
+            (true, Some(seed)) => {
+                features.insert(
+                    "network_github_meta".to_owned(),
+                    FeatureAdmission {
+                        decision: FeatureDecision::Enforced,
+                        mechanism: format!(
+                            "host_seeded_official_https_meta_v2:sha256={}+authenticated_network_report_v1:{mechanism}",
+                            seed.sha256_hex()
+                        ),
+                    },
+                );
+            }
+            (false, None) => {}
+            _ => {
+                return Err(HostError::Invalid(
+                    "a GitHub Meta seed must accompany exactly a github.com delegation".to_owned(),
+                ));
+            }
         }
         if policy.dns_port.is_some() {
             features.insert(
@@ -2252,6 +2282,7 @@ struct SecurityComposition<'a> {
     git_guard_policy: Option<&'a GuardPolicyDocument>,
     mcp_policy: Option<&'a RuntimePolicyDocument>,
     egress_policy: Option<&'a EgressRuntimePolicyDocument>,
+    github_meta: Option<&'a GitHubMetaSeed>,
     credentials: &'a EffectiveCredentialSet,
     features: &'a BTreeMap<String, FeatureAdmission>,
 }
@@ -2268,6 +2299,7 @@ fn validate_security_composition(composition: SecurityComposition<'_>) -> Result
         git_guard_policy,
         mcp_policy,
         egress_policy,
+        github_meta,
         credentials,
         features,
     } = composition;
@@ -2357,6 +2389,7 @@ fn validate_security_composition(composition: SecurityComposition<'_>) -> Result
         git_guard_policy,
         mcp_policy,
         egress_policy,
+        github_meta,
         credentials,
     )?;
     if &expected_features != features {
@@ -3129,7 +3162,8 @@ mod tests {
             copilot_auth: false,
             git_ssh_auth: false,
         };
-        let features = boundary_features(&configuration, None, None, None, &credentials).unwrap();
+        let features =
+            boundary_features(&configuration, None, None, None, None, &credentials).unwrap();
         assert_eq!(
             features["syscall_tracing"].decision,
             FeatureDecision::Enforced
@@ -3295,8 +3329,15 @@ mod tests {
             copilot_auth: false,
             git_ssh_auth: false,
         };
-        let features = boundary_features(&configuration, None, Some(&policy), None, &credentials)
-            .expect("MCP features");
+        let features = boundary_features(
+            &configuration,
+            None,
+            Some(&policy),
+            None,
+            None,
+            &credentials,
+        )
+        .expect("MCP features");
         assert!(features.contains_key("mcp_stdio_broker"));
         assert!(features.contains_key("mcp_stdio_observation"));
         validate_security_composition(SecurityComposition {
@@ -3310,6 +3351,7 @@ mod tests {
             git_guard_policy: None,
             mcp_policy: Some(&policy),
             egress_policy: None,
+            github_meta: None,
             credentials: &credentials,
             features: &features,
         })
@@ -3319,9 +3361,15 @@ mod tests {
         drifted
             .fixed_environment
             .insert("PATH".to_owned(), "/tmp/bin".to_owned());
-        let drifted_features =
-            boundary_features(&configuration, None, Some(&drifted), None, &credentials)
-                .expect("drifted features");
+        let drifted_features = boundary_features(
+            &configuration,
+            None,
+            Some(&drifted),
+            None,
+            None,
+            &credentials,
+        )
+        .expect("drifted features");
         assert!(
             validate_security_composition(SecurityComposition {
                 selected_runtime: ResolvedRuntime::Kata,
@@ -3334,6 +3382,7 @@ mod tests {
                 git_guard_policy: None,
                 mcp_policy: Some(&drifted),
                 egress_policy: None,
+                github_meta: None,
                 credentials: &credentials,
                 features: &drifted_features,
             })
@@ -3392,8 +3441,15 @@ mod tests {
             copilot_auth: false,
             git_ssh_auth: false,
         };
-        let features = boundary_features(&configuration, None, Some(&policy), None, &credentials)
-            .expect("features");
+        let features = boundary_features(
+            &configuration,
+            None,
+            Some(&policy),
+            None,
+            None,
+            &credentials,
+        )
+        .expect("features");
         assert!(features.contains_key("github_safe_outputs"));
     }
 
@@ -3545,6 +3601,62 @@ mod tests {
     }
 
     #[test]
+    fn github_delegation_binds_the_host_seed_digest_into_the_signed_plan() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut configuration = supported_configuration(temp.path().to_path_buf());
+        configuration.policy.network.default_action = Action::Deny;
+        configuration.policy.network.allowed_domains = vec!["github.com".to_owned()];
+        let egress = make_egress_policy(ResolvedRuntime::Kata, &configuration, test_session())
+            .expect("egress policy")
+            .expect("restrictive network");
+        let credentials = EffectiveCredentialSet {
+            values: BTreeMap::new(),
+            github_https_auth: false,
+            copilot_auth: false,
+            git_ssh_auth: false,
+        };
+        assert!(
+            boundary_features(
+                &configuration,
+                None,
+                None,
+                Some(&egress),
+                None,
+                &credentials
+            )
+            .is_err()
+        );
+        let seed = GitHubMetaSeed {
+            body: b"{\"fixture\":1}".to_vec(),
+            etag: None,
+            validated_unix_seconds: 1_800_000_000,
+            last_attempt_unix_seconds: 1_800_000_000,
+            last_error: None,
+        };
+        let mechanism = |seed: &GitHubMetaSeed| {
+            boundary_features(
+                &configuration,
+                None,
+                None,
+                Some(&egress),
+                Some(seed),
+                &credentials,
+            )
+            .expect("seeded features")
+            .remove("network_github_meta")
+            .expect("Meta admission")
+            .mechanism
+        };
+        assert!(mechanism(&seed).starts_with(&format!(
+            "host_seeded_official_https_meta_v2:sha256={}+",
+            seed.sha256_hex()
+        )));
+        let mut other = seed.clone();
+        other.body = b"{\"fixture\":2}".to_vec();
+        assert_ne!(mechanism(&other), mechanism(&seed));
+    }
+
+    #[test]
     fn authenticated_egress_binds_runtime_mcp_features_and_drift() {
         let temp = TempDir::new().expect("temp dir");
         let mut configuration = supported_configuration(temp.path().to_path_buf());
@@ -3564,9 +3676,15 @@ mod tests {
             git_ssh_auth: false,
         };
 
-        let egress_only =
-            boundary_features(&configuration, None, None, Some(&egress), &credentials)
-                .expect("egress features");
+        let egress_only = boundary_features(
+            &configuration,
+            None,
+            None,
+            Some(&egress),
+            None,
+            &credentials,
+        )
+        .expect("egress features");
         assert!(egress_only.contains_key("network_egress_enforcement"));
         assert!(egress_only.contains_key("network_dns_broker"));
 
@@ -3601,6 +3719,7 @@ mod tests {
             None,
             Some(&mcp),
             Some(&egress),
+            None,
             &credentials,
         )
         .expect("composed features");
@@ -3625,6 +3744,7 @@ mod tests {
             git_guard_policy: None,
             mcp_policy: Some(&mcp),
             egress_policy: Some(&egress),
+            github_meta: None,
             credentials: &credentials,
             features: &features,
         })
@@ -3637,6 +3757,7 @@ mod tests {
             None,
             Some(&mcp),
             Some(&drifted),
+            None,
             &credentials,
         )
         .expect("drifted features");
@@ -3652,6 +3773,7 @@ mod tests {
                 git_guard_policy: None,
                 mcp_policy: Some(&mcp),
                 egress_policy: Some(&drifted),
+                github_meta: None,
                 credentials: &credentials,
                 features: &drifted_features,
             })
@@ -3715,10 +3837,24 @@ mod tests {
             copilot_auth: false,
             git_ssh_auth: false,
         };
-        let first = boundary_features(&configuration, Some(&policy), None, None, &credentials)
-            .expect("features");
-        let second = boundary_features(&configuration, Some(&policy), None, None, &credentials)
-            .expect("features");
+        let first = boundary_features(
+            &configuration,
+            Some(&policy),
+            None,
+            None,
+            None,
+            &credentials,
+        )
+        .expect("features");
+        let second = boundary_features(
+            &configuration,
+            Some(&policy),
+            None,
+            None,
+            None,
+            &credentials,
+        )
+        .expect("features");
         assert_eq!(first, second);
         let admission = first
             .get("git_branch_protection")
@@ -3850,9 +3986,15 @@ mod tests {
             &credentials,
         )
         .expect("policy");
-        let mut features =
-            boundary_features(&configuration, policy.as_ref(), None, None, &credentials)
-                .expect("features");
+        let mut features = boundary_features(
+            &configuration,
+            policy.as_ref(),
+            None,
+            None,
+            None,
+            &credentials,
+        )
+        .expect("features");
         validate_security_composition(SecurityComposition {
             selected_runtime: ResolvedRuntime::Kata,
             configuration: &configuration,
@@ -3864,6 +4006,7 @@ mod tests {
             git_guard_policy: policy.as_ref(),
             mcp_policy: None,
             egress_policy: None,
+            github_meta: None,
             credentials: &credentials,
             features: &features,
         })
@@ -3882,6 +4025,7 @@ mod tests {
                 git_guard_policy: policy.as_ref(),
                 mcp_policy: None,
                 egress_policy: None,
+                github_meta: None,
                 credentials: &credentials,
                 features: &features,
             })
@@ -3900,10 +4044,12 @@ mod tests {
                 git_guard_policy: policy.as_ref(),
                 mcp_policy: None,
                 egress_policy: None,
+                github_meta: None,
                 credentials: &credentials,
                 features: &boundary_features(
                     &configuration,
                     policy.as_ref(),
+                    None,
                     None,
                     None,
                     &credentials,

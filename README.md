@@ -42,8 +42,9 @@ controls must be ready before the agent starts. An unavailable provider or
 unsupported capability is an error, **not a fallback to running on the host**.
 
 Network grants support explicit subdomain wildcards. On Apple and Kata, an exact
-`github.com` grant also includes periodically refreshed official GitHub Meta
-domains and IPv4/IPv6 CIDRs, including shared-cloud ranges. See
+`github.com` grant also includes official GitHub Meta domains and IPv4/IPv6
+CIDRs, including shared-cloud ranges. The host caches them for all sessions and
+revalidates at most hourly, keeping within GitHub's anonymous rate limit. See
 [network scope, outages, and provenance](docs/configuration.md#network-grants).
 
 ## Supported coding agents

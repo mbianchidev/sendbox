@@ -209,7 +209,8 @@ dependency.
 
 The pinned libseccomp source is downloaded through GitHub's release-asset API
 using its immutable asset ID, with bounded retries and network timeouts.
-SHA-256 verification remains mandatory before extraction.
+SHA-256 verification remains mandatory before extraction. The optional
+`github_token` BuildKit secret authenticates the request in CI.
 
 Guest Supervisor CI passes `--build-arg CARGO_BUILD_JOBS=2` to the quality build
 and both clean builds on each native architecture, matching production bundle

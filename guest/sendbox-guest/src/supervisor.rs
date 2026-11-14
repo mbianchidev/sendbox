@@ -183,6 +183,7 @@ pub async fn run<P: PlatformControls>(
                 .and_then(|broker| broker.mcp_policy.clone()),
             std::mem::take(&mut bootstrap.gateway_credentials),
             registry_proxy,
+            bootstrap.github_meta.take(),
         )?;
         if bootstrap.required_services.contains(&ServiceId::Audit)
             && !service.dependencies.contains(&ServiceId::Audit)
