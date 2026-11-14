@@ -14,6 +14,7 @@ use std::time::Duration;
 use sendbox_bootstrap::{
     BootstrapDocumentConfiguration, ExecutionBrokerConfiguration, GatewayCredential,
     REQUIRED_RUNTIME_CONTROLS, RegistryProxyConfiguration, encode_bootstrap_document,
+    encode_injection_envelope,
 };
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
 use sendbox_egress::github_meta::GitHubMetaSeed;
@@ -33,7 +34,6 @@ use sendbox_runtime::{
     RuntimeHealth, RuntimeId, RuntimeProvider, RuntimeSignal, RuntimeStatus, SearchPathResolver,
     StartRequest, StopRequest,
 };
-use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
@@ -991,19 +991,13 @@ impl OutputSubscription for OwnedProcessSubscription {
     }
 }
 
-#[derive(Serialize)]
-struct BootstrapEnvelope<'a> {
-    bootstrap: &'a [u8],
-    trust_root: &'a [u8],
-}
-
 fn bootstrap_payload(
     configuration: &KataProviderConfiguration,
     channel: &ControlChannelRequest,
     create: &sendbox_runtime::CreateRequest,
     secret: &[u8],
     trust_root: &[u8],
-) -> Result<Vec<u8>, RuntimeError> {
+) -> Result<Zeroizing<Vec<u8>>, RuntimeError> {
     let workspace = create
         .mounts
         .iter()
@@ -1049,11 +1043,8 @@ fn bootstrap_payload(
         secret,
     )
     .map_err(|error| RuntimeError::Provider(format!("encode bootstrap: {error}")))?;
-    serde_json::to_vec(&BootstrapEnvelope {
-        bootstrap: bootstrap.as_ref(),
-        trust_root,
-    })
-    .map_err(|error| RuntimeError::Provider(format!("encode bootstrap injection: {error}")))
+    encode_injection_envelope(&bootstrap, trust_root)
+        .map_err(|error| RuntimeError::Provider(format!("encode bootstrap injection: {error}")))
 }
 
 fn strict_host_preflight(
@@ -1370,7 +1361,7 @@ fn spawn_stderr_capture(stderr: ChildStderr) -> JoinHandle<Vec<u8>> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use sendbox_bootstrap::decode_bootstrap_document;
+    use sendbox_bootstrap::{decode_bootstrap_document, decode_injection_envelope};
     use sendbox_core::{BoundaryPlanDigest, SessionId};
     use sendbox_policy::Action;
     use sendbox_runtime::{
@@ -1457,12 +1448,6 @@ mod tests {
         assert!(KataRuntimeProvider::new(config).is_err());
     }
 
-    #[derive(serde::Deserialize)]
-    struct DecodedBootstrapEnvelope {
-        bootstrap: Vec<u8>,
-        trust_root: Vec<u8>,
-    }
-
     #[test]
     fn kata_wraps_the_shared_guest_bootstrap_document() {
         let temporary = tempdir().expect("temporary");
@@ -1505,11 +1490,10 @@ mod tests {
 
         let payload = bootstrap_payload(&configuration, &channel, &create, &[9; 32], &[7; 32])
             .expect("Kata bootstrap envelope");
-        let envelope: DecodedBootstrapEnvelope =
-            serde_json::from_slice(&payload).expect("bootstrap envelope JSON");
-        assert_eq!(envelope.trust_root, vec![7; 32]);
+        let injected = decode_injection_envelope(&payload).expect("bootstrap envelope");
+        assert_eq!(injected.trust_root.as_slice(), [7; 32]);
         let decoded =
-            decode_bootstrap_document(&envelope.bootstrap).expect("shared guest bootstrap schema");
+            decode_bootstrap_document(&injected.bootstrap).expect("shared guest bootstrap schema");
         assert_eq!(decoded.session_id, channel.session_id);
         assert_eq!(decoded.boundary_plan_digest, channel.boundary_plan_digest);
         assert_eq!(
@@ -1523,6 +1507,32 @@ mod tests {
         assert_eq!(
             broker.cgroup_parent,
             egress.execution_cgroup_parent(Path::new(DEFAULT_CGROUP_ROOT))
+        );
+
+        // A maximum-size GitHub Meta seed must still fit the guest's stdin bound.
+        let mut github = egress.network_policy.clone();
+        github.allowed_domains = vec!["github.com".to_owned()];
+        configuration.egress_policy = Some(EgressRuntimePolicyDocument::for_session(
+            create.session_id,
+            github,
+        ));
+        let seed = sendbox_egress::github_meta::GitHubMetaSeed {
+            body: vec![b'x'; sendbox_egress::github_meta::MAX_META_BYTES],
+            etag: Some("\"fixture\"".to_owned()),
+            validated_unix_seconds: 1_800_000_000,
+            last_attempt_unix_seconds: 1_800_000_000,
+            last_error: None,
+        };
+        configuration.github_meta = Some(seed.clone());
+        let payload = bootstrap_payload(&configuration, &channel, &create, &[9; 32], &[7; 32])
+            .expect("seeded Kata bootstrap envelope");
+        assert!(payload.len() <= sendbox_bootstrap::MAX_INJECTION_ENVELOPE_BYTES);
+        let injected = decode_injection_envelope(&payload).expect("seeded envelope");
+        assert_eq!(
+            decode_bootstrap_document(&injected.bootstrap)
+                .expect("seeded bootstrap")
+                .github_meta,
+            Some(seed)
         );
     }
 

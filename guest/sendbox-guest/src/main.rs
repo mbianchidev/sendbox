@@ -315,16 +315,9 @@ async fn execute(cli: Cli) -> Result<(), GuestError> {
         Commands::InjectBootstrap(args) => inject_bootstrap(args).await,
     };
 
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct InjectionEnvelope {
-        bootstrap: Vec<u8>,
-        trust_root: Vec<u8>,
-    }
-
     async fn inject_bootstrap(args: InjectBootstrapArgs) -> Result<(), GuestError> {
+        use sendbox_bootstrap::{MAX_INJECTION_ENVELOPE_BYTES, decode_injection_envelope};
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        use zeroize::Zeroize;
 
         if args.bootstrap_target.parent() != args.trust_root_target.parent()
             || !args.bootstrap_target.is_absolute()
@@ -346,28 +339,17 @@ async fn execute(cli: Cli) -> Result<(), GuestError> {
         sendbox_guest::platform::prepare_native_exec_cgroup(Path::new("/sys/fs/cgroup"))?;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
             .map_err(|error| GuestError::io("setting bootstrap injection directory mode", error))?;
-        let mut encoded = Vec::new();
+        let mut encoded = zeroize::Zeroizing::new(Vec::new());
         tokio::io::stdin()
-            .take(128 * 1024)
+            .take(u64::try_from(MAX_INJECTION_ENVELOPE_BYTES + 1).expect("envelope bound fits u64"))
             .read_to_end(&mut encoded)
             .await
             .map_err(|error| GuestError::io("reading injected bootstrap", error))?;
-        let mut envelope: InjectionEnvelope =
-            serde_json::from_slice(&encoded).map_err(|error| {
-                GuestError::Bootstrap(format!("decode injection envelope: {error}"))
-            })?;
-        encoded.zeroize();
-        if envelope.trust_root.len() != 32 {
-            envelope.bootstrap.zeroize();
-            envelope.trust_root.zeroize();
-            return Err(GuestError::Bootstrap(
-                "injected trust root must contain exactly 32 bytes".to_owned(),
-            ));
-        }
-        write_injected(&args.bootstrap_target, &envelope.bootstrap, 0o400)?;
-        write_injected(&args.trust_root_target, &envelope.trust_root, 0o444)?;
-        envelope.bootstrap.zeroize();
-        envelope.trust_root.zeroize();
+        let injected = decode_injection_envelope(&encoded).map_err(|error| {
+            GuestError::Bootstrap(format!("decode injection envelope: {error}"))
+        })?;
+        write_injected(&args.bootstrap_target, &injected.bootstrap, 0o400)?;
+        write_injected(&args.trust_root_target, &injected.trust_root, 0o444)?;
         Ok(())
     }
 

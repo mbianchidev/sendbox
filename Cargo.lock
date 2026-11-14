@@ -2498,6 +2498,7 @@ dependencies = [
 name = "sendbox-bootstrap"
 version = "0.2.6"
 dependencies = [
+ "base64",
  "getrandom 0.4.3",
  "sendbox-core",
  "sendbox-egress",
