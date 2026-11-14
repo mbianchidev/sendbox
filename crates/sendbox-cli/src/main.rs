@@ -1321,6 +1321,7 @@ fn host_error_exit_code(error: &HostError) -> u8 {
             INVALID_CONFIGURATION_EXIT
         }
         HostError::OutputFinalization { runtime, .. } => host_error_exit_code(runtime),
+        error if error.is_github_meta_policy_denial() => INVALID_CONFIGURATION_EXIT,
         HostError::Invalid(_)
         | HostError::Boundary(_)
         | HostError::Credentials(_)

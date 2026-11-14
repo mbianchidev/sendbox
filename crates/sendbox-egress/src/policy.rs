@@ -263,13 +263,16 @@ impl PolicyEngine {
         self.github_meta.as_ref()
     }
 
-    pub(crate) fn github_meta_name_permitted(&self, name: &str) -> bool {
+    /// Whether a delegating policy still admits the fixed Meta source. An
+    /// explicit `api.github.com` deny, disabled DNS, or a TCP/443 exclusion
+    /// keeps the session from starting instead of narrowing silently.
+    #[must_use]
+    pub fn github_meta_source_permitted(&self) -> bool {
         self.github_meta.is_some()
             && self.allow_dns
-            && !self
-                .blocked_domains
-                .iter()
-                .any(|pattern| domain::pattern_matches(pattern, name))
+            && !self.blocked_domains.iter().any(|pattern| {
+                domain::pattern_matches(pattern, crate::github_meta_client::META_HOST)
+            })
             && (self.allowed_ports.is_empty()
                 || self
                     .allowed_ports
@@ -577,6 +580,33 @@ mod tests {
     }
 
     #[test]
+    fn meta_source_denials_block_delegation_instead_of_narrowing_it() {
+        let mut raw = policy(Action::Deny);
+        raw.allowed_domains = vec!["github.com".to_owned()];
+        assert!(
+            PolicyEngine::compile(&raw)
+                .unwrap()
+                .github_meta_source_permitted()
+        );
+        let mut blocked = raw.clone();
+        blocked.blocked_domains = vec!["api.github.com".to_owned()];
+        let mut no_dns = raw.clone();
+        no_dns.allow_dns = false;
+        let mut no_https = raw;
+        no_https.allowed_ports = vec![sendbox_policy::PortRule {
+            protocol: Protocol::Tcp,
+            port: 22,
+        }];
+        for denied in [blocked, no_dns, no_https] {
+            assert!(
+                !PolicyEngine::compile(&denied)
+                    .unwrap()
+                    .github_meta_source_permitted()
+            );
+        }
+    }
+
+    #[test]
     fn explicit_github_grant_adds_published_destinations_without_overriding_denies() {
         let mut raw = policy(Action::Deny);
         raw.allowed_domains = vec!["GitHub.COM.".to_owned()];
@@ -587,17 +617,23 @@ mod tests {
         engine
             .github_meta()
             .unwrap()
-            .install_response(crate::github_meta::GitHubMetaResponse::Modified {
-                body: serde_json::to_vec(&serde_json::json!({
-                    "verifiable_password_authentication": false,
-                    "web": ["203.0.113.0/24"],
-                    "api": ["2001:db8:1234::/48"],
-                    "git": ["10.0.0.0/8"],
-                    "domains": {"website": ["*.github.test"]}
-                }))
-                .unwrap(),
-                etag: Some("\"fixture-v1\"".to_owned()),
-            })
+            .install_seed(
+                &crate::github_meta::GitHubMetaSeed {
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "verifiable_password_authentication": false,
+                        "web": ["203.0.113.0/24"],
+                        "api": ["2001:db8:1234::/48"],
+                        "git": ["10.0.0.0/8"],
+                        "domains": {"website": ["*.github.test"]}
+                    }))
+                    .unwrap(),
+                    etag: Some("\"fixture-v1\"".to_owned()),
+                    validated_unix_seconds: crate::github_meta::unix_now().unwrap(),
+                    last_attempt_unix_seconds: crate::github_meta::unix_now().unwrap(),
+                    last_error: None,
+                },
+                &crate::audit::NullAuditSink,
+            )
             .unwrap();
         assert!(engine.evaluate_domain_name("api.github.test").unwrap());
         assert!(!engine.evaluate_domain_name("denied.github.test").unwrap());

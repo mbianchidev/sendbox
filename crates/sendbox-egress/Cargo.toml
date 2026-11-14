@@ -19,6 +19,7 @@ path = "src/bin/harness.rs"
 sendbox-core = { path = "../sendbox-core" }
 sendbox-policy = { path = "../sendbox-policy" }
 async-trait.workspace = true
+base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
 hickory-proto.workspace = true

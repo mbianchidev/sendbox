@@ -16,6 +16,7 @@ use sendbox_bootstrap::{
     REQUIRED_RUNTIME_CONTROLS, RegistryProxyConfiguration, encode_bootstrap_document,
 };
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
+use sendbox_egress::github_meta::GitHubMetaSeed;
 use sendbox_egress::runtime::{
     DEFAULT_CGROUP_ROOT, RuntimePolicyDocument as EgressRuntimePolicyDocument,
 };
@@ -66,6 +67,7 @@ pub struct KataProviderConfiguration {
     pub mcp_policy: Option<RuntimePolicyDocument>,
     pub syscall_tracing: bool,
     pub egress_policy: Option<EgressRuntimePolicyDocument>,
+    pub github_meta: Option<GitHubMetaSeed>,
     pub gateway_credentials: Vec<GatewayCredential>,
     pub registry_proxy: Option<RegistryProxyConfiguration>,
     pub workload_uid: u32,
@@ -1040,6 +1042,7 @@ fn bootstrap_payload(
                 syscall_tracing: configuration.syscall_tracing,
             }),
             egress_policy: configuration.egress_policy.clone(),
+            github_meta: configuration.github_meta.clone(),
             gateway_credentials: configuration.gateway_credentials.clone(),
             registry_proxy: configuration.registry_proxy.clone(),
         },
@@ -1405,6 +1408,7 @@ mod tests {
             mcp_policy: None,
             syscall_tracing: false,
             egress_policy: None,
+            github_meta: None,
             gateway_credentials: Vec::new(),
             registry_proxy: None,
             workload_uid: 65_534,

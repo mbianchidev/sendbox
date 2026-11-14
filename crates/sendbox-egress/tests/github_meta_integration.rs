@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -14,45 +13,13 @@ use sendbox_egress::connect_proto::{
 use sendbox_egress::dialer::{Dialer, DirectDialer};
 use sendbox_egress::fixture_resolver::StaticResolver;
 use sendbox_egress::gateway::{Gateway, GatewayConfig, GatewayListeners};
-use sendbox_egress::github_meta::{
-    GitHubMetaClient, GitHubMetaError, GitHubMetaResponse, GitHubMetaState,
-};
+use sendbox_egress::github_meta::{GitHubMetaError, GitHubMetaSeed, GitHubMetaState, unix_now};
 use sendbox_egress::policy::PolicyEngine;
 use sendbox_egress::resolver::{ResolvedAddress, ResolvedChain};
 use sendbox_policy::NetworkPolicy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
-
-struct FixtureClient {
-    responses: Mutex<VecDeque<Result<GitHubMetaResponse, GitHubMetaError>>>,
-    requests: Mutex<Vec<Option<String>>>,
-}
-
-impl FixtureClient {
-    fn new(responses: Vec<Result<GitHubMetaResponse, GitHubMetaError>>) -> Self {
-        Self {
-            responses: Mutex::new(responses.into()),
-            requests: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl GitHubMetaClient for FixtureClient {
-    async fn fetch(
-        &self,
-        _policy: &PolicyEngine,
-        etag: Option<&str>,
-    ) -> Result<GitHubMetaResponse, GitHubMetaError> {
-        self.requests.lock().unwrap().push(etag.map(str::to_owned));
-        self.responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("unexpected metadata request")
-    }
-}
 
 fn policy() -> NetworkPolicy {
     serde_json::from_value(serde_json::json!({
@@ -64,21 +31,27 @@ fn policy() -> NetworkPolicy {
     .unwrap()
 }
 
-fn metadata(
-    domains: &[&str],
-    v4: &str,
-    v6: &str,
-    etag: &str,
-) -> Result<GitHubMetaResponse, GitHubMetaError> {
-    Ok(GitHubMetaResponse::Modified {
-        body: serde_json::to_vec(&serde_json::json!({
+fn seed(body: Vec<u8>, etag: &str) -> GitHubMetaSeed {
+    let now = unix_now().unwrap();
+    GitHubMetaSeed {
+        body,
+        etag: Some(etag.to_owned()),
+        validated_unix_seconds: now,
+        last_attempt_unix_seconds: now,
+        last_error: None,
+    }
+}
+
+fn metadata(domains: &[&str], v4: &str, v6: &str, etag: &str) -> GitHubMetaSeed {
+    seed(
+        serde_json::to_vec(&serde_json::json!({
             "verifiable_password_authentication": false,
             "web": [v4], "api": [v6], "git": [v4],
             "domains": {"website": domains}
         }))
         .unwrap(),
-        etag: Some(etag.to_owned()),
-    })
+        etag,
+    )
 }
 
 struct FixtureDialer {
@@ -96,7 +69,6 @@ impl Dialer for FixtureDialer {
 
 struct Harness {
     engine: Arc<PolicyEngine>,
-    client: Arc<FixtureClient>,
     resolver: Arc<StaticResolver>,
     audit: Arc<CollectingAuditSink>,
     dialer: Arc<FixtureDialer>,
@@ -112,7 +84,7 @@ impl Harness {
     async fn start(
         raw: NetworkPolicy,
         frontend: ConnectFrontend,
-        responses: Vec<Result<GitHubMetaResponse, GitHubMetaError>>,
+        seed: Option<GitHubMetaSeed>,
     ) -> Self {
         let cancel = CancellationToken::new();
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -146,8 +118,7 @@ impl Harness {
         let engine = Arc::new(PolicyEngine::compile(&raw).unwrap());
         let resolver = Arc::new(StaticResolver::new());
         let audit = Arc::new(CollectingAuditSink::new());
-        let client = Arc::new(FixtureClient::new(responses));
-        let gateway = Gateway::new(
+        let mut gateway = Gateway::new(
             Arc::clone(&engine),
             Arc::clone(&resolver),
             Arc::clone(&dialer) as Arc<_>,
@@ -159,9 +130,11 @@ impl Harness {
                 },
                 ..GatewayConfig::default()
             },
-        )
-        .with_github_meta_client(Arc::clone(&client) as Arc<_>);
-        gateway.prepare_github_meta(&cancel).await.unwrap();
+        );
+        if let Some(seed) = seed {
+            gateway = gateway.with_github_meta_seed(seed);
+        }
+        gateway.prepare_github_meta().unwrap();
         let listeners = GatewayListeners::bind_with_http_proxy(
             Some("127.0.0.1:0".parse().unwrap()),
             "127.0.0.1:0".parse().unwrap(),
@@ -176,7 +149,6 @@ impl Harness {
         let gateway = tokio::spawn(async move { gateway.serve(listeners, gateway_cancel).await });
         Self {
             engine,
-            client,
             resolver,
             audit,
             dialer,
@@ -347,7 +319,22 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn failed_bootstrap_is_an_error_not_a_ready_exact_host_fallback() {
+async fn missing_or_invalid_seed_is_an_error_not_a_ready_exact_host_fallback() {
+    let listeners = || GatewayListeners::bind(None, "127.0.0.1:0".parse().unwrap());
+    let engine = Arc::new(PolicyEngine::compile(&policy()).unwrap());
+    let unseeded = Gateway::new(
+        Arc::clone(&engine),
+        Arc::new(StaticResolver::new()),
+        Arc::new(DirectDialer),
+        Arc::new(CollectingAuditSink::new()),
+        GatewayConfig::default(),
+    );
+    let error = unseeded
+        .serve(listeners().await.unwrap(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), GitHubMetaError::MissingSeed.to_string());
+
     let engine = Arc::new(PolicyEngine::compile(&policy()).unwrap());
     let audit = Arc::new(CollectingAuditSink::new());
     let gateway = Gateway::new(
@@ -357,15 +344,10 @@ async fn failed_bootstrap_is_an_error_not_a_ready_exact_host_fallback() {
         Arc::clone(&audit) as Arc<_>,
         GatewayConfig::default(),
     )
-    .with_github_meta_client(Arc::new(FixtureClient::new(vec![Err(
-        GitHubMetaError::HttpStatus(503),
-    )])));
-    let listeners = GatewayListeners::bind(None, "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
+    .with_github_meta_seed(seed(b"{malformed".to_vec(), "\"bad\""));
     assert!(
         gateway
-            .serve(listeners, CancellationToken::new())
+            .serve(listeners().await.unwrap(), CancellationToken::new())
             .await
             .is_err()
     );
@@ -375,7 +357,8 @@ async fn failed_bootstrap_is_an_error_not_a_ready_exact_host_fallback() {
     );
     assert!(
         matches!(&audit.events()[0], AuditEvent::GitHubMeta { status }
-        if !status.grants_active && status.last_error == Some(GitHubMetaError::HttpStatus(503)))
+        if !status.grants_active
+            && matches!(status.last_error, Some(GitHubMetaError::InvalidDocument(_))))
     );
 }
 
@@ -392,12 +375,12 @@ async fn metadata_scope_is_enforced_across_dns_native_socks_http_and_ip_families
         let h = Harness::start(
             raw,
             frontend,
-            vec![metadata(
+            Some(metadata(
                 &["*.github.test", "edge.cdn.test"],
                 "203.0.113.0/24",
                 "2001:db8:1234::/48",
                 "\"v1\"",
-            )],
+            )),
         )
         .await;
         h.resolve("download.github.test", "203.0.113.1", Some("edge.cdn.test"));
@@ -461,7 +444,6 @@ async fn metadata_scope_is_enforced_across_dns_native_socks_http_and_ip_families
                 .iter()
                 .any(|address| address.ip().is_ipv6())
         );
-        assert_eq!(h.client.requests.lock().unwrap().as_slice(), [None]);
         h.stop().await;
     }
 }
@@ -472,7 +454,7 @@ async fn wildcard_grants_keep_apex_exact_host_and_label_boundaries_on_every_fron
         let mut raw = policy();
         raw.allowed_domains = vec!["*.tools.test".to_owned(), "exact.test".to_owned()];
         raw.blocked_domains = vec!["blocked.tools.test".to_owned()];
-        let h = Harness::start(raw, frontend, Vec::new()).await;
+        let h = Harness::start(raw, frontend, None).await;
         for host in [
             "a.tools.test",
             "nested.a.tools.test",
@@ -499,35 +481,21 @@ async fn wildcard_grants_keep_apex_exact_host_and_label_boundaries_on_every_fron
             h.tunnel(frontend, host, 443, allowed).await;
             h.tunnel(ConnectFrontend::Http, host, 443, allowed).await;
         }
-        assert!(h.client.requests.lock().unwrap().is_empty());
         h.stop().await;
     }
 }
 
 #[tokio::test]
-async fn refresh_retires_removed_domains_networks_and_cached_cname_authorizations() {
+async fn newer_seed_retires_removed_domains_networks_and_cached_cname_authorizations() {
     let h = Harness::start(
         policy(),
         ConnectFrontend::Socks5,
-        vec![
-            metadata(
-                &["*.github.test", "edge.cdn.test"],
-                "203.0.113.0/24",
-                "2001:db8:1234::/48",
-                "\"v1\"",
-            ),
-            metadata(
-                &["*.github.test", "new.test"],
-                "198.51.100.0/24",
-                "2001:db8:5678::/48",
-                "\"v2\"",
-            ),
-            Ok(GitHubMetaResponse::Modified {
-                body: b"{malformed".to_vec(),
-                etag: Some("\"bad\"".to_owned()),
-            }),
-            Ok(GitHubMetaResponse::NotModified),
-        ],
+        Some(metadata(
+            &["*.github.test", "edge.cdn.test"],
+            "203.0.113.0/24",
+            "2001:db8:1234::/48",
+            "\"v1\"",
+        )),
     )
     .await;
     h.resolve("download.github.test", "203.0.113.1", Some("edge.cdn.test"));
@@ -543,10 +511,15 @@ async fn refresh_retires_removed_domains_networks_and_cached_cname_authorization
         .await;
     h.tunnel(ConnectFrontend::Http, "new.test", 443, false)
         .await;
-    let metadata = h.engine.github_meta().unwrap();
-    metadata
-        .refresh_once(h.client.as_ref(), &h.engine, h.audit.as_ref())
-        .await
+    let metadata_state = h.engine.github_meta().unwrap();
+    let newer = metadata(
+        &["*.github.test", "new.test"],
+        "198.51.100.0/24",
+        "2001:db8:5678::/48",
+        "\"v2\"",
+    );
+    metadata_state
+        .install_seed(&newer, h.audit.as_ref())
         .unwrap();
     h.tunnel(ConnectFrontend::Socks5, "download.github.test", 443, false)
         .await;
@@ -555,54 +528,32 @@ async fn refresh_retires_removed_domains_networks_and_cached_cname_authorization
         .await;
     h.tunnel(ConnectFrontend::Http, "198.51.100.1", 443, true)
         .await;
+    h.tunnel(ConnectFrontend::Socks5, "2001:db8:5678::1", 443, true)
+        .await;
     h.tunnel(ConnectFrontend::Socks5, "2001:db8:1234::1", 443, false)
         .await;
-    h.tunnel(ConnectFrontend::Http, "2001:db8:5678::1", 443, true)
-        .await;
-    let previous = metadata.status();
+    let previous = metadata_state.status();
     assert!(
-        metadata
-            .refresh_once(h.client.as_ref(), &h.engine, h.audit.as_ref())
-            .await
+        metadata_state
+            .install_seed(&seed(b"{malformed".to_vec(), "\"bad\""), h.audit.as_ref())
             .is_err()
     );
-    assert_eq!(metadata.status().state, GitHubMetaState::Degraded);
-    assert_eq!(metadata.status().published_scope, previous.published_scope);
-    h.tunnel(ConnectFrontend::Http, "new.test", 443, true).await;
-    metadata
-        .refresh_once(h.client.as_ref(), &h.engine, h.audit.as_ref())
-        .await
-        .unwrap();
-    assert_eq!(metadata.status().state, GitHubMetaState::Fresh);
+    assert_eq!(metadata_state.status().state, GitHubMetaState::Degraded);
     assert_eq!(
-        h.client.requests.lock().unwrap().as_slice(),
-        [
-            None,
-            Some("\"v1\"".to_owned()),
-            Some("\"v2\"".to_owned()),
-            Some("\"v2\"".to_owned()),
-        ]
+        metadata_state.status().published_scope,
+        previous.published_scope
     );
+    h.tunnel(ConnectFrontend::Http, "new.test", 443, true).await;
+    metadata_state
+        .install_seed(&newer, h.audit.as_ref())
+        .unwrap();
+    assert_eq!(metadata_state.status().state, GitHubMetaState::Fresh);
     h.stop().await;
 }
 
 #[tokio::test]
-async fn restarting_the_gateway_fetches_fresh_metadata_and_cannot_reuse_dns_pins() {
+async fn restarting_the_gateway_reinstalls_its_seed_and_cannot_reuse_dns_pins() {
     let engine = Arc::new(PolicyEngine::compile(&policy()).unwrap());
-    let client = Arc::new(FixtureClient::new(vec![
-        metadata(
-            &["old.test"],
-            "203.0.113.0/24",
-            "2001:db8:1234::/48",
-            "\"old\"",
-        ),
-        metadata(
-            &["new.test"],
-            "198.51.100.0/24",
-            "2001:db8:5678::/48",
-            "\"new\"",
-        ),
-    ]));
     let gateway = Gateway::new(
         Arc::clone(&engine),
         Arc::new(StaticResolver::new()),
@@ -610,19 +561,24 @@ async fn restarting_the_gateway_fetches_fresh_metadata_and_cannot_reuse_dns_pins
         Arc::new(CollectingAuditSink::new()),
         GatewayConfig::default(),
     )
-    .with_github_meta_client(Arc::clone(&client) as Arc<_>);
+    .with_github_meta_seed(metadata(
+        &["fixture.test"],
+        "203.0.113.0/24",
+        "2001:db8:1234::/48",
+        "\"fixture\"",
+    ));
     let cache = gateway.authorizations();
     let mut previous_revision = 0;
-    for name in ["old.test", "new.test"] {
+    for _ in 0..2 {
         let cancel = CancellationToken::new();
-        gateway.prepare_github_meta(&cancel).await.unwrap();
-        assert!(engine.evaluate_domain_name(name).unwrap());
+        gateway.prepare_github_meta().unwrap();
+        assert!(engine.evaluate_domain_name("fixture.test").unwrap());
         let revision = engine.snapshot().revision();
         assert_ne!(revision, previous_revision);
         previous_revision = revision;
         assert!(cache.is_empty());
         cache.authorize_for_revision(
-            name,
+            "fixture.test",
             "203.0.113.1".parse().unwrap(),
             Duration::from_secs(300),
             revision,
@@ -638,21 +594,19 @@ async fn restarting_the_gateway_fetches_fresh_metadata_and_cannot_reuse_dns_pins
         assert!(cache.is_empty());
         assert!(!engine.github_meta().unwrap().status().grants_active);
     }
-
-    assert_eq!(client.requests.lock().unwrap().as_slice(), [None, None]);
 }
 
 #[tokio::test]
-async fn aborting_the_gateway_future_cancels_its_owned_refresh_and_scope() {
+async fn aborting_the_gateway_future_revokes_its_scope() {
     let h = Harness::start(
         policy(),
         ConnectFrontend::Socks5,
-        vec![metadata(
+        Some(metadata(
             &["fixture.test"],
             "203.0.113.0/24",
             "2001:db8:1234::/48",
             "\"fixture\"",
-        )],
+        )),
     )
     .await;
     tokio::task::yield_now().await;
