@@ -41,8 +41,11 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Run pinned quality environment
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           docker build \
+            --secret "id=github_token,env=GITHUB_TOKEN" \
             --no-cache \
             --build-arg CARGO_BUILD_JOBS=2 \
             --file guest/sendbox-guest/Dockerfile \
@@ -69,9 +72,12 @@ jobs:
           driver-opts: image=moby/buildkit:buildx-stable-1@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
 
       - name: Build twice without cache
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           for attempt in first second; do
             docker buildx build \
+              --secret "id=github_token,env=GITHUB_TOKEN" \
               --no-cache \
               --platform "linux/${{ matrix.architecture }}" \
               --build-arg CARGO_BUILD_JOBS=2 \

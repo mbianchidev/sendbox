@@ -119,7 +119,10 @@ Build inputs:
 Supervisor and production bundle builds download the pinned libseccomp source
 through GitHub's release-asset API using its immutable asset ID. Requests use
 bounded connection, transfer, and retry timeouts. The pinned version and SHA-256
-verification remain mandatory; exhausted retries fail the build.
+verification remain mandatory; exhausted retries fail the build. An optional
+BuildKit secret `github_token` authenticates the request so shared CI runner
+addresses do not hit GitHub's anonymous limit of 60 requests per hour; CI passes
+`--secret id=github_token,env=GITHUB_TOKEN`. It never reaches an image layer.
 
 The production bundle, standalone supervisor, and BPF spike Dockerfiles use the
 same `musl-dev`, `zlib`, `zlib-dev`, and `zlib-static` revisions, available for both

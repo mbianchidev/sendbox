@@ -66,6 +66,7 @@ jobs:
       - name: Cache pinned quality build dependencies
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
+          secrets: github_token=${{ github.token }}
           context: .
           file: packaging/guest/Dockerfile
           platforms: linux/amd64
@@ -76,8 +77,11 @@ jobs:
           outputs: type=cacheonly
 
       - name: Run fresh quality checks
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           docker buildx build \
+            --secret "id=github_token,env=GITHUB_TOKEN" \
             --no-cache-filter quality \
             --platform linux/amd64 \
             --build-arg CARGO_BUILD_JOBS=2 \
@@ -114,8 +118,11 @@ jobs:
           chmod 0400 "$RUNNER_TEMP/guest-artifact-ci.key"
 
       - name: Build independent bundle without cache
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           docker buildx build \
+            --secret "id=github_token,env=GITHUB_TOKEN" \
             --no-cache \
             --platform "linux/${{ matrix.architecture }}" \
             --build-arg CARGO_BUILD_JOBS=2 \
@@ -127,8 +134,11 @@ jobs:
 
       - name: Export OCI layout from the same build
         if: matrix.attempt == 'first'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           docker buildx build \
+            --secret "id=github_token,env=GITHUB_TOKEN" \
             --platform "linux/${{ matrix.architecture }}" \
             --build-arg CARGO_BUILD_JOBS=2 \
             --target image \
@@ -272,8 +282,11 @@ jobs:
             clang libelf-dev libzstd-dev make pkg-config zlib1g-dev
 
       - name: Export architecture-specific BPF object
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           docker build \
+            --secret "id=github_token,env=GITHUB_TOKEN" \
             --no-cache \
             --platform "linux/${{ matrix.platform }}" \
             --target bpf-artifact \
