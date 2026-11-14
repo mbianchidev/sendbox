@@ -54,8 +54,15 @@ else
     directory="$(mktemp -d "$RUNNER_TEMP/python-api.XXXXXX")"
     trap 'rm -rf "$directory"' EXIT
     archive="$directory/python.tar.gz"
+    # Anonymous API calls share 60 requests/hour per runner IP; authenticate
+    # when the workflow token is available. curl drops it on the CDN redirect.
+    authorization=()
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        authorization=(--header "Authorization: Bearer $GITHUB_TOKEN")
+    fi
     curl -fsSL --retry 5 --retry-max-time 600 --connect-timeout 10 --max-time 600 \
         --header 'Accept: application/octet-stream' \
+        ${authorization[@]+"${authorization[@]}"} \
         "https://api.github.com/repos/actions/python-versions/releases/assets/$ASSET_ID" \
         --output "$archive"
     printf '%s  %s\n' "$SHA256" "$archive" | "${CHECKSUM_COMMAND[@]}"
