@@ -29,6 +29,7 @@ to a first run. Use this index for setup, operation, and implementation details.
 ## Security
 
 - [Security model](security-model.md)
+- [Governed sessions and brokered credentials](architecture/governed-sessions.md)
 - [Egress enforcement trust boundary](security/egress-enforcement-trust-boundary.md)
 - [Secrets migration](migration/secrets.md)
 - [Security-record migration](migration/security-records.md)
@@ -52,6 +53,7 @@ to a first run. Use this index for setup, operation, and implementation details.
 - [MCP broker](architecture/mcp-broker.md)
 - [Package registry proxy](architecture/package-registry-proxy.md)
 - [Secrets and credential broker](architecture/secrets-and-credential-broker.md)
+- [Governed sessions](architecture/governed-sessions.md)
 - [Git branch guard](architecture/git-branch-guard.md)
 - [Safe Outputs](architecture/safe-outputs.md)
 - [Security records](architecture/security-records.md)

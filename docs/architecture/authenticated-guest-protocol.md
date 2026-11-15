@@ -128,6 +128,20 @@ operation. The host atomically persists the validated JSON with mode `0600`,
 records its digest in signed session provenance, and includes a compact
 `network_report: {path, sha256}` reference in `run --json`.
 
+[Governed sessions](governed-sessions.md) with brokered credential services
+append event kinds 10 to 15 for the credential relay (schema version 1):
+`CredentialRelayRequest`, `CredentialRelayRequestBody`, and
+`CredentialRelayCredit` travel guest to host, `CredentialRelayResponseHead` and
+`CredentialRelayResponseBody` travel host to guest, and `CredentialRelayEnd`
+closes a stream in either direction. The guest chooses strictly increasing
+stream identifiers starting at `1 << 32`, so they never collide with request
+IDs. Response bodies use 32 KiB chunks, and the host never has more than 16
+uncredited chunks outstanding per stream. Relay events carry no credential
+material. There is no new capability discriminant: a brokered plan requires the
+guest's authenticated readiness to report a healthy `credential_relay`
+service, and the host rejects relay events in a session without a brokered
+relay.
+
 ## Terminal post-processing ordering
 
 The launch request remains request ID `1`. If package analysis is configured,
@@ -219,6 +233,9 @@ state and terminally poisons the connection.
 - V2 terminal input is additionally bounded to 64 authenticated chunks of at most
   4 KiB each. Credits travel guest-to-host without blocking the guest socket reader,
   and end of file remains outside the credit budget.
+- Credential relay responses are bounded to 16 outstanding 32 KiB chunks per
+  stream and to the profile's concurrent stream limit, so a slow agent cannot
+  stall terminal or control traffic.
 
 Dropping a receive future is resumable because already-read bytes remain in the
 bounded reader buffer. Dropping a send future can leave a partial frame on the

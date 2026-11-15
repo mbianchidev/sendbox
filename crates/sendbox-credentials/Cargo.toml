@@ -13,6 +13,8 @@ http.workspace = true
 reqwest.workspace = true
 sendbox-config = { path = "../sendbox-config" }
 sendbox-egress = { path = "../sendbox-egress" }
+sendbox-governance = { path = "../sendbox-governance" }
+sendbox-protocol = { path = "../sendbox-protocol" }
 sendbox-runtime = { path = "../sendbox-runtime" }
 sendbox-secrets = { path = "../sendbox-secrets" }
 serde.workspace = true

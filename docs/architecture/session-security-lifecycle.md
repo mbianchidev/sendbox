@@ -95,3 +95,9 @@ snapshots, restores eligible mutations on failure, and quarantines changed
 excluded cache/dependency entries. Runtime cleanup still runs when security
 finalization fails, and all primary, rollback, audit, publication, and cleanup
 failures remain visible.
+
+[Governed sessions](governed-sessions.md#audit) append governance admission
+and credential grant and request records to the same signed audit chain. Each
+record names the profile revision and the binding digest signed into the
+boundary plan, and never includes credential material. A failure to record
+relay evidence fails the run.

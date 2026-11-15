@@ -59,6 +59,13 @@ token is retrieved only after complete pagination succeeds. Apple and Kata runs
 deliver approved credentials through authenticated, policy-bound secret
 envelopes.
 
+[Governed sessions](architecture/governed-sessions.md) go further for model
+provider keys: an operator-signed profile bounds what a project may request,
+the admission is bound into the signed boundary plan, and Anthropic or OpenAI
+requests are relayed to the host over the authenticated control channel. The
+host checks a leased, revocable grant and injects the key, so the provider
+credential never enters the guest.
+
 ### Production package mediation
 
 The Rust [`sendbox-registry`](package-supply-chain.md) component is a trusted

@@ -397,6 +397,11 @@ pub struct SandboxConfiguration {
     pub resources: ResourceConfiguration,
     pub policy: PolicyConfiguration,
     pub secrets: Vec<String>,
+    /// Brokered credential services, by governance-profile service id, that
+    /// this project requests. Only governed sessions can use them; the
+    /// credential itself never enters the guest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_services: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub devcontainer: Option<DevContainerConfiguration>,
     pub github: GitHubConfiguration,
@@ -477,6 +482,7 @@ impl SandboxConfiguration {
             resources: ResourceConfiguration::default(),
             policy,
             secrets: Vec::new(),
+            credential_services: Vec::new(),
             devcontainer: Some(DevContainerConfiguration {
                 config_path: None,
                 auto_generate: true,
@@ -561,6 +567,7 @@ impl SandboxConfiguration {
                 );
             }
         }
+        self.validate_credential_services(&mut diagnostics);
 
         if diagnostics.is_empty() {
             Ok(())
@@ -603,6 +610,32 @@ impl SandboxConfiguration {
                 source,
             }
         })
+    }
+
+    fn validate_credential_services(&self, diagnostics: &mut Vec<Diagnostic>) {
+        let mut seen = std::collections::BTreeSet::new();
+        for (index, service) in self.credential_services.iter().enumerate() {
+            let bytes = service.as_bytes();
+            let valid = !bytes.is_empty()
+                && bytes.len() <= 32
+                && bytes[0].is_ascii_lowercase()
+                && bytes.iter().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-'
+                });
+            if !valid {
+                invalid_value(
+                    diagnostics,
+                    format!("credential_services[{index}]"),
+                    "must be a governance-profile service id: 1-32 lowercase letters, digits, or '-', starting with a letter",
+                );
+            } else if !seen.insert(service) {
+                invalid_value(
+                    diagnostics,
+                    format!("credential_services[{index}]"),
+                    "is listed more than once",
+                );
+            }
+        }
     }
 
     fn validate_runtime(&self, diagnostics: &mut Vec<Diagnostic>) {

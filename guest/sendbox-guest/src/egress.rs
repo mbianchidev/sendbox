@@ -483,6 +483,9 @@ pub async fn run_supervisor(config_path: PathBuf) -> Result<(), GuestError> {
     if let Some(port) = config.policy.mcp_gateway_port {
         supervisor_config = supervisor_config.with_mcp_gateway_port(port);
     }
+    if let Some(port) = config.policy.credential_relay_port {
+        supervisor_config = supervisor_config.with_credential_relay_port(port);
+    }
     if let Some(registry) = &config.policy.registry {
         supervisor_config = supervisor_config
             .with_registry_proxy(registry.proxy_port, registry.trusted_upstream_port);

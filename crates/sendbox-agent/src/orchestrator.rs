@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use sendbox_protocol::agent_host_capabilities;
 use sendbox_runtime::{
@@ -92,6 +93,7 @@ pub struct AgentOrchestrator {
     signals: Arc<dyn SignalSource>,
     terminal: Arc<dyn crate::TerminalSource>,
     terminal_size: Option<crate::GuestTerminalSize>,
+    credential_relay: Option<Arc<dyn crate::CredentialRelayHandler>>,
 }
 
 impl AgentOrchestrator {
@@ -111,6 +113,24 @@ impl AgentOrchestrator {
             signals,
             terminal: Arc::new(crate::NoTerminal),
             terminal_size: None,
+            credential_relay: None,
+        }
+    }
+
+    /// Serves brokered credential requests from the guest relay. Required
+    /// when the signed plan admits brokered credential services.
+    #[must_use]
+    pub fn with_credential_relay(
+        mut self,
+        handler: Arc<dyn crate::CredentialRelayHandler>,
+    ) -> Self {
+        self.credential_relay = Some(handler);
+        self
+    }
+
+    async fn close_credential_relay(&self) {
+        if let Some(relay) = &self.credential_relay {
+            relay.close(Duration::ZERO).await;
         }
     }
 
@@ -183,6 +203,11 @@ impl AgentOrchestrator {
         context: &mut RunContext,
     ) -> Result<(GuestTerminal, Option<crate::CollectedSafeOutputs>), AgentError> {
         check_cancelled(cancellation)?;
+        if plan.credential_relay() != self.credential_relay.is_some() {
+            return Err(AgentError::InvalidPlan(
+                "brokered credential services require exactly one host relay handler".to_owned(),
+            ));
+        }
         let preflight = self
             .runtime
             .preflight(
@@ -308,6 +333,7 @@ impl AgentOrchestrator {
                     required_capabilities: plan.required_guest_capabilities().clone(),
                     safe_outputs_required: plan.safe_outputs(),
                     syscall_tracing_required: plan.syscall_tracing(),
+                    credential_relay_required: plan.credential_relay(),
                     bootstrap_secret: bootstrap.as_bytes().to_vec(),
                     policy_digest: plan.policy_digest(),
                 },
@@ -353,6 +379,12 @@ impl AgentOrchestrator {
                 cancellation,
             )
             .await?;
+        if let Some(relay) = &self.credential_relay {
+            let outbound = execution.credential_relay_outbound().ok_or_else(|| {
+                AgentError::Guest("guest execution did not provide a credential relay".to_owned())
+            })?;
+            relay.attach(outbound);
+        }
         context.execution = Some(execution);
         context.transition(AgentState::Running)?;
         let terminal = self
@@ -436,7 +468,17 @@ impl AgentOrchestrator {
                             GuestEvent::TerminalInputCredit { credits } => {
                                 self.terminal.grant_input_credit(credits)?;
                             }
+                            GuestEvent::CredentialRelay(event) => match &self.credential_relay {
+                                Some(relay) => relay.handle(event)?,
+                                None => {
+                                    return Err(AgentError::Guest(
+                                        "guest sent a credential relay event without a relay"
+                                            .to_owned(),
+                                    ));
+                                }
+                            },
                             GuestEvent::Terminal(terminal) => {
+                                self.close_credential_relay().await;
                                 if let Some(maximum_bytes) = package_report_maximum_bytes {
                                     context.package_report = Some(
                                         execution
@@ -480,6 +522,7 @@ impl AgentOrchestrator {
     ) -> Vec<CleanupFailure> {
         let cleanup_cancellation = CancellationToken::new();
         let mut failures = Vec::new();
+        self.close_credential_relay().await;
         if context.state != AgentState::Cleaning
             && context.state.can_transition_to(AgentState::Cleaning)
         {

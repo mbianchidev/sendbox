@@ -7,6 +7,8 @@ pub mod bootstrap;
 #[cfg(feature = "execution-broker")]
 pub mod broker;
 #[cfg(feature = "execution-broker")]
+pub(crate) mod credential_relay;
+#[cfg(feature = "execution-broker")]
 pub mod egress;
 pub mod error;
 pub mod git_guard;

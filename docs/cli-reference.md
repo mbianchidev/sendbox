@@ -14,6 +14,7 @@ SUBCOMMANDS:
   mcp           Parse and summarize native or legacy MCP observations
   package       Show package verdict status or a complete security report
   boundary      Inspect the structured native boundary plan
+  governance    Sign, verify, and check operator governance profiles
   completions   Install or print shell completions
   help          Show help for any subcommand
 ```
@@ -41,6 +42,7 @@ entry program and initial inference endpoints; `open-code` is an alias for
 | `--trust-root PATH` | Release public key used to verify the bundle |
 | `--json` | Emit machine-readable events instead of raw output |
 | `--interactive` | Run the workload on a pseudoterminal; conflicts with `--json` |
+| `--governance-config PATH` | Opt-in governance configuration; rejected when a managed configuration names a different file |
 
 See [interactive sessions](interactive-sessions.md) for terminal-specific
 requirements and [configuration](configuration.md) for the YAML reference.
@@ -59,6 +61,21 @@ explicit deny and restricted-address rules still apply. It is authenticated
 guest evidence whose digest is recorded in session provenance, not a separately
 GitHub-signed feed or a complete refresh log.
 See [network grants](configuration.md#network-grants).
+
+## Governance
+
+`sendbox governance` manages operator-signed profiles for
+[governed sessions](architecture/governed-sessions.md):
+
+| Subcommand | Purpose |
+|---|---|
+| `keygen --output PATH` | Create an Ed25519 signing key (mode `0600`, never overwritten) and print its public identity |
+| `sign PROFILE --key PATH [--append]` | Sign the profile's exact bytes into `PROFILE.sig.json`; `--append` adds a threshold signature |
+| `verify [--governance-config PATH]` | Verify the active operator configuration, profile, and signatures |
+| `check --config PATH [--governance-config PATH] [--runtime apple\|kata] [--image IMAGE@sha256:DIGEST]` | List every violation of the active profile without starting a session |
+
+Each subcommand accepts `--json`. A governance failure or a rejected
+configuration exits with code `6`.
 
 ## Examples
 
@@ -102,4 +119,7 @@ sendbox mcp report /var/log/sendbox/mcp-trace.log
 
 # Inspect the structured boundary declaration without generating scripts
 sendbox boundary inspect --config .sendbox.yaml --json
+
+# Check a project against the active governance profile
+sendbox governance check --config .sendbox.yaml --runtime apple
 ```

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod github_meta;
+pub mod governance;
 mod masking;
 mod safe_outputs;
 mod security;
@@ -123,6 +124,11 @@ pub struct HostRunRequest {
     pub readiness_timeout: Duration,
     /// Requests a pseudoterminal for the workload with this initial geometry.
     pub terminal: Option<GuestTerminalSize>,
+    /// Root-owned operator governance configuration. When it exists, every
+    /// session is governed and `governance_config` cannot override it.
+    pub managed_governance_path: PathBuf,
+    /// Opt-in governance configuration for an unmanaged host.
+    pub governance_config: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -363,6 +369,24 @@ pub enum HostError {
     Bundle(String),
     #[error("GitHub Meta: {0}")]
     GitHubMeta(#[from] sendbox_egress::github_meta::GitHubMetaError),
+    #[error("governance: {0}")]
+    Governance(String),
+    #[error(
+        "governance profile {profile} does not permit this session:\n{}",
+        render_violations(.violations)
+    )]
+    GovernanceRejected {
+        profile: String,
+        violations: Vec<governance::Violation>,
+    },
+}
+
+fn render_violations(violations: &[governance::Violation]) -> String {
+    violations
+        .iter()
+        .map(|violation| format!("  - {violation}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl HostError {
@@ -398,6 +422,7 @@ pub struct PreparedHostRun {
     safe_outputs: Option<safe_outputs::ProcessingContext>,
     signed_plan_path: PathBuf,
     terminal_source: Option<Arc<dyn TerminalSource>>,
+    governance: Option<governance::GovernedRun>,
 }
 
 struct RuntimeInputs {
@@ -407,6 +432,7 @@ struct RuntimeInputs {
     output: Arc<dyn OutputSink>,
     signals: Arc<dyn SignalSource>,
     terminal_source: Option<Arc<dyn TerminalSource>>,
+    governance: Option<governance::GovernedRun>,
 }
 
 struct EffectiveCredentialSet {
@@ -474,6 +500,7 @@ impl PreparedHostRun {
             safe_outputs,
             signed_plan_path: _,
             terminal_source,
+            governance,
         } = self;
         let masker = secrets.masker.clone();
         let masked_output = Arc::new(masking::MaskingOutputSink::new(masker.clone(), output));
@@ -484,6 +511,7 @@ impl PreparedHostRun {
             output: masked_output.clone(),
             signals,
             terminal_source,
+            governance,
         };
         let runtime_masker = masker.clone();
         let result = security::execute(
@@ -517,6 +545,24 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
     validate_reserved_secret_names(&request.configuration, None)?;
+    let governance = governance::GovernedSession::prepare(
+        &mut request.configuration,
+        &request.managed_governance_path,
+        request.governance_config.as_deref(),
+        governance::BundleSelection {
+            trust_root: &request.trust_root,
+            trust_root_id: &request.trust_root_id,
+            minimum_release_sequence: request.minimum_release_sequence,
+        },
+        &request.state_root,
+        unix_time()?,
+    )?;
+    if governance.is_some() {
+        request
+            .configuration
+            .validate()
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+    }
     let command = validate_command(&request.command)?;
     validate_command_policy(&request.configuration.policy.commands, &request.command)?;
     let host = current_host()?;
@@ -535,6 +581,24 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let project_source = workspace.host_project;
     let workspace_source = workspace.host_root;
     let project_destination = workspace.guest_project;
+    if let Some(governance) = &governance {
+        governance.admit(
+            &request.configuration,
+            &governance::SessionFacts {
+                runtime: governance::runtime_kind(selected_runtime),
+                image: request.image.as_deref(),
+                workspace_root: &workspace_source,
+            },
+        )?;
+    }
+    let brokered_services = governance
+        .as_ref()
+        .map(|governance| governance.brokered_services(&request.configuration))
+        .transpose()?
+        .unwrap_or_default();
+    let credential_relay = governance
+        .as_ref()
+        .and_then(|governance| governance.relay_bootstrap(&brokered_services));
     request.configuration.project_path = project_source.clone();
     if let Some(root) = &mut request.configuration.workspace_path {
         root.clone_from(&workspace_source);
@@ -578,7 +642,11 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         &state_root,
         workload_identity,
     )?;
-    let egress_policy = make_egress_policy(selected_runtime, &request.configuration, session_id)?;
+    let egress_policy = make_egress_policy(selected_runtime, &request.configuration, session_id)?
+        .map(|policy| match &credential_relay {
+            Some(relay) => policy.with_credential_relay(relay.port),
+            None => policy,
+        });
     let github_meta = github_meta::session_seed(egress_policy.as_ref(), &state_root).await?;
     let git_guard_policy = make_git_guard_policy(
         selected_runtime,
@@ -597,8 +665,14 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         workload_identity,
         egress_policy.as_ref(),
     )?;
-    let environment = runtime_environment(mcp_policy.as_ref(), egress_policy.as_ref());
-    let features = boundary_features(
+    let mut environment = runtime_environment(mcp_policy.as_ref(), egress_policy.as_ref());
+    if let Some(relay) = &credential_relay {
+        environment.extend(governance::relay_environment(
+            &brokered_services,
+            relay.port,
+        ));
+    }
+    let mut features = boundary_features(
         &request.configuration,
         git_guard_policy.as_ref(),
         mcp_policy.as_ref(),
@@ -621,6 +695,15 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         credentials: &credentials,
         features: &features,
     })?;
+    if credential_relay.is_some() {
+        features.insert(
+            "credential_relay".to_owned(),
+            FeatureAdmission {
+                decision: FeatureDecision::Enforced,
+                mechanism: "host_broker+grant_authority+authenticated_guest_relay".to_owned(),
+            },
+        );
+    }
 
     let prospective_state_directory = state_root.join("sessions").join(session_id.to_string());
     security::validate_state_workspace_disjoint(&workspace_source, &prospective_state_directory)?;
@@ -638,6 +721,13 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         security::PackageReportValidation::from_policy(&request.configuration.policy.packages)?;
     let configuration_sha256 = sha256_hex(&configuration_bytes);
     let policy_sha256 = sha256_hex(&policy_bytes);
+    let mut governance = governance
+        .map(|session| {
+            let project = governance::project_id(selected_repository.as_ref(), &workspace_source)?;
+            let binding = session.binding(project, &policy_sha256, &request.configuration)?;
+            governance::GovernedRun::new(session, binding, session_id)
+        })
+        .transpose()?;
     let resources = runtime_resources(&request.configuration)?;
     let bootstrap_reference =
         SecretReference::new(format!("bootstrap-{session_id}")).map_err(HostError::AgentPlan)?;
@@ -665,6 +755,16 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
                 .register(credential.expose_to_registry_proxy())?;
         }
     }
+    if let Some(run) = governance.as_mut()
+        && !brokered_services.is_empty()
+    {
+        let brokered_secrets = governance::relay::BrokeredSecrets::resolve(
+            &brokered_services,
+            secrets.native.as_ref(),
+            &secrets.masker,
+        )?;
+        run.attach_brokered(brokered_services, brokered_secrets);
+    }
 
     let runtime = build_runtime(
         selected_runtime,
@@ -681,6 +781,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         github_meta.as_ref(),
         &gateway_credentials,
         registry_proxy.as_ref(),
+        credential_relay.as_ref(),
     )?;
     let registry_mounts = registry_proxy
         .as_ref()
@@ -751,6 +852,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         provider: runtime.declaration,
         artifacts: runtime.artifacts,
         features,
+        governance: governance.as_ref().map(|run| run.binding.clone()),
     };
     let signed_plan = SignedBoundaryPlan::sign(plan, &key, now_unix)?;
     let verified_plan = signed_plan.verify(&signer_fingerprint, now_unix)?;
@@ -762,6 +864,9 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
             .map_err(|error| HostError::Invalid(error.to_string()))?,
         0o600,
     )?;
+    if let Some(run) = &governance {
+        run.session.record_admission(&state_root)?;
+    }
 
     let execution = match runtime.provider {
         RuntimeInstance::Persistent(provider) => {
@@ -878,6 +983,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         safe_outputs,
         signed_plan_path,
         terminal_source: None,
+        governance,
     })
 }
 
@@ -893,7 +999,13 @@ async fn execute_runtime(
         output,
         signals,
         terminal_source,
+        mut governance,
     } = inputs;
+    let mut credential_relay = None;
+    if let Some(run) = governance.as_mut() {
+        run.record_admission(&audit)?;
+        credential_relay = run.start_relay(&audit).await?;
+    }
     match execution {
         HostExecution::Persistent {
             provider,
@@ -915,11 +1027,27 @@ async fn execute_runtime(
                 })?;
                 orchestrator = orchestrator.with_terminal(size, source);
             }
+            if let Some(relay) = &credential_relay {
+                orchestrator = orchestrator.with_credential_relay(relay.clone());
+            }
             let session_id = plan.session_id();
-            let agent = orchestrator
-                .run(&plan, cancellation)
-                .await
-                .map_err(HostError::AgentRun)?;
+            let agent = orchestrator.run(&plan, cancellation).await;
+            if let Some(relay) = &credential_relay {
+                let reason = match &agent {
+                    Ok(_) => sendbox_governance::RevocationReason::SessionCompleted,
+                    Err(failure)
+                        if matches!(failure.primary, sendbox_agent::AgentError::Cancelled) =>
+                    {
+                        sendbox_governance::RevocationReason::SessionCancelled
+                    }
+                    Err(_) => sendbox_governance::RevocationReason::SessionFailed,
+                };
+                let finished = relay.finish(reason).await;
+                if let (Ok(_), Err(error)) = (&agent, finished) {
+                    return Err(error);
+                }
+            }
+            let agent = agent.map_err(HostError::AgentRun)?;
             drop(orchestrator);
             drop(secrets);
             match (safe_outputs.as_ref(), agent.safe_outputs.as_ref()) {
@@ -986,6 +1114,7 @@ fn build_runtime(
     github_meta: Option<&GitHubMetaSeed>,
     gateway_credentials: &[GatewayCredential],
     registry_proxy: Option<&PreparedRegistryProxy>,
+    credential_relay: Option<&sendbox_bootstrap::CredentialRelayBootstrap>,
 ) -> Result<RuntimeBuild, HostError> {
     let manifest_path = bundle_root.join("manifest.json");
     let mut artifacts = vec![
@@ -1028,6 +1157,7 @@ fn build_runtime(
             configuration.gateway_credentials = gateway_credentials.to_vec();
             configuration.registry_proxy =
                 registry_proxy.map(|prepared| prepared.bootstrap.clone());
+            configuration.credential_relay = credential_relay.cloned();
             configuration.workload_uid = workload_uid;
             configuration.workload_gid = workload_gid;
             configuration.launch.resources.cpus =
@@ -1096,6 +1226,7 @@ fn build_runtime(
                 github_meta: github_meta.cloned(),
                 gateway_credentials: gateway_credentials.to_vec(),
                 registry_proxy: registry_proxy.map(|prepared| prepared.bootstrap.clone()),
+                credential_relay: credential_relay.cloned(),
                 workload_uid,
                 workload_gid,
             };

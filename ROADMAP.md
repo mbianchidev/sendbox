@@ -286,7 +286,9 @@ Features planned after core platform and agent support is solid.
 
 ### Policy as Code
 - [ ] OPA/Rego policy language support for complex rules
-- [ ] Policy inheritance (org → team → project)
+- [x] Operator-signed governance profiles that projects can only narrow ([governed sessions](docs/architecture/governed-sessions.md), single host)
+- [x] Host-side brokered model provider credentials with leased, revocable grants (Anthropic, OpenAI)
+- [ ] Policy inheritance (org → team → project) with shared multi-user management (`sendbox-fleet`)
 - [ ] Policy testing framework
 - [ ] Community policy library
 

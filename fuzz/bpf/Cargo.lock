@@ -1525,6 +1525,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "getrandom 0.3.4",
+ "http",
  "libc",
  "rustix",
  "sendbox-bootstrap",

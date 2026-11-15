@@ -2,6 +2,7 @@
 
 mod boundary;
 mod completions;
+mod governance;
 mod mcp;
 mod package;
 mod secrets;
@@ -35,6 +36,7 @@ const INVALID_CONFIGURATION_EXIT: u8 = 2;
 const ANALYSIS_EXIT: u8 = 3;
 const OUTPUT_EXIT: u8 = 4;
 const RUNTIME_EXIT: u8 = 5;
+const GOVERNANCE_EXIT: u8 = 6;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -54,6 +56,8 @@ enum Command {
     Boundary(boundary::BoundaryArgs),
     Completions(CompletionsArgs),
     Devcontainer(Box<DevContainerArgs>),
+    /// Sign, verify, and check operator governance profiles.
+    Governance(governance::GovernanceArgs),
     Init(InitArgs),
     Mcp(mcp::McpArgs),
     Package(package::PackageArgs),
@@ -87,6 +91,10 @@ struct RunArgs {
     trust_root_id: String,
     #[arg(long, default_value_t = 1)]
     minimum_release_sequence: u64,
+    /// Opt-in governance configuration for an unmanaged host. Rejected when an
+    /// operator-managed configuration exists.
+    #[arg(long, value_name = "PATH")]
+    governance_config: Option<PathBuf>,
     #[arg(long)]
     json: bool,
     /// Run the workload on a pseudoterminal and forward this terminal's
@@ -435,6 +443,7 @@ async fn main() -> ExitCode {
         Command::Devcontainer(arguments) => match arguments.command {
             DevContainerCommand::Generate(arguments) => generate_devcontainer(arguments),
         },
+        Command::Governance(arguments) => governance::execute(arguments),
         Command::Init(arguments) => init(arguments),
         Command::Mcp(arguments) => mcp::execute(arguments),
         Command::Package(arguments) => match runtime_state_directory() {
@@ -525,6 +534,10 @@ async fn run(arguments: RunArgs) -> ExitCode {
         state_root,
         readiness_timeout: Duration::from_secs(60),
         terminal: terminal_size,
+        managed_governance_path: PathBuf::from(
+            sendbox_host::governance::MANAGED_CONFIGURATION_PATH,
+        ),
+        governance_config: arguments.governance_config,
     })
     .await
     {
@@ -1320,7 +1333,13 @@ fn host_error_exit_code(error: &HostError) -> u8 {
         {
             INVALID_CONFIGURATION_EXIT
         }
+        HostError::CredentialMasked { kind, .. }
+            if matches!(*kind, "governance" | "governance_rejected") =>
+        {
+            GOVERNANCE_EXIT
+        }
         HostError::OutputFinalization { runtime, .. } => host_error_exit_code(runtime),
+        HostError::Governance(_) | HostError::GovernanceRejected { .. } => GOVERNANCE_EXIT,
         error if error.is_github_meta_policy_denial() => INVALID_CONFIGURATION_EXIT,
         HostError::Invalid(_)
         | HostError::Boundary(_)

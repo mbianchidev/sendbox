@@ -708,6 +708,119 @@ mod platform {
 #[cfg(unix)]
 pub use platform::SecureRoot;
 
+/// Who may own a trusted configuration file and every directory above it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrustedOwnership {
+    /// The file and every ancestor are root-owned. Use for operator-managed
+    /// configuration that an unprivileged user must not be able to change.
+    Root,
+    /// The file and every ancestor are owned by root or the given user. Use for
+    /// configuration a user opts into for their own sessions.
+    RootOrUser(u32),
+}
+
+impl TrustedOwnership {
+    const fn permits(self, owner: u32) -> bool {
+        match self {
+            Self::Root => owner == 0,
+            Self::RootOrUser(user) => owner == 0 || owner == user,
+        }
+    }
+}
+
+/// Reads a bounded regular file whose path cannot be changed by anyone other
+/// than the permitted owners.
+///
+/// The file must be a single-link regular file. The file and every ancestor
+/// of its canonical location must be owned according to `ownership` and must
+/// not be writable by group or other users. The file is opened without
+/// following symlinks and its identity is rechecked after opening.
+#[cfg(unix)]
+pub fn read_trusted_file(
+    path: &Path,
+    ownership: TrustedOwnership,
+    max_bytes: u64,
+) -> SecurityResult<Vec<u8>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let invalid = |detail: String| SecurityError::Policy(format!("{}: {detail}", path.display()));
+    if !path.is_absolute() {
+        return Err(invalid(
+            "trusted configuration paths must be absolute".to_owned(),
+        ));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("path has no file name".to_owned()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("path has no parent directory".to_owned()))?;
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|source| io_error("canonicalize trusted directory", parent, source))?;
+    for ancestor in parent.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor)
+            .map_err(|source| io_error("inspect trusted directory", ancestor, source))?;
+        if !metadata.is_dir() || !ownership.permits(metadata.uid()) || metadata.mode() & 0o022 != 0
+        {
+            return Err(invalid(format!(
+                "directory {} must be a non-symlink directory owned by a permitted owner and not writable by group or other users",
+                ancestor.display()
+            )));
+        }
+    }
+    let canonical = parent.join(name);
+    let expected = std::fs::symlink_metadata(&canonical)
+        .map_err(|source| io_error("inspect trusted file", &canonical, source))?;
+    let validate = |metadata: &std::fs::Metadata| {
+        metadata.file_type().is_file()
+            && metadata.nlink() == 1
+            && ownership.permits(metadata.uid())
+            && metadata.mode() & 0o022 == 0
+    };
+    if !validate(&expected) {
+        return Err(invalid(
+            "file must be a single-link regular file owned by a permitted owner and not writable by group or other users".to_owned(),
+        ));
+    }
+    if expected.size() > max_bytes {
+        return Err(SecurityError::SizeLimit {
+            path: canonical,
+            limit: max_bytes,
+        });
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(&canonical)
+        .map_err(|source| io_error("open trusted file", &canonical, source))?;
+    let opened = file
+        .metadata()
+        .map_err(|source| io_error("inspect opened trusted file", &canonical, source))?;
+    if opened.dev() != expected.dev() || opened.ino() != expected.ino() || !validate(&opened) {
+        return Err(invalid("file changed while it was being opened".to_owned()));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error("read trusted file", &canonical, source))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(SecurityError::SizeLimit {
+            path: canonical,
+            limit: max_bytes,
+        });
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+pub fn read_trusted_file(
+    _path: &Path,
+    _ownership: TrustedOwnership,
+    _max_bytes: u64,
+) -> SecurityResult<Vec<u8>> {
+    Err(SecurityError::UnsupportedPlatform)
+}
+
 #[cfg(not(unix))]
 pub struct SecureRoot;
 
@@ -715,5 +828,69 @@ pub struct SecureRoot;
 impl SecureRoot {
     pub fn open(_path: impl AsRef<Path>) -> SecurityResult<Self> {
         Err(SecurityError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod trusted_file_tests {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use super::*;
+
+    fn private_directory() -> tempfile::TempDir {
+        let directory = tempfile::Builder::new()
+            .prefix(".trusted-file-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("temporary directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private mode");
+        directory
+    }
+
+    fn write(path: &Path, mode: u32) {
+        std::fs::write(path, b"trusted").expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
+    }
+
+    #[test]
+    fn trusted_files_require_permitted_owners_and_protected_paths() {
+        let directory = private_directory();
+        let uid = rustix::process::getuid().as_raw();
+        let file = directory.path().join("governance.yaml");
+        write(&file, 0o644);
+        if ancestors_are_protected(directory.path(), uid) {
+            assert_eq!(
+                read_trusted_file(&file, TrustedOwnership::RootOrUser(uid), 64).expect("read"),
+                b"trusted"
+            );
+            assert!(matches!(
+                read_trusted_file(&file, TrustedOwnership::RootOrUser(uid), 3),
+                Err(SecurityError::SizeLimit { .. })
+            ));
+        }
+        if uid != 0 {
+            assert!(read_trusted_file(&file, TrustedOwnership::Root, 64).is_err());
+        }
+
+        let writable = directory.path().join("writable.yaml");
+        write(&writable, 0o664);
+        assert!(read_trusted_file(&writable, TrustedOwnership::RootOrUser(uid), 64).is_err());
+
+        let link = directory.path().join("link.yaml");
+        symlink(&file, &link).expect("symlink");
+        assert!(read_trusted_file(&link, TrustedOwnership::RootOrUser(uid), 64).is_err());
+        assert!(read_trusted_file(Path::new("relative.yaml"), TrustedOwnership::Root, 64).is_err());
+    }
+
+    fn ancestors_are_protected(path: &Path, uid: u32) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::canonicalize(path)
+            .expect("canonical")
+            .ancestors()
+            .all(|ancestor| {
+                std::fs::symlink_metadata(ancestor).is_ok_and(|metadata| {
+                    (metadata.uid() == 0 || metadata.uid() == uid) && metadata.mode() & 0o022 == 0
+                })
+            })
     }
 }

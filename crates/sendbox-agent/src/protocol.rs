@@ -55,6 +55,7 @@ impl GuestConnector for ProtocolGuestConnector {
                 })?;
             let safe_outputs_required = configuration.safe_outputs_required;
             let syscall_tracing_required = configuration.syscall_tracing_required;
+            let credential_relay = configuration.credential_relay_required;
             let handshake = HandshakeConfig::new(
                 configuration.session_id,
                 VersionRange::default(),
@@ -84,6 +85,7 @@ impl GuestConnector for ProtocolGuestConnector {
                 &readiness.payload,
                 safe_outputs_required,
                 syscall_tracing_required,
+                credential_relay,
             )?;
             Ok(Box::new(ProtocolGuestSession {
                 negotiated,
@@ -94,6 +96,7 @@ impl GuestConnector for ProtocolGuestConnector {
                 boundary_plan_digest: configuration.boundary_plan_digest,
                 secret_cipher,
                 next_secret_sequence: 1,
+                credential_relay,
             }) as Box<dyn GuestSession>)
         })
     }
@@ -108,6 +111,7 @@ pub struct ProtocolGuestSession {
     boundary_plan_digest: sendbox_core::BoundaryPlanDigest,
     secret_cipher: EnvelopeCipher,
     next_secret_sequence: u64,
+    credential_relay: bool,
 }
 
 impl GuestSession for ProtocolGuestSession {
@@ -210,6 +214,7 @@ impl GuestSession for ProtocolGuestSession {
                 report_fetched: false,
                 syscall_report_fetched: false,
                 network_report_fetched: false,
+                credential_relay: self.credential_relay,
             }) as Box<dyn GuestExecution>)
         })
     }
@@ -317,6 +322,7 @@ pub struct ProtocolGuestExecution {
     report_fetched: bool,
     syscall_report_fetched: bool,
     network_report_fetched: bool,
+    credential_relay: bool,
 }
 
 #[derive(Debug, Default)]
@@ -371,6 +377,10 @@ const WRITER_CONTROL_DEPTH: usize = 4;
 /// Queue depth for the credited input window plus its FIFO EOF reservation.
 const WRITER_INPUT_DEPTH: usize = sendbox_core::TERMINAL_INPUT_WINDOW_CREDITS as usize + 1;
 
+/// Queue depth for host-to-guest credential relay events. Relay tasks await
+/// capacity, so this bounds memory without ever blocking the event loop.
+const WRITER_RELAY_DEPTH: usize = 64;
+
 struct WriterMessage {
     message: Message,
     ack: Option<tokio::sync::oneshot::Sender<Result<(), sendbox_protocol::ProtocolError>>>,
@@ -386,6 +396,7 @@ struct WriterHandle {
     control: tokio::sync::mpsc::Sender<WriterMessage>,
     input: tokio::sync::mpsc::Sender<WriterMessage>,
     resize: tokio::sync::watch::Sender<Option<Message>>,
+    relay: tokio::sync::mpsc::Sender<WriterMessage>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -397,6 +408,8 @@ impl WriterHandle {
         let (input, mut input_receiver) =
             tokio::sync::mpsc::channel::<WriterMessage>(WRITER_INPUT_DEPTH);
         let (resize, mut resize_receiver) = tokio::sync::watch::channel::<Option<Message>>(None);
+        let (relay, mut relay_receiver) =
+            tokio::sync::mpsc::channel::<WriterMessage>(WRITER_RELAY_DEPTH);
         let task = tokio::spawn(async move {
             loop {
                 let queued = tokio::select! {
@@ -419,6 +432,10 @@ impl WriterHandle {
                         Some(queued) => queued,
                         None => continue,
                     },
+                    relay = relay_receiver.recv() => match relay {
+                        Some(queued) => queued,
+                        None => continue,
+                    },
                 };
                 let WriterMessage { message, ack } = queued;
                 let result = writer.send(&message).await;
@@ -437,6 +454,7 @@ impl WriterHandle {
             control,
             input,
             resize,
+            relay,
             task,
         }
     }
@@ -476,6 +494,34 @@ impl WriterHandle {
         self.resize
             .send(Some(message))
             .map_err(|_| AgentError::Guest("guest connection writer stopped".to_owned()))
+    }
+}
+
+/// Host-to-guest relay sender. Only host relay event kinds are accepted, so a
+/// relay endpoint can never inject terminal input or control messages.
+struct RelaySender(tokio::sync::mpsc::Sender<WriterMessage>);
+
+impl crate::CredentialRelayOutbound for RelaySender {
+    fn send(&self, event: Event) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async move {
+            if !matches!(
+                event.kind,
+                EventKind::CredentialRelayResponseHead
+                    | EventKind::CredentialRelayResponseBody
+                    | EventKind::CredentialRelayEnd
+            ) {
+                return Err(AgentError::Guest(
+                    "only host credential relay events may use the relay sender".to_owned(),
+                ));
+            }
+            self.0
+                .send(WriterMessage {
+                    message: Message::Event(event),
+                    ack: None,
+                })
+                .await
+                .map_err(|_| AgentError::Guest("guest connection writer stopped".to_owned()))
+        })
     }
 }
 
@@ -528,6 +574,14 @@ impl GuestExecution for ProtocolGuestExecution {
                         Ok(GuestEvent::TerminalInputCredit {
                             credits: credit.credits,
                         })
+                    }
+                    sendbox_protocol::EventKind::CredentialRelayRequest
+                    | sendbox_protocol::EventKind::CredentialRelayRequestBody
+                    | sendbox_protocol::EventKind::CredentialRelayEnd
+                    | sendbox_protocol::EventKind::CredentialRelayCredit
+                        if self.credential_relay =>
+                    {
+                        Ok(GuestEvent::CredentialRelay(event))
                     }
                     kind => Err(AgentError::Guest(format!(
                         "unexpected guest event kind {kind:?}"
@@ -614,6 +668,15 @@ impl GuestExecution for ProtocolGuestExecution {
                 .decode()
                 .map_err(|error| AgentError::Guest(error.to_string()))?;
             Ok(crate::CollectedSafeOutputs { artifact, seal })
+        })
+    }
+
+    fn credential_relay_outbound(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::CredentialRelayOutbound>> {
+        self.credential_relay.then(|| {
+            std::sync::Arc::new(RelaySender(self.writer.relay.clone()))
+                as std::sync::Arc<dyn crate::CredentialRelayOutbound>
         })
     }
 
@@ -969,6 +1032,7 @@ fn validate_operational_readiness(
     payload: &[u8],
     safe_outputs_required: bool,
     syscall_tracing_required: bool,
+    credential_relay_required: bool,
 ) -> Result<(), AgentError> {
     let readiness: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|error| AgentError::Guest(format!("decode guest readiness: {error}")))?;
@@ -1003,6 +1067,11 @@ fn validate_operational_readiness(
     if syscall_tracing_required && !service_live("bpf") {
         return Err(AgentError::Guest(
             "guest readiness did not prove a live mandatory syscall tracing service".to_owned(),
+        ));
+    }
+    if credential_relay_required && !service_live("credential_relay") {
+        return Err(AgentError::Guest(
+            "guest readiness did not prove a live mandatory credential relay".to_owned(),
         ));
     }
     Ok(())
@@ -1070,10 +1139,12 @@ mod tests {
         let (control, _control) = tokio::sync::mpsc::channel(WRITER_CONTROL_DEPTH);
         let (input, mut receiver) = tokio::sync::mpsc::channel(WRITER_INPUT_DEPTH);
         let (resize, mut resize_receiver) = tokio::sync::watch::channel::<Option<Message>>(None);
+        let (relay, _relay) = tokio::sync::mpsc::channel(WRITER_RELAY_DEPTH);
         let writer = WriterHandle {
             control,
             input,
             resize,
+            relay,
             task: tokio::spawn(std::future::pending()),
         };
 
@@ -1165,18 +1236,60 @@ mod tests {
     fn required_safe_outputs_service_must_be_present_and_healthy() {
         let exec_only =
             br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true}]}"#;
-        validate_operational_readiness(exec_only, false, false).expect("ordinary readiness");
-        assert!(validate_operational_readiness(exec_only, true, false).is_err());
+        validate_operational_readiness(exec_only, false, false, false).expect("ordinary readiness");
+        assert!(validate_operational_readiness(exec_only, true, false, false).is_err());
         let complete = br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true},{"id":"safe_outputs","mandatory":true,"healthy":true}]}"#;
-        validate_operational_readiness(complete, true, false).expect("Safe Outputs readiness");
+        validate_operational_readiness(complete, true, false, false)
+            .expect("Safe Outputs readiness");
+    }
+
+    #[test]
+    fn brokered_credentials_require_a_live_guest_relay() {
+        let exec_only =
+            br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true}]}"#;
+        assert!(validate_operational_readiness(exec_only, false, false, true).is_err());
+        let unhealthy = br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true},{"id":"credential_relay","mandatory":true,"healthy":false}]}"#;
+        assert!(validate_operational_readiness(unhealthy, false, false, true).is_err());
+        let relayed = br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true},{"id":"credential_relay","mandatory":true,"healthy":true}]}"#;
+        validate_operational_readiness(relayed, false, false, true).expect("relay readiness");
+    }
+
+    #[tokio::test]
+    async fn relay_sender_only_carries_host_relay_events() {
+        use crate::CredentialRelayOutbound as _;
+        let (relay, mut receiver) = tokio::sync::mpsc::channel(WRITER_RELAY_DEPTH);
+        let sender = RelaySender(relay);
+        let event = |kind| Event {
+            stream_id: sendbox_protocol::relay::CREDENTIAL_RELAY_STREAM_BASE,
+            kind,
+            payload: vec![1],
+        };
+        sender
+            .send(event(EventKind::CredentialRelayResponseBody))
+            .await
+            .expect("relay body");
+        assert!(matches!(
+            receiver.recv().await.expect("queued").message,
+            Message::Event(Event {
+                kind: EventKind::CredentialRelayResponseBody,
+                ..
+            })
+        ));
+        for kind in [
+            EventKind::StandardInput,
+            EventKind::CredentialRelayRequest,
+            EventKind::CredentialRelayCredit,
+        ] {
+            assert!(sender.send(event(kind)).await.is_err());
+        }
     }
 
     #[test]
     fn requested_tracing_must_be_present_in_authenticated_readiness() {
         let exec_only =
             br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true}]}"#;
-        assert!(validate_operational_readiness(exec_only, false, true).is_err());
+        assert!(validate_operational_readiness(exec_only, false, true, false).is_err());
         let traced = br#"{"state":"ready","services":[{"id":"exec","mandatory":true,"healthy":true},{"id":"bpf","mandatory":true,"healthy":true}]}"#;
-        validate_operational_readiness(traced, false, true).expect("traced readiness");
+        validate_operational_readiness(traced, false, true, false).expect("traced readiness");
     }
 }

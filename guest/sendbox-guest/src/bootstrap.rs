@@ -201,6 +201,7 @@ mod tests {
                 github_meta: None,
                 gateway_credentials: Vec::new(),
                 registry_proxy: None,
+                credential_relay: None,
             },
             &secret,
         )

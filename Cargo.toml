@@ -13,6 +13,7 @@ members = [
     "crates/sendbox-egress",
     "crates/sendbox-exec",
     "crates/sendbox-git",
+    "crates/sendbox-governance",
     "crates/sendbox-mcp",
     "crates/sendbox-policy",
     "crates/sendbox-project",

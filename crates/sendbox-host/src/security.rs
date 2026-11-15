@@ -1275,6 +1275,8 @@ impl HostError {
             Self::Io { .. } => "io",
             Self::Bundle(_) => "bundle",
             Self::GitHubMeta(_) => "github_meta",
+            Self::Governance(_) => "governance",
+            Self::GovernanceRejected { .. } => "governance_rejected",
         }
     }
 }
@@ -1526,6 +1528,7 @@ mod tests {
                 memory_bytes: 512 * 1024 * 1024,
             },
             features: BTreeMap::new(),
+            governance: None,
         };
         let signed = SignedBoundaryPlan::sign(plan, &key, now_unix).expect("sign plan");
         let verified = signed

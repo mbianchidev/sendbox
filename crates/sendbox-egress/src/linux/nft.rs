@@ -109,6 +109,9 @@ pub struct NftConfig {
     /// The loopback HTTP MCP gateway port, or `None` when no remote MCP server
     /// is configured.
     pub mcp_gateway_port: Option<u16>,
+    /// The loopback brokered-credential relay port served by the trusted guest
+    /// supervisor, or `None` when no credential service is brokered.
+    pub credential_relay_tcp_port: Option<u16>,
     /// Workload-facing registry proxy port and registry-only trusted SOCKS port.
     /// Both are configured together or both omitted.
     pub registry_proxy_tcp_port: Option<u16>,
@@ -172,6 +175,7 @@ impl NftConfig {
         if let Some(port) = self.mcp_gateway_port {
             ports.push(port);
         }
+        ports.extend(self.credential_relay_tcp_port);
         if let Some(port) = self.registry_proxy_tcp_port {
             ports.push(port);
         }
@@ -229,6 +233,9 @@ impl NftConfig {
         if let Some(mcp_port) = self.mcp_gateway_port {
             self.push_loopback_accept(&mut out, "    iif lo", "tcp", mcp_port);
         }
+        if let Some(relay_port) = self.credential_relay_tcp_port {
+            self.push_loopback_accept(&mut out, "    iif lo", "tcp", relay_port);
+        }
         if let Some(proxy_port) = self.registry_proxy_tcp_port {
             self.push_loopback_accept(&mut out, "    iif lo", "tcp", proxy_port);
         }
@@ -261,6 +268,9 @@ impl NftConfig {
         }
         if let Some(mcp_port) = self.mcp_gateway_port {
             self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", mcp_port);
+        }
+        if let Some(relay_port) = self.credential_relay_tcp_port {
+            self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", relay_port);
         }
         if let Some(proxy_port) = self.registry_proxy_tcp_port {
             self.push_cgroup_loopback_accept(&mut out, &agent, "tcp", proxy_port);
@@ -509,6 +519,7 @@ mod tests {
             http_proxy_tcp_port: Some(15083),
             dns_broker_port: Some(15053),
             mcp_gateway_port: Some(15082),
+            credential_relay_tcp_port: None,
             registry_proxy_tcp_port: Some(14873),
             trusted_registry_tcp_port: Some(15081),
             metadata_v4_addresses: crate::address::METADATA_V4_ADDRESSES.to_vec(),
@@ -564,6 +575,20 @@ mod tests {
         // The agent identity never gets a blanket accept.
         assert!(!text.contains("\"sendbox/inst01/agent\" meta mark"));
         assert!(!text.contains("\"sendbox/inst01/agent\" accept"));
+    }
+
+    #[test]
+    fn render_admits_the_credential_relay_only_when_configured() {
+        let relay = "\"sendbox/inst01/agent\" ip daddr 127.0.0.1 tcp dport 15084 accept";
+        assert!(!config().render().contains(relay));
+        let mut configured = config();
+        configured.credential_relay_tcp_port = Some(15084);
+        let text = configured.render();
+        assert!(text.contains(relay));
+        assert!(text.contains("iif lo ip daddr 127.0.0.1 tcp dport 15084 accept"));
+        assert!(!text.contains("\"sendbox/inst01/registry\" ip daddr 127.0.0.1 tcp dport 15084"));
+        configured.credential_relay_tcp_port = Some(15082);
+        assert!(configured.validate().is_err());
     }
 
     #[test]

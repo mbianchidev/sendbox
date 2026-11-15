@@ -295,6 +295,38 @@ pub async fn run<P: PlatformControls>(
             .map_err(|error| GuestError::io("setting private guest root mode", error))
     }
 
+    let credential_relay = match bootstrap.credential_relay.as_ref() {
+        Some(configuration) => {
+            match crate::credential_relay::CredentialRelay::bind(configuration).await {
+                Ok((relay, listener)) => {
+                    let task = relay.serve(listener);
+                    audit.lock().expect("audit mutex").record(
+                        "credential_relay_started",
+                        bootstrap.session_id.to_string(),
+                        configuration.services.join(","),
+                    );
+                    Some((relay, task))
+                }
+                Err(error) => {
+                    fail_and_cleanup(&state, &audit, &runtime, &mut services).await?;
+                    return Err(error);
+                }
+            }
+        }
+        None => None,
+    };
+    if credential_relay.is_some() {
+        service_health.push(ServiceHealth {
+            id: ServiceId::CredentialRelay,
+            mandatory: true,
+            healthy: true,
+            restart_count: 0,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            output_truncated: false,
+        });
+    }
+
     let (safe_outputs, mut safe_outputs_task) = if let Some((policy, workload_uid, workload_gid)) =
         safe_outputs_configuration
     {
@@ -401,7 +433,10 @@ pub async fn run<P: PlatformControls>(
                     .with_package_report(package_report)
                     .with_network_reports(network_reports)
                     .with_syscall_tracing(tracing_requested)
-                    .with_safe_outputs(safe_outputs.clone()),
+                    .with_safe_outputs(safe_outputs.clone())
+                    .with_credential_relay(
+                        credential_relay.as_ref().map(|(relay, _)| Arc::clone(relay)),
+                    ),
                 ) => protocol,
                 failure = services.wait_for_mandatory_failure() => Err(failure),
                 failure = wait_for_safe_outputs_failure(safe_outputs.as_ref()), if safe_outputs.is_some() => Err(failure),
@@ -411,6 +446,10 @@ pub async fn run<P: PlatformControls>(
         Err(error) => Err(error),
     };
 
+    if let Some((relay, task)) = &credential_relay {
+        relay.abort_all();
+        task.abort();
+    }
     if let Some(handle) = &safe_outputs {
         handle.shutdown().await;
     }

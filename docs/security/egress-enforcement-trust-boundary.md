@@ -36,8 +36,11 @@ nftables default-drop denies every other cgroup/destination combination
 ## What the kernel layer enforces
 
 - The agent cgroup can originate traffic **only** to the exact loopback broker
-  ports (CONNECT always; DNS only when `allow_dns = true`) and the configured
-  npm proxy port.
+  ports (CONNECT always; DNS only when `allow_dns = true`), the configured
+  npm proxy port, and, in a governed session with brokered credentials, the
+  credential relay port (15084). The relay is served by the trusted guest
+  supervisor and forwards to the host over the authenticated control channel,
+  not through the broker cgroup.
 - The registry cgroup can originate traffic **only** to the exact
   registry-only SOCKS port. It cannot reach public broker ports or external
   destinations.
