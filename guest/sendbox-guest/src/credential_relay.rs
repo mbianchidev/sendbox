@@ -31,6 +31,7 @@ use crate::GuestError;
 const OUTBOUND_DEPTH: usize = 64;
 const STREAM_DEPTH: usize = CREDENTIAL_RELAY_WINDOW_CHUNKS as usize + 4;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const END_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Credentials a workload might attach itself. They are dropped here and the
 /// host additionally forwards only a provider allowlist.
 const DROPPED_REQUEST_HEADERS: &[&str] = &[
@@ -177,13 +178,23 @@ impl CredentialRelay {
             .await
             .is_ok();
         if opened {
-            let outcome = self.respond(stream_id, &mut stream, &mut frames).await;
-            if outcome == Delivery::ClientGone {
-                let _ = self.outbound.try_send(end_event(
-                    stream_id,
-                    CredentialRelayOutcomeV1::Aborted,
-                    "client_disconnected",
-                ));
+            let reason = match self.respond(stream_id, &mut stream, &mut frames).await {
+                Delivery::Complete | Delivery::HostEnded => None,
+                Delivery::ClientGone => Some("client_disconnected"),
+                Delivery::Abandoned => Some("relay_abandoned"),
+            };
+            if let Some(reason) = reason {
+                // The host keeps the stream and its upstream connection open
+                // until it learns the guest stopped reading.
+                let _ = tokio::time::timeout(
+                    END_SEND_TIMEOUT,
+                    self.outbound.send(end_event(
+                        stream_id,
+                        CredentialRelayOutcomeV1::Aborted,
+                        reason,
+                    )),
+                )
+                .await;
             }
         } else {
             let _ = write_error(&mut stream, 502, "relay_unavailable").await;
@@ -291,11 +302,11 @@ impl CredentialRelay {
                     let Ok(head) =
                         serde_json::from_slice::<CredentialRelayResponseHeadV1>(&event.payload)
                     else {
-                        return Delivery::Failed;
+                        return Delivery::Abandoned;
                     };
                     if head.validate().is_err() {
                         let _ = write_error(client, 502, "invalid_upstream_response").await;
-                        return Delivery::Failed;
+                        return Delivery::Abandoned;
                     }
                     if write_head(client, &head).await.is_err() {
                         return Delivery::ClientGone;
@@ -332,36 +343,41 @@ impl CredentialRelay {
                             let _ = client.shutdown().await;
                             Delivery::Complete
                         }
-                        (_, true) => Delivery::Failed,
+                        (_, true) => Delivery::HostEnded,
                         (Some(end), false) => {
                             let status = match end.outcome {
                                 CredentialRelayOutcomeV1::Denied => 403,
                                 _ => 502,
                             };
                             let _ = write_error(client, status, &end.reason).await;
-                            Delivery::Failed
+                            Delivery::HostEnded
                         }
                         (None, false) => {
                             let _ = write_error(client, 502, "invalid_relay_end").await;
-                            Delivery::Failed
+                            Delivery::HostEnded
                         }
                     };
                 }
-                _ => return Delivery::Failed,
+                _ => return Delivery::Abandoned,
             }
         }
         if !head_sent {
             let _ = write_error(client, 502, "relay_closed").await;
         }
-        Delivery::Failed
+        Delivery::Abandoned
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delivery {
+    /// The host completed the stream.
     Complete,
-    Failed,
+    /// The host ended the stream with a failure.
+    HostEnded,
+    /// The agent closed its connection before the stream ended.
     ClientGone,
+    /// The guest stopped reading a stream the host may still be serving.
+    Abandoned,
 }
 
 fn end_event(stream_id: u64, outcome: CredentialRelayOutcomeV1, reason: &str) -> Event {
@@ -610,6 +626,15 @@ mod tests {
         let opened = next(&relay).await;
         relay.abort_all();
         assert!(response(client).await.starts_with("HTTP/1.1 502"));
+        let abandoned = next(&relay).await;
+        assert_eq!(abandoned.stream_id, opened.stream_id);
+        assert_eq!(abandoned.kind, EventKind::CredentialRelayEnd);
+        let abandoned: CredentialRelayEndV1 = serde_json::from_slice(&abandoned.payload).unwrap();
+        assert_eq!(
+            (abandoned.outcome, abandoned.reason.as_str()),
+            (CredentialRelayOutcomeV1::Aborted, "relay_abandoned"),
+            "the host must learn that the guest stopped reading"
+        );
         assert!(
             relay
                 .deliver(end_event(

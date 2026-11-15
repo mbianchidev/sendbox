@@ -12,7 +12,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use http::{HeaderName, Method};
@@ -248,8 +248,21 @@ struct Receiving {
     expected: usize,
 }
 
+/// Why a running stream was cancelled. The first cause recorded wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbortCause {
+    /// The guest ended the stream; it already knows, so no `End` is sent.
+    Guest,
+    /// The stream's grant lapsed and its revocation grace elapsed.
+    GrantLapsed,
+    /// The session is closing.
+    Closing,
+}
+
 struct Running {
+    service: String,
     cancel: CancellationToken,
+    cause: Arc<OnceLock<AbortCause>>,
     credits: Arc<Semaphore>,
     sent: Arc<AtomicU64>,
     granted: u64,
@@ -276,6 +289,7 @@ struct Shared {
     limits: RelayLimits,
     state: Mutex<EndpointState>,
     closed: AtomicBool,
+    closing: CancellationToken,
 }
 
 impl Shared {
@@ -341,6 +355,7 @@ impl RelayEndpoint {
                 limits,
                 state: Mutex::new(EndpointState::default()),
                 closed: AtomicBool::new(false),
+                closing: CancellationToken::new(),
             }),
             tasks: Mutex::new(JoinSet::new()),
         })
@@ -527,18 +542,21 @@ impl RelayEndpoint {
         if let Some(state) = self.shared.lock().streams.remove(&stream)
             && let StreamState::Running(running) = state
         {
-            running.cancel.cancel();
+            running.abort(AbortCause::Guest);
         }
     }
 
     fn start(&self, stream: u64, receiving: Receiving) {
         let cancel = CancellationToken::new();
+        let cause = Arc::new(OnceLock::new());
         let credits = Arc::new(Semaphore::new(usize::from(CREDENTIAL_RELAY_WINDOW_CHUNKS)));
         let sent = Arc::new(AtomicU64::new(0));
         self.shared.lock().streams.insert(
             stream,
             StreamState::Running(Running {
+                service: receiving.service.id.clone(),
                 cancel: cancel.clone(),
+                cause: Arc::clone(&cause),
                 credits: Arc::clone(&credits),
                 sent: Arc::clone(&sent),
                 granted: 0,
@@ -553,6 +571,7 @@ impl RelayEndpoint {
                 service: receiving.service,
                 request: receiving.request,
                 cancel,
+                cause,
                 credits,
                 sent,
             };
@@ -561,26 +580,34 @@ impl RelayEndpoint {
         });
     }
 
-    /// Ends streams that were authorized before a grant lapsed. Later
-    /// requests are denied by the authorizer; streams already running get
-    /// `grace` to finish before they are cancelled.
-    pub fn expire_in_flight(&self, grace: Duration) {
+    /// Ends streams of `services` that were authorized before their grant
+    /// lapsed. Later requests are denied by the authorizer; streams already
+    /// running get `grace` to finish before they are cancelled, and the guest
+    /// is told the stream ended with `grant_lapsed`.
+    pub fn expire_in_flight(&self, services: &[&str], grace: Duration) {
         let running = self
             .shared
             .lock()
             .streams
             .values()
             .filter_map(|stream| match stream {
-                StreamState::Running(running) => Some(running.cancel.clone()),
-                StreamState::Receiving(_) => None,
+                StreamState::Running(running) if services.contains(&running.service.as_str()) => {
+                    Some((running.cancel.clone(), Arc::clone(&running.cause)))
+                }
+                _ => None,
             })
             .collect::<Vec<_>>();
         if running.is_empty() {
             return;
         }
+        let closing = self.shared.closing.clone();
         self.spawn(async move {
-            tokio::time::sleep(grace).await;
-            for cancel in running {
+            tokio::select! {
+                () = tokio::time::sleep(grace) => {}
+                () = closing.cancelled() => return,
+            }
+            for (cancel, cause) in running {
+                let _ = cause.set(AbortCause::GrantLapsed);
                 cancel.cancel();
             }
         });
@@ -591,6 +618,7 @@ impl RelayEndpoint {
     /// upstream are reported as uncertain.
     pub async fn close(&self, grace: Duration) -> RelayCloseReport {
         self.shared.closed.store(true, Ordering::SeqCst);
+        self.shared.closing.cancel();
         let mut tasks = std::mem::take(
             &mut *self
                 .tasks
@@ -610,7 +638,7 @@ impl RelayEndpoint {
                     };
                     for (_, stream) in running {
                         if let StreamState::Running(running) = stream {
-                            running.cancel.cancel();
+                            running.abort(AbortCause::Closing);
                         }
                     }
                     while let Some(result) = tasks.join_next().await {
@@ -627,6 +655,13 @@ impl RelayEndpoint {
     }
 }
 
+impl Running {
+    fn abort(&self, cause: AbortCause) {
+        let _ = self.cause.set(cause);
+        self.cancel.cancel();
+    }
+}
+
 struct Exchange {
     shared: Arc<Shared>,
     stream: u64,
@@ -634,6 +669,7 @@ struct Exchange {
     service: Arc<RelayService>,
     request: CredentialRelayRequestV1,
     cancel: CancellationToken,
+    cause: Arc<OnceLock<AbortCause>>,
     credits: Arc<Semaphore>,
     sent: Arc<AtomicU64>,
 }
@@ -682,16 +718,22 @@ impl Exchange {
                 reason,
                 Some((CredentialRelayOutcomeV1::Failed, reason)),
             ),
-            Err(Failure::Aborted) => (
-                if progress.contacted {
-                    RelayStreamOutcome::AbortedUncertain
-                } else {
-                    RelayStreamOutcome::Aborted
-                },
-                "aborted",
-                (!self.cancel.is_cancelled() || self.shared.closed.load(Ordering::SeqCst))
-                    .then_some((CredentialRelayOutcomeV1::Aborted, "aborted")),
-            ),
+            Err(Failure::Aborted) => {
+                let reason = match self.cause.get() {
+                    Some(AbortCause::GrantLapsed) => "grant_lapsed",
+                    _ => "aborted",
+                };
+                (
+                    if progress.contacted {
+                        RelayStreamOutcome::AbortedUncertain
+                    } else {
+                        RelayStreamOutcome::Aborted
+                    },
+                    reason,
+                    (self.cause.get() != Some(&AbortCause::Guest))
+                        .then_some((CredentialRelayOutcomeV1::Aborted, reason)),
+                )
+            }
         };
         if let Some((outcome, reason)) = end
             && let Some(outbound) = self.shared.outbound()
@@ -874,7 +916,9 @@ impl Exchange {
                 let permit = tokio::select! {
                     () = self.cancel.cancelled() => return Err(Failure::Aborted),
                     () = tokio::time::sleep_until(deadline) => return Err(Failure::Failed("max_duration")),
-                    permit = self.credits.acquire() => permit.map_err(|_| Failure::Aborted)?,
+                    permit = tokio::time::timeout(self.service.idle_timeout, self.credits.acquire()) => permit
+                        .map_err(|_| Failure::Failed("credit_timeout"))?
+                        .map_err(|_| Failure::Aborted)?,
                 };
                 permit.forget();
                 self.sent.fetch_add(1, Ordering::SeqCst);
@@ -1356,6 +1400,78 @@ credential_services:
             CredentialRelayOutcomeV1::Complete
         );
         harness.endpoint.close(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn lapsed_grants_end_only_their_streams_and_guest_ends_are_not_echoed() {
+        let transport = Transport {
+            stall: true,
+            ..transport(Vec::new())
+        };
+        let mut harness = harness(allowed(), transport);
+        let stream = CREDENTIAL_RELAY_STREAM_BASE;
+        for event in request_event(stream, "/v1/messages", b"{}") {
+            harness.endpoint.handle(event).unwrap();
+        }
+        assert_eq!(
+            next(&mut harness.events).await.kind,
+            EventKind::CredentialRelayResponseHead
+        );
+        harness
+            .endpoint
+            .expire_in_flight(&["openai"], Duration::ZERO);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), harness.events.recv())
+                .await
+                .is_err(),
+            "another service's lapse must not end this stream"
+        );
+        harness
+            .endpoint
+            .expire_in_flight(&["anthropic"], Duration::ZERO);
+        let ended = end(&next(&mut harness.events).await);
+        assert_eq!(ended.outcome, CredentialRelayOutcomeV1::Aborted);
+        assert_eq!(ended.reason, "grant_lapsed");
+
+        let guest_ended = stream + 1;
+        for event in request_event(guest_ended, "/v1/messages", b"{}") {
+            harness.endpoint.handle(event).unwrap();
+        }
+        assert_eq!(
+            next(&mut harness.events).await.kind,
+            EventKind::CredentialRelayResponseHead
+        );
+        harness
+            .endpoint
+            .handle(Event {
+                stream_id: guest_ended,
+                kind: EventKind::CredentialRelayEnd,
+                payload: serde_json::to_vec(&CredentialRelayEndV1::new(
+                    CredentialRelayOutcomeV1::Aborted,
+                    "client_disconnected",
+                ))
+                .unwrap(),
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), harness.events.recv())
+                .await
+                .is_err(),
+            "a guest-initiated end is not echoed"
+        );
+        harness.endpoint.close(Duration::from_secs(1)).await;
+        let reasons = harness
+            .audit
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                RelayAuditEvent::Outcome { reason, .. } => Some(*reason),
+                RelayAuditEvent::Decision { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reasons, ["grant_lapsed", "aborted"]);
     }
 
     #[tokio::test]

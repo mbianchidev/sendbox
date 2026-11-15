@@ -78,7 +78,9 @@ revision_cache_seconds: 30
   older revision, and every grant bound to one, stale.
 - `bundle` pins the `--trust-root`, `--trust-root-id`, and minimum
   `--minimum-release-sequence` a governed run may use, so a caller cannot
-  substitute their own guest supervisor.
+  substitute their own guest supervisor. In managed mode the pinned trust root
+  file must be root-owned with protected ancestors, so it cannot be swapped
+  between the pin check and bundle verification.
 - `revision_cache_seconds` bounds how long the grant authority reuses a
   verified profile before re-reading and re-verifying it.
 
@@ -261,7 +263,10 @@ system proxy, and redirects denied. Responses stream back as they arrive,
 including server-sent events. The guest grants one credit per chunk written
 to the agent and the host never exceeds 16 outstanding 32 KiB chunks, so a
 slow agent cannot stall terminal or control traffic. Limits per service bound
-request size, response size, total duration, and idle time.
+request size, response size, total duration, and idle time; a stream whose
+upstream or guest credit stays idle longer than `idle_timeout_seconds` fails.
+When the agent disconnects or the guest stops reading a stream, the guest
+tells the host so it closes the upstream connection.
 
 ## Grants and revocation
 
@@ -279,9 +284,11 @@ lifetime. Every request is checked for:
   and not below the minimum.
 
 An unreadable or unverifiable profile denies with `authority_unavailable`. The
-host renews leases at a third of the lease length. When renewal fails, new
-requests are denied and in-flight streams get `revocation_grace_seconds` to
-finish before they are cancelled. Streams are authorized once at start and are
+host renews leases at a third of the lease length. When a grant's renewal
+fails, new requests for that service are denied and its in-flight streams get
+`revocation_grace_seconds` to finish before they are cancelled and the agent
+sees the stream end with `grant_lapsed`. Streams of other services are not
+affected. Streams are authorized once at start and are
 otherwise bounded by `max_duration_seconds`.
 
 When the workload ends, is cancelled, or fails, the relay stops accepting

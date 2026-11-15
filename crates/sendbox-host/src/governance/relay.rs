@@ -379,17 +379,17 @@ impl HostCredentialRelay {
             .collect::<Vec<_>>();
         let interval = (self.lease / 3).max(Duration::from_secs(10));
         let grace = self.revocation_grace;
+        let audit_failed = Arc::clone(&self.audit_failed);
         let task = tokio::spawn(async move {
             let mut live = grants;
             while !live.is_empty() {
                 tokio::time::sleep(interval).await;
-                let mut lapsed = false;
+                let mut lapsed = Vec::new();
                 let mut remaining = Vec::with_capacity(live.len());
                 for (grant, service) in live {
                     match authority.renew(&grant).await {
                         Ok(_) => remaining.push((grant, service)),
                         Err(error) => {
-                            lapsed = true;
                             let mut metadata = metadata.clone();
                             metadata.extend([
                                 ("service".to_owned(), service.clone()),
@@ -408,15 +408,18 @@ impl HostCredentialRelay {
                                 AuditResult::Denied,
                                 metadata,
                             ) {
+                                audit_failed.store(true, Ordering::SeqCst);
                                 eprintln!(
                                     "sendbox: recording credential grant lapse failed: {error}"
                                 );
                             }
+                            lapsed.push(service);
                         }
                     }
                 }
-                if lapsed {
-                    endpoint.expire_in_flight(grace);
+                if !lapsed.is_empty() {
+                    let services = lapsed.iter().map(String::as_str).collect::<Vec<_>>();
+                    endpoint.expire_in_flight(&services, grace);
                 }
                 live = remaining;
             }

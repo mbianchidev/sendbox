@@ -62,6 +62,7 @@ impl GovernedSession {
         let operator = source.load()?;
         operator.verify_bundle(
             bundle.trust_root,
+            source.ownership,
             bundle.trust_root_id,
             bundle.minimum_release_sequence,
         )?;

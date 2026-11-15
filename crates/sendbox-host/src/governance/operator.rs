@@ -28,6 +28,7 @@ pub const SIGNATURES_FORMAT: &str = "sendbox.governance-signatures";
 const FORMAT_VERSION: u32 = 1;
 const MAX_OPERATOR_BYTES: u64 = 256 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 256 * 1024;
+const MAX_TRUST_ROOT_BYTES: u64 = 64 * 1024;
 const MAX_SIGNERS: usize = 32;
 const MAX_REVISION_CACHE_SECONDS: u64 = 300;
 const SIGNATURE_SUFFIX: &str = ".sig.json";
@@ -260,20 +261,28 @@ impl OperatorConfiguration {
     }
 
     /// Rejects a guest bundle trust root the operator has not pinned.
+    ///
+    /// The pinned file must meet the same ownership rule as the governance
+    /// configuration. In managed mode that means root-owned with protected
+    /// ancestors, so the caller cannot replace it after this check and before
+    /// the bundle is verified and launched from the same path.
     pub fn verify_bundle(
         &self,
         trust_root: &Path,
+        ownership: TrustedOwnership,
         trust_root_id: &str,
         minimum_release_sequence: u64,
     ) -> Result<(), HostError> {
         let Some(pin) = &self.bundle else {
             return Ok(());
         };
-        let bytes = std::fs::read(trust_root).map_err(|source| HostError::Io {
-            context: "read bundle trust root",
+        let canonical = std::fs::canonicalize(trust_root).map_err(|source| HostError::Io {
+            context: "resolve bundle trust root",
             path: trust_root.to_path_buf(),
             source,
         })?;
+        let bytes = read_trusted_file(&canonical, ownership, MAX_TRUST_ROOT_BYTES)
+            .map_err(|error| HostError::Governance(format!("bundle trust root: {error}")))?;
         if !pin.trust_root_sha256.contains(&Sha256Digest::of(&bytes)) {
             return Err(HostError::Governance(
                 "the guest bundle trust root is not pinned by the operator".to_owned(),
@@ -778,16 +787,28 @@ credential_services:
             operator.signatures_path(),
             PathBuf::from("/governance/acme.yaml.sig.json")
         );
-        operator.verify_bundle(&root, "any", 0).unwrap();
+        let user = TrustedOwnership::RootOrUser(crate::current_uid());
+        operator.verify_bundle(&root, user, "any", 0).unwrap();
         operator.bundle = Some(BundlePin {
             trust_root_sha256: vec![Sha256Digest::of(b"public key")],
             trust_root_ids: vec!["release".to_owned()],
             minimum_release_sequence: 5,
         });
-        operator.verify_bundle(&root, "release", 5).unwrap();
-        assert!(operator.verify_bundle(&root, "other", 5).is_err());
-        assert!(operator.verify_bundle(&root, "release", 4).is_err());
+        if crate::current_uid() != 0 {
+            assert!(
+                operator
+                    .verify_bundle(&root, TrustedOwnership::Root, "release", 5)
+                    .is_err(),
+                "managed mode requires a root-owned trust root"
+            );
+        }
+        if !protected_test_tree() {
+            return;
+        }
+        operator.verify_bundle(&root, user, "release", 5).unwrap();
+        assert!(operator.verify_bundle(&root, user, "other", 5).is_err());
+        assert!(operator.verify_bundle(&root, user, "release", 4).is_err());
         write_private(&root, b"different");
-        assert!(operator.verify_bundle(&root, "release", 5).is_err());
+        assert!(operator.verify_bundle(&root, user, "release", 5).is_err());
     }
 }
