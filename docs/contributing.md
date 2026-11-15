@@ -1,7 +1,9 @@
 # Contributing to SendBox
 
 Contributions are welcome. For larger changes, open an issue first to discuss
-the approach. The [roadmap](../ROADMAP.md) tracks planned work.
+the approach. The [roadmap](../ROADMAP.md) tracks planned work. Report
+security vulnerabilities privately as described in the
+[security policy](../SECURITY.md), not in issues or pull requests.
 
 ## Source setup
 
