@@ -356,6 +356,7 @@ guest syscall tracing.
 | `policy.boundaries.tool_calls.servers.*.http.allowed_auth_methods` | list | Admitted HTTP auth methods: `none`, `bearer` |
 | `policy.boundaries.syscalls.additional_denylist` | list | Extra syscall names blocked by seccomp |
 | `secrets` | list | Secret names injected at runtime |
+| `credential_services` | list | Brokered credential service ids from the active [governance profile](architecture/governed-sessions.md#brokered-credentials); rejected outside governed sessions |
 | `devcontainer.auto_generate` | bool | Generate a devcontainer spec |
 | `github.forward_auth` | bool | Forward guarded GitHub credentials for the selected repository |
 | `github.forward_copilot_auth` | bool | Forward Copilot authentication independently as `COPILOT_GITHUB_TOKEN` |

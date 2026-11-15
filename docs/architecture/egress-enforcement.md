@@ -250,6 +250,9 @@ Workloads receive exact upper- and lower-case `ALL_PROXY`/`NO_PROXY` and
 The HTTP listener on port 15083 and SOCKS listener on 15080 share the same
 authorization cache, DNS guard, semaphore, and marked dialer. Both ports are
 signed and pairwise distinct from DNS, MCP, and package ports.
+A brokered [governed session](governed-sessions.md) adds the signed credential
+relay port 15084, also pairwise distinct, which nftables admits only from the
+agent cgroup to loopback.
 The authenticated stdio MCP broker receives the same fixed proxy environment,
 so local servers remain descendants of execution leaves and cannot bypass
 enforcement. The remote MCP gateway remains in the broker cgroup and uses

@@ -84,6 +84,11 @@ github:
 ```
 
 For Codex use `OPENAI_API_KEY`; for another provider use its documented variable.
+
+In a [governed session](architecture/governed-sessions.md#brokered-credentials),
+list `credential_services: [anthropic]` (or `openai`) instead of the provider
+key in `secrets`. The key stays on the host, and Claude Code or Codex receive
+only a loopback `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` and a placeholder key.
 The host's home, global agent configuration, browser, keychain files, and
 runtime sockets are not mounted. Each session gets an owner-only guest home at
 `/run/sendbox-workload/<session-id>` and isolated XDG directories. Login state

@@ -155,6 +155,19 @@ credentials into CONNECT tunnels. Clients that hardcode their service origin or
 only support HTTPS proxy tunneling are incompatible until they gain an explicit
 base-URL setting.
 
+### Governed provider relay
+
+[Governed sessions](governed-sessions.md) connect this broker to compatible
+agents for Anthropic and OpenAI without placing the credential in the guest.
+The guest supervisor listens on loopback port 15084 and forwards each request
+over the authenticated control channel. The host relay
+(`sendbox_credentials::relay::RelayEndpoint`) authorizes it against a leased
+grant, injects the host-held key, and reuses the pinned transport above with
+redirects denied. Unlike the per-connection listener, the relay streams
+response bodies, including server-sent events, under guest credit and per
+service size, duration, and idle limits. Agents receive only the provider base
+URL variable and a fixed placeholder key.
+
 ## Guarded GitHub repository authentication
 
 `GitHubMetadataClient` separates repository metadata from the production `gh`
@@ -205,6 +218,8 @@ features because it does not provide persistent secret delivery.
 
 ## Remaining qualification
 
-- Connect generic explicit-base-URL credential rules to compatible agents.
+- Connect generic explicit-base-URL credential rules to compatible agents
+  outside governed sessions. Governed sessions already broker Anthropic and
+  OpenAI through the relay.
 - Run the ignored Keychain ACL qualification whenever the production signing
   identity or Keychain service identity changes.

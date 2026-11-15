@@ -296,6 +296,13 @@ policy:
 secrets:
   - DATABASE_URL
 
+# Brokered model provider credentials (governed sessions only). Each id must be
+# offered by the operator's signed governance profile. The provider key stays
+# on the host; the agent receives a loopback base URL and a placeholder key.
+# Rejected when no governance configuration is active.
+# See docs/architecture/governed-sessions.md.
+# credential_services: [anthropic]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DevContainer Configuration
 # ─────────────────────────────────────────────────────────────────────────────

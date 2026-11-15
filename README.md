@@ -237,6 +237,8 @@ too. Package inspection, Safe Outputs, and syscall tracing are opt-in.
 
 Use the [configuration guide](docs/configuration.md) and
 [annotated YAML reference](config/example-sandbox.yaml) for individual settings.
+Operators can require signed policy profiles and keep model provider keys on
+the host with [governed sessions](docs/architecture/governed-sessions.md).
 These commands do not launch a VM or require an agent login:
 
 ```bash
