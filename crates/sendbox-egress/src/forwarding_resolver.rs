@@ -700,6 +700,12 @@ mod tests {
         response
     }
 
+    async fn bind_dns_upstream() -> (UdpSocket, TcpListener, SocketAddr) {
+        GatewayListeners::bind_dns_pair(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap()
+    }
+
     async fn receive_query(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut bytes = vec![0; 4096];
@@ -813,9 +819,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn udp_silence_recovers_on_the_same_upstream_tcp_within_the_original_budget() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = upstream.local_addr().unwrap();
-        let tcp = TcpListener::bind(address).await.unwrap();
+        let (upstream, tcp, address) = bind_dns_upstream().await;
         let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
         let began = Instant::now();
         let task = tokio::spawn(async move {
@@ -855,9 +859,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn silent_udp_and_incomplete_tcp_keep_one_deadline_and_close_both_transports() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = upstream.local_addr().unwrap();
-        let tcp = TcpListener::bind(address).await.unwrap();
+        let (upstream, tcp, address) = bind_dns_upstream().await;
         let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
         let task = tokio::spawn(async move {
             resolver
@@ -891,9 +893,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_tcp_recovery_does_not_discard_a_later_valid_udp_reply() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = upstream.local_addr().unwrap();
-        let tcp = TcpListener::bind(address).await.unwrap();
+        let (upstream, tcp, address) = bind_dns_upstream().await;
         let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
         let task = tokio::spawn(async move {
             resolver
@@ -925,9 +925,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn completed_udp_never_starts_tcp_or_a_later_recovery_task() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = upstream.local_addr().unwrap();
-        let tcp = TcpListener::bind(address).await.unwrap();
+        let (upstream, tcp, address) = bind_dns_upstream().await;
         let accepted = tokio::spawn(async move { tcp.accept().await });
         let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
         let task = tokio::spawn(async move {
@@ -956,9 +954,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancellation_during_silent_udp_tcp_recovery_drops_both_without_more_sends() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = upstream.local_addr().unwrap();
-        let tcp = TcpListener::bind(address).await.unwrap();
+        let (upstream, tcp, address) = bind_dns_upstream().await;
         let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
         let task = tokio::spawn(async move {
             resolver
@@ -988,9 +984,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn malformed_silence_recovery_tcp_cannot_be_replaced_by_a_later_udp_answer() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = upstream.local_addr().unwrap();
-        let tcp = TcpListener::bind(address).await.unwrap();
+        let (upstream, tcp, address) = bind_dns_upstream().await;
         let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
         let task = tokio::spawn(async move {
             resolver
@@ -1022,9 +1016,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn both_families_require_their_original_validated_tcp_answers_after_udp_silence() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = upstream.local_addr().unwrap();
-        let tcp = TcpListener::bind(address).await.unwrap();
+        let (upstream, tcp, address) = bind_dns_upstream().await;
         let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
         let task = tokio::spawn(async move {
             resolver
@@ -1237,9 +1229,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn tcp_fallback_body_cannot_restart_the_udp_deadline() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = upstream.local_addr().unwrap();
-        let tcp = tokio::net::TcpListener::bind(address).await.unwrap();
+        let (upstream, tcp, address) = bind_dns_upstream().await;
         let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
         let task = tokio::spawn(async move {
             resolver
@@ -1271,9 +1261,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancellation_during_tcp_fallback_closes_the_connection() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = upstream.local_addr().unwrap();
-        let tcp = tokio::net::TcpListener::bind(address).await.unwrap();
+        let (upstream, tcp, address) = bind_dns_upstream().await;
         let resolver = ForwardingResolver::new(ForwardingResolverConfig::new(address));
         let task = tokio::spawn(async move {
             resolver
@@ -1764,9 +1752,8 @@ mod tests {
     /// TCP on the truncation bit.
     async fn spawn_truncating_dns_server(tcp_truncated: bool) -> SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let addr = udp.local_addr().unwrap();
-        let tcp = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let (udp, tcp, addr) = bind_dns_upstream().await;
+        let udp = Arc::new(udp);
 
         // UDP half: echo the query header/question but set the truncation bit
         // and return no answers, forcing a TCP retry.
