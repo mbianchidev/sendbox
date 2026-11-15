@@ -88,7 +88,9 @@ impl GatewayListeners {
         })
     }
 
-    async fn bind_dns_pair(addr: SocketAddr) -> io::Result<(UdpSocket, TcpListener, SocketAddr)> {
+    pub(crate) async fn bind_dns_pair(
+        addr: SocketAddr,
+    ) -> io::Result<(UdpSocket, TcpListener, SocketAddr)> {
         let attempts = if addr.port() == 0 {
             Self::EPHEMERAL_DNS_BIND_ATTEMPTS
         } else {
