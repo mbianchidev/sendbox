@@ -245,24 +245,26 @@ impl HostCredentialRelay {
         audit: AuditRecorder,
     ) -> Result<Self, HostError> {
         let limits = &run.session.verified.profile.grants;
-        let authority: Arc<dyn GrantAuthority> = Arc::new(LocalGrantAuthority::new(
-            Arc::new(OperatorRevisionSource::new(
-                run.session.source.clone(),
+        let authority = run.authority(|| {
+            Arc::new(LocalGrantAuthority::new(
+                Arc::new(OperatorRevisionSource::new(
+                    run.session.source.clone(),
+                    Arc::new(SystemClock),
+                )),
                 Arc::new(SystemClock),
-            )),
-            Arc::new(SystemClock),
-            LocalAuthorityLimits {
-                lease_seconds: limits.lease_seconds,
-                max_grants: services.len(),
-            },
-            Box::new(|| {
-                let mut bytes = [0_u8; 16];
-                getrandom::fill(&mut bytes).map_err(|error| {
-                    sendbox_governance::GovernanceError::AuthorityUnavailable(error.to_string())
-                })?;
-                Ok(bytes)
-            }),
-        ));
+                LocalAuthorityLimits {
+                    lease_seconds: limits.lease_seconds,
+                    max_grants: services.len(),
+                },
+                Box::new(|| {
+                    let mut bytes = [0_u8; 16];
+                    getrandom::fill(&mut bytes).map_err(|error| {
+                        sendbox_governance::GovernanceError::AuthorityUnavailable(error.to_string())
+                    })?;
+                    Ok(bytes)
+                }),
+            ))
+        });
         let metadata = run.audit_metadata();
         let mut grants = Vec::with_capacity(services.len());
         let mut grant_ids = BTreeMap::new();
@@ -510,65 +512,11 @@ impl CredentialRelayHandler for HostCredentialRelay {
 #[cfg(test)]
 mod tests {
     use sendbox_core::SessionId;
-    use sendbox_secrets::{
-        CredentialMasker, RecordVersion, Secret, SecretMetadata, SecretStoreError,
-    };
+    use sendbox_secrets::CredentialMasker;
 
     use super::super::operator::tests::{fixture, protected_test_tree};
-    use super::super::tests::{admitted_run, brokered_profile, configuration};
+    use super::super::tests::{FakeStore, admitted_run, brokered_profile, configuration};
     use super::*;
-
-    struct FakeStore(BTreeMap<&'static str, &'static str>);
-
-    impl FakeStore {
-        fn unsupported<T>() -> Result<T, SecretStoreError> {
-            Err(SecretStoreError::AccessDenied)
-        }
-    }
-
-    impl SecretStore for FakeStore {
-        fn store(
-            &self,
-            _: &SecretName,
-            _: SecretValue,
-        ) -> Result<SecretMetadata, SecretStoreError> {
-            Self::unsupported()
-        }
-        fn update(
-            &self,
-            _: &SecretName,
-            _: SecretValue,
-        ) -> Result<SecretMetadata, SecretStoreError> {
-            Self::unsupported()
-        }
-        fn retrieve(&self, name: &SecretName) -> Result<Secret, SecretStoreError> {
-            let value = self
-                .0
-                .get(name.as_str())
-                .ok_or_else(|| SecretStoreError::NotFound(name.clone()))?;
-            Ok(Secret {
-                metadata: SecretMetadata {
-                    name: name.clone(),
-                    created_at_unix_ms: 0,
-                    updated_at_unix_ms: 0,
-                    version: RecordVersion::V1,
-                },
-                value: SecretValue::try_from(*value)?,
-            })
-        }
-        fn delete(&self, _: &SecretName) -> Result<(), SecretStoreError> {
-            Self::unsupported()
-        }
-        fn list(&self) -> Result<Vec<SecretMetadata>, SecretStoreError> {
-            Self::unsupported()
-        }
-        fn exists(&self, name: &SecretName) -> Result<bool, SecretStoreError> {
-            Ok(self.0.contains_key(name.as_str()))
-        }
-        fn migrate(&self, _: &SecretName) -> Result<SecretMetadata, SecretStoreError> {
-            Self::unsupported()
-        }
-    }
 
     const ANTHROPIC_KEY: &str = "sk-ant-test-0123456789";
     const OPENAI_KEY: &str = "sk-openai-test-0123456789";
@@ -622,7 +570,7 @@ mod tests {
         }
         let fixture = fixture(&brokered_profile(), 1);
         let mut configuration = configuration(&["anthropic", "openai"]);
-        let run = admitted_run(&fixture, &mut configuration);
+        let run = admitted_run(&fixture, &mut configuration).await;
         let services = run
             .session
             .brokered_services(&configuration)

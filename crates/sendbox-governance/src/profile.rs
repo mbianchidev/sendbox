@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     GovernanceError, ProfileId, ServiceId,
     digest::Sha256Digest,
+    exception::{ExceptionPolicy, ExceptionScope},
     grant::{validate_method, validate_path_prefix},
 };
 
@@ -57,6 +58,10 @@ pub struct GovernanceProfile {
     pub credential_services: Vec<CredentialServiceProfile>,
     #[serde(default)]
     pub grants: GrantLimits,
+    /// Denials that an approved, expiring exception may lift. Empty by default,
+    /// so exceptions require the operator's explicit opt-in.
+    #[serde(default)]
+    pub exceptions: ExceptionPolicy,
 }
 
 /// Identity of one exact profile revision.
@@ -554,6 +559,12 @@ impl GovernanceProfile {
         Ok(())
     }
 
+    /// Whether an exception for `scope` may be requested under this revision.
+    #[must_use]
+    pub fn permits_exception(&self, scope: &ExceptionScope) -> bool {
+        scope.validate().is_ok() && self.exceptions.permits(scope)
+    }
+
     #[must_use]
     pub fn credential_service(&self, id: &ServiceId) -> Option<&CredentialServiceProfile> {
         self.credential_services
@@ -596,6 +607,7 @@ impl GovernanceProfile {
         validate_patterns(&self.denials.networks, "denials.networks", &mut problems);
         self.validate_credential_services(&mut problems);
         self.grants.validate(&mut problems);
+        self.exceptions.validate(&self.denials, &mut problems);
         if problems.is_empty() {
             Ok(())
         } else {
@@ -986,6 +998,28 @@ credential_services:
         }
         let unknown = format!("{MINIMAL}unexpected: true\n");
         assert!(GovernanceProfile::parse(unknown.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn exceptions_require_an_explicit_opt_in_for_listed_denials() {
+        use crate::exception::ExceptionKind;
+        let scope = ExceptionScope {
+            kind: ExceptionKind::Domain,
+            value: "gist.github.com".to_owned(),
+        };
+        let profile = GovernanceProfile::parse(MINIMAL.as_bytes()).expect("profile");
+        assert!(!profile.permits_exception(&scope));
+
+        let opted_in = format!(
+            "{MINIMAL}denials:\n  domains: [gist.github.com]\nexceptions:\n  max_ttl_seconds: 3600\n  domains: [gist.github.com]\n"
+        );
+        let profile = GovernanceProfile::parse(opted_in.as_bytes()).expect("profile");
+        assert!(profile.permits_exception(&scope));
+        assert_eq!(profile.exceptions.max_ttl_seconds, 3600);
+
+        let undeclared = format!("{MINIMAL}exceptions:\n  domains: [gist.github.com]\n");
+        let error = GovernanceProfile::parse(undeclared.as_bytes()).expect_err("not a denial");
+        assert!(error.to_string().contains("denials.domains"));
     }
 
     #[test]

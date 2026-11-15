@@ -2,30 +2,36 @@
 //! binding, and brokered credential grants.
 
 pub mod composition;
+pub(crate) mod fleet;
 pub mod operator;
 pub(crate) mod relay;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sendbox_agent::EnvironmentIntent;
 use sendbox_bootstrap::CredentialRelayBootstrap;
 use sendbox_config::{RuntimeProvider as ConfiguredRuntime, SandboxConfiguration};
 use sendbox_core::SessionId;
 use sendbox_egress::runtime::DEFAULT_CREDENTIAL_RELAY_PORT;
+use sendbox_governance::api::SessionOutcome;
+use sendbox_governance::exception::MAX_SESSION_EXCEPTIONS;
 use sendbox_governance::profile::{CredentialServiceProfile, RuntimeKind};
 use sendbox_governance::{
-    CONTRACT_VERSION, GovernanceBinding, PrincipalId, ProjectId, ServiceId, SessionRef,
-    Sha256Digest,
+    CONTRACT_VERSION, ExceptionScope, GovernanceBinding, PolicyException, PrincipalId, ProjectId,
+    ServiceId, SessionRef, Sha256Digest,
 };
+use sendbox_secrets::{SecretName, SecretStore};
 use sendbox_security::audit::{AuditCategory, AuditResult};
 use sendbox_session_security::AuditRecorder;
 use serde::Serialize;
 
 pub use composition::{SessionFacts, Violation, ViolationKind};
 pub use operator::{
-    GovernanceMode, GovernanceSource, MANAGED_CONFIGURATION_PATH, OperatorConfiguration,
-    SIGNATURES_FORMAT, VerifiedProfile, encode_signatures, verify_profile,
+    DEFAULT_FLEET_TOKEN_SECRET, FleetSettings, GovernanceMode, GovernanceSource,
+    MANAGED_CONFIGURATION_PATH, OperatorConfiguration, SIGNATURES_FORMAT, VerifiedProfile,
+    encode_signatures, verify_profile,
 };
 
 use crate::HostError;
@@ -36,13 +42,23 @@ pub(crate) struct GovernedSession {
     pub(crate) source: GovernanceSource,
     pub(crate) verified: VerifiedProfile,
     pub(crate) principal: PrincipalId,
+    operator: OperatorConfiguration,
+    project: Option<ProjectId>,
+    /// Approved exceptions whose denials this session lifts, sorted by id.
+    pub(crate) exceptions: Vec<PolicyException>,
+    pub(crate) fleet: Option<Arc<fleet::FleetClient>>,
 }
 
+/// Opens the host secret store that holds the caller's fleet token.
+pub(crate) type SecretStoreOpener<'a> =
+    &'a (dyn Fn() -> Result<Arc<dyn SecretStore>, HostError> + Sync);
+
 impl GovernedSession {
-    /// Discovers, loads, and verifies governance, then applies profile
-    /// denials to `configuration`. Returns `None` for standalone sessions.
+    /// Discovers, loads, and verifies governance. Returns `None` for
+    /// standalone sessions. Profile denials are applied later by
+    /// [`Self::apply`], once the project is known.
     pub(crate) fn prepare(
-        configuration: &mut SandboxConfiguration,
+        configuration: &SandboxConfiguration,
         managed_path: &Path,
         opt_in: Option<&Path>,
         bundle: BundleSelection<'_>,
@@ -70,13 +86,82 @@ impl GovernedSession {
         crate::ensure_private_directory(state_root)?;
         operator::RevisionHighWater::open(state_root)?
             .check(&verified.authority, &verified.reference)?;
-        composition::apply_denials(&verified.profile, &mut configuration.policy);
         Ok(Some(Self {
             mode: source.mode,
             source,
             verified,
             principal: PrincipalId::local_user(uid),
+            operator,
+            project: None,
+            exceptions: Vec::new(),
+            fleet: None,
         }))
+    }
+
+    /// Binds the project and applies the profile denials to `configuration`.
+    ///
+    /// With a shared governance service, the service first authenticates the
+    /// caller (who becomes the session principal) and reports the project's
+    /// active exceptions. Only approved exceptions bound to this exact profile
+    /// revision, for this principal or the whole project, and permitted by the
+    /// profile, lift a denial. The ceiling check still applies afterwards.
+    pub(crate) async fn apply(
+        &mut self,
+        configuration: &mut SandboxConfiguration,
+        project: ProjectId,
+        open_secrets: SecretStoreOpener<'_>,
+        now_unix: u64,
+    ) -> Result<(), HostError> {
+        if let Some(settings) = &self.operator.fleet {
+            if configuration
+                .secrets
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&settings.token_secret))
+            {
+                return Err(HostError::Governance(format!(
+                    "the fleet token `{}` can never be a workload secret",
+                    settings.token_secret
+                )));
+            }
+            let token = open_secrets()?
+                .retrieve(&SecretName::new(settings.token_secret.clone())?)
+                .map_err(|error| {
+                    HostError::Governance(format!(
+                        "fleet token `{0}` is unavailable in the host secret store ({error}); add it with `sendbox secrets add {0}`",
+                        settings.token_secret
+                    ))
+                })?;
+            let client = Arc::new(fleet::FleetClient::new(settings, &token.value)?);
+            let caller = client.whoami().await?;
+            let active = client.active_exceptions(&project).await?;
+            self.exceptions = select_exceptions(
+                active,
+                &project,
+                &caller.principal,
+                &self.verified,
+                now_unix,
+            )?;
+            self.principal = caller.principal;
+            self.fleet = Some(client);
+        }
+        let lifted = self
+            .exceptions
+            .iter()
+            .map(|exception| exception.scope.clone())
+            .collect::<Vec<ExceptionScope>>();
+        composition::apply_denials(&self.verified.profile, &lifted, &mut configuration.policy);
+        self.project = Some(project);
+        configuration
+            .validate()
+            .map_err(|error| HostError::Invalid(error.to_string()))
+    }
+
+    /// The earliest expiry among lifted exceptions. The session must stop
+    /// then, because its egress and command rules are fixed at start.
+    pub(crate) fn exception_deadline(&self) -> Option<&PolicyException> {
+        self.exceptions
+            .iter()
+            .min_by_key(|exception| exception.expires_at_unix)
     }
 
     /// Rejects the session unless its effective configuration stays within
@@ -102,10 +187,12 @@ impl GovernedSession {
 
     pub(crate) fn binding(
         &self,
-        project: ProjectId,
         effective_policy_sha256: &str,
         configuration: &SandboxConfiguration,
     ) -> Result<GovernanceBinding, HostError> {
+        let project = self.project.clone().ok_or_else(|| {
+            HostError::Governance("governance denials were not applied".to_owned())
+        })?;
         let mut brokered_services =
             composition::selected_services(&self.verified.profile, configuration)
                 .map_err(HostError::Governance)?
@@ -122,6 +209,11 @@ impl GovernedSession {
             effective_policy_sha256: Sha256Digest::parse_hex(effective_policy_sha256)
                 .map_err(operator::governance_error)?,
             brokered_services,
+            exceptions: self
+                .exceptions
+                .iter()
+                .map(|exception| exception.id.clone())
+                .collect(),
         };
         binding.validate().map_err(operator::governance_error)?;
         Ok(binding)
@@ -192,6 +284,40 @@ pub(crate) fn relay_environment(
         .collect()
 }
 
+/// Picks the exceptions a session lifts: for each permitted scope, the
+/// applicable exception that lasts longest. Sorted by id for the binding.
+fn select_exceptions(
+    active: Vec<PolicyException>,
+    project: &ProjectId,
+    principal: &PrincipalId,
+    verified: &VerifiedProfile,
+    now_unix: u64,
+) -> Result<Vec<PolicyException>, HostError> {
+    let mut by_scope = BTreeMap::<ExceptionScope, PolicyException>::new();
+    for exception in active {
+        if !exception.applies_to(project, principal, &verified.reference, now_unix)
+            || !verified.profile.permits_exception(&exception.scope)
+        {
+            continue;
+        }
+        let replace = by_scope.get(&exception.scope).is_none_or(|kept| {
+            (exception.expires_at_unix, std::cmp::Reverse(&exception.id))
+                > (kept.expires_at_unix, std::cmp::Reverse(&kept.id))
+        });
+        if replace {
+            by_scope.insert(exception.scope.clone(), exception);
+        }
+    }
+    if by_scope.len() > MAX_SESSION_EXCEPTIONS {
+        return Err(HostError::Governance(format!(
+            "more than {MAX_SESSION_EXCEPTIONS} policy exceptions apply to this session"
+        )));
+    }
+    let mut selected = by_scope.into_values().collect::<Vec<_>>();
+    selected.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(selected)
+}
+
 /// An admitted governed run: the verified profile plus the exact binding
 /// signed into the boundary plan.
 pub(crate) struct GovernedRun {
@@ -216,6 +342,35 @@ impl GovernedRun {
             session_ref: SessionRef::from_session_id(session_id),
             brokered: None,
         })
+    }
+
+    /// Registers the session with the shared governance service, which
+    /// checks the caller's project role, the profile revision, and every
+    /// bound exception. A local authority has nothing to register.
+    pub(crate) async fn admit_remote(&self) -> Result<(), HostError> {
+        if let Some(client) = &self.session.fleet {
+            client.admit(&self.session_ref, &self.binding).await?;
+        }
+        Ok(())
+    }
+
+    /// Tells the shared governance service that the session ended, which
+    /// revokes any grant it still holds.
+    pub(crate) async fn end_remote(&self, outcome: SessionOutcome) -> Result<(), HostError> {
+        if let Some(client) = &self.session.fleet {
+            client.end(&self.session_ref, outcome).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authority(
+        &self,
+        local: impl FnOnce() -> Arc<dyn sendbox_governance::GrantAuthority>,
+    ) -> Arc<dyn sendbox_governance::GrantAuthority> {
+        match &self.session.fleet {
+            Some(client) => Arc::new(fleet::FleetGrantAuthority::new(Arc::clone(client))),
+            None => local(),
+        }
     }
 
     pub(crate) fn attach_brokered(
@@ -264,6 +419,31 @@ impl GovernedRun {
         ])
     }
 
+    /// Records a session stopped because a lifted exception expired.
+    pub(crate) fn record_exception_expiry(
+        &self,
+        audit: &AuditRecorder,
+        exception: &PolicyException,
+    ) -> Result<(), HostError> {
+        let mut metadata = self.audit_metadata();
+        metadata.extend([
+            ("exception".to_owned(), exception.id.to_string()),
+            ("scope".to_owned(), exception.scope.to_string()),
+            (
+                "expires_at_unix".to_owned(),
+                exception.expires_at_unix.to_string(),
+            ),
+        ]);
+        record_audit(
+            audit,
+            AuditCategory::Policy,
+            "governance.exception.expired",
+            &self.session_ref.to_string(),
+            AuditResult::Denied,
+            metadata,
+        )
+    }
+
     pub(crate) fn record_admission(&self, audit: &AuditRecorder) -> Result<(), HostError> {
         let mut metadata = self.audit_metadata();
         metadata.insert(
@@ -297,6 +477,32 @@ impl GovernedRun {
                 .collect::<Vec<_>>()
                 .join(","),
         );
+        if let Some(settings) = &self.session.operator.fleet {
+            metadata.insert("authority_url".to_owned(), settings.url.clone());
+        }
+        if !self.session.exceptions.is_empty() {
+            metadata.insert(
+                "exceptions".to_owned(),
+                self.binding
+                    .exceptions
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        for exception in &self.session.exceptions {
+            let key = |field: &str| format!("exception.{}.{field}", exception.id);
+            metadata.insert(key("scope"), exception.scope.to_string());
+            metadata.insert(key("requested_by"), exception.requested_by.to_string());
+            if let Some(approver) = &exception.decided_by {
+                metadata.insert(key("approved_by"), approver.to_string());
+            }
+            metadata.insert(
+                key("expires_at_unix"),
+                exception.expires_at_unix.to_string(),
+            );
+        }
         record_audit(
             audit,
             AuditCategory::Policy,
@@ -447,7 +653,7 @@ pub fn check(request: GovernanceCheckRequest) -> Result<GovernanceCheckReport, H
         });
     };
     let before = configuration.policy.clone();
-    composition::apply_denials(&verified.profile, &mut configuration.policy);
+    composition::apply_denials(&verified.profile, &[], &mut configuration.policy);
     let added = |after: &[String], before: &[String]| {
         after
             .iter()
@@ -513,6 +719,7 @@ pub fn check(request: GovernanceCheckRequest) -> Result<GovernanceCheckReport, H
 pub(crate) mod tests {
     use sendbox_config::{PolicyPreset, RuntimeProvider};
     use sendbox_governance::profile::GovernanceProfile;
+    use sendbox_secrets::{RecordVersion, Secret, SecretMetadata, SecretStoreError, SecretValue};
 
     use super::operator::tests::{Fixture, fixture, private_directory, protected_test_tree};
     use super::*;
@@ -578,27 +785,103 @@ credential_services:
         }
     }
 
-    pub(crate) fn prepare(
+    pub(crate) struct FakeStore(pub(crate) BTreeMap<&'static str, &'static str>);
+
+    impl FakeStore {
+        fn unsupported<T>() -> Result<T, SecretStoreError> {
+            Err(SecretStoreError::AccessDenied)
+        }
+    }
+
+    impl SecretStore for FakeStore {
+        fn store(
+            &self,
+            _: &SecretName,
+            _: SecretValue,
+        ) -> Result<SecretMetadata, SecretStoreError> {
+            Self::unsupported()
+        }
+        fn update(
+            &self,
+            _: &SecretName,
+            _: SecretValue,
+        ) -> Result<SecretMetadata, SecretStoreError> {
+            Self::unsupported()
+        }
+        fn retrieve(&self, name: &SecretName) -> Result<Secret, SecretStoreError> {
+            let value = self
+                .0
+                .get(name.as_str())
+                .ok_or_else(|| SecretStoreError::NotFound(name.clone()))?;
+            Ok(Secret {
+                metadata: SecretMetadata {
+                    name: name.clone(),
+                    created_at_unix_ms: 0,
+                    updated_at_unix_ms: 0,
+                    version: RecordVersion::V1,
+                },
+                value: SecretValue::try_from(*value)?,
+            })
+        }
+        fn delete(&self, _: &SecretName) -> Result<(), SecretStoreError> {
+            Self::unsupported()
+        }
+        fn list(&self) -> Result<Vec<SecretMetadata>, SecretStoreError> {
+            Self::unsupported()
+        }
+        fn exists(&self, name: &SecretName) -> Result<bool, SecretStoreError> {
+            Ok(self.0.contains_key(name.as_str()))
+        }
+        fn migrate(&self, _: &SecretName) -> Result<SecretMetadata, SecretStoreError> {
+            Self::unsupported()
+        }
+    }
+
+    pub(crate) fn no_secret_store() -> Result<Arc<dyn SecretStore>, HostError> {
+        Err(HostError::Invalid(
+            "no secret store in this test".to_owned(),
+        ))
+    }
+
+    pub(crate) async fn prepare(
         fixture: &Fixture,
         configuration: &mut SandboxConfiguration,
-    ) -> GovernedSession {
-        GovernedSession::prepare(
+        open_secrets: SecretStoreOpener<'_>,
+    ) -> Result<GovernedSession, HostError> {
+        let mut session = GovernedSession::prepare(
             configuration,
             &fixture.directory.path().join("absent-managed.yaml"),
             Some(&fixture.source.path),
             bundle(),
             &fixture.directory.path().join("state"),
             now_unix(),
-        )
-        .expect("prepare")
-        .expect("governed")
+        )?
+        .expect("governed");
+        session
+            .apply(
+                configuration,
+                ProjectId::github("acme", "app").expect("project"),
+                open_secrets,
+                now_unix(),
+            )
+            .await?;
+        Ok(session)
     }
 
-    pub(crate) fn admitted_run(
+    pub(crate) async fn admitted_run(
         fixture: &Fixture,
         configuration: &mut SandboxConfiguration,
     ) -> GovernedRun {
-        let session = prepare(fixture, configuration);
+        let session = prepare(fixture, configuration, &no_secret_store)
+            .await
+            .expect("prepare");
+        run_for(session, configuration)
+    }
+
+    pub(crate) fn run_for(
+        session: GovernedSession,
+        configuration: &SandboxConfiguration,
+    ) -> GovernedRun {
         let facts = SessionFacts {
             runtime: RuntimeKind::Apple,
             image: None,
@@ -606,11 +889,7 @@ credential_services:
         };
         session.admit(configuration, &facts).expect("admit");
         let binding = session
-            .binding(
-                ProjectId::github("acme", "app").expect("project"),
-                &"ab".repeat(32),
-                configuration,
-            )
+            .binding(&"ab".repeat(32), configuration)
             .expect("binding");
         GovernedRun::new(session, binding, SessionId::from_bytes([7; 16])).expect("run")
     }
@@ -620,14 +899,14 @@ credential_services:
         let directory = private_directory();
         let managed = directory.path().join("absent.yaml");
         let state = directory.path().join("state");
-        let mut standalone = configuration(&[]);
+        let standalone = configuration(&[]);
         assert!(
-            GovernedSession::prepare(&mut standalone, &managed, None, bundle(), &state, 0)
+            GovernedSession::prepare(&standalone, &managed, None, bundle(), &state, 0)
                 .expect("standalone")
                 .is_none()
         );
-        let mut brokered = configuration(&["anthropic"]);
-        let error = GovernedSession::prepare(&mut brokered, &managed, None, bundle(), &state, 0)
+        let brokered = configuration(&["anthropic"]);
+        let error = GovernedSession::prepare(&brokered, &managed, None, bundle(), &state, 0)
             .err()
             .expect("brokered services without governance are rejected");
         assert!(
@@ -668,14 +947,14 @@ credential_services:
         );
     }
 
-    #[test]
-    fn governed_session_binds_admission_and_brokered_services() {
+    #[tokio::test]
+    async fn governed_session_binds_admission_and_brokered_services() {
         if !protected_test_tree() {
             return;
         }
         let fixture = fixture(&brokered_profile(), 1);
         let mut configuration = configuration(&["openai", "anthropic"]);
-        let run = admitted_run(&fixture, &mut configuration);
+        let run = admitted_run(&fixture, &mut configuration).await;
         for host in ["api.anthropic.com", "api.openai.com"] {
             assert!(
                 configuration

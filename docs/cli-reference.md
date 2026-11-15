@@ -75,7 +75,10 @@ See [network grants](configuration.md#network-grants).
 | `check --config PATH [--governance-config PATH] [--runtime apple\|kata] [--image IMAGE@sha256:DIGEST]` | List every violation of the active profile without starting a session |
 
 Each subcommand accepts `--json`. A governance failure or a rejected
-configuration exits with code `6`.
+configuration exits with code `6`. `check` evaluates the local profile only;
+with a [shared governance service](architecture/governed-sessions.md#shared-governance-service),
+store your service token with `sendbox secrets add SENDBOX_FLEET_TOKEN` before
+`sendbox run`.
 
 ## Examples
 

@@ -100,4 +100,6 @@ failures remain visible.
 and credential grant and request records to the same signed audit chain. Each
 record names the profile revision and the binding digest signed into the
 boundary plan, and never includes credential material. A failure to record
-relay evidence fails the run.
+relay evidence fails the run. A session that lifted a policy exception is
+stopped when the exception expires, which follows the normal cancellation and
+rollback path.

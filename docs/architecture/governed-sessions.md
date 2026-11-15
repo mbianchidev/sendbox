@@ -1,14 +1,22 @@
 # Governed sessions
 
-Status: **increment 1, single host**. Governed sessions add operator-signed
-policy profiles and host-side credential mediation on top of the existing VM
-isolation, signed boundary plan, and session audit. Standalone sessions are
-unchanged unless governance is selected or required by the host.
+Governed sessions add operator-signed policy profiles and host-side
+credential mediation on top of the existing VM isolation, signed boundary
+plan, and session audit. Standalone sessions are unchanged unless governance
+is selected or required by the host.
 
-Increment 1 is not multi-user governance. Authenticated shared management,
-project-scoped roles, central audit, and approved exceptions are tracked for
-the separate `sendbox-fleet` service, which shares the
-[`sendbox-governance`](../../crates/sendbox-governance) contract crate.
+Two authorities are supported:
+
+- **Local** (single host): the host verifies the profile and runs the grant
+  authority in process. The principal is the local OS account.
+- **Shared** ([`sendbox-fleet`](https://github.com/mbianchidev/sendbox-fleet)):
+  an authenticated, multi-user service enforces project-scoped roles, approves
+  bounded, expiring exceptions, admits sessions, issues and checks grants, and
+  keeps a central, hash-chained audit log. See
+  [shared governance service](#shared-governance-service).
+
+Both share the [`sendbox-governance`](../../crates/sendbox-governance)
+contract crate (contract version 2).
 
 ```mermaid
 flowchart LR
@@ -69,6 +77,10 @@ bundle:                     # optional: pin the guest bundle trust root
   trust_root_ids: [external-release-root]
   minimum_release_sequence: 7
 revision_cache_seconds: 30
+fleet:                      # optional: use a shared governance service
+  url: https://fleet.acme.example
+  token_secret: SENDBOX_FLEET_TOKEN   # host secret holding the caller's token
+  timeout_seconds: 10
 ```
 
 - `trust` builds a provenance trust store with `allow_unsigned: false`. At
@@ -83,6 +95,11 @@ revision_cache_seconds: 30
   between the pin check and bundle verification.
 - `revision_cache_seconds` bounds how long the grant authority reuses a
   verified profile before re-reading and re-verifying it.
+- `fleet` selects the [shared governance service](#shared-governance-service)
+  as the authority. `authority` must then equal the service's
+  `FLEET_AUTHORITY_ID` and cannot be `local`. `url` must use `https://`;
+  plain `http://` is accepted only for a loopback host. `timeout_seconds` is
+  1 to 60.
 
 The host also keeps a per-user high-water mark of admitted revisions under the
 runtime state directory and rejects a lower revision. That record is
@@ -153,10 +170,16 @@ grants:
   max_ttl_seconds: 28800
   revocation_grace_seconds: 5
   max_concurrent_streams: 8
+exceptions:                    # optional: denials an approved exception may lift
+  max_ttl_seconds: 86400       # at most 7 days
+  commands: []
+  domains: [pastebin.com]      # each entry must also be listed in denials
+  networks: []
 ```
 
 Omitted ceiling sections take their most restrictive value. Unknown fields are
-rejected.
+rejected. An omitted `exceptions` section permits no exceptions; see
+[exceptions](#exceptions).
 
 ### Signing workflow
 
@@ -210,11 +233,13 @@ Observability settings are not capabilities and are not compared.
 
 `BoundaryPlan.governance` records the authority (id and trust digest), the
 exact profile (id, revision, SHA-256), the principal, the project, the
-effective policy SHA-256, and the brokered service ids. It is omitted from
-standalone plans, whose canonical bytes are unchanged. The effective policy
-digest must equal the plan's `policy_sha256`, which secret envelopes already
-authenticate. Increment 1 uses `local-user:<uid>` as the principal and
-`github:<owner>/<repository>` (or a workspace path digest) as the project.
+effective policy SHA-256, the brokered service ids, and the ids of any
+exceptions the session lifted (omitted when there are none). It is omitted
+from standalone plans, whose canonical bytes are unchanged. The effective
+policy digest must equal the plan's `policy_sha256`, which secret envelopes
+already authenticate. A local authority uses `local-user:<uid>` as the
+principal; a shared service uses the principal it authenticated. The project
+is `github:<owner>/<repository>` (or a workspace path digest).
 
 ## Brokered credentials
 
@@ -270,7 +295,7 @@ tells the host so it closes the upstream connection.
 
 ## Grants and revocation
 
-At session start the local grant authority issues one grant per brokered
+At session start the grant authority issues one grant per brokered
 service, bound to the principal, project, session, binding digest, profile
 revision, methods, path prefixes, a renewable lease, and a hard maximum
 lifetime. Every request is checked for:
@@ -306,12 +331,81 @@ Records join the existing signed session audit chain:
 | `credential.grant.issued`, `.lapsed`, `.revoked` | grant lifecycle |
 | `credential.request.allowed`, `.denied` | each authorization decision |
 | `credential.request.outcome` | each stream ends, with status, byte counts, duration, and outcome |
+| `governance.exception.expired` | a lifted exception expired and the session was stopped |
 
 Each record carries principal, project, session, authority, profile id,
-revision and digest, effective policy digest, and binding digest. Request
+revision and digest, effective policy digest, and binding digest. The
+admission record also lists each lifted exception with its scope, requester,
+approver, and expiry, and the service URL when a shared service is used. Request
 records add the service, method, path without query, and reason. Credentials,
 headers, query strings, and request or response bodies are never recorded. A
 failure to record relay evidence fails the run.
+
+## Shared governance service
+
+With `fleet` in the operator configuration, the host uses
+[`sendbox-fleet`](https://github.com/mbianchidev/sendbox-fleet) as its
+authority. The profile is still read from `profile_path` and verified against
+the operator's `trust` signers on the host; the service separately verifies the
+same signed bytes when an operator publishes them, and only admits sessions
+bound to its current revision.
+
+```mermaid
+sequenceDiagram
+  participant H as SendBox host (caller's token)
+  participant F as sendbox-fleet
+  H->>F: GET /v1/whoami
+  F-->>H: principal (becomes the session principal)
+  H->>F: GET /v1/exceptions?project=…&state=active
+  Note over H: lift only approved exceptions for this principal,<br/>project, and exact profile revision; check the ceiling
+  H->>F: POST /v1/sessions:admit (session, binding)
+  Note over F: caller = binding principal, role ≥ member,<br/>current revision, every exception still valid
+  H->>F: POST /v1/grants · /v1/authorize · :renew
+  H->>F: POST /v1/sessions/{id}:end (revokes remaining grants)
+```
+
+- **Authentication.** The caller stores their bearer token in the host
+  secret store (`sendbox secrets add SENDBOX_FLEET_TOKEN`, or the name in
+  `token_secret`). It is sent only to the configured URL, redirects are never
+  followed, system proxies are ignored, and it can never be a workload secret.
+- **Identity.** The authenticated principal, not the local account, is the
+  session principal. The service refuses a binding whose principal is not the
+  caller, so a host cannot claim another identity.
+- **Roles.** Admission needs the `member` role or higher in the project.
+  Roles, exceptions, and audit are managed through the service; see its
+  [architecture](https://github.com/mbianchidev/sendbox-fleet/blob/main/docs/architecture.md).
+- **Grants.** The service is the grant authority. Every brokered request is
+  authorized by the service; any non-200 answer, timeout, or unreachable
+  service denies with `authority_unavailable`. Nothing falls back to the
+  local authority or to credential delivery.
+- **End.** After the workload ends, the host revokes its grants and ends the
+  session on the service, which revokes any grant still live.
+
+### Exceptions
+
+An exception lifts exactly one profile denial for a project, or for one
+principal in it, until it expires (at most 7 days). Only denials the operator
+listed under the profile's `exceptions` section can be lifted, so the
+operator's signed opt-in bounds every exception. Lifting a denial never adds a
+capability: the session must still fit the ceiling, and provider hosts blocked
+for brokered services are never lifted.
+
+A project member requests an exception against the current profile revision;
+a different principal with the `owner` or `admin` role approves it. The host
+lifts a denial only for an approved, unrevoked, unexpired exception bound to
+the exact revision it runs under, binds its id into the signed boundary plan,
+and the service re-checks it at admission. A new revision or a raised minimum
+revision makes the approval stale, so it can no longer admit sessions.
+
+Egress and command rules are fixed when the VM starts, so the host stops the
+session when the earliest lifted exception expires
+(`governance.exception.expired`, exit code `6`). Like any failed run, the
+workspace is rolled back to its starting snapshot, so request an expiry that
+covers the work. Grants are capped at that
+expiry, and once an exception is revoked the service denies the session's
+brokered requests and lease renewals with `stale_policy`. Revocation does not
+reach into the VM's egress rules: a revoked exception's lifted denial stays
+lifted until the session ends or the exception's original expiry stops it.
 
 ## Trust boundaries and residual risks
 
@@ -327,6 +421,14 @@ failure to record relay evidence fails the run.
   that has its own provider key could still call the provider directly. Keep
   the default to block the provider host for the workload.
 
-Non-goals for increment 1: Kubernetes or fleet scheduling, universal TLS
-interception, formal policy verification, model API translation, and
-replacing isolation providers.
+- A shared service that is compromised can authorize misuse but never sees
+  provider keys; the host broker keeps them. A compromised host is limited to
+  sessions and grants issued to the principals whose tokens it holds.
+- The fleet token is a bearer credential for its principal. Keep token
+  lifetimes short; revoke tokens and disable principals in the service.
+- `sendbox governance check` evaluates the local profile only and does not
+  consult the service for exceptions.
+
+Non-goals: Kubernetes or fleet scheduling, universal TLS interception, formal
+policy verification, model API translation, and replacing isolation
+providers.

@@ -1829,6 +1829,7 @@ fn brokered_plan(resources: &TempResource, capabilities: &RuntimeCapabilities) -
         project: ProjectId::new("github:octo/api").unwrap(),
         effective_policy_sha256: Sha256Digest::parse_hex(&boundary.policy_sha256).unwrap(),
         brokered_services: vec![ServiceId::new("anthropic").unwrap()],
+        exceptions: Vec::new(),
     });
     let signing_key = SigningKeyMaterial::generate().unwrap();
     let fingerprint = signing_key
