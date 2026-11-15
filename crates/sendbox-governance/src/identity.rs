@@ -77,8 +77,9 @@ impl PrincipalId {
     /// Identity of a local operating-system account. Increment 1 uses this for
     /// every session; a shared governance service authenticates its own
     /// principals and never accepts this kind from a workload.
-    pub fn local_user(uid: u32, name: &str) -> Result<Self, GovernanceError> {
-        Self::new(format!("local-user:{uid}:{name}"))
+    #[must_use]
+    pub fn local_user(uid: u32) -> Self {
+        Self(format!("local-user:{uid}"))
     }
 
     #[must_use]

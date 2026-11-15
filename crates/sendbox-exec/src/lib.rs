@@ -40,5 +40,6 @@ pub use error::{
 };
 pub use policy::{
     CommandAdmission, CommandPolicyCompileError, CompiledCommandPolicy, MatchKind, MatchedRule,
+    rule_covers,
 };
 pub use sendbox_core::SessionId;

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use sendbox_config::RuntimeProvider;
 use sendbox_core::{BoundaryPlanDigest, SessionId};
+pub use sendbox_governance::GovernanceBinding;
 use sendbox_security::SecurityError;
 use sendbox_security::provenance::{
     DetachedSignature, Identity, SignedSubject, SigningKeyMaterial, SubjectKind, TrustPolicy,
@@ -341,6 +342,10 @@ pub struct BoundaryPlan {
     pub artifacts: Vec<ArtifactIdentity>,
     pub resources: ResourceDeclaration,
     pub features: BTreeMap<String, FeatureAdmission>,
+    /// Present only for governed sessions. Omitted entirely otherwise so
+    /// standalone plans keep their existing canonical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<GovernanceBinding>,
 }
 
 impl BoundaryPlan {
@@ -390,6 +395,16 @@ impl BoundaryPlan {
             return Err(BoundaryError::Invalid(
                 "runtime resources must be greater than zero".to_owned(),
             ));
+        }
+        if let Some(governance) = &self.governance {
+            governance
+                .validate()
+                .map_err(|error| BoundaryError::Invalid(error.to_string()))?;
+            if governance.effective_policy_sha256.to_string() != self.policy_sha256 {
+                return Err(BoundaryError::Invalid(
+                    "governance binding does not match the signed policy digest".to_owned(),
+                ));
+            }
         }
         for (feature, admission) in &self.features {
             if feature.is_empty()
@@ -988,6 +1003,7 @@ mod tests {
                     mechanism: "authenticated guest broker".to_owned(),
                 },
             )]),
+            governance: None,
         }
     }
 
@@ -1077,5 +1093,58 @@ mod tests {
             .verify(&expected, now)
             .expect("verified plan");
         assert!(verified.reverify(now + 301).is_err());
+    }
+
+    #[test]
+    fn governance_binding_is_omitted_when_absent_and_must_match_the_policy() {
+        use sendbox_governance::{
+            AuthorityRef, CONTRACT_VERSION, PrincipalId, ProfileId, ProfileRef, ProjectId,
+            Sha256Digest,
+        };
+
+        let now = 50_000;
+        let standalone = plan(now);
+        let encoded = String::from_utf8(standalone.encode().expect("encode")).expect("utf8");
+        assert!(!encoded.contains("governance"));
+
+        let mut governed = plan(now);
+        governed.governance = Some(GovernanceBinding {
+            contract_version: CONTRACT_VERSION,
+            authority: AuthorityRef {
+                id: "local".to_owned(),
+                trust_sha256: Sha256Digest::of(b"trust"),
+            },
+            profile: ProfileRef {
+                id: ProfileId::new("acme").expect("profile id"),
+                revision: 2,
+                sha256: Sha256Digest::of(b"profile"),
+            },
+            principal: PrincipalId::local_user(501),
+            project: ProjectId::new("github:octo/api").expect("project id"),
+            effective_policy_sha256: Sha256Digest::parse_hex(&governed.policy_sha256)
+                .expect("policy digest"),
+            brokered_services: Vec::new(),
+        });
+        governed.validate(now).expect("governed plan");
+        assert_ne!(
+            governed.digest().expect("digest"),
+            standalone.digest().expect("digest")
+        );
+        let key = SigningKeyMaterial::generate().expect("signing key");
+        let signed = SignedBoundaryPlan::sign(governed.clone(), &key, now).expect("signed plan");
+        assert_eq!(
+            SignedBoundaryPlan::decode(&signed.encode().expect("encode"))
+                .expect("decode")
+                .plan
+                .governance,
+            governed.governance
+        );
+
+        governed
+            .governance
+            .as_mut()
+            .expect("binding")
+            .effective_policy_sha256 = Sha256Digest::of(b"other policy");
+        assert!(governed.validate(now).is_err());
     }
 }

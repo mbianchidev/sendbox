@@ -231,6 +231,7 @@ fn verified_boundary_plan(
                 * 1024,
         },
         features: BTreeMap::new(),
+        governance: None,
     };
     let key = SigningKeyMaterial::generate().expect("signing key");
     let fingerprint = key.identity("test", None, 0, None).fingerprint.clone();

@@ -303,6 +303,39 @@ fn admission(disposition: AdmissionDisposition, rule: &CompiledRule) -> CommandA
     }
 }
 
+/// Reports whether every argv that `candidate` admits is also admitted by
+/// `ceiling`.
+///
+/// The answer is conservative: a wildcard candidate is covered only by an
+/// identical ceiling rule, while an exact candidate is covered when the ceiling
+/// rule matches it with the runtime's own program-basename semantics.
+pub fn rule_covers(ceiling: &str, candidate: &str) -> Result<bool, CommandPolicyCompileError> {
+    let ceiling = compile_rule("ceiling", 0, ceiling)?;
+    let candidate = compile_rule("candidate", 0, candidate)?;
+    match &candidate.exact {
+        Some(argv) => Ok(ceiling.matches(argv)),
+        None => Ok(ceiling.exact.is_none()
+            && ceiling.tokens.len() == candidate.tokens.len()
+            && ceiling
+                .tokens
+                .iter()
+                .zip(&candidate.tokens)
+                .all(|(left, right)| left.same_as(right))),
+    }
+}
+
+impl TokenPattern {
+    fn same_as(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().zip(&other.0).all(|pair| match pair {
+                (PatternAtom::Literal(left), PatternAtom::Literal(right)) => left == right,
+                (PatternAtom::AnyCharacter, PatternAtom::AnyCharacter)
+                | (PatternAtom::AnySequence, PatternAtom::AnySequence) => true,
+                _ => false,
+            })
+    }
+}
+
 const fn convert_action(action: Action) -> AdmissionDisposition {
     match action {
         Action::Allow => AdmissionDisposition::Allow,
@@ -402,6 +435,19 @@ mod tests {
                 .disposition,
             AdmissionDisposition::Allow
         );
+    }
+
+    #[test]
+    fn rule_coverage_uses_runtime_matching_and_is_conservative_for_wildcards() {
+        assert!(rule_covers("git *", "git status").unwrap());
+        assert!(rule_covers("git *", "/usr/bin/git status").unwrap());
+        assert!(!rule_covers("git *", "git status --short").unwrap());
+        assert!(!rule_covers("/usr/bin/git *", "git status").unwrap());
+        assert!(rule_covers("git *", "git  *").unwrap());
+        assert!(!rule_covers("git *", "git s*").unwrap());
+        assert!(!rule_covers("git s*", "git *").unwrap());
+        assert!(!rule_covers(r"git \*", "git *").unwrap());
+        assert!(rule_covers(r"tool literal\*", r"tool literal\*").unwrap());
     }
 
     #[test]

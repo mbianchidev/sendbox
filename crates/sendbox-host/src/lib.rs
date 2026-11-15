@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod github_meta;
+pub mod governance;
 mod masking;
 mod safe_outputs;
 mod security;
@@ -123,6 +124,11 @@ pub struct HostRunRequest {
     pub readiness_timeout: Duration,
     /// Requests a pseudoterminal for the workload with this initial geometry.
     pub terminal: Option<GuestTerminalSize>,
+    /// Root-owned operator governance configuration. When it exists, every
+    /// session is governed and `governance_config` cannot override it.
+    pub managed_governance_path: PathBuf,
+    /// Opt-in governance configuration for an unmanaged host.
+    pub governance_config: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -363,6 +369,24 @@ pub enum HostError {
     Bundle(String),
     #[error("GitHub Meta: {0}")]
     GitHubMeta(#[from] sendbox_egress::github_meta::GitHubMetaError),
+    #[error("governance: {0}")]
+    Governance(String),
+    #[error(
+        "governance profile {profile} does not permit this session:\n{}",
+        render_violations(.violations)
+    )]
+    GovernanceRejected {
+        profile: String,
+        violations: Vec<governance::Violation>,
+    },
+}
+
+fn render_violations(violations: &[governance::Violation]) -> String {
+    violations
+        .iter()
+        .map(|violation| format!("  - {violation}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl HostError {
@@ -398,6 +422,7 @@ pub struct PreparedHostRun {
     safe_outputs: Option<safe_outputs::ProcessingContext>,
     signed_plan_path: PathBuf,
     terminal_source: Option<Arc<dyn TerminalSource>>,
+    governance: Option<governance::GovernedRun>,
 }
 
 struct RuntimeInputs {
@@ -407,6 +432,7 @@ struct RuntimeInputs {
     output: Arc<dyn OutputSink>,
     signals: Arc<dyn SignalSource>,
     terminal_source: Option<Arc<dyn TerminalSource>>,
+    governance: Option<governance::GovernedRun>,
 }
 
 struct EffectiveCredentialSet {
@@ -474,6 +500,7 @@ impl PreparedHostRun {
             safe_outputs,
             signed_plan_path: _,
             terminal_source,
+            governance,
         } = self;
         let masker = secrets.masker.clone();
         let masked_output = Arc::new(masking::MaskingOutputSink::new(masker.clone(), output));
@@ -484,6 +511,7 @@ impl PreparedHostRun {
             output: masked_output.clone(),
             signals,
             terminal_source,
+            governance,
         };
         let runtime_masker = masker.clone();
         let result = security::execute(
@@ -517,6 +545,24 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
     validate_reserved_secret_names(&request.configuration, None)?;
+    let governance = governance::GovernedSession::prepare(
+        &mut request.configuration,
+        &request.managed_governance_path,
+        request.governance_config.as_deref(),
+        governance::BundleSelection {
+            trust_root: &request.trust_root,
+            trust_root_id: &request.trust_root_id,
+            minimum_release_sequence: request.minimum_release_sequence,
+        },
+        &request.state_root,
+        unix_time()?,
+    )?;
+    if governance.is_some() {
+        request
+            .configuration
+            .validate()
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+    }
     let command = validate_command(&request.command)?;
     validate_command_policy(&request.configuration.policy.commands, &request.command)?;
     let host = current_host()?;
@@ -535,6 +581,16 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let project_source = workspace.host_project;
     let workspace_source = workspace.host_root;
     let project_destination = workspace.guest_project;
+    if let Some(governance) = &governance {
+        governance.admit(
+            &request.configuration,
+            &governance::SessionFacts {
+                runtime: governance::runtime_kind(selected_runtime),
+                image: request.image.as_deref(),
+                workspace_root: &workspace_source,
+            },
+        )?;
+    }
     request.configuration.project_path = project_source.clone();
     if let Some(root) = &mut request.configuration.workspace_path {
         root.clone_from(&workspace_source);
@@ -638,6 +694,13 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         security::PackageReportValidation::from_policy(&request.configuration.policy.packages)?;
     let configuration_sha256 = sha256_hex(&configuration_bytes);
     let policy_sha256 = sha256_hex(&policy_bytes);
+    let governance = governance
+        .map(|session| {
+            let project = governance::project_id(selected_repository.as_ref(), &workspace_source)?;
+            let binding = session.binding(project, &policy_sha256, &request.configuration)?;
+            governance::GovernedRun::new(session, binding, session_id)
+        })
+        .transpose()?;
     let resources = runtime_resources(&request.configuration)?;
     let bootstrap_reference =
         SecretReference::new(format!("bootstrap-{session_id}")).map_err(HostError::AgentPlan)?;
@@ -751,6 +814,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         provider: runtime.declaration,
         artifacts: runtime.artifacts,
         features,
+        governance: governance.as_ref().map(|run| run.binding.clone()),
     };
     let signed_plan = SignedBoundaryPlan::sign(plan, &key, now_unix)?;
     let verified_plan = signed_plan.verify(&signer_fingerprint, now_unix)?;
@@ -762,6 +826,9 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
             .map_err(|error| HostError::Invalid(error.to_string()))?,
         0o600,
     )?;
+    if let Some(run) = &governance {
+        run.session.record_admission(&state_root)?;
+    }
 
     let execution = match runtime.provider {
         RuntimeInstance::Persistent(provider) => {
@@ -878,6 +945,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         safe_outputs,
         signed_plan_path,
         terminal_source: None,
+        governance,
     })
 }
 
@@ -893,7 +961,11 @@ async fn execute_runtime(
         output,
         signals,
         terminal_source,
+        governance,
     } = inputs;
+    if let Some(run) = &governance {
+        run.record_admission(&audit)?;
+    }
     match execution {
         HostExecution::Persistent {
             provider,

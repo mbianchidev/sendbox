@@ -2518,6 +2518,7 @@ version = "0.2.7"
 dependencies = [
  "sendbox-config",
  "sendbox-core",
+ "sendbox-governance",
  "sendbox-security",
  "serde",
  "serde_json",
@@ -2565,6 +2566,7 @@ dependencies = [
  "sendbox-agent",
  "sendbox-config",
  "sendbox-core",
+ "sendbox-governance",
  "sendbox-host",
  "sendbox-mcp",
  "sendbox-policy",
@@ -2572,11 +2574,13 @@ dependencies = [
  "sendbox-registry",
  "sendbox-runtime",
  "sendbox-secrets",
+ "sendbox-security",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2741,6 +2745,7 @@ name = "sendbox-host"
 version = "0.2.7"
 dependencies = [
  "getrandom 0.3.4",
+ "ipnet",
  "reqwest",
  "rustix",
  "sendbox-agent",
@@ -2754,6 +2759,7 @@ dependencies = [
  "sendbox-egress",
  "sendbox-exec",
  "sendbox-git",
+ "sendbox-governance",
  "sendbox-mcp",
  "sendbox-policy",
  "sendbox-registry",
@@ -2770,6 +2776,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "url",
+ "yaml_serde",
  "zeroize",
 ]
 

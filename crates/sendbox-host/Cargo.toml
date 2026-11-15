@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 getrandom = "0.3.4"
+ipnet.workspace = true
 reqwest.workspace = true
 rustix.workspace = true
 sendbox-agent = { path = "../sendbox-agent" }
@@ -21,6 +22,7 @@ sendbox-credentials = { path = "../sendbox-credentials" }
 sendbox-egress = { path = "../sendbox-egress" }
 sendbox-exec = { path = "../sendbox-exec" }
 sendbox-git = { path = "../sendbox-git" }
+sendbox-governance = { path = "../sendbox-governance" }
 sendbox-mcp = { path = "../sendbox-mcp" }
 sendbox-policy = { path = "../sendbox-policy" }
 sendbox-registry = { path = "../sendbox-registry" }
@@ -33,6 +35,7 @@ sendbox-security = { path = "../sendbox-security" }
 sendbox-session-security = { path = "../sendbox-session-security" }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 sendbox-config = { path = "../sendbox-config" }
 sendbox-core = { path = "../sendbox-core" }
+sendbox-governance = { path = "../sendbox-governance" }
 sendbox-security = { path = "../sendbox-security" }
 serde.workspace = true
 serde_json.workspace = true
