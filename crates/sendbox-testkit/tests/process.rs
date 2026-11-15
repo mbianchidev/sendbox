@@ -445,10 +445,55 @@ async fn named_program_resolver_must_return_an_absolute_path() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn cancellation_kills_child_processes_in_the_same_group() {
+async fn read_child_pid(
+    process: &mut sendbox_runtime::RunningProcess,
+    cancellation: &CancellationToken,
+) -> i32 {
+    let mut subscription = process
+        .take_output_subscription()
+        .expect("output subscription");
+    let mut child_pid_bytes = Vec::new();
+    while !child_pid_bytes.contains(&b'\n') {
+        let event = tokio::time::timeout(Duration::from_secs(5), subscription.next(cancellation))
+            .await
+            .expect("child pid output timeout")
+            .expect("child pid output")
+            .expect("child pid event");
+        if let OutputEvent::Data {
+            stream: OutputStream::Stdout,
+            bytes,
+            ..
+        } = event
+        {
+            child_pid_bytes.extend(bytes);
+        }
+    }
+    String::from_utf8(child_pid_bytes)
+        .expect("child pid UTF-8")
+        .trim()
+        .parse::<i32>()
+        .expect("child pid")
+}
+
+#[cfg(unix)]
+async fn assert_process_exits(pid: i32) {
     use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match kill(Pid::from_raw(pid), None) {
+            Err(Errno::ESRCH) => break,
+            Ok(()) | Err(Errno::EPERM) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => panic!("process {pid} survived process group cleanup: {result:?}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_kills_child_processes_in_the_same_group() {
     let cancellation = CancellationToken::new();
     let mut process = runner()
         .spawn(
@@ -462,30 +507,7 @@ async fn cancellation_kills_child_processes_in_the_same_group() {
         )
         .await
         .expect("spawn process group");
-    let mut subscription = process
-        .take_output_subscription()
-        .expect("output subscription");
-    let mut child_pid_bytes = Vec::new();
-    while !child_pid_bytes.contains(&b'\n') {
-        let event = tokio::time::timeout(Duration::from_secs(5), subscription.next(&cancellation))
-            .await
-            .expect("child pid output timeout")
-            .expect("child pid output")
-            .expect("child pid event");
-        if let OutputEvent::Data {
-            stream: OutputStream::Stdout,
-            bytes,
-            ..
-        } = event
-        {
-            child_pid_bytes.extend(bytes);
-        }
-    }
-    let child_pid = String::from_utf8(child_pid_bytes)
-        .expect("child pid UTF-8")
-        .trim()
-        .parse::<i32>()
-        .expect("child pid");
+    let child_pid = read_child_pid(&mut process, &cancellation).await;
     cancellation.cancel();
     let outcome = process
         .wait(&cancellation)
@@ -493,23 +515,39 @@ async fn cancellation_kills_child_processes_in_the_same_group() {
         .expect("cancel process group");
     assert_eq!(outcome.termination, TerminationReason::Cancelled);
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match kill(Pid::from_raw(child_pid), None) {
-            Err(Errno::ESRCH) => break,
-            Ok(()) | Err(Errno::EPERM) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            result => panic!("child process {child_pid} survived group cleanup: {result:?}"),
-        }
-    }
+    assert_process_exits(child_pid).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_kills_group_members_that_outlive_the_leader() {
+    let cancellation = CancellationToken::new();
+    let mut process = runner()
+        .spawn(
+            fixture_command("spawn-term-ignoring-child", ["5000".to_owned()]),
+            ProcessOptions {
+                termination_grace: Duration::from_secs(2),
+                output_channel_capacity: 4,
+                ..ProcessOptions::default()
+            },
+            &cancellation,
+        )
+        .await
+        .expect("spawn process group");
+    let child_pid = read_child_pid(&mut process, &cancellation).await;
+    cancellation.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(3), process.wait(&cancellation))
+        .await
+        .expect("a surviving group member must not hold the output pipes open")
+        .expect("cancel process group");
+    assert_eq!(outcome.termination, TerminationReason::Cancelled);
+
+    assert_process_exits(child_pid).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn dropping_running_process_synchronously_kills_its_process_group() {
-    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-
     let cancellation = CancellationToken::new();
     let mut process = runner()
         .spawn(
@@ -523,43 +561,11 @@ async fn dropping_running_process_synchronously_kills_its_process_group() {
         .await
         .expect("spawn process group");
     let parent_pid = i32::try_from(process.pid()).expect("parent pid");
-    let mut subscription = process
-        .take_output_subscription()
-        .expect("output subscription");
-    let mut child_pid_bytes = Vec::new();
-    while !child_pid_bytes.contains(&b'\n') {
-        let event = tokio::time::timeout(Duration::from_secs(5), subscription.next(&cancellation))
-            .await
-            .expect("child pid output timeout")
-            .expect("child pid output")
-            .expect("child pid event");
-        if let OutputEvent::Data {
-            stream: OutputStream::Stdout,
-            bytes,
-            ..
-        } = event
-        {
-            child_pid_bytes.extend(bytes);
-        }
-    }
-    let child_pid = String::from_utf8(child_pid_bytes)
-        .expect("child pid UTF-8")
-        .trim()
-        .parse::<i32>()
-        .expect("child pid");
+    let child_pid = read_child_pid(&mut process, &cancellation).await;
 
     drop(process);
 
     for pid in [parent_pid, child_pid] {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match kill(Pid::from_raw(pid), None) {
-                Err(Errno::ESRCH) => break,
-                Ok(()) | Err(Errno::EPERM) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                result => panic!("process {pid} survived RunningProcess drop: {result:?}"),
-            }
-        }
+        assert_process_exits(pid).await;
     }
 }
