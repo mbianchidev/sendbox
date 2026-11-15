@@ -124,7 +124,12 @@ pipe reads. Captures report total and truncated bytes.
 Unix children start in a new process group using the standard library
 `process_group(0)` configuration. Signals use the safe `nix::killpg` API.
 Cancellation and timeout send `SIGTERM`, wait the configured grace period, then
-send `SIGKILL` and reap. `RunningProcess::drop` directly sends `SIGKILL` to the
+send `SIGKILL` and reap. Once the leader is reaped, the runner sends `SIGKILL`
+to the group again, so a descendant that missed `SIGTERM` (for example one
+forked while the signal was in flight, which macOS can leave alive) cannot keep
+the output pipes open and stall the drain. `ESRCH` and macOS's `EPERM` for a
+group with only exiting members mean nothing is left to kill.
+`RunningProcess::drop` directly sends `SIGKILL` to the
 group synchronously as a last-resort fallback; it does not depend on an async
 command channel.
 

@@ -76,6 +76,20 @@ fn run() -> Result<(), String> {
             io::stdout().flush().map_err(|error| error.to_string())?;
             thread::sleep(Duration::from_millis(milliseconds));
         }
+        "spawn-term-ignoring-child" => {
+            let milliseconds = parse_u64(arguments.next(), "milliseconds")?;
+            // The child inherits stdout and stderr and reports its PID only after it ignores
+            // SIGTERM, so it outlives the leader while holding the output pipes open.
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(r#"trap '' TERM; echo "$$"; exec "$0" sleep "$1""#)
+                .arg(env::current_exe().map_err(|error| error.to_string())?)
+                .arg(milliseconds.to_string())
+                .stdin(Stdio::null())
+                .spawn()
+                .map_err(|error| error.to_string())?;
+            thread::sleep(Duration::from_millis(milliseconds));
+        }
         other => return Err(format!("unknown mode `{other}`")),
     }
     Ok(())

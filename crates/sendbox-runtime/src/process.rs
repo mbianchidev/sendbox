@@ -497,13 +497,15 @@ impl RunningProcess {
             .child
             .as_mut()
             .ok_or_else(|| RuntimeError::Provider("process was already reaped".to_owned()))?;
-        tokio::select! {
-            result = child.wait() => result.map_err(RuntimeError::Wait),
+        let status = tokio::select! {
+            result = child.wait() => result.map_err(RuntimeError::Wait)?,
             () = tokio::time::sleep(grace) => {
                 force_kill_process(Some(child), self.process_group)?;
-                child.wait().await.map_err(RuntimeError::Wait)
+                child.wait().await.map_err(RuntimeError::Wait)?
             }
-        }
+        };
+        kill_surviving_group_members(self.process_group)?;
+        Ok(status)
     }
 }
 
@@ -858,6 +860,30 @@ fn force_kill_process(
         .ok_or_else(|| RuntimeError::Provider("process was already reaped".to_owned()))?
         .start_kill()
         .map_err(RuntimeError::Wait)
+}
+
+/// A descendant forked while the group SIGTERM is in flight can miss it, outlive the
+/// leader, and keep the output pipes open. macOS reports EPERM when only exiting
+/// members remain, so that is treated like an already empty group.
+#[cfg(unix)]
+fn kill_surviving_group_members(process_group: Option<i32>) -> Result<(), RuntimeError> {
+    match send_process_group_signal(process_group, ProcessSignal::Kill) {
+        Err(RuntimeError::Signal { source, .. })
+            if matches!(
+                source.raw_os_error(),
+                Some(code) if code == nix::errno::Errno::ESRCH as i32
+                    || code == nix::errno::Errno::EPERM as i32
+            ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_surviving_group_members(_process_group: Option<i32>) -> Result<(), RuntimeError> {
+    Ok(())
 }
 
 #[cfg(unix)]
