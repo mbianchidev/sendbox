@@ -288,7 +288,8 @@ Features planned after core platform and agent support is solid.
 - [ ] OPA/Rego policy language support for complex rules
 - [x] Operator-signed governance profiles that projects can only narrow ([governed sessions](docs/architecture/governed-sessions.md), single host)
 - [x] Host-side brokered model provider credentials with leased, revocable grants (Anthropic, OpenAI)
-- [ ] Policy inheritance (org → team → project) with shared multi-user management (`sendbox-fleet`)
+- [x] Shared multi-user governance service with project-scoped roles, approved expiring exceptions, and central audit ([`sendbox-fleet`](https://github.com/mbianchidev/sendbox-fleet), [shared governance service](docs/architecture/governed-sessions.md#shared-governance-service))
+- [ ] Policy inheritance (org → team → project)
 - [ ] Policy testing framework
 - [ ] Community policy library
 
