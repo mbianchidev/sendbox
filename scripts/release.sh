@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export GIT_PAGER=cat
+export GIT_PAGER=cat GH_PAGER=cat
 
 usage() {
     printf 'Usage: %s VERSION\nSwitch to main, pull fast-forward-only, then create or resume a release.\n' \

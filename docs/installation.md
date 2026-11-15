@@ -252,8 +252,9 @@ Actions workflows. Cargo is also required when preparing a new version bump.
 For a new release, pass a stable `X.Y.Z` version greater than the version on
 `main`; a leading `v` is also accepted.
 
-Git pagers are disabled for the script and its subprocesses, so output never
-pauses for pager input.
+Git and GitHub CLI pagers are disabled for the script and its subprocesses, so
+output never pauses for pager input and the script exits on its own after
+printing the release URL.
 
 After its preflight safety checks, the script switches the invoking checkout
 to `main` and pulls `origin/main` with `--ff-only` before inspecting or resuming
