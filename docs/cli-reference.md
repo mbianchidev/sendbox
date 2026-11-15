@@ -73,12 +73,13 @@ See [network grants](configuration.md#network-grants).
 | `sign PROFILE --key PATH [--append]` | Sign the profile's exact bytes into `PROFILE.sig.json`; `--append` adds a threshold signature |
 | `verify [--governance-config PATH]` | Verify the active operator configuration, profile, and signatures |
 | `check --config PATH [--governance-config PATH] [--runtime apple\|kata] [--image IMAGE@sha256:DIGEST]` | List every violation of the active profile without starting a session |
+| `login [--governance-config PATH] [--identity-token-file PATH] [--ttl-seconds N] [--description TEXT]` | Exchange an identity-provider token (read from the file, stdin, or a prompt) with the configured shared governance service and store the returned service token in the host secret store |
 
 Each subcommand accepts `--json`. A governance failure or a rejected
 configuration exits with code `6`. `check` evaluates the local profile only;
 with a [shared governance service](architecture/governed-sessions.md#shared-governance-service),
-store your service token with `sendbox secrets add SENDBOX_FLEET_TOKEN` before
-`sendbox run`.
+run `sendbox governance login` (or `sendbox secrets add SENDBOX_FLEET_TOKEN`)
+before `sendbox run`.
 
 ## Examples
 

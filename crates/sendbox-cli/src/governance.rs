@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -10,8 +10,8 @@ use clap::{Args, Subcommand, ValueEnum};
 use sendbox_config::SandboxConfiguration;
 use sendbox_governance::{GovernanceProfile, RuntimeKind};
 use sendbox_host::governance::{
-    GovernanceCheckRequest, MANAGED_CONFIGURATION_PATH, SIGNATURES_FORMAT, check,
-    encode_signatures, verify_active,
+    FleetLoginRequest, GovernanceCheckRequest, MANAGED_CONFIGURATION_PATH, SIGNATURES_FORMAT,
+    check, encode_signatures, fleet_login, verify_active,
 };
 use sendbox_security::provenance::{
     DetachedSignature, SignedSubject, SigningKeyMaterial, SubjectKind,
@@ -37,6 +37,9 @@ enum GovernanceCommand {
     Verify(VerifyArgs),
     /// Explain whether a project configuration fits the active profile.
     Check(CheckArgs),
+    /// Exchange an identity-provider token for a shared governance service
+    /// token and store it in the host secret store.
+    Login(LoginArgs),
 }
 
 #[derive(Debug, Args)]
@@ -78,6 +81,24 @@ struct VerifyArgs {
     /// configuration when one exists.
     #[arg(long, value_name = "PATH")]
     governance_config: Option<PathBuf>,
+    #[arg(long, help = "Emit a deterministic JSON result")]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LoginArgs {
+    #[arg(long, value_name = "PATH")]
+    governance_config: Option<PathBuf>,
+    /// File holding the identity-provider token (for example an OIDC ID
+    /// token). Without it the token is read from stdin, or prompted for on a
+    /// terminal.
+    #[arg(long, value_name = "PATH")]
+    identity_token_file: Option<PathBuf>,
+    /// Requested lifetime; the service caps it.
+    #[arg(long, value_name = "SECONDS")]
+    ttl_seconds: Option<u64>,
+    #[arg(long)]
+    description: Option<String>,
     #[arg(long, help = "Emit a deterministic JSON result")]
     json: bool,
 }
@@ -148,6 +169,7 @@ pub(crate) fn execute(arguments: GovernanceArgs) -> ExitCode {
         GovernanceCommand::Sign(arguments) => (arguments.json, sign(&arguments)),
         GovernanceCommand::Verify(arguments) => (arguments.json, verify(&arguments)),
         GovernanceCommand::Check(arguments) => (arguments.json, check_configuration(&arguments)),
+        GovernanceCommand::Login(arguments) => (arguments.json, login(arguments)),
     };
     match result {
         Ok(code) => code,
@@ -331,6 +353,81 @@ fn sign(arguments: &SignArgs) -> CommandResult {
             reference.sha256,
             output.display(),
             signatures.len()
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+const MAX_IDENTITY_TOKEN_BYTES: u64 = 16 * 1024;
+
+fn read_identity_token(path: Option<&Path>) -> Result<Zeroizing<String>, (u8, String)> {
+    let mut text = Zeroizing::new(String::new());
+    match path {
+        Some(path) => {
+            fs::File::open(path)
+                .and_then(|file| {
+                    file.take(MAX_IDENTITY_TOKEN_BYTES + 1)
+                        .read_to_string(&mut text)
+                })
+                .map_err(|error| invalid(format!("read {}: {error}", path.display())))?;
+        }
+        None if !std::io::stdin().is_terminal() => {
+            std::io::stdin()
+                .take(MAX_IDENTITY_TOKEN_BYTES + 1)
+                .read_to_string(&mut text)
+                .map_err(|error| invalid(format!("read the identity token from stdin: {error}")))?;
+        }
+        None => {
+            text = Zeroizing::new(
+                rpassword::prompt_password("Identity token: ")
+                    .map_err(|error| invalid(format!("read the identity token: {error}")))?,
+            );
+        }
+    }
+    if text.len() as u64 > MAX_IDENTITY_TOKEN_BYTES {
+        return Err(invalid(format!(
+            "the identity token exceeds {MAX_IDENTITY_TOKEN_BYTES} bytes"
+        )));
+    }
+    let trimmed = Zeroizing::new(text.trim().to_owned());
+    if trimmed.is_empty() {
+        return Err(invalid("the identity token is empty"));
+    }
+    Ok(trimmed)
+}
+
+fn login(arguments: LoginArgs) -> CommandResult {
+    let token = read_identity_token(arguments.identity_token_file.as_deref())?;
+    let identity_token =
+        sendbox_secrets::SecretValue::new(token.as_bytes().to_vec()).map_err(invalid)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| invalid(format!("start the async runtime: {error}")))?;
+    let report = runtime
+        .block_on(fleet_login(FleetLoginRequest {
+            managed_path: PathBuf::from(MANAGED_CONFIGURATION_PATH),
+            governance_config: arguments.governance_config,
+            identity_token,
+            ttl_seconds: arguments.ttl_seconds,
+            description: arguments.description,
+        }))
+        .map_err(governance)?;
+    if arguments.json {
+        print_json(&serde_json::json!({
+            "schema_version": sendbox_core::CONFIG_SCHEMA_VERSION,
+            "ok": true,
+            "login": report,
+        }));
+    } else {
+        println!(
+            "logged in to {} ({}) as {}; token {} stored in host secret {} until {} (Unix seconds)",
+            report.url,
+            report.authority,
+            report.principal,
+            report.token_id,
+            report.secret,
+            report.expires_at_unix
         );
     }
     Ok(ExitCode::SUCCESS)

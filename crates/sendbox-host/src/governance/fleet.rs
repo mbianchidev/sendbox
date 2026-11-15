@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use reqwest::{Method, StatusCode, Url, header};
 use sendbox_governance::api::{
-    CallerIdentity, ExceptionList, RevokeGrantRequest, SessionAdmission, SessionAdmissionRequest,
-    SessionEnd, SessionOutcome,
+    CallerIdentity, ExceptionList, IssuedToken, RequestOutcomeReport, RevokeGrantRequest,
+    SessionAdmission, SessionAdmissionRequest, SessionEnd, SessionOutcome, TokenRequest,
 };
 use sendbox_governance::{
     AuthorityFuture, CredentialGrant, Decision, DenyReason, GovernanceBinding, GovernanceError,
@@ -259,6 +259,32 @@ impl FleetClient {
     }
 }
 
+impl FleetClient {
+    /// Exchanges the identity-provider token this client was built with for a
+    /// service token.
+    pub(crate) async fn exchange(&self, request: &TokenRequest) -> Result<IssuedToken, FleetError> {
+        self.call_required(Method::POST, "/v1/tokens", &[], Some(request))
+            .await
+    }
+
+    /// Reports how one brokered stream ended so the central audit can
+    /// correlate it with the authorization decision.
+    pub(crate) async fn report_outcome(
+        &self,
+        grant: &GrantId,
+        report: &RequestOutcomeReport,
+    ) -> Result<(), FleetError> {
+        self.call::<serde_json::Value>(
+            Method::POST,
+            &format!("/v1/grants/{grant}:outcome"),
+            &[],
+            Some(report),
+        )
+        .await
+        .map(drop)
+    }
+}
+
 /// The shared service as the session's grant authority.
 pub(crate) struct FleetGrantAuthority {
     client: std::sync::Arc<FleetClient>,
@@ -398,12 +424,12 @@ mod erased {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
 
-    use sendbox_governance::api::{CallerKind, SessionOutcome};
+    use sendbox_governance::api::{CallerKind, IssuedToken, SessionOutcome};
     use sendbox_governance::{
         ExceptionId, ExceptionKind, ExceptionScope, ExceptionStatus, PrincipalId, ProfileRef,
         ServiceId, Sha256Digest,
@@ -418,21 +444,21 @@ mod tests {
     };
     use super::*;
 
-    const TOKEN: &str = "sbf_synthetic-test-token";
+    pub(crate) const TOKEN: &str = "sbf_synthetic-test-token";
     const ALICE: &str = "oidc:alice@example.com";
 
     #[derive(Debug, Clone)]
-    struct Recorded {
-        method: String,
-        target: String,
-        authorization: Option<String>,
-        body: Vec<u8>,
+    pub(crate) struct Recorded {
+        pub(crate) method: String,
+        pub(crate) target: String,
+        pub(crate) authorization: Option<String>,
+        pub(crate) body: Vec<u8>,
     }
 
-    type Handler = dyn Fn(&Recorded) -> (u16, String) + Send + Sync;
+    pub(crate) type Handler = dyn Fn(&Recorded) -> (u16, String) + Send + Sync;
 
     /// A loopback HTTP/1.1 stand-in for the governance service.
-    async fn serve(handler: Arc<Handler>) -> (SocketAddr, Arc<Mutex<Vec<Recorded>>>) {
+    pub(crate) async fn serve(handler: Arc<Handler>) -> (SocketAddr, Arc<Mutex<Vec<Recorded>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -513,6 +539,14 @@ mod tests {
             "{}denials:\n  domains: [gist.github.com, pastebin.com]\nexceptions:\n  max_ttl_seconds: 3600\n  domains: [gist.github.com]\n",
             brokered_profile()
         )
+    }
+
+    pub(crate) fn settings(address: SocketAddr) -> FleetSettings {
+        FleetSettings {
+            url: format!("http://{address}"),
+            token_secret: DEFAULT_FLEET_TOKEN_SECRET.to_owned(),
+            timeout_seconds: 5,
+        }
     }
 
     fn use_fleet(fixture: &Fixture, address: SocketAddr) {
@@ -790,5 +824,152 @@ mod tests {
             .await
             .expect_err("mismatched admission");
         assert!(error.detail.contains("different session or binding"));
+    }
+
+    /// A writable in-memory secret store.
+    struct MemoryStore(Mutex<BTreeMap<String, Vec<u8>>>);
+
+    impl MemoryStore {
+        fn metadata(name: &sendbox_secrets::SecretName) -> sendbox_secrets::SecretMetadata {
+            sendbox_secrets::SecretMetadata {
+                name: name.clone(),
+                created_at_unix_ms: 0,
+                updated_at_unix_ms: 0,
+                version: sendbox_secrets::RecordVersion::V1,
+            }
+        }
+    }
+
+    impl SecretStore for MemoryStore {
+        fn store(
+            &self,
+            name: &sendbox_secrets::SecretName,
+            value: SecretValue,
+        ) -> Result<sendbox_secrets::SecretMetadata, sendbox_secrets::SecretStoreError> {
+            let mut values = self.0.lock().unwrap();
+            if values.contains_key(name.as_str()) {
+                return Err(sendbox_secrets::SecretStoreError::AlreadyExists(
+                    name.clone(),
+                ));
+            }
+            values.insert(name.as_str().to_owned(), value.expose_secret().to_vec());
+            Ok(Self::metadata(name))
+        }
+        fn update(
+            &self,
+            name: &sendbox_secrets::SecretName,
+            value: SecretValue,
+        ) -> Result<sendbox_secrets::SecretMetadata, sendbox_secrets::SecretStoreError> {
+            let mut values = self.0.lock().unwrap();
+            let slot = values
+                .get_mut(name.as_str())
+                .ok_or_else(|| sendbox_secrets::SecretStoreError::NotFound(name.clone()))?;
+            *slot = value.expose_secret().to_vec();
+            Ok(Self::metadata(name))
+        }
+        fn retrieve(
+            &self,
+            name: &sendbox_secrets::SecretName,
+        ) -> Result<sendbox_secrets::Secret, sendbox_secrets::SecretStoreError> {
+            let values = self.0.lock().unwrap();
+            let value = values
+                .get(name.as_str())
+                .ok_or_else(|| sendbox_secrets::SecretStoreError::NotFound(name.clone()))?;
+            Ok(sendbox_secrets::Secret {
+                metadata: Self::metadata(name),
+                value: SecretValue::new(value.clone())?,
+            })
+        }
+        fn delete(
+            &self,
+            _: &sendbox_secrets::SecretName,
+        ) -> Result<(), sendbox_secrets::SecretStoreError> {
+            Err(sendbox_secrets::SecretStoreError::AccessDenied)
+        }
+        fn list(
+            &self,
+        ) -> Result<Vec<sendbox_secrets::SecretMetadata>, sendbox_secrets::SecretStoreError>
+        {
+            Err(sendbox_secrets::SecretStoreError::AccessDenied)
+        }
+        fn exists(
+            &self,
+            name: &sendbox_secrets::SecretName,
+        ) -> Result<bool, sendbox_secrets::SecretStoreError> {
+            Ok(self.0.lock().unwrap().contains_key(name.as_str()))
+        }
+        fn migrate(
+            &self,
+            _: &sendbox_secrets::SecretName,
+        ) -> Result<sendbox_secrets::SecretMetadata, sendbox_secrets::SecretStoreError> {
+            Err(sendbox_secrets::SecretStoreError::AccessDenied)
+        }
+    }
+
+    #[tokio::test]
+    async fn login_exchanges_the_identity_token_and_stores_the_service_token() {
+        if !protected_test_tree() {
+            return;
+        }
+        const ID_TOKEN: &str = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
+        let issued = std::sync::atomic::AtomicU8::new(0);
+        let handler: Arc<Handler> = Arc::new(move |request: &Recorded| {
+            match (request.method.as_str(), request.target.as_str()) {
+                ("POST", "/v1/tokens")
+                    if request.authorization.as_deref() == Some(&format!("Bearer {ID_TOKEN}")) =>
+                {
+                    let round = issued.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        201,
+                        json(&IssuedToken {
+                            id: "ab".repeat(16),
+                            token: format!("sbf_issued-{round}"),
+                            principal: PrincipalId::new(ALICE).unwrap(),
+                            expires_at_unix: 99,
+                        }),
+                    )
+                }
+                _ => (
+                    401,
+                    r#"{"detail":"bearer token was not accepted"}"#.to_owned(),
+                ),
+            }
+        });
+        let (address, recorded) = serve(handler).await;
+        let fixture = fixture(&fleet_profile(), 1);
+        let store = Arc::new(MemoryStore(Mutex::new(BTreeMap::new())));
+        let opener = {
+            let store = Arc::clone(&store);
+            move || -> Result<Arc<dyn SecretStore>, HostError> { Ok(store.clone()) }
+        };
+        let request = || super::super::FleetLoginRequest {
+            managed_path: fixture.directory.path().join("absent-managed.yaml"),
+            governance_config: Some(fixture.source.path.clone()),
+            identity_token: SecretValue::try_from(ID_TOKEN).unwrap(),
+            ttl_seconds: Some(3_600),
+            description: Some("laptop".to_owned()),
+        };
+        let error = super::super::fleet_login_with(request(), &opener)
+            .await
+            .expect_err("no fleet section");
+        assert!(error.to_string().contains("no `fleet` section"), "{error}");
+
+        use_fleet(&fixture, address);
+        for round in 0..2 {
+            let report = super::super::fleet_login_with(request(), &opener)
+                .await
+                .expect("login");
+            assert_eq!(report.principal, ALICE);
+            assert_eq!(report.secret, DEFAULT_FLEET_TOKEN_SECRET);
+            let stored = store.0.lock().unwrap()[DEFAULT_FLEET_TOKEN_SECRET].clone();
+            assert_eq!(stored, format!("sbf_issued-{round}").into_bytes());
+            assert!(!format!("{report:?}").contains("sbf_issued"));
+        }
+        let requests = recorded.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].body,
+            br#"{"ttl_seconds":3600,"description":"laptop"}"#
+        );
     }
 }
