@@ -594,6 +594,82 @@ pub fn verify_active(
     }))
 }
 
+/// Inputs for `sendbox governance login`.
+pub struct FleetLoginRequest {
+    pub managed_path: PathBuf,
+    pub governance_config: Option<PathBuf>,
+    /// The identity-provider token (for example an OIDC ID token) to exchange.
+    pub identity_token: sendbox_secrets::SecretValue,
+    pub ttl_seconds: Option<u64>,
+    pub description: Option<String>,
+}
+
+/// What `sendbox governance login` stored.
+#[derive(Debug, Clone, Serialize)]
+pub struct FleetLoginReport {
+    pub authority: String,
+    pub url: String,
+    pub principal: String,
+    pub token_id: String,
+    pub expires_at_unix: u64,
+    pub secret: String,
+}
+
+/// Exchanges an identity-provider token with the configured shared
+/// governance service and stores the returned service token in the host
+/// secret store under the operator's `fleet.token_secret`. The service URL
+/// comes only from the verified operator configuration.
+pub async fn fleet_login(request: FleetLoginRequest) -> Result<FleetLoginReport, HostError> {
+    fleet_login_with(request, &crate::native_secret_store).await
+}
+
+async fn fleet_login_with(
+    request: FleetLoginRequest,
+    open_secrets: SecretStoreOpener<'_>,
+) -> Result<FleetLoginReport, HostError> {
+    let Some(ActiveGovernance { operator, .. }) =
+        verify_active(&request.managed_path, request.governance_config.as_deref())?
+    else {
+        return Err(HostError::Governance(
+            "no governance configuration is active; select one with --governance-config".to_owned(),
+        ));
+    };
+    let settings = operator.fleet.as_ref().ok_or_else(|| {
+        HostError::Governance(
+            "the operator configuration has no `fleet` section; login applies only to a shared governance service"
+                .to_owned(),
+        )
+    })?;
+    let client = fleet::FleetClient::new(settings, &request.identity_token)?;
+    let mut issued = client
+        .exchange(&sendbox_governance::api::TokenRequest {
+            ttl_seconds: request.ttl_seconds,
+            description: request.description,
+        })
+        .await?;
+    let token = sendbox_secrets::SecretValue::new(std::mem::take(&mut issued.token).into_bytes())?;
+    fleet::FleetClient::new(settings, &token)?;
+    let name = SecretName::new(settings.token_secret.clone())?;
+    let store = open_secrets()?;
+    let exists = store
+        .exists(&name)
+        .map_err(|error| HostError::Governance(format!("read host secret `{name}`: {error}")))?;
+    if exists {
+        store.update(&name, token)
+    } else {
+        store.store(&name, token)
+    }
+    .map_err(|error| HostError::Governance(format!("store host secret `{name}`: {error}")))?;
+    Ok(FleetLoginReport {
+        authority: operator.authority.clone(),
+        url: settings.url.clone(),
+        principal: issued.principal.to_string(),
+        token_id: issued.id,
+        expires_at_unix: issued.expires_at_unix,
+        secret: settings.token_secret.clone(),
+    })
+}
+
 /// Inputs for `sendbox governance check`.
 #[derive(Debug, Clone)]
 pub struct GovernanceCheckRequest {

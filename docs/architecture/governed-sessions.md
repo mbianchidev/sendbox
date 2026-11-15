@@ -332,6 +332,7 @@ Records join the existing signed session audit chain:
 | `credential.request.allowed`, `.denied` | each authorization decision |
 | `credential.request.outcome` | each stream ends, with status, byte counts, duration, and outcome |
 | `governance.exception.expired` | a lifted exception expired and the session was stopped |
+| `credential.request.outcome_report_failed` | a stream outcome could not be reported to the shared service |
 
 Each record carries principal, project, session, authority, profile id,
 revision and digest, effective policy digest, and binding digest. The
@@ -364,10 +365,20 @@ sequenceDiagram
   H->>F: POST /v1/sessions/{id}:end (revokes remaining grants)
 ```
 
-- **Authentication.** The caller stores their bearer token in the host
-  secret store (`sendbox secrets add SENDBOX_FLEET_TOKEN`, or the name in
-  `token_secret`). It is sent only to the configured URL, redirects are never
-  followed, system proxies are ignored, and it can never be a workload secret.
+- **Authentication.** The caller stores a service token in the host secret
+  store under `token_secret` (default `SENDBOX_FLEET_TOKEN`). With an
+  identity provider, `sendbox governance login` exchanges an OIDC token for a
+  short-lived service token and stores it:
+
+  ```bash
+  my-idp print-id-token | sendbox governance login   # or --identity-token-file PATH
+  ```
+
+  The service URL comes only from the verified operator configuration.
+  Tokens can also be issued by the service operator and added with
+  `sendbox secrets add SENDBOX_FLEET_TOKEN`. A token is sent only to the
+  configured URL, redirects are never followed, system proxies are ignored,
+  and it can never be a workload secret.
 - **Identity.** The authenticated principal, not the local account, is the
   session principal. The service refuses a binding whose principal is not the
   caller, so a host cannot claim another identity.
@@ -378,6 +389,12 @@ sequenceDiagram
   authorized by the service; any non-200 answer, timeout, or unreachable
   service denies with `authority_unavailable`. Nothing falls back to the
   local authority or to credential delivery.
+- **Outcomes.** When a brokered stream ends, the host reports its redacted
+  outcome (`succeeded`, `failed`, or `unknown` when a stream was cut after
+  reaching the provider) to the service, which records it in the central
+  audit. Reports are sent in order and flushed before grants are revoked; a
+  report that fails is recorded as `credential.request.outcome_report_failed`
+  in the session audit, which keeps the authoritative local record.
 - **End.** After the workload ends, the host revokes its grants and ends the
   session on the service, which revokes any grant still live.
 

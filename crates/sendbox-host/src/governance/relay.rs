@@ -9,9 +9,10 @@ use std::time::Duration;
 use sendbox_agent::{AgentError, BoxFuture, CredentialRelayHandler, CredentialRelayOutbound};
 use sendbox_credentials::relay::{
     RelayAuditEvent, RelayAuditSink, RelayAuthorization, RelayAuthorizer, RelayEndpoint,
-    RelayFuture, RelayLimits, RelayOutbound, RelayService,
+    RelayFuture, RelayLimits, RelayOutbound, RelayService, RelayStreamOutcome,
 };
 use sendbox_credentials::{CredentialBrokerError, PinnedHttpsTransport, SecretResolver};
+use sendbox_governance::api::{ReportedOutcome, RequestOutcomeReport};
 use sendbox_governance::profile::CredentialServiceProfile;
 use sendbox_governance::{
     CredentialGrant, Decision, GrantAuthority, GrantId, GrantRequest, LocalAuthorityLimits,
@@ -23,8 +24,12 @@ use sendbox_security::audit::{AuditCategory, AuditResult};
 use sendbox_session_security::AuditRecorder;
 use tokio::task::JoinHandle;
 
+use super::fleet::FleetClient;
 use super::{GovernedRun, operator::OperatorRevisionSource, record_audit};
 use crate::HostError;
+
+/// Longest the relay waits for queued outcome reports at session end.
+const OUTCOME_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Provider credentials resolved from the host secret store before the
 /// session starts. They are held only in this process.
@@ -120,11 +125,113 @@ impl RelayAuthorizer for GrantAuthorizer {
     }
 }
 
-/// Writes relay evidence into the signed session audit chain.
+enum OutcomeMessage {
+    Report(GrantId, RequestOutcomeReport),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Sends stream outcomes to a shared governance service in order. A failed
+/// report is recorded in the session audit; the local record stays
+/// authoritative.
+struct OutcomeReporter {
+    sender: tokio::sync::mpsc::UnboundedSender<OutcomeMessage>,
+    grants: BTreeMap<String, GrantId>,
+    task: JoinHandle<()>,
+}
+
+impl OutcomeReporter {
+    fn start(
+        client: Arc<FleetClient>,
+        grants: BTreeMap<String, GrantId>,
+        audit: AuditRecorder,
+        metadata: BTreeMap<String, String>,
+        failed: Arc<AtomicBool>,
+    ) -> Self {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    OutcomeMessage::Report(grant, report) => {
+                        if let Err(error) = client.report_outcome(&grant, &report).await {
+                            eprintln!(
+                                "sendbox: reporting a credential request outcome to the governance service failed: {error}"
+                            );
+                            let mut metadata = metadata.clone();
+                            metadata.extend([
+                                ("grant".to_owned(), grant.to_string()),
+                                ("outcome".to_owned(), report.outcome.code().to_owned()),
+                                ("error".to_owned(), error.to_string()),
+                            ]);
+                            if record_audit(
+                                &audit,
+                                AuditCategory::Secret,
+                                "credential.request.outcome_report_failed",
+                                report.service.as_str(),
+                                AuditResult::Error,
+                                metadata,
+                            )
+                            .is_err()
+                            {
+                                failed.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    OutcomeMessage::Flush(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        Self {
+            sender,
+            grants,
+            task,
+        }
+    }
+
+    fn report(&self, report: RequestOutcomeReport) {
+        let Some(grant) = self.grants.get(report.service.as_str()) else {
+            return;
+        };
+        if self
+            .sender
+            .send(OutcomeMessage::Report(grant.clone(), report))
+            .is_err()
+        {
+            eprintln!("sendbox: the outcome reporter stopped before the session ended");
+        }
+    }
+
+    /// Waits until every queued report was attempted, then stops the task.
+    async fn finish(&self) -> bool {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        let flushed = self.sender.send(OutcomeMessage::Flush(done)).is_ok()
+            && tokio::time::timeout(OUTCOME_FLUSH_TIMEOUT, wait)
+                .await
+                .is_ok_and(|result| result.is_ok());
+        self.task.abort();
+        flushed
+    }
+}
+
+/// Maps a relay stream outcome to the central audit vocabulary.
+fn reported_outcome(outcome: RelayStreamOutcome) -> ReportedOutcome {
+    match outcome {
+        RelayStreamOutcome::Complete => ReportedOutcome::Succeeded,
+        RelayStreamOutcome::AbortedUncertain => ReportedOutcome::Unknown,
+        RelayStreamOutcome::Denied | RelayStreamOutcome::Failed | RelayStreamOutcome::Aborted => {
+            ReportedOutcome::Failed
+        }
+    }
+}
+
+/// Writes relay evidence into the signed session audit chain and, with a
+/// shared governance service, reports stream outcomes to it.
 struct RelayAudit {
     audit: AuditRecorder,
     metadata: BTreeMap<String, String>,
     failed: Arc<AtomicBool>,
+    reporter: Option<Arc<OutcomeReporter>>,
 }
 
 impl RelayAuditSink for RelayAudit {
@@ -172,6 +279,24 @@ impl RelayAuditSink for RelayAudit {
                 response_bytes,
                 duration_ms,
             } => {
+                if let (Some(reporter), Ok(service_id)) =
+                    (&self.reporter, ServiceId::new(service.clone()))
+                {
+                    let report = RequestOutcomeReport {
+                        service: service_id,
+                        method: method.clone(),
+                        path: path.clone(),
+                        outcome: reported_outcome(outcome),
+                        reason: reason.to_owned(),
+                        status,
+                        request_bytes,
+                        response_bytes,
+                        duration_ms,
+                    };
+                    if report.validate().is_ok() {
+                        reporter.report(report);
+                    }
+                }
                 metadata.extend([
                     ("stream".to_owned(), stream.to_string()),
                     ("service".to_owned(), service.clone()),
@@ -187,10 +312,8 @@ impl RelayAuditSink for RelayAudit {
                     metadata.insert("upstream_status".to_owned(), status.to_string());
                 }
                 let result = match outcome {
-                    sendbox_credentials::relay::RelayStreamOutcome::Complete => {
-                        AuditResult::Success
-                    }
-                    sendbox_credentials::relay::RelayStreamOutcome::Denied => AuditResult::Denied,
+                    RelayStreamOutcome::Complete => AuditResult::Success,
+                    RelayStreamOutcome::Denied => AuditResult::Denied,
                     _ => AuditResult::Error,
                 };
                 ("credential.request.outcome", result, service)
@@ -235,6 +358,7 @@ pub(crate) struct HostCredentialRelay {
     lease: Duration,
     revocation_grace: Duration,
     finished: AtomicBool,
+    reporter: Option<Arc<OutcomeReporter>>,
 }
 
 impl HostCredentialRelay {
@@ -322,6 +446,15 @@ impl HostCredentialRelay {
             .map(RelayService::from_profile)
             .collect::<Result<Vec<_>, _>>()?;
         let audit_failed = Arc::new(AtomicBool::new(false));
+        let reporter = run.session.fleet.as_ref().map(|client| {
+            Arc::new(OutcomeReporter::start(
+                Arc::clone(client),
+                grant_ids.clone(),
+                audit.clone(),
+                metadata.clone(),
+                Arc::clone(&audit_failed),
+            ))
+        });
         let endpoint = RelayEndpoint::new(
             relay_services,
             Arc::new(GrantAuthorizer {
@@ -349,6 +482,7 @@ impl HostCredentialRelay {
                 audit: audit.clone(),
                 metadata: metadata.clone(),
                 failed: Arc::clone(&audit_failed),
+                reporter: reporter.clone(),
             }),
             RelayLimits {
                 max_streams: usize::try_from(limits.max_concurrent_streams).unwrap_or(1),
@@ -366,6 +500,7 @@ impl HostCredentialRelay {
             lease: Duration::from_secs(limits.lease_seconds),
             revocation_grace: Duration::from_secs(limits.revocation_grace_seconds),
             finished: AtomicBool::new(false),
+            reporter,
         })
     }
 
@@ -451,6 +586,13 @@ impl HostCredentialRelay {
         }
         self.stop_renewal();
         self.endpoint.close(Duration::ZERO).await;
+        if let Some(reporter) = &self.reporter
+            && !reporter.finish().await
+        {
+            eprintln!(
+                "sendbox: some credential request outcomes were not reported to the governance service; the session audit keeps them"
+            );
+        }
         let mut failures = Vec::new();
         for grant in &self.grants {
             let mut metadata = self.metadata.clone();
@@ -512,7 +654,7 @@ impl CredentialRelayHandler for HostCredentialRelay {
 #[cfg(test)]
 mod tests {
     use sendbox_core::SessionId;
-    use sendbox_secrets::CredentialMasker;
+    use sendbox_secrets::{CredentialMasker, SecretValue};
 
     use super::super::operator::tests::{fixture, protected_test_tree};
     use super::super::tests::{FakeStore, admitted_run, brokered_profile, configuration};
@@ -613,5 +755,84 @@ mod tests {
             assert!(!serialized.contains(ANTHROPIC_KEY) && !serialized.contains(OPENAI_KEY));
         }
         assert_eq!(records[2].event.metadata["reason"], "session_completed");
+    }
+
+    #[test]
+    fn stream_outcomes_map_to_the_central_vocabulary() {
+        assert_eq!(
+            reported_outcome(RelayStreamOutcome::Complete),
+            ReportedOutcome::Succeeded
+        );
+        assert_eq!(
+            reported_outcome(RelayStreamOutcome::AbortedUncertain),
+            ReportedOutcome::Unknown
+        );
+        for failed in [
+            RelayStreamOutcome::Denied,
+            RelayStreamOutcome::Failed,
+            RelayStreamOutcome::Aborted,
+        ] {
+            assert_eq!(reported_outcome(failed), ReportedOutcome::Failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn outcomes_are_reported_in_order_and_failed_reports_are_audited() {
+        use super::super::fleet::tests::{Handler, Recorded, TOKEN, serve, settings};
+        let handler: Arc<Handler> = Arc::new(|request: &Recorded| {
+            if String::from_utf8_lossy(&request.body).contains("/v1/fail") {
+                (503, r#"{"detail":"unavailable"}"#.to_owned())
+            } else {
+                (204, String::new())
+            }
+        });
+        let (address, recorded) = serve(handler).await;
+        let client = Arc::new(
+            FleetClient::new(&settings(address), &SecretValue::try_from(TOKEN).unwrap())
+                .expect("client"),
+        );
+        let audit = AuditRecorder::new(SessionId::from_bytes([7; 16])).expect("audit");
+        let grant = GrantId::from_bytes([3; 16]);
+        let failed = Arc::new(AtomicBool::new(false));
+        let reporter = OutcomeReporter::start(
+            client,
+            BTreeMap::from([("anthropic".to_owned(), grant.clone())]),
+            audit.clone(),
+            BTreeMap::from([("session".to_owned(), "s".to_owned())]),
+            Arc::clone(&failed),
+        );
+        let report = |path: &str, outcome| RequestOutcomeReport {
+            service: ServiceId::new("anthropic").unwrap(),
+            method: "POST".to_owned(),
+            path: path.to_owned(),
+            outcome,
+            reason: "complete".to_owned(),
+            status: Some(200),
+            request_bytes: 1,
+            response_bytes: 2,
+            duration_ms: 3,
+        };
+        reporter.report(report("/v1/messages", ReportedOutcome::Succeeded));
+        reporter.report(report("/v1/fail", ReportedOutcome::Unknown));
+        let mut unknown_service = report("/v1/messages", ReportedOutcome::Failed);
+        unknown_service.service = ServiceId::new("openai").unwrap();
+        reporter.report(unknown_service);
+        assert!(reporter.finish().await);
+
+        let requests = recorded.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "only granted services are reported");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.target == format!("/v1/grants/{grant}:outcome"))
+        );
+        let first: RequestOutcomeReport = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(first.path, "/v1/messages");
+        let records = audit.records().expect("records");
+        let failure = &records.last().expect("failure record").event;
+        assert_eq!(failure.action, "credential.request.outcome_report_failed");
+        assert_eq!(failure.metadata["outcome"], "unknown");
+        assert!(failure.metadata["error"].contains("503"));
+        assert!(!failed.load(Ordering::SeqCst));
     }
 }
