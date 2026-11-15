@@ -28,6 +28,7 @@ to a first run. Use this index for setup, operation, and implementation details.
 
 ## Security
 
+- [Reporting vulnerabilities](../SECURITY.md)
 - [Security model](security-model.md)
 - [Governed sessions and brokered credentials](architecture/governed-sessions.md)
 - [Egress enforcement trust boundary](security/egress-enforcement-trust-boundary.md)

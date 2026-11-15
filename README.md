@@ -348,6 +348,11 @@ for source setup, checks, and release procedures. The [roadmap](ROADMAP.md)
 includes future proposals and historical designs; use the CLI and runtime
 guides above for current behavior.
 
+## Security
+
+Report vulnerabilities privately as described in the
+[security policy](SECURITY.md). Only the latest release receives security fixes.
+
 ## License
 
 [Apache License 2.0](LICENSE).
