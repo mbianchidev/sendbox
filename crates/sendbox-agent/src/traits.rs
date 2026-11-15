@@ -1,6 +1,6 @@
-use std::{fmt, future::Future, pin::Pin};
+use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
-use sendbox_protocol::CapabilitySet;
+use sendbox_protocol::{CapabilitySet, Event};
 use sendbox_runtime::{CancellationToken, ControlStream, OutputStream};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -116,7 +116,27 @@ pub enum GuestEvent {
     TerminalInputCredit {
         credits: u16,
     },
+    /// A guest-to-host brokered credential relay event.
+    CredentialRelay(Event),
     Terminal(GuestTerminal),
+}
+
+/// Sends host-to-guest credential relay events on the authenticated channel.
+pub trait CredentialRelayOutbound: Send + Sync {
+    fn send(&self, event: Event) -> BoxFuture<'_, Result<(), AgentError>>;
+}
+
+/// Host endpoint for brokered credential requests from the guest relay.
+pub trait CredentialRelayHandler: Send + Sync {
+    /// Connects the handler to the running workload's channel.
+    fn attach(&self, outbound: Arc<dyn CredentialRelayOutbound>);
+
+    /// Accepts one guest relay event without blocking the event loop. An
+    /// error means the channel was misused and the run must fail.
+    fn handle(&self, event: Event) -> Result<(), AgentError>;
+
+    /// Stops accepting requests and ends in-flight streams after `grace`.
+    fn close(&self, grace: Duration) -> BoxFuture<'_, ()>;
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -179,6 +199,7 @@ pub struct GuestConnectionConfiguration {
     pub required_capabilities: CapabilitySet,
     pub safe_outputs_required: bool,
     pub syscall_tracing_required: bool,
+    pub credential_relay_required: bool,
     pub bootstrap_secret: Vec<u8>,
     pub policy_digest: [u8; 32],
 }
@@ -193,6 +214,7 @@ impl fmt::Debug for GuestConnectionConfiguration {
             .field("required_capabilities", &self.required_capabilities)
             .field("safe_outputs_required", &self.safe_outputs_required)
             .field("syscall_tracing_required", &self.syscall_tracing_required)
+            .field("credential_relay_required", &self.credential_relay_required)
             .field("bootstrap_secret", &"[REDACTED]")
             .field("policy_digest", &self.policy_digest)
             .finish()
@@ -273,6 +295,12 @@ pub trait GuestExecution: Send {
                 "this execution does not support syscall report retrieval".to_owned(),
             ))
         })
+    }
+
+    /// Returns the host-to-guest sender for credential relay events when the
+    /// guest proved a live relay during readiness.
+    fn credential_relay_outbound(&self) -> Option<Arc<dyn CredentialRelayOutbound>> {
+        None
     }
 
     /// Forwards one host terminal command to the guest.

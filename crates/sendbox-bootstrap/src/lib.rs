@@ -68,6 +68,7 @@ pub enum ServiceId {
     Audit,
     Bpf,
     SafeOutputs,
+    CredentialRelay,
 }
 
 impl ServiceId {
@@ -81,6 +82,7 @@ impl ServiceId {
             Self::Audit => "audit",
             Self::Bpf => "bpf",
             Self::SafeOutputs => "safe_outputs",
+            Self::CredentialRelay => "credential_relay",
         }
     }
 }
@@ -312,6 +314,84 @@ pub struct RegistryProxyConfiguration {
     pub credentials: Vec<RegistryCredential>,
 }
 
+pub const MAX_CREDENTIAL_RELAY_SERVICES: usize = 16;
+pub const MAX_CREDENTIAL_RELAY_STREAMS: u32 = 64;
+pub const MAX_CREDENTIAL_RELAY_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Guest relay listener for brokered credential services. It routes
+/// `/<service>/...` requests to the host broker and never carries a credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialRelayBootstrap {
+    pub port: u16,
+    pub services: Vec<String>,
+    pub max_streams: u32,
+    pub max_request_bytes: u64,
+}
+
+impl CredentialRelayBootstrap {
+    pub fn validate(&self) -> Result<(), BootstrapError> {
+        let invalid = |message: &str| Err(BootstrapError::Invalid(message.to_owned()));
+        if self.port == 0 {
+            return invalid("credential relay port must be non-zero");
+        }
+        let unique = self
+            .services
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if self.services.is_empty()
+            || self.services.len() > MAX_CREDENTIAL_RELAY_SERVICES
+            || unique.len() != self.services.len()
+            || !self.services.iter().all(|service| {
+                let bytes = service.as_bytes();
+                !bytes.is_empty()
+                    && bytes.len() <= 32
+                    && bytes[0].is_ascii_lowercase()
+                    && bytes.iter().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-'
+                    })
+            })
+        {
+            return invalid("credential relay services must be 1-16 unique service ids");
+        }
+        if !(1..=MAX_CREDENTIAL_RELAY_STREAMS).contains(&self.max_streams) {
+            return invalid("credential relay stream limit is out of range");
+        }
+        if !(1..=MAX_CREDENTIAL_RELAY_REQUEST_BYTES).contains(&self.max_request_bytes) {
+            return invalid("credential relay request limit is out of range");
+        }
+        Ok(())
+    }
+}
+
+fn validate_credential_relay(
+    relay: Option<&CredentialRelayBootstrap>,
+    egress: Option<&EgressRuntimePolicyDocument>,
+    has_broker: bool,
+) -> Result<(), BootstrapError> {
+    let egress_port = egress.and_then(|policy| policy.credential_relay_port);
+    match relay {
+        None if egress_port.is_some() => Err(BootstrapError::Invalid(
+            "egress admits a credential relay port without a relay".to_owned(),
+        )),
+        None => Ok(()),
+        Some(relay) => {
+            relay.validate()?;
+            if !has_broker {
+                return Err(BootstrapError::Invalid(
+                    "credential relay requires the authenticated execution broker".to_owned(),
+                ));
+            }
+            if egress.is_some() && egress_port != Some(relay.port) {
+                return Err(BootstrapError::Invalid(
+                    "credential relay port does not match the signed egress policy".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapDocumentConfiguration {
     pub session_id: SessionId,
@@ -328,6 +408,7 @@ pub struct BootstrapDocumentConfiguration {
     pub github_meta: Option<GitHubMetaSeed>,
     pub gateway_credentials: Vec<GatewayCredential>,
     pub registry_proxy: Option<RegistryProxyConfiguration>,
+    pub credential_relay: Option<CredentialRelayBootstrap>,
 }
 
 pub struct BootstrapDocument {
@@ -347,6 +428,7 @@ pub struct BootstrapDocument {
     pub github_meta: Option<GitHubMetaSeed>,
     pub gateway_credentials: Vec<GatewayCredential>,
     pub registry_proxy: Option<RegistryProxyConfiguration>,
+    pub credential_relay: Option<CredentialRelayBootstrap>,
 }
 
 #[derive(Debug, Error)]
@@ -389,6 +471,8 @@ struct BootstrapWire {
     gateway_credentials: Vec<GatewayCredential>,
     #[serde(default)]
     registry_proxy: Option<RegistryProxyConfiguration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_relay: Option<CredentialRelayBootstrap>,
 }
 
 struct SecretBytes(Zeroizing<[u8; 32]>);
@@ -493,6 +577,7 @@ pub fn encode_bootstrap_document(
         github_meta: configuration.github_meta,
         gateway_credentials: configuration.gateway_credentials,
         registry_proxy: configuration.registry_proxy,
+        credential_relay: configuration.credential_relay,
     };
     let encoded = serde_json::to_vec(&wire).map_err(BootstrapError::Encode)?;
     if encoded.len() > MAX_BOOTSTRAP_BYTES {
@@ -647,6 +732,11 @@ fn validate_configuration(
             .as_ref()
             .map(|broker| (broker.workload_uid, broker.workload_gid)),
     )?;
+    validate_credential_relay(
+        configuration.credential_relay.as_ref(),
+        configuration.egress_policy.as_ref(),
+        configuration.execution_broker.is_some(),
+    )?;
     Ok(())
 }
 
@@ -718,6 +808,11 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
             .as_ref()
             .map(|broker| (broker.workload_uid, broker.workload_gid)),
     )?;
+    validate_credential_relay(
+        wire.credential_relay.as_ref(),
+        wire.egress_policy.as_ref(),
+        wire.execution_broker.is_some(),
+    )?;
     let bootstrap_secret = BootstrapSecret::new(wire.bootstrap_secret.0.as_ref().to_vec())
         .map_err(|_| BootstrapError::Invalid("bootstrap secret is invalid".to_owned()))?;
     Ok(BootstrapDocument {
@@ -737,6 +832,7 @@ fn validate_wire(wire: BootstrapWire) -> Result<BootstrapDocument, BootstrapErro
         github_meta: wire.github_meta,
         gateway_credentials: wire.gateway_credentials,
         registry_proxy: wire.registry_proxy,
+        credential_relay: wire.credential_relay,
     })
 }
 
@@ -1187,7 +1283,57 @@ mod tests {
             github_meta: None,
             gateway_credentials: Vec::new(),
             registry_proxy: None,
+            credential_relay: None,
         }
+    }
+
+    #[test]
+    fn credential_relay_is_bounded_and_bound_to_the_signed_egress_port() {
+        let relay = CredentialRelayBootstrap {
+            port: 15_084,
+            services: vec!["anthropic".to_owned(), "openai".to_owned()],
+            max_streams: 8,
+            max_request_bytes: 8 * 1024 * 1024,
+        };
+        let mut config = configuration();
+        config.credential_relay = Some(relay.clone());
+        let encoded = encode_bootstrap_document(config, &[3; 32]).expect("encode");
+        assert_eq!(
+            decode_bootstrap_document(&encoded)
+                .expect("decode")
+                .credential_relay,
+            Some(relay.clone())
+        );
+        let plain = encode_bootstrap_document(configuration(), &[3; 32]).expect("encode");
+        assert!(!String::from_utf8_lossy(&plain).contains("credential_relay"));
+
+        for invalid in [
+            CredentialRelayBootstrap {
+                port: 0,
+                ..relay.clone()
+            },
+            CredentialRelayBootstrap {
+                services: vec!["Anthropic".to_owned()],
+                ..relay.clone()
+            },
+            CredentialRelayBootstrap {
+                services: vec!["openai".to_owned(), "openai".to_owned()],
+                ..relay.clone()
+            },
+            CredentialRelayBootstrap {
+                max_streams: 0,
+                ..relay.clone()
+            },
+        ] {
+            let mut config = configuration();
+            config.credential_relay = Some(invalid);
+            assert!(encode_bootstrap_document(config, &[3; 32]).is_err());
+        }
+
+        let mut no_broker = configuration();
+        no_broker.execution_broker = None;
+        no_broker.credential_relay = Some(relay);
+        assert!(encode_bootstrap_document(no_broker, &[3; 32]).is_err());
     }
 
     fn mcp_policy() -> RuntimePolicyDocument {

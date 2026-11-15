@@ -19,6 +19,7 @@ pub const DEFAULT_HTTP_PROXY_PORT: u16 = 15_083;
 pub const DEFAULT_DNS_PORT: u16 = 53;
 pub const DEFAULT_REGISTRY_PROXY_PORT: u16 = 14_873;
 pub const DEFAULT_TRUSTED_REGISTRY_PORT: u16 = 15_081;
+pub const DEFAULT_CREDENTIAL_RELAY_PORT: u16 = 15_084;
 pub const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const INSTANCE_ID_HEX_BYTES: usize = 12;
 const TABLE_PREFIX: &str = "sbxeg_";
@@ -40,6 +41,10 @@ pub struct RuntimePolicyDocument {
     pub network_policy: NetworkPolicy,
     #[serde(default)]
     pub registry: Option<RegistryEgressPolicy>,
+    /// Loopback port of the brokered-credential relay that the agent may
+    /// reach. Omitted when no credential service is brokered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_relay_port: Option<u16>,
     pub proxy_environment: BTreeMap<String, String>,
 }
 
@@ -121,8 +126,15 @@ impl RuntimePolicyDocument {
             deny_direct_ip: remote_mcp_active,
             network_policy,
             registry: None,
+            credential_relay_port: None,
             proxy_environment: proxy_environment(connect_port, DEFAULT_HTTP_PROXY_PORT, None),
         })
+    }
+
+    #[must_use]
+    pub fn with_credential_relay(mut self, port: u16) -> Self {
+        self.credential_relay_port = Some(port);
+        self
     }
 
     #[must_use]
@@ -199,6 +211,7 @@ impl RuntimePolicyDocument {
         let mut loopback_ports = vec![self.connect_port, self.http_proxy_port];
         loopback_ports.extend(self.dns_port);
         loopback_ports.extend(self.mcp_gateway_port);
+        loopback_ports.extend(self.credential_relay_port);
         if let Some(registry) = &self.registry {
             loopback_ports.extend([registry.proxy_port, registry.trusted_upstream_port]);
             PolicyEngine::compile(&registry.upstream_network_policy)?;
@@ -346,6 +359,31 @@ mod tests {
                 .join("agent")
         );
         first.validate().expect("valid policy");
+    }
+
+    #[test]
+    fn credential_relay_port_is_optional_and_must_be_distinct() {
+        let policy =
+            RuntimePolicyDocument::for_session(SessionId::from_bytes([7; 16]), network_policy());
+        assert!(
+            !serde_json::to_string(&policy)
+                .expect("encode")
+                .contains("credential_relay_port")
+        );
+        let relayed = policy
+            .clone()
+            .with_credential_relay(DEFAULT_CREDENTIAL_RELAY_PORT);
+        relayed.validate().expect("relay port");
+        let decoded: RuntimePolicyDocument =
+            serde_json::from_str(&serde_json::to_string(&relayed).expect("encode"))
+                .expect("decode");
+        assert_eq!(decoded, relayed);
+        assert!(matches!(
+            policy
+                .with_credential_relay(DEFAULT_CONNECT_PORT)
+                .validate(),
+            Err(RuntimePolicyError::InvalidLoopbackPorts)
+        ));
     }
 
     #[test]

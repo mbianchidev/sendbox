@@ -1359,6 +1359,7 @@ async fn protocol_connector_authenticates_over_unix_stream() {
                 required_capabilities: sendbox_protocol::agent_host_required_capabilities(),
                 safe_outputs_required: false,
                 syscall_tracing_required: false,
+                credential_relay_required: false,
                 bootstrap_secret: vec![7; 32],
                 policy_digest: [9; 32],
             },
@@ -1684,4 +1685,215 @@ fn headless_plan_does_not_require_the_runtime_terminal_capability() {
     );
 
     assert!(!plan.interactive());
+}
+
+struct RelayLog {
+    attached: std::sync::atomic::AtomicBool,
+    handled: Mutex<Vec<Event>>,
+    closed: std::sync::atomic::AtomicUsize,
+}
+
+impl sendbox_agent::CredentialRelayHandler for RelayLog {
+    fn attach(&self, _outbound: Arc<dyn sendbox_agent::CredentialRelayOutbound>) {
+        self.attached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn handle(&self, event: Event) -> Result<(), AgentError> {
+        self.handled
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(event);
+        Ok(())
+    }
+
+    fn close(&self, _grace: std::time::Duration) -> BoxFuture<'_, ()> {
+        self.closed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {})
+    }
+}
+
+struct NullOutbound;
+
+impl sendbox_agent::CredentialRelayOutbound for NullOutbound {
+    fn send(&self, _event: Event) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct RelayConnector;
+
+struct RelaySession;
+
+struct RelayExecution {
+    events: VecDeque<GuestEvent>,
+}
+
+fn relay_event() -> Event {
+    Event {
+        stream_id: sendbox_protocol::relay::CREDENTIAL_RELAY_STREAM_BASE,
+        kind: sendbox_protocol::EventKind::CredentialRelayCredit,
+        payload: b"{}".to_vec(),
+    }
+}
+
+impl GuestConnector for RelayConnector {
+    fn connect<'a>(
+        &'a self,
+        _stream: Box<dyn ControlStream>,
+        configuration: GuestConnectionConfiguration,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<Box<dyn GuestSession>, AgentError>> {
+        Box::pin(async move {
+            assert!(configuration.credential_relay_required);
+            Ok(Box::new(RelaySession) as Box<dyn GuestSession>)
+        })
+    }
+}
+
+impl GuestSession for RelaySession {
+    fn negotiated_capabilities(&self) -> &CapabilitySet {
+        static CAPABILITIES: std::sync::OnceLock<CapabilitySet> = std::sync::OnceLock::new();
+        CAPABILITIES.get_or_init(negotiated_agent_capabilities)
+    }
+
+    fn start<'a>(
+        &'a mut self,
+        _request: GuestLaunchRequest<'a>,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<Box<dyn GuestExecution>, AgentError>> {
+        Box::pin(async {
+            Ok(Box::new(RelayExecution {
+                events: VecDeque::from([
+                    GuestEvent::CredentialRelay(relay_event()),
+                    GuestEvent::Terminal(GuestTerminal::Exited { code: 0 }),
+                ]),
+            }) as Box<dyn GuestExecution>)
+        })
+    }
+
+    fn cleanup<'a>(
+        &'a mut self,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl GuestExecution for RelayExecution {
+    fn next_event<'a>(
+        &'a mut self,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<GuestEvent, AgentError>> {
+        Box::pin(async move {
+            self.events
+                .pop_front()
+                .ok_or_else(|| AgentError::Guest("event stream ended".to_owned()))
+        })
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn credential_relay_outbound(&self) -> Option<Arc<dyn sendbox_agent::CredentialRelayOutbound>> {
+        Some(Arc::new(NullOutbound))
+    }
+}
+
+fn brokered_plan(resources: &TempResource, capabilities: &RuntimeCapabilities) -> RunPlan {
+    use sendbox_governance::{
+        AuthorityRef, CONTRACT_VERSION, GovernanceBinding, PrincipalId, ProfileId, ProfileRef,
+        ProjectId, ServiceId, Sha256Digest,
+    };
+    let session_id = SessionId::from_bytes([21; 16]);
+    let configuration = configuration(resources.path().to_path_buf());
+    let mut request = request_for_configuration(resources, session_id, &configuration);
+    let mut boundary = request.boundary_plan.plan().clone();
+    boundary.governance = Some(GovernanceBinding {
+        contract_version: CONTRACT_VERSION,
+        authority: AuthorityRef {
+            id: "local".to_owned(),
+            trust_sha256: Sha256Digest::of(b"trust"),
+        },
+        profile: ProfileRef {
+            id: ProfileId::new("acme").unwrap(),
+            revision: 1,
+            sha256: Sha256Digest::of(b"profile"),
+        },
+        principal: PrincipalId::local_user(501),
+        project: ProjectId::new("github:octo/api").unwrap(),
+        effective_policy_sha256: Sha256Digest::parse_hex(&boundary.policy_sha256).unwrap(),
+        brokered_services: vec![ServiceId::new("anthropic").unwrap()],
+    });
+    let signing_key = SigningKeyMaterial::generate().unwrap();
+    let fingerprint = signing_key
+        .identity("test", None, 0, None)
+        .fingerprint
+        .clone();
+    request.boundary_plan = SignedBoundaryPlan::sign(boundary, &signing_key, plan_time())
+        .unwrap()
+        .verify(&fingerprint, plan_time())
+        .unwrap();
+    RunPlan::compile(&configuration, request, capabilities, plan_time()).expect("brokered plan")
+}
+
+#[tokio::test]
+async fn brokered_plans_dispatch_relay_events_and_close_the_relay() {
+    let resources = TempResource::new().expect("resources");
+    resources.create_directory("state").expect("state");
+    let runtime = Arc::new(FakeRuntime::new(runtime_capabilities()).expect("runtime"));
+    let (host, _guest) = tokio::io::duplex(4096);
+    runtime.set_control_stream(Box::new(host));
+    let plan = brokered_plan(&resources, &runtime.capabilities());
+    assert!(plan.credential_relay());
+
+    let without_handler = AgentOrchestrator::new(
+        runtime.clone(),
+        Arc::new(FakeSecrets),
+        Arc::new(RelayConnector),
+        Arc::new(RecordingOutput::default()),
+        Arc::new(NoSignals),
+    )
+    .run(&plan, &CancellationToken::new())
+    .await
+    .expect_err("relay handler is mandatory");
+    assert!(matches!(
+        without_handler.primary,
+        AgentError::InvalidPlan(_)
+    ));
+
+    let log = Arc::new(RelayLog {
+        attached: std::sync::atomic::AtomicBool::new(false),
+        handled: Mutex::new(Vec::new()),
+        closed: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let runtime = Arc::new(FakeRuntime::new(runtime_capabilities()).expect("runtime"));
+    let (host, _guest) = tokio::io::duplex(4096);
+    runtime.set_control_stream(Box::new(host));
+    let report = AgentOrchestrator::new(
+        runtime,
+        Arc::new(FakeSecrets),
+        Arc::new(RelayConnector),
+        Arc::new(RecordingOutput::default()),
+        Arc::new(NoSignals),
+    )
+    .with_credential_relay(log.clone())
+    .run(&plan, &CancellationToken::new())
+    .await
+    .expect("brokered run");
+    assert_eq!(report.terminal, GuestTerminal::Exited { code: 0 });
+    assert!(log.attached.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        log.handled
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_slice(),
+        &[relay_event()]
+    );
+    assert!(log.closed.load(std::sync::atomic::Ordering::SeqCst) >= 1);
 }

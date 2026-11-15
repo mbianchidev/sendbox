@@ -12,9 +12,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use sendbox_bootstrap::{
-    BootstrapDocumentConfiguration, ExecutionBrokerConfiguration, GatewayCredential,
-    REQUIRED_RUNTIME_CONTROLS, RegistryProxyConfiguration, encode_bootstrap_document,
-    encode_injection_envelope,
+    BootstrapDocumentConfiguration, CredentialRelayBootstrap, ExecutionBrokerConfiguration,
+    GatewayCredential, REQUIRED_RUNTIME_CONTROLS, RegistryProxyConfiguration,
+    encode_bootstrap_document, encode_injection_envelope,
 };
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
 use sendbox_egress::github_meta::GitHubMetaSeed;
@@ -70,6 +70,7 @@ pub struct KataProviderConfiguration {
     pub github_meta: Option<GitHubMetaSeed>,
     pub gateway_credentials: Vec<GatewayCredential>,
     pub registry_proxy: Option<RegistryProxyConfiguration>,
+    pub credential_relay: Option<CredentialRelayBootstrap>,
     pub workload_uid: u32,
     pub workload_gid: u32,
 }
@@ -1039,6 +1040,7 @@ fn bootstrap_payload(
             github_meta: configuration.github_meta.clone(),
             gateway_credentials: configuration.gateway_credentials.clone(),
             registry_proxy: configuration.registry_proxy.clone(),
+            credential_relay: configuration.credential_relay.clone(),
         },
         secret,
     )
@@ -1402,6 +1404,7 @@ mod tests {
             github_meta: None,
             gateway_credentials: Vec::new(),
             registry_proxy: None,
+            credential_relay: None,
             workload_uid: 65_534,
             workload_gid: 65_534,
         }

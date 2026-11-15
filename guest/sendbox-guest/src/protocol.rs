@@ -24,6 +24,7 @@ use tokio::net::UnixStream;
 
 use crate::GuestError;
 use crate::broker::BrokerClientConfiguration;
+use crate::credential_relay::CredentialRelay;
 use crate::runtime::{ReadinessSnapshot, RuntimeSession};
 use crate::safe_outputs::SafeOutputsHandle;
 use crate::secure_fs::{
@@ -88,6 +89,7 @@ pub(crate) struct ProtocolServices {
     secret_decryptor: GuestSecretDecryptor,
     safe_outputs: Option<SafeOutputsHandle>,
     syscall_tracing: bool,
+    credential_relay: Option<Arc<CredentialRelay>>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +152,7 @@ impl ProtocolServices {
             secret_decryptor,
             safe_outputs: None,
             syscall_tracing: false,
+            credential_relay: None,
         }
     }
 
@@ -177,6 +180,19 @@ impl ProtocolServices {
     pub(crate) fn with_safe_outputs(mut self, safe_outputs: Option<SafeOutputsHandle>) -> Self {
         self.safe_outputs = safe_outputs;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_credential_relay(mut self, relay: Option<Arc<CredentialRelay>>) -> Self {
+        self.credential_relay = relay;
+        self
+    }
+}
+
+async fn next_relay_outbound(relay: Option<&Arc<CredentialRelay>>) -> Option<Event> {
+    match relay {
+        Some(relay) => relay.next_outbound().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -318,6 +334,12 @@ where
                     }))
                     .await?;
             }
+            // Host relay frames already queued when the workload ended belong
+            // to streams that were aborted with it.
+            Message::Event(event)
+                if terminal_response_sent
+                    && services.credential_relay.is_some()
+                    && event.kind.is_credential_relay() => {}
             other => {
                 writer
                     .send(&Message::ProtocolError(ProtocolErrorMessage {
@@ -863,6 +885,9 @@ where
     drop(eof_sender);
     drop(resize_sender);
     writer_task.abort();
+    if let Some(relay) = &services.credential_relay {
+        relay.abort_all();
+    }
     result
 }
 
@@ -971,8 +996,28 @@ where
 
                 }
             }
+            relay_event = next_relay_outbound(services.credential_relay.as_ref()) => {
+                if let Some(event) = relay_event {
+                    host_writer.send(&Message::Event(event)).await?;
+                }
+            }
             host_message = host_reader.receive() => {
                 match host_message? {
+                    Message::Event(event) if event.kind.is_credential_relay() => {
+                        let delivered = match services.credential_relay.as_ref() {
+                            Some(relay) => relay.deliver(event),
+                            None => Err("credential relay is not configured".to_owned()),
+                        };
+                        if let Err(detail) = delivered {
+                            host_writer.send(&Message::ProtocolError(ProtocolErrorMessage {
+                                code: ProtocolErrorCode::InvalidState,
+                                detail,
+                            })).await?;
+                            return Err(GuestError::Protocol(
+                                "invalid credential relay event during execution".to_owned(),
+                            ));
+                        }
+                    }
                     Message::Cancellation(cancellation) if cancellation.request_id == request.request_id => {
                         let _ = control_sender.send(
                             sendbox_exec::service::ClientFrame::Cancel {

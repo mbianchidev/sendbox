@@ -11,10 +11,12 @@ publish = false
 default = ["execution-broker"]
 execution-broker = [
     "dep:sendbox-bpf",
+    "dep:sendbox-credentials",
     "dep:sendbox-egress",
     "dep:sendbox-exec",
     "dep:sendbox-policy",
     "dep:sendbox-registry",
+    "dep:sendbox-runtime",
 ]
 
 [dependencies]
@@ -22,12 +24,14 @@ async-trait.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 getrandom = "0.3.4"
+http.workspace = true
 libc.workspace = true
 rustix = { workspace = true, features = ["mount"] }
 sendbox-bpf = { path = "../../crates/sendbox-bpf", optional = true }
 sendbox-config = { path = "../../crates/sendbox-config" }
 sendbox-bootstrap = { path = "../../crates/sendbox-bootstrap" }
 sendbox-core = { path = "../../crates/sendbox-core" }
+sendbox-credentials = { path = "../../crates/sendbox-credentials", optional = true }
 sendbox-egress = { path = "../../crates/sendbox-egress", optional = true }
 sendbox-exec = { path = "../../crates/sendbox-exec", optional = true }
 sendbox-git = { path = "../../crates/sendbox-git" }
@@ -35,6 +39,7 @@ sendbox-mcp = { path = "../../crates/sendbox-mcp" }
 sendbox-policy = { path = "../../crates/sendbox-policy", optional = true }
 sendbox-protocol = { path = "../../crates/sendbox-protocol" }
 sendbox-registry = { path = "../../crates/sendbox-registry", optional = true }
+sendbox-runtime = { path = "../../crates/sendbox-runtime", optional = true }
 sendbox-secrets = { path = "../../crates/sendbox-secrets" }
 serde.workspace = true
 serde_json.workspace = true

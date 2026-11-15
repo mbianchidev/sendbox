@@ -109,6 +109,7 @@ pub struct RunPlan {
     safe_outputs: bool,
     syscall_tracing: bool,
     network_report: bool,
+    credential_relay: bool,
 }
 
 impl RunPlan {
@@ -197,6 +198,10 @@ impl RunPlan {
         .or_else(|_| ContainerId::new(format!("sendbox-{}", boundary.session_id)))
         .map_err(AgentError::Runtime)?;
         let safe_outputs = configuration.github.safe_outputs.enabled;
+        let credential_relay = boundary
+            .governance
+            .as_ref()
+            .is_some_and(|governance| !governance.brokered_services.is_empty());
         Ok(Self {
             verified_boundary_plan: request.boundary_plan,
             resolved_runtime: boundary.selection.selected,
@@ -240,6 +245,7 @@ impl RunPlan {
             safe_outputs,
             syscall_tracing,
             network_report,
+            credential_relay,
         })
     }
 
@@ -257,6 +263,13 @@ impl RunPlan {
     #[must_use]
     pub const fn syscall_tracing(&self) -> bool {
         self.syscall_tracing
+    }
+
+    /// Whether the signed plan admits brokered credential services, which
+    /// require a live guest relay and a host relay handler.
+    #[must_use]
+    pub const fn credential_relay(&self) -> bool {
+        self.credential_relay
     }
 
     #[must_use]

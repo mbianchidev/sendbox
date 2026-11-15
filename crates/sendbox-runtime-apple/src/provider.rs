@@ -9,8 +9,9 @@ use std::{
 };
 
 use sendbox_bootstrap::{
-    BootstrapDocumentConfiguration, ExecutionBrokerConfiguration, GatewayCredential,
-    REQUIRED_RUNTIME_CONTROLS, RegistryProxyConfiguration, encode_bootstrap_document,
+    BootstrapDocumentConfiguration, CredentialRelayBootstrap, ExecutionBrokerConfiguration,
+    GatewayCredential, REQUIRED_RUNTIME_CONTROLS, RegistryProxyConfiguration,
+    encode_bootstrap_document,
 };
 use sendbox_bundle::{Architecture, VerifyOptions, verify_bundle};
 use sendbox_egress::github_meta::GitHubMetaSeed;
@@ -70,6 +71,7 @@ pub struct AppleRuntimeConfiguration {
     pub github_meta: Option<GitHubMetaSeed>,
     pub gateway_credentials: Vec<GatewayCredential>,
     pub registry_proxy: Option<RegistryProxyConfiguration>,
+    pub credential_relay: Option<CredentialRelayBootstrap>,
     pub workload_uid: u32,
     pub workload_gid: u32,
     pub launch: AppleLaunchConfiguration,
@@ -112,6 +114,7 @@ impl AppleRuntimeConfiguration {
             github_meta: None,
             gateway_credentials: Vec::new(),
             registry_proxy: None,
+            credential_relay: None,
             workload_uid: 65_534,
             workload_gid: 65_534,
             launch: AppleLaunchConfiguration::default(),
@@ -625,6 +628,7 @@ impl AppleRuntime {
                 github_meta: self.configuration.github_meta.clone(),
                 gateway_credentials: self.configuration.gateway_credentials.clone(),
                 registry_proxy: self.configuration.registry_proxy.clone(),
+                credential_relay: self.configuration.credential_relay.clone(),
             },
             channel.bootstrap_material.as_bytes(),
         )
