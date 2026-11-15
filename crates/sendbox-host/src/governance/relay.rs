@@ -1,0 +1,505 @@
+//! Host wiring for brokered credential services: grants from the local
+//! authority, per-request authorization, host-held secrets, and audit.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use sendbox_agent::{AgentError, BoxFuture, CredentialRelayHandler, CredentialRelayOutbound};
+use sendbox_credentials::relay::{
+    RelayAuditEvent, RelayAuditSink, RelayAuthorization, RelayAuthorizer, RelayEndpoint,
+    RelayFuture, RelayLimits, RelayOutbound, RelayService,
+};
+use sendbox_credentials::{CredentialBrokerError, PinnedHttpsTransport, SecretResolver};
+use sendbox_governance::profile::CredentialServiceProfile;
+use sendbox_governance::{
+    CredentialGrant, Decision, GrantAuthority, GrantId, GrantRequest, LocalAuthorityLimits,
+    LocalGrantAuthority, RequestContext, RevocationReason, ServiceId, SystemClock,
+};
+use sendbox_protocol::Event;
+use sendbox_secrets::{SecretName, SecretStore, SecretValue};
+use sendbox_security::audit::{AuditCategory, AuditResult};
+use sendbox_session_security::AuditRecorder;
+use tokio::task::JoinHandle;
+
+use super::{GovernedRun, operator::OperatorRevisionSource, record_audit};
+use crate::HostError;
+
+/// Provider credentials resolved from the host secret store before the
+/// session starts. They are held only in this process.
+pub(crate) struct BrokeredSecrets {
+    values: BTreeMap<String, SecretValue>,
+}
+
+impl std::fmt::Debug for BrokeredSecrets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokeredSecrets")
+            .field("names", &self.values.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl BrokeredSecrets {
+    pub(crate) fn resolve(
+        services: &[CredentialServiceProfile],
+        store: &dyn SecretStore,
+        masker: &sendbox_secrets::CredentialMasker,
+    ) -> Result<Self, HostError> {
+        let mut values = BTreeMap::new();
+        for service in services {
+            if values.contains_key(&service.secret) {
+                continue;
+            }
+            let name = SecretName::new(service.secret.clone())?;
+            let secret = store.retrieve(&name).map_err(|error| {
+                HostError::Governance(format!(
+                    "brokered credential `{}` for service `{}` is unavailable in the host secret store: {error}",
+                    service.secret, service.id
+                ))
+            })?;
+            masker.register(secret.value.expose_secret())?;
+            values.insert(service.secret.clone(), secret.value);
+        }
+        Ok(Self { values })
+    }
+}
+
+impl SecretResolver for BrokeredSecrets {
+    fn retrieve(&self, name: &SecretName) -> Result<SecretValue, CredentialBrokerError> {
+        let value = self.values.get(name.as_str()).ok_or_else(|| {
+            CredentialBrokerError::InvalidConfiguration(
+                "brokered credential was not resolved for this session".to_owned(),
+            )
+        })?;
+        SecretValue::new(value.expose_secret().to_vec()).map_err(CredentialBrokerError::from)
+    }
+}
+
+/// Authorizes relay requests against the session's grants. Identity comes
+/// from the admitted binding, never from the workload request.
+struct GrantAuthorizer {
+    authority: Arc<dyn GrantAuthority>,
+    grants: BTreeMap<String, GrantId>,
+    context: RequestContext,
+}
+
+impl RelayAuthorizer for GrantAuthorizer {
+    fn authorize<'a>(
+        &'a self,
+        service: &'a str,
+        method: &'a str,
+        path: &'a str,
+    ) -> RelayFuture<'a, RelayAuthorization> {
+        Box::pin(async move {
+            let (Some(grant), Ok(service)) =
+                (self.grants.get(service), ServiceId::new(service.to_owned()))
+            else {
+                return RelayAuthorization::Denied {
+                    reason: "service_not_granted",
+                };
+            };
+            let context = RequestContext {
+                grant_id: grant.clone(),
+                service,
+                method: method.to_owned(),
+                path: path.to_owned(),
+                ..self.context.clone()
+            };
+            match self.authority.authorize(&context).await {
+                Decision::Allow(allowed) => RelayAuthorization::Allowed {
+                    grant: allowed.grant_id.to_string(),
+                    generation: allowed.generation,
+                },
+                Decision::Deny { reason } => RelayAuthorization::Denied {
+                    reason: reason.code(),
+                },
+            }
+        })
+    }
+}
+
+/// Writes relay evidence into the signed session audit chain.
+struct RelayAudit {
+    audit: AuditRecorder,
+    metadata: BTreeMap<String, String>,
+    failed: Arc<AtomicBool>,
+}
+
+impl RelayAuditSink for RelayAudit {
+    fn record(&self, event: RelayAuditEvent) {
+        let mut metadata = self.metadata.clone();
+        let (action, result, subject) = match event {
+            RelayAuditEvent::Decision {
+                stream,
+                service,
+                method,
+                path,
+                allowed,
+                reason,
+                grant,
+                generation,
+            } => {
+                metadata.extend([
+                    ("stream".to_owned(), stream.to_string()),
+                    ("service".to_owned(), service.clone()),
+                    ("method".to_owned(), method),
+                    ("target_path".to_owned(), path),
+                    ("reason".to_owned(), reason.to_owned()),
+                ]);
+                if let Some(grant) = grant {
+                    metadata.insert("grant".to_owned(), grant);
+                }
+                if let Some(generation) = generation {
+                    metadata.insert("grant_generation".to_owned(), generation.to_string());
+                }
+                if allowed {
+                    ("credential.request.allowed", AuditResult::Allowed, service)
+                } else {
+                    ("credential.request.denied", AuditResult::Denied, service)
+                }
+            }
+            RelayAuditEvent::Outcome {
+                stream,
+                service,
+                method,
+                path,
+                outcome,
+                reason,
+                status,
+                request_bytes,
+                response_bytes,
+                duration_ms,
+            } => {
+                metadata.extend([
+                    ("stream".to_owned(), stream.to_string()),
+                    ("service".to_owned(), service.clone()),
+                    ("method".to_owned(), method),
+                    ("target_path".to_owned(), path),
+                    ("outcome".to_owned(), outcome.code().to_owned()),
+                    ("reason".to_owned(), reason.to_owned()),
+                    ("request_bytes".to_owned(), request_bytes.to_string()),
+                    ("response_bytes".to_owned(), response_bytes.to_string()),
+                    ("duration_ms".to_owned(), duration_ms.to_string()),
+                ]);
+                if let Some(status) = status {
+                    metadata.insert("upstream_status".to_owned(), status.to_string());
+                }
+                let result = match outcome {
+                    sendbox_credentials::relay::RelayStreamOutcome::Complete => {
+                        AuditResult::Success
+                    }
+                    sendbox_credentials::relay::RelayStreamOutcome::Denied => AuditResult::Denied,
+                    _ => AuditResult::Error,
+                };
+                ("credential.request.outcome", result, service)
+            }
+        };
+        if let Err(error) = record_audit(
+            &self.audit,
+            AuditCategory::Secret,
+            action,
+            &subject,
+            result,
+            metadata,
+        ) {
+            self.failed.store(true, Ordering::SeqCst);
+            eprintln!("sendbox: recording credential relay audit failed: {error}");
+        }
+    }
+}
+
+struct OutboundAdapter(Arc<dyn CredentialRelayOutbound>);
+
+impl RelayOutbound for OutboundAdapter {
+    fn send(&self, event: Event) -> RelayFuture<'_, Result<(), CredentialBrokerError>> {
+        Box::pin(async move {
+            self.0
+                .send(event)
+                .await
+                .map_err(|error| CredentialBrokerError::Upstream(error.to_string()))
+        })
+    }
+}
+
+/// The host credential relay for one governed session.
+pub(crate) struct HostCredentialRelay {
+    endpoint: Arc<RelayEndpoint>,
+    authority: Arc<dyn GrantAuthority>,
+    grants: Vec<CredentialGrant>,
+    audit: AuditRecorder,
+    metadata: BTreeMap<String, String>,
+    audit_failed: Arc<AtomicBool>,
+    renewal: Mutex<Option<JoinHandle<()>>>,
+    lease: Duration,
+    revocation_grace: Duration,
+    finished: AtomicBool,
+}
+
+impl HostCredentialRelay {
+    pub(crate) async fn start(
+        run: &GovernedRun,
+        services: &[CredentialServiceProfile],
+        secrets: BrokeredSecrets,
+        audit: AuditRecorder,
+    ) -> Result<Self, HostError> {
+        let limits = &run.session.verified.profile.grants;
+        let authority: Arc<dyn GrantAuthority> = Arc::new(LocalGrantAuthority::new(
+            Arc::new(OperatorRevisionSource::new(
+                run.session.source.clone(),
+                Arc::new(SystemClock),
+            )),
+            Arc::new(SystemClock),
+            LocalAuthorityLimits {
+                lease_seconds: limits.lease_seconds,
+                max_grants: services.len(),
+            },
+            Box::new(|| {
+                let mut bytes = [0_u8; 16];
+                getrandom::fill(&mut bytes).map_err(|error| {
+                    sendbox_governance::GovernanceError::AuthorityUnavailable(error.to_string())
+                })?;
+                Ok(bytes)
+            }),
+        ));
+        let metadata = run.audit_metadata();
+        let mut grants = Vec::with_capacity(services.len());
+        let mut grant_ids = BTreeMap::new();
+        for service in services {
+            let grant = authority
+                .issue(GrantRequest {
+                    principal: run.binding.principal.clone(),
+                    project: run.binding.project.clone(),
+                    session: run.session_ref.clone(),
+                    binding: run.binding.clone(),
+                    service: service.id.clone(),
+                    methods: service.effective_methods(),
+                    path_prefixes: service.effective_path_prefixes(),
+                    max_ttl_seconds: limits.max_ttl_seconds,
+                })
+                .await
+                .map_err(|error| {
+                    HostError::Governance(format!(
+                        "issue credential grant for `{}`: {error}",
+                        service.id
+                    ))
+                })?;
+            let mut grant_metadata = metadata.clone();
+            grant_metadata.extend([
+                ("service".to_owned(), service.id.to_string()),
+                ("grant".to_owned(), grant.grant_id.to_string()),
+                ("grant_generation".to_owned(), grant.generation.to_string()),
+                (
+                    "lease_expires_at_unix".to_owned(),
+                    grant.lease_expires_at_unix.to_string(),
+                ),
+                (
+                    "max_expires_at_unix".to_owned(),
+                    grant.max_expires_at_unix.to_string(),
+                ),
+                (
+                    "methods".to_owned(),
+                    grant.methods.iter().cloned().collect::<Vec<_>>().join(","),
+                ),
+                ("path_prefixes".to_owned(), grant.path_prefixes.join(",")),
+            ]);
+            record_audit(
+                &audit,
+                AuditCategory::Secret,
+                "credential.grant.issued",
+                service.id.as_str(),
+                AuditResult::Allowed,
+                grant_metadata,
+            )?;
+            grant_ids.insert(service.id.to_string(), grant.grant_id.clone());
+            grants.push(grant);
+        }
+        let relay_services = services
+            .iter()
+            .map(RelayService::from_profile)
+            .collect::<Result<Vec<_>, _>>()?;
+        let audit_failed = Arc::new(AtomicBool::new(false));
+        let endpoint = RelayEndpoint::new(
+            relay_services,
+            Arc::new(GrantAuthorizer {
+                authority: Arc::clone(&authority),
+                grants: grant_ids,
+                context: RequestContext {
+                    grant_id: grants
+                        .first()
+                        .map(|grant| grant.grant_id.clone())
+                        .ok_or_else(|| {
+                            HostError::Governance("no brokered service was granted".to_owned())
+                        })?,
+                    principal: run.binding.principal.clone(),
+                    project: run.binding.project.clone(),
+                    session: run.session_ref.clone(),
+                    binding_sha256: run.binding_sha256,
+                    service: grants[0].service.clone(),
+                    method: String::new(),
+                    path: String::new(),
+                },
+            }),
+            Arc::new(secrets),
+            Arc::new(PinnedHttpsTransport::default()),
+            Arc::new(RelayAudit {
+                audit: audit.clone(),
+                metadata: metadata.clone(),
+                failed: Arc::clone(&audit_failed),
+            }),
+            RelayLimits {
+                max_streams: usize::try_from(limits.max_concurrent_streams).unwrap_or(1),
+                ..RelayLimits::default()
+            },
+        )?;
+        Ok(Self {
+            endpoint: Arc::new(endpoint),
+            authority,
+            grants,
+            audit,
+            metadata,
+            audit_failed,
+            renewal: Mutex::new(None),
+            lease: Duration::from_secs(limits.lease_seconds),
+            revocation_grace: Duration::from_secs(limits.revocation_grace_seconds),
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    fn start_renewal(&self) {
+        let authority = Arc::clone(&self.authority);
+        let endpoint = Arc::clone(&self.endpoint);
+        let audit = self.audit.clone();
+        let metadata = self.metadata.clone();
+        let grants = self
+            .grants
+            .iter()
+            .map(|grant| (grant.grant_id.clone(), grant.service.to_string()))
+            .collect::<Vec<_>>();
+        let interval = (self.lease / 3).max(Duration::from_secs(10));
+        let grace = self.revocation_grace;
+        let task = tokio::spawn(async move {
+            let mut live = grants;
+            while !live.is_empty() {
+                tokio::time::sleep(interval).await;
+                let mut lapsed = false;
+                let mut remaining = Vec::with_capacity(live.len());
+                for (grant, service) in live {
+                    match authority.renew(&grant).await {
+                        Ok(_) => remaining.push((grant, service)),
+                        Err(error) => {
+                            lapsed = true;
+                            let mut metadata = metadata.clone();
+                            metadata.extend([
+                                ("service".to_owned(), service.clone()),
+                                ("grant".to_owned(), grant.to_string()),
+                                ("reason".to_owned(), error.to_string()),
+                                (
+                                    "in_flight_grace_seconds".to_owned(),
+                                    grace.as_secs().to_string(),
+                                ),
+                            ]);
+                            if let Err(error) = record_audit(
+                                &audit,
+                                AuditCategory::Secret,
+                                "credential.grant.lapsed",
+                                &service,
+                                AuditResult::Denied,
+                                metadata,
+                            ) {
+                                eprintln!(
+                                    "sendbox: recording credential grant lapse failed: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
+                if lapsed {
+                    endpoint.expire_in_flight(grace);
+                }
+                live = remaining;
+            }
+        });
+        *self
+            .renewal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+    }
+
+    fn stop_renewal(&self) {
+        if let Some(task) = self
+            .renewal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+    }
+
+    /// Ends the session's grants after the workload finished and reports
+    /// whether audit evidence could not be recorded.
+    pub(crate) async fn finish(&self, reason: RevocationReason) -> Result<(), HostError> {
+        if self.finished.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.stop_renewal();
+        self.endpoint.close(Duration::ZERO).await;
+        let mut failures = Vec::new();
+        for grant in &self.grants {
+            let mut metadata = self.metadata.clone();
+            metadata.extend([
+                ("service".to_owned(), grant.service.to_string()),
+                ("grant".to_owned(), grant.grant_id.to_string()),
+                ("reason".to_owned(), reason.code().to_owned()),
+            ]);
+            let revoked = self.authority.revoke(&grant.grant_id, reason).await;
+            if let Err(error) = &revoked {
+                failures.push(format!("revoke grant {}: {error}", grant.grant_id));
+            }
+            if let Err(error) = record_audit(
+                &self.audit,
+                AuditCategory::Secret,
+                "credential.grant.revoked",
+                grant.service.as_str(),
+                if revoked.is_ok() {
+                    AuditResult::Success
+                } else {
+                    AuditResult::Error
+                },
+                metadata,
+            ) {
+                failures.push(error.to_string());
+            }
+        }
+        if self.audit_failed.load(Ordering::SeqCst) {
+            failures.push("credential relay audit evidence could not be recorded".to_owned());
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(HostError::Governance(failures.join("; ")))
+        }
+    }
+}
+
+impl CredentialRelayHandler for HostCredentialRelay {
+    fn attach(&self, outbound: Arc<dyn CredentialRelayOutbound>) {
+        self.endpoint.attach(Arc::new(OutboundAdapter(outbound)));
+        self.start_renewal();
+    }
+
+    fn handle(&self, event: Event) -> Result<(), AgentError> {
+        self.endpoint
+            .handle(event)
+            .map_err(|error| AgentError::Guest(error.to_string()))
+    }
+
+    fn close(&self, grace: Duration) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.stop_renewal();
+            self.endpoint.close(grace).await;
+        })
+    }
+}

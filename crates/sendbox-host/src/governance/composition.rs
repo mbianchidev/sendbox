@@ -727,9 +727,32 @@ impl Checker {
         configuration: &SandboxConfiguration,
         facts: &SessionFacts<'_>,
     ) {
-        if let Err(message) = selected_services(profile, configuration) {
-            self.widening("credential_services", message);
-            return;
+        let services = match selected_services(profile, configuration) {
+            Ok(services) => services,
+            Err(message) => {
+                self.widening("credential_services", message);
+                return;
+            }
+        };
+        for service in services {
+            for variable in [
+                service.provider.base_url_environment(),
+                service.provider.api_key_environment(),
+            ] {
+                if configuration
+                    .secrets
+                    .iter()
+                    .any(|secret| secret == variable)
+                {
+                    self.unsupported(
+                        "secrets",
+                        format!(
+                            "`{variable}` is configured by brokered service `{}` and cannot also be a workload secret",
+                            service.id
+                        ),
+                    );
+                }
+            }
         }
         if !configuration.credential_services.is_empty() && facts.runtime == RuntimeKind::Hyperlight
         {

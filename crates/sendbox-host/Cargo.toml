@@ -25,6 +25,7 @@ sendbox-git = { path = "../sendbox-git" }
 sendbox-governance = { path = "../sendbox-governance" }
 sendbox-mcp = { path = "../sendbox-mcp" }
 sendbox-policy = { path = "../sendbox-policy" }
+sendbox-protocol = { path = "../sendbox-protocol" }
 sendbox-registry = { path = "../sendbox-registry" }
 sendbox-runtime = { path = "../sendbox-runtime" }
 sendbox-runtime-apple = { path = "../sendbox-runtime-apple" }

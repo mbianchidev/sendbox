@@ -3,13 +3,17 @@
 
 pub mod composition;
 pub mod operator;
+pub(crate) mod relay;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use sendbox_agent::EnvironmentIntent;
+use sendbox_bootstrap::CredentialRelayBootstrap;
 use sendbox_config::{RuntimeProvider as ConfiguredRuntime, SandboxConfiguration};
 use sendbox_core::SessionId;
-use sendbox_governance::profile::RuntimeKind;
+use sendbox_egress::runtime::DEFAULT_CREDENTIAL_RELAY_PORT;
+use sendbox_governance::profile::{CredentialServiceProfile, RuntimeKind};
 use sendbox_governance::{
     CONTRACT_VERSION, GovernanceBinding, PrincipalId, ProjectId, ServiceId, SessionRef,
     Sha256Digest,
@@ -126,6 +130,65 @@ impl GovernedSession {
         operator::RevisionHighWater::open(state_root)?
             .record(&self.verified.authority, &self.verified.reference)
     }
+
+    /// Profile definitions of the services this session brokers, sorted by id.
+    pub(crate) fn brokered_services(
+        &self,
+        configuration: &SandboxConfiguration,
+    ) -> Result<Vec<CredentialServiceProfile>, HostError> {
+        composition::selected_services(&self.verified.profile, configuration)
+            .map(|services| services.into_iter().cloned().collect())
+            .map_err(HostError::Governance)
+    }
+
+    /// Guest relay listener configuration. It names services and limits only.
+    pub(crate) fn relay_bootstrap(
+        &self,
+        services: &[CredentialServiceProfile],
+    ) -> Option<CredentialRelayBootstrap> {
+        (!services.is_empty()).then(|| CredentialRelayBootstrap {
+            port: DEFAULT_CREDENTIAL_RELAY_PORT,
+            services: services
+                .iter()
+                .map(|service| service.id.to_string())
+                .collect(),
+            max_streams: self.verified.profile.grants.max_concurrent_streams,
+            max_request_bytes: services
+                .iter()
+                .map(|service| service.max_request_bytes)
+                .max()
+                .unwrap_or(1),
+        })
+    }
+}
+
+/// Provider-standard endpoint variables for compatible agents. The key is a
+/// fixed placeholder: the host broker discards it and injects the real one.
+pub(crate) fn relay_environment(
+    services: &[CredentialServiceProfile],
+    port: u16,
+) -> Vec<EnvironmentIntent> {
+    services
+        .iter()
+        .flat_map(|service| {
+            [
+                EnvironmentIntent {
+                    name: service.provider.base_url_environment().to_owned(),
+                    value: format!(
+                        "http://127.0.0.1:{port}/{}{}",
+                        service.id,
+                        service.provider.base_url_suffix()
+                    ),
+                    sensitive: false,
+                },
+                EnvironmentIntent {
+                    name: service.provider.api_key_environment().to_owned(),
+                    value: sendbox_governance::BROKERED_CREDENTIAL_PLACEHOLDER.to_owned(),
+                    sensitive: false,
+                },
+            ]
+        })
+        .collect()
 }
 
 /// An admitted governed run: the verified profile plus the exact binding
@@ -135,6 +198,7 @@ pub(crate) struct GovernedRun {
     pub(crate) binding: GovernanceBinding,
     pub(crate) binding_sha256: Sha256Digest,
     pub(crate) session_ref: SessionRef,
+    brokered: Option<(Vec<CredentialServiceProfile>, relay::BrokeredSecrets)>,
 }
 
 impl GovernedRun {
@@ -149,7 +213,29 @@ impl GovernedRun {
             binding,
             binding_sha256,
             session_ref: SessionRef::from_session_id(session_id),
+            brokered: None,
         })
+    }
+
+    pub(crate) fn attach_brokered(
+        &mut self,
+        services: Vec<CredentialServiceProfile>,
+        secrets: relay::BrokeredSecrets,
+    ) {
+        self.brokered = Some((services, secrets));
+    }
+
+    /// Starts the host credential relay for a brokered session.
+    pub(crate) async fn start_relay(
+        &mut self,
+        audit: &AuditRecorder,
+    ) -> Result<Option<std::sync::Arc<relay::HostCredentialRelay>>, HostError> {
+        let Some((services, secrets)) = self.brokered.take() else {
+            return Ok(None);
+        };
+        relay::HostCredentialRelay::start(self, &services, secrets, audit.clone())
+            .await
+            .map(|relay| Some(std::sync::Arc::new(relay)))
     }
 
     /// Identity metadata shared by every governance audit record. It never

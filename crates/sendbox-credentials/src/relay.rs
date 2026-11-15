@@ -561,6 +561,31 @@ impl RelayEndpoint {
         });
     }
 
+    /// Ends streams that were authorized before a grant lapsed. Later
+    /// requests are denied by the authorizer; streams already running get
+    /// `grace` to finish before they are cancelled.
+    pub fn expire_in_flight(&self, grace: Duration) {
+        let running = self
+            .shared
+            .lock()
+            .streams
+            .values()
+            .filter_map(|stream| match stream {
+                StreamState::Running(running) => Some(running.cancel.clone()),
+                StreamState::Receiving(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if running.is_empty() {
+            return;
+        }
+        self.spawn(async move {
+            tokio::time::sleep(grace).await;
+            for cancel in running {
+                cancel.cancel();
+            }
+        });
+    }
+
     /// Stops accepting requests, lets in-flight streams finish within
     /// `grace`, then aborts the rest. Aborted streams that already reached the
     /// upstream are reported as uncertain.

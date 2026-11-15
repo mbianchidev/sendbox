@@ -2768,6 +2768,7 @@ dependencies = [
  "sendbox-governance",
  "sendbox-mcp",
  "sendbox-policy",
+ "sendbox-protocol",
  "sendbox-registry",
  "sendbox-runtime",
  "sendbox-runtime-apple",
