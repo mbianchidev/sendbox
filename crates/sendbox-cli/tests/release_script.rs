@@ -151,7 +151,15 @@ case "$1 $2" in
         fi
         printf 'success\n' >"$RELEASE_TEST_STATE/conclusion"
         ;;
-    "release view") printf 'https://github.com/mbianchidev/sendbox/releases/tag/v0.2.0\n' ;;
+    "release view")
+        url='https://github.com/mbianchidev/sendbox/releases/tag/v0.2.0'
+        pager="${GH_PAGER-${PAGER-}}"
+        if [[ -t 1 && -n "$pager" && "$pager" != cat ]]; then
+            printf '%s\n' "$url" | "$pager"
+        else
+            printf '%s\n' "$url"
+        fi
+        ;;
     *)
         printf 'Unexpected GitHub command: %s\n' "$*" >&2
         exit 1
@@ -486,7 +494,7 @@ fn switches_to_updated_main_before_releasing_and_refreshing_every_lockfile() {
 }
 
 #[test]
-fn disables_configured_git_pagers_when_releasing_in_a_terminal() {
+fn disables_configured_git_and_gh_pagers_when_releasing_in_a_terminal() {
     let repository = ReleaseRepository::new();
     executable(
         repository.bin.join("pager"),
@@ -506,6 +514,7 @@ fn disables_configured_git_pagers_when_releasing_in_a_terminal() {
                 "/bin/bash",
             ])
             .env("GIT_PAGER", "pager")
+            .env("GH_PAGER", "pager")
             .env("PAGER", "pager");
         let result = repository.run_command(command, &[version], "success");
         repository.assert_succeeded(&result);
@@ -514,7 +523,7 @@ fn disables_configured_git_pagers_when_releasing_in_a_terminal() {
     let trace = repository.trace();
     assert!(
         !trace.contains("pager invoked"),
-        "release invoked the configured Git pager:\n{trace}"
+        "release invoked a configured pager:\n{trace}"
     );
 }
 
