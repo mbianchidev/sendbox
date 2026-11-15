@@ -575,10 +575,12 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let project_source = workspace.host_project;
     let workspace_source = workspace.host_root;
     let project_destination = workspace.guest_project;
-    let selected_repository =
-        discover_selected_repository(&request.configuration, &project_source)?;
+    // Governed sessions need the project identity before profile denials and
+    // exceptions apply; standalone sessions keep their original order.
+    let mut governed_repository = None;
     if let Some(governance) = governance.as_mut() {
-        let project = governance::project_id(selected_repository.as_ref(), &workspace_source)?;
+        let repository = discover_selected_repository(&request.configuration, &project_source)?;
+        let project = governance::project_id(repository.as_ref(), &workspace_source)?;
         governance
             .apply(
                 &mut request.configuration,
@@ -588,6 +590,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
             )
             .await?;
         validate_command_policy(&request.configuration.policy.commands, &request.command)?;
+        governed_repository = Some(repository);
     }
     if let Some(governance) = &governance {
         governance.admit(
@@ -625,6 +628,10 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     .map_err(|error| HostError::Bundle(error.to_string()))?;
     let manifest_sha256 = hash_file(&bundle_root.join("manifest.json"))?;
     let bundle_id = format!("{}:{}", request.trust_root_id, bundle.release_sequence);
+    let selected_repository = match governed_repository {
+        Some(repository) => repository,
+        None => discover_selected_repository(&request.configuration, &project_source)?,
+    };
     let credentials =
         prepare_effective_credentials(&request.configuration, selected_repository.as_ref()).await?;
     credentials.apply_to(&mut request.configuration);
