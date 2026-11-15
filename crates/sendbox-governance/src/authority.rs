@@ -134,12 +134,7 @@ impl LocalGrantAuthority {
             .revisions
             .current(&reference.id)
             .map_err(|_| DenyReason::AuthorityUnavailable)?;
-        if current.reference != *reference
-            || reference.revision < current.minimum_revision
-            || now >= current.expires_at_unix
-        {
-            return Err(DenyReason::StalePolicy);
-        }
+        check_current(reference, &current, now)?;
         Ok(current)
     }
 
@@ -223,62 +218,15 @@ impl LocalGrantAuthority {
 
     fn authorize_sync(&self, context: &RequestContext) -> Decision {
         let now = self.clock.now_unix();
-        let grant = {
+        let (grant, revoked) = {
             let grants = self.lock();
             let Some(state) = grants.get(&context.grant_id) else {
                 return deny(DenyReason::UnknownGrant);
             };
-            if state.revoked.is_some() {
-                return deny(DenyReason::Revoked);
-            }
-            state.grant.clone()
+            (state.grant.clone(), state.revoked.is_some())
         };
-        let checks = [
-            (now >= grant.max_expires_at_unix, DenyReason::Expired),
-            (now >= grant.lease_expires_at_unix, DenyReason::LeaseExpired),
-            (
-                context.principal != grant.principal,
-                DenyReason::PrincipalMismatch,
-            ),
-            (
-                context.project != grant.project,
-                DenyReason::ProjectMismatch,
-            ),
-            (
-                context.session != grant.session,
-                DenyReason::SessionMismatch,
-            ),
-            (
-                context.binding_sha256 != grant.binding_sha256,
-                DenyReason::BindingMismatch,
-            ),
-            (
-                context.service != grant.service,
-                DenyReason::ServiceNotGranted,
-            ),
-            (
-                !grant.methods.contains(&context.method),
-                DenyReason::MethodNotGranted,
-            ),
-        ];
-        if let Some((_, reason)) = checks.iter().find(|(failed, _)| *failed) {
-            return deny(*reason);
-        }
-        if crate::grant::validate_request_path(&context.path).is_err() {
-            return deny(DenyReason::InvalidPath);
-        }
-        if !path_permitted(&grant.path_prefixes, &context.path) {
-            return deny(DenyReason::PathNotGranted);
-        }
-        if let Err(reason) = self.current_revision(&grant.profile, now) {
-            return deny(reason);
-        }
-        Decision::Allow(AllowedRequest {
-            grant_id: grant.grant_id,
-            generation: grant.generation,
-            profile: grant.profile,
-            lease_expires_at_unix: grant.lease_expires_at_unix,
-        })
+        let current = self.revisions.current(&grant.profile.id).ok();
+        evaluate_request(&grant, revoked, context, now, current.as_ref())
     }
 
     fn renew_sync(&self, grant_id: &GrantId) -> Result<CredentialGrant, GovernanceError> {
@@ -334,6 +282,93 @@ impl LocalGrantAuthority {
 
 fn deny(reason: DenyReason) -> Decision {
     Decision::Deny { reason }
+}
+
+/// Rejects a profile reference that is not the authority's current, unexpired
+/// revision at or above the minimum.
+pub fn check_current(
+    reference: &ProfileRef,
+    current: &CurrentProfile,
+    now_unix: u64,
+) -> Result<(), DenyReason> {
+    if current.reference != *reference
+        || reference.revision < current.minimum_revision
+        || now_unix >= current.expires_at_unix
+    {
+        return Err(DenyReason::StalePolicy);
+    }
+    Ok(())
+}
+
+/// Decides one brokered request against a stored grant. Every authority uses
+/// this so local and shared authorities deny for the same reasons. `current`
+/// is `None` when the authority cannot establish the current profile.
+#[must_use]
+pub fn evaluate_request(
+    grant: &CredentialGrant,
+    revoked: bool,
+    context: &RequestContext,
+    now_unix: u64,
+    current: Option<&CurrentProfile>,
+) -> Decision {
+    if context.grant_id != grant.grant_id {
+        return deny(DenyReason::UnknownGrant);
+    }
+    if revoked {
+        return deny(DenyReason::Revoked);
+    }
+    let checks = [
+        (now_unix >= grant.max_expires_at_unix, DenyReason::Expired),
+        (
+            now_unix >= grant.lease_expires_at_unix,
+            DenyReason::LeaseExpired,
+        ),
+        (
+            context.principal != grant.principal,
+            DenyReason::PrincipalMismatch,
+        ),
+        (
+            context.project != grant.project,
+            DenyReason::ProjectMismatch,
+        ),
+        (
+            context.session != grant.session,
+            DenyReason::SessionMismatch,
+        ),
+        (
+            context.binding_sha256 != grant.binding_sha256,
+            DenyReason::BindingMismatch,
+        ),
+        (
+            context.service != grant.service,
+            DenyReason::ServiceNotGranted,
+        ),
+        (
+            !grant.methods.contains(&context.method),
+            DenyReason::MethodNotGranted,
+        ),
+    ];
+    if let Some((_, reason)) = checks.iter().find(|(failed, _)| *failed) {
+        return deny(*reason);
+    }
+    if crate::grant::validate_request_path(&context.path).is_err() {
+        return deny(DenyReason::InvalidPath);
+    }
+    if !path_permitted(&grant.path_prefixes, &context.path) {
+        return deny(DenyReason::PathNotGranted);
+    }
+    let Some(current) = current else {
+        return deny(DenyReason::AuthorityUnavailable);
+    };
+    if let Err(reason) = check_current(&grant.profile, current, now_unix) {
+        return deny(reason);
+    }
+    Decision::Allow(AllowedRequest {
+        grant_id: grant.grant_id.clone(),
+        generation: grant.generation,
+        profile: grant.profile.clone(),
+        lease_expires_at_unix: grant.lease_expires_at_unix,
+    })
 }
 
 impl GrantAuthority for LocalGrantAuthority {
@@ -416,6 +451,7 @@ mod tests {
             project: ProjectId::new("github:octo/api").unwrap(),
             effective_policy_sha256: Sha256Digest::of(b"policy"),
             brokered_services: vec![ServiceId::new("anthropic").unwrap()],
+            exceptions: Vec::new(),
         }
     }
 

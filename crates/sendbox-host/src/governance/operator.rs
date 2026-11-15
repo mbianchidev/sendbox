@@ -32,6 +32,9 @@ const MAX_TRUST_ROOT_BYTES: u64 = 64 * 1024;
 const MAX_SIGNERS: usize = 32;
 const MAX_REVISION_CACHE_SECONDS: u64 = 300;
 const SIGNATURE_SUFFIX: &str = ".sig.json";
+const MAX_FLEET_TIMEOUT_SECONDS: u64 = 60;
+/// Default host secret-store name holding the caller's fleet bearer token.
+pub const DEFAULT_FLEET_TOKEN_SECRET: &str = "SENDBOX_FLEET_TOKEN";
 
 /// How governance was selected for this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -111,6 +114,63 @@ pub struct OperatorConfiguration {
     pub bundle: Option<BundlePin>,
     #[serde(default = "default_revision_cache_seconds")]
     pub revision_cache_seconds: u64,
+    /// Shared governance service. When set, it authenticates the caller,
+    /// enforces project roles and exceptions, and replaces the local grant
+    /// authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<FleetSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetSettings {
+    /// `https://` base URL of the service. Plain `http://` is accepted only
+    /// for a loopback host.
+    pub url: String,
+    /// Host secret-store name holding the caller's bearer token.
+    #[serde(default = "default_fleet_token_secret")]
+    pub token_secret: String,
+    #[serde(default = "default_fleet_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+impl FleetSettings {
+    pub fn base_url(&self) -> Result<reqwest::Url, HostError> {
+        let invalid = |message: &str| {
+            HostError::Governance(format!("operator configuration: fleet.url {message}"))
+        };
+        let url = reqwest::Url::parse(&self.url).map_err(|error| invalid(&error.to_string()))?;
+        let loopback = match url.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        };
+        if !(url.scheme() == "https" || (url.scheme() == "http" && loopback)) {
+            return Err(invalid("must use https (http only for a loopback host)"));
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(invalid(
+                "must not contain credentials, a query, or a fragment",
+            ));
+        }
+        if url.path() != "/" && url.path().ends_with('/') {
+            return Err(invalid("must not end with `/` after a path"));
+        }
+        Ok(url)
+    }
+}
+
+fn default_fleet_token_secret() -> String {
+    DEFAULT_FLEET_TOKEN_SECRET.to_owned()
+}
+
+const fn default_fleet_timeout_seconds() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +275,20 @@ impl OperatorConfiguration {
             && (bundle.trust_root_sha256.is_empty() || bundle.trust_root_ids.is_empty())
         {
             return invalid("bundle pins require at least one trust root digest and id");
+        }
+        if let Some(fleet) = &self.fleet {
+            fleet.base_url()?;
+            if self.authority == "local" {
+                return invalid("a fleet authority needs its own `authority` id, not `local`");
+            }
+            if !sendbox_governance::profile::valid_secret_name(&fleet.token_secret) {
+                return invalid("fleet.token_secret must be a valid secret name");
+            }
+            if !(1..=MAX_FLEET_TIMEOUT_SECONDS).contains(&fleet.timeout_seconds) {
+                return invalid(&format!(
+                    "fleet.timeout_seconds must be 1..={MAX_FLEET_TIMEOUT_SECONDS}"
+                ));
+            }
         }
         self.trust_store()?;
         Ok(())
@@ -605,6 +679,7 @@ credential_services:
             },
             bundle: None,
             revision_cache_seconds: 1,
+            fleet: None,
         }
     }
 
@@ -765,6 +840,40 @@ credential_services:
             source.current(&ProfileId::new("acme").unwrap()),
             Err(GovernanceError::AuthorityUnavailable(_))
         ));
+    }
+
+    #[test]
+    fn fleet_settings_require_a_dedicated_authority_and_a_safe_url() {
+        let key = SigningKeyMaterial::generate().unwrap();
+        let mut operator = test_operator(
+            key.identity("Operator", None, 0, None),
+            PathBuf::from("/governance/acme.yaml"),
+            1,
+        );
+        let parse = |operator: &OperatorConfiguration| {
+            OperatorConfiguration::parse(serde_yaml_ng::to_string(operator).unwrap().as_bytes())
+        };
+        operator.fleet = Some(FleetSettings {
+            url: "https://fleet.example.com".to_owned(),
+            token_secret: DEFAULT_FLEET_TOKEN_SECRET.to_owned(),
+            timeout_seconds: 10,
+        });
+        assert!(parse(&operator).is_err(), "local authority id with a fleet");
+        operator.authority = "fleet.example.com".to_owned();
+        assert!(parse(&operator).is_ok());
+        for (url, accepted) in [
+            ("https://fleet.example.com/governance", true),
+            ("http://127.0.0.1:8080", true),
+            ("http://localhost:8080", true),
+            ("http://fleet.example.com", false),
+            ("https://user:pass@fleet.example.com", false),
+            ("https://fleet.example.com/?x=1", false),
+            ("https://fleet.example.com/governance/", false),
+            ("ftp://fleet.example.com", false),
+        ] {
+            operator.fleet.as_mut().unwrap().url = url.to_owned();
+            assert_eq!(parse(&operator).is_ok(), accepted, "{url}");
+        }
     }
 
     #[test]

@@ -6,9 +6,11 @@
 //! identities, signed policy profiles, session bindings, and credential
 //! grants. It never holds credential material.
 
+pub mod api;
 pub mod authority;
 pub mod binding;
 pub mod digest;
+pub mod exception;
 pub mod grant;
 pub mod identity;
 pub mod profile;
@@ -17,15 +19,21 @@ use thiserror::Error;
 
 pub use authority::{
     AuthorityFuture, Clock, CurrentProfile, GrantAuthority, LocalAuthorityLimits,
-    LocalGrantAuthority, RevisionSource, SystemClock,
+    LocalGrantAuthority, RevisionSource, SystemClock, check_current, evaluate_request,
 };
 pub use binding::{AuthorityRef, GovernanceBinding};
 pub use digest::{Sha256Digest, canonical_digest};
+pub use exception::{
+    ExceptionKind, ExceptionPolicy, ExceptionScope, ExceptionStatus, MAX_EXCEPTION_TTL_SECONDS,
+    PolicyException,
+};
 pub use grant::{
     AllowedRequest, CredentialGrant, Decision, DenyReason, GrantRequest, RequestContext,
     RevocationReason, path_permitted, validate_request_path,
 };
-pub use identity::{GrantId, PrincipalId, ProfileId, ProjectId, ServiceId, SessionRef};
+pub use identity::{
+    ExceptionId, GrantId, PrincipalId, ProfileId, ProjectId, ServiceId, SessionRef,
+};
 pub use profile::{
     BROKERED_CREDENTIAL_PLACEHOLDER, Ceiling, CeilingAction, CredentialProvider,
     CredentialServiceProfile, GovernanceProfile, PROFILE_FORMAT, PROFILE_VERSION, ProfileRef,
@@ -33,7 +41,8 @@ pub use profile::{
 };
 
 /// Wire and digest version shared with external governance services.
-pub const CONTRACT_VERSION: u32 = 1;
+/// Version 2 added policy exceptions to the session binding.
+pub const CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum GovernanceError {
@@ -53,6 +62,8 @@ pub enum GovernanceError {
     InvalidBinding(String),
     #[error("invalid credential grant: {0}")]
     InvalidGrant(String),
+    #[error("invalid policy exception: {0}")]
+    InvalidException(String),
     #[error("credential grant denied: {0}")]
     Denied(&'static str),
     #[error("governance authority unavailable: {0}")]

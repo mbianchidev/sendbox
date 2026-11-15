@@ -1124,6 +1124,7 @@ mod tests {
             effective_policy_sha256: Sha256Digest::parse_hex(&governed.policy_sha256)
                 .expect("policy digest"),
             brokered_services: Vec::new(),
+            exceptions: Vec::new(),
         });
         governed.validate(now).expect("governed plan");
         assert_ne!(

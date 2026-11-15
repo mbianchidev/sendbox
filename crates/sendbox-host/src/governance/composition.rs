@@ -13,11 +13,11 @@ use std::path::Path;
 use ipnet::IpNet;
 use sendbox_config::{KataRuntimeConfiguration, SafeOutputsMode, SandboxConfiguration};
 use sendbox_egress::domain::{normalize_pattern, pattern_matches};
-use sendbox_governance::ServiceId;
 use sendbox_governance::profile::{
     CeilingAction, CredentialServiceProfile, DnsCeiling, GovernanceProfile, McpTransportCeiling,
     RuntimeKind, TransportProtocol,
 };
+use sendbox_governance::{ExceptionKind, ExceptionScope, ServiceId};
 use sendbox_policy::{
     Action, DnsRecordType, McpServerPolicy, NetworkPolicy, PackageAction, PolicyConfiguration,
     Protocol, ToolTransport, normalize_mcp_http_endpoint,
@@ -58,15 +58,36 @@ impl fmt::Display for Violation {
 
 /// Appends the profile's explicit denials. Denials only ever narrow: they add
 /// deny rules and blocked destinations and never remove an existing entry.
-pub fn apply_denials(profile: &GovernanceProfile, policy: &mut PolicyConfiguration) {
-    extend_unique(&mut policy.commands.denylist, &profile.denials.commands);
+///
+/// Denials named by `lifted` (approved exceptions the profile permits) are
+/// skipped. Provider hosts blocked for brokered services are never lifted.
+pub fn apply_denials(
+    profile: &GovernanceProfile,
+    lifted: &[ExceptionScope],
+    policy: &mut PolicyConfiguration,
+) {
+    let kept = |kind: ExceptionKind, entries: &[String]| {
+        entries
+            .iter()
+            .filter(|entry| {
+                !lifted.iter().any(|scope| {
+                    scope.kind == kind && &scope.value == *entry && profile.permits_exception(scope)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    extend_unique(
+        &mut policy.commands.denylist,
+        &kept(ExceptionKind::Command, &profile.denials.commands),
+    );
     extend_unique(
         &mut policy.network.blocked_domains,
-        &profile.denials.domains,
+        &kept(ExceptionKind::Domain, &profile.denials.domains),
     );
     extend_unique(
         &mut policy.network.blocked_networks,
-        &profile.denials.networks,
+        &kept(ExceptionKind::Network, &profile.denials.networks),
     );
     let provider_hosts = profile
         .credential_services
@@ -870,6 +891,39 @@ credential_services:
     }
 
     #[test]
+    fn only_permitted_exceptions_lift_profile_denials() {
+        let text =
+            format!("{PROFILE}exceptions:\n  max_ttl_seconds: 3600\n  commands: [\"git push\"]\n");
+        let profile = GovernanceProfile::parse(text.as_bytes()).expect("profile");
+        let scope = |kind, value: &str| ExceptionScope {
+            kind,
+            value: value.to_owned(),
+        };
+        let mut policy = configuration().policy;
+        apply_denials(
+            &profile,
+            &[
+                scope(ExceptionKind::Command, "git push"),
+                scope(ExceptionKind::Domain, "pastebin.com"),
+                scope(ExceptionKind::Domain, "api.anthropic.com"),
+            ],
+            &mut policy,
+        );
+        assert!(!policy.commands.denylist.contains(&"git push".to_owned()));
+        for blocked in ["pastebin.com", "api.anthropic.com"] {
+            assert!(
+                policy.network.blocked_domains.contains(&blocked.to_owned()),
+                "{blocked} is not liftable"
+            );
+        }
+
+        let mut configuration = configuration();
+        configuration.policy.commands.allowlist = vec!["git push".to_owned()];
+        configuration.policy.commands.denylist = policy.commands.denylist;
+        assert!(check(&profile, &configuration, &facts()).is_empty());
+    }
+
+    #[test]
     fn narrowed_configuration_is_admitted() {
         let violations = check(&profile(), &configuration(), &facts());
         assert!(violations.is_empty(), "{violations:?}");
@@ -880,8 +934,8 @@ credential_services:
         let profile = profile();
         let mut policy = configuration().policy;
         let before = policy.clone();
-        apply_denials(&profile, &mut policy);
-        apply_denials(&profile, &mut policy);
+        apply_denials(&profile, &[], &mut policy);
+        apply_denials(&profile, &[], &mut policy);
         assert!(
             before
                 .network

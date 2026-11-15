@@ -545,8 +545,8 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         .validate()
         .map_err(|error| HostError::Invalid(error.to_string()))?;
     validate_reserved_secret_names(&request.configuration, None)?;
-    let governance = governance::GovernedSession::prepare(
-        &mut request.configuration,
+    let mut governance = governance::GovernedSession::prepare(
+        &request.configuration,
         &request.managed_governance_path,
         request.governance_config.as_deref(),
         governance::BundleSelection {
@@ -557,12 +557,6 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         &request.state_root,
         unix_time()?,
     )?;
-    if governance.is_some() {
-        request
-            .configuration
-            .validate()
-            .map_err(|error| HostError::Invalid(error.to_string()))?;
-    }
     let command = validate_command(&request.command)?;
     validate_command_policy(&request.configuration.policy.commands, &request.command)?;
     let host = current_host()?;
@@ -581,6 +575,20 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let project_source = workspace.host_project;
     let workspace_source = workspace.host_root;
     let project_destination = workspace.guest_project;
+    let selected_repository =
+        discover_selected_repository(&request.configuration, &project_source)?;
+    if let Some(governance) = governance.as_mut() {
+        let project = governance::project_id(selected_repository.as_ref(), &workspace_source)?;
+        governance
+            .apply(
+                &mut request.configuration,
+                project,
+                &native_secret_store,
+                unix_time()?,
+            )
+            .await?;
+        validate_command_policy(&request.configuration.policy.commands, &request.command)?;
+    }
     if let Some(governance) = &governance {
         governance.admit(
             &request.configuration,
@@ -617,8 +625,6 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     .map_err(|error| HostError::Bundle(error.to_string()))?;
     let manifest_sha256 = hash_file(&bundle_root.join("manifest.json"))?;
     let bundle_id = format!("{}:{}", request.trust_root_id, bundle.release_sequence);
-    let selected_repository =
-        discover_selected_repository(&request.configuration, &project_source)?;
     let credentials =
         prepare_effective_credentials(&request.configuration, selected_repository.as_ref()).await?;
     credentials.apply_to(&mut request.configuration);
@@ -723,8 +729,7 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
     let policy_sha256 = sha256_hex(&policy_bytes);
     let mut governance = governance
         .map(|session| {
-            let project = governance::project_id(selected_repository.as_ref(), &workspace_source)?;
-            let binding = session.binding(project, &policy_sha256, &request.configuration)?;
+            let binding = session.binding(&policy_sha256, &request.configuration)?;
             governance::GovernedRun::new(session, binding, session_id)
         })
         .transpose()?;
@@ -975,6 +980,9 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         key,
         package_report_validation,
     );
+    if let Some(run) = &governance {
+        run.admit_remote().await?;
+    }
 
     Ok(PreparedHostRun {
         execution,
@@ -984,6 +992,29 @@ pub async fn prepare(mut request: HostRunRequest) -> Result<PreparedHostRun, Hos
         signed_plan_path,
         terminal_source: None,
         governance,
+    })
+}
+
+/// Cancels `run` when `outer` is cancelled or when a lifted policy exception
+/// expires. The task's result reports whether the expiry fired.
+fn watch_exception_deadline(
+    outer: CancellationToken,
+    run: CancellationToken,
+    expires_at_unix: u64,
+) -> tokio::task::JoinHandle<bool> {
+    tokio::spawn(async move {
+        let remaining = expires_at_unix.saturating_sub(unix_time().unwrap_or(u64::MAX));
+        tokio::select! {
+            () = outer.cancelled() => {
+                run.cancel();
+                false
+            }
+            () = tokio::time::sleep(Duration::from_secs(remaining)) => {
+                eprintln!("sendbox: a policy exception for this session expired; stopping the session");
+                run.cancel();
+                true
+            }
+        }
     })
 }
 
@@ -1031,20 +1062,49 @@ async fn execute_runtime(
                 orchestrator = orchestrator.with_credential_relay(relay.clone());
             }
             let session_id = plan.session_id();
-            let agent = orchestrator.run(&plan, cancellation).await;
-            if let Some(relay) = &credential_relay {
-                let reason = match &agent {
-                    Ok(_) => sendbox_governance::RevocationReason::SessionCompleted,
+            let deadline = governance
+                .as_ref()
+                .and_then(|run| run.session.exception_deadline().cloned());
+            let (agent, expired) = match deadline {
+                Some(exception) => {
+                    let run_cancellation = CancellationToken::new();
+                    let watcher = watch_exception_deadline(
+                        cancellation.clone(),
+                        run_cancellation.clone(),
+                        exception.expires_at_unix,
+                    );
+                    let agent = orchestrator.run(&plan, &run_cancellation).await;
+                    watcher.abort();
+                    let expired = watcher.await.unwrap_or(false);
+                    (agent, expired.then_some(exception))
+                }
+                None => (orchestrator.run(&plan, cancellation).await, None),
+            };
+            if let Some(run) = &governance {
+                let outcome = match &agent {
+                    Ok(_) => sendbox_governance::api::SessionOutcome::Completed,
                     Err(failure)
                         if matches!(failure.primary, sendbox_agent::AgentError::Cancelled) =>
                     {
-                        sendbox_governance::RevocationReason::SessionCancelled
+                        sendbox_governance::api::SessionOutcome::Cancelled
                     }
-                    Err(_) => sendbox_governance::RevocationReason::SessionFailed,
+                    Err(_) => sendbox_governance::api::SessionOutcome::Failed,
                 };
-                let finished = relay.finish(reason).await;
-                if let (Ok(_), Err(error)) = (&agent, finished) {
-                    return Err(error);
+                let mut finished = Ok(());
+                if let Some(relay) = &credential_relay {
+                    finished = relay.finish(outcome.revocation_reason()).await;
+                }
+                let ended = run.end_remote(outcome).await;
+                if let Some(exception) = &expired {
+                    run.record_exception_expiry(&audit, exception)?;
+                    return Err(HostError::Governance(format!(
+                        "policy exception {} ({}) expired at {}; the session was stopped",
+                        exception.id, exception.scope, exception.expires_at_unix
+                    )));
+                }
+                if agent.is_ok() {
+                    finished?;
+                    ended?;
                 }
             }
             let agent = agent.map_err(HostError::AgentRun)?;

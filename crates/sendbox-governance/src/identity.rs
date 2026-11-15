@@ -72,6 +72,7 @@ string_identifier!(ProfileId, valid_profile_id, "profile");
 string_identifier!(ServiceId, valid_service_id, "service");
 string_identifier!(SessionRef, valid_session_ref, "session");
 string_identifier!(GrantId, valid_grant_id, "grant");
+string_identifier!(ExceptionId, valid_grant_id, "exception");
 
 impl PrincipalId {
     /// Identity of a local operating-system account. Increment 1 uses this for
@@ -101,12 +102,7 @@ impl ProjectId {
     /// Project identity for a workspace without a resolvable repository.
     #[must_use]
     pub fn from_canonical_path(path: &[u8]) -> Self {
-        let digest = Sha256::digest(path);
-        let mut encoded = String::from("path-sha256:");
-        for byte in digest {
-            encoded.push_str(&format!("{byte:02x}"));
-        }
-        Self(encoded)
+        Self(format!("path-sha256:{}", lower_hex(&Sha256::digest(path))))
     }
 }
 
@@ -120,12 +116,23 @@ impl SessionRef {
 impl GrantId {
     #[must_use]
     pub fn from_bytes(bytes: [u8; GRANT_ID_BYTES]) -> Self {
-        let mut encoded = String::with_capacity(GRANT_ID_BYTES * 2);
-        for byte in bytes {
-            encoded.push_str(&format!("{byte:02x}"));
-        }
-        Self(encoded)
+        Self(lower_hex(&bytes))
     }
+}
+
+impl ExceptionId {
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; GRANT_ID_BYTES]) -> Self {
+        Self(lower_hex(&bytes))
+    }
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
 }
 
 fn printable_prefix(value: &str) -> String {
@@ -248,6 +255,11 @@ mod tests {
         assert!(ProfileId::new("").is_err());
 
         assert!(GrantId::new("00".repeat(16)).is_ok());
+        assert_eq!(
+            ExceptionId::from_bytes([0xab; 16]).as_str(),
+            "ab".repeat(16)
+        );
+        assert!(ExceptionId::new("AB".repeat(16)).is_err());
         assert!(GrantId::new("0".repeat(31)).is_err());
         assert!(SessionRef::new("AB".repeat(16)).is_err());
     }

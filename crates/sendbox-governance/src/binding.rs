@@ -3,8 +3,9 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CONTRACT_VERSION, GovernanceError, PrincipalId, ProjectId, ServiceId,
+    CONTRACT_VERSION, ExceptionId, GovernanceError, PrincipalId, ProjectId, ServiceId,
     digest::{Sha256Digest, canonical_digest},
+    exception::MAX_SESSION_EXCEPTIONS,
     profile::ProfileRef,
 };
 
@@ -32,6 +33,10 @@ pub struct GovernanceBinding {
     pub project: ProjectId,
     pub effective_policy_sha256: Sha256Digest,
     pub brokered_services: Vec<ServiceId>,
+    /// Approved exceptions whose denials this session lifted, sorted. Omitted
+    /// from the canonical form when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exceptions: Vec<ExceptionId>,
 }
 
 impl GovernanceBinding {
@@ -61,6 +66,13 @@ impl GovernanceBinding {
             return Err(GovernanceError::InvalidBinding(
                 "brokered services must be sorted and unique".to_owned(),
             ));
+        }
+        if self.exceptions.len() > MAX_SESSION_EXCEPTIONS
+            || !self.exceptions.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err(GovernanceError::InvalidBinding(format!(
+                "exceptions must be sorted, unique, and at most {MAX_SESSION_EXCEPTIONS}"
+            )));
         }
         Ok(())
     }
@@ -96,6 +108,7 @@ mod tests {
                 ServiceId::new("anthropic").unwrap(),
                 ServiceId::new("openai").unwrap(),
             ],
+            exceptions: Vec::new(),
         }
     }
 
@@ -112,6 +125,21 @@ mod tests {
         let mut changed = original;
         changed.effective_policy_sha256 = Sha256Digest::of(b"other");
         assert_ne!(changed.digest().unwrap(), digest);
+    }
+
+    #[test]
+    fn exceptions_are_bound_only_when_present() {
+        let original = binding();
+        let canonical = serde_json_canonicalizer::to_string(&original).unwrap();
+        assert!(!canonical.contains("exceptions"));
+        let mut excepted = original.clone();
+        excepted.exceptions = vec![
+            ExceptionId::from_bytes([1; 16]),
+            ExceptionId::from_bytes([2; 16]),
+        ];
+        assert_ne!(excepted.digest().unwrap(), original.digest().unwrap());
+        excepted.exceptions.reverse();
+        assert!(excepted.digest().is_err());
     }
 
     #[test]
