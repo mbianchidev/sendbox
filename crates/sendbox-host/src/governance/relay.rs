@@ -503,3 +503,164 @@ impl CredentialRelayHandler for HostCredentialRelay {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sendbox_core::SessionId;
+    use sendbox_secrets::{
+        CredentialMasker, RecordVersion, Secret, SecretMetadata, SecretStoreError,
+    };
+
+    use super::super::operator::tests::{fixture, protected_test_tree};
+    use super::super::tests::{admitted_run, brokered_profile, configuration};
+    use super::*;
+
+    struct FakeStore(BTreeMap<&'static str, &'static str>);
+
+    impl FakeStore {
+        fn unsupported<T>() -> Result<T, SecretStoreError> {
+            Err(SecretStoreError::AccessDenied)
+        }
+    }
+
+    impl SecretStore for FakeStore {
+        fn store(
+            &self,
+            _: &SecretName,
+            _: SecretValue,
+        ) -> Result<SecretMetadata, SecretStoreError> {
+            Self::unsupported()
+        }
+        fn update(
+            &self,
+            _: &SecretName,
+            _: SecretValue,
+        ) -> Result<SecretMetadata, SecretStoreError> {
+            Self::unsupported()
+        }
+        fn retrieve(&self, name: &SecretName) -> Result<Secret, SecretStoreError> {
+            let value = self
+                .0
+                .get(name.as_str())
+                .ok_or_else(|| SecretStoreError::NotFound(name.clone()))?;
+            Ok(Secret {
+                metadata: SecretMetadata {
+                    name: name.clone(),
+                    created_at_unix_ms: 0,
+                    updated_at_unix_ms: 0,
+                    version: RecordVersion::V1,
+                },
+                value: SecretValue::try_from(*value)?,
+            })
+        }
+        fn delete(&self, _: &SecretName) -> Result<(), SecretStoreError> {
+            Self::unsupported()
+        }
+        fn list(&self) -> Result<Vec<SecretMetadata>, SecretStoreError> {
+            Self::unsupported()
+        }
+        fn exists(&self, name: &SecretName) -> Result<bool, SecretStoreError> {
+            Ok(self.0.contains_key(name.as_str()))
+        }
+        fn migrate(&self, _: &SecretName) -> Result<SecretMetadata, SecretStoreError> {
+            Self::unsupported()
+        }
+    }
+
+    const ANTHROPIC_KEY: &str = "sk-ant-test-0123456789";
+    const OPENAI_KEY: &str = "sk-openai-test-0123456789";
+
+    fn store() -> FakeStore {
+        FakeStore(BTreeMap::from([
+            ("SENDBOX_ANTHROPIC_API_KEY", ANTHROPIC_KEY),
+            ("SENDBOX_OPENAI_API_KEY", OPENAI_KEY),
+        ]))
+    }
+
+    fn services() -> Vec<CredentialServiceProfile> {
+        sendbox_governance::profile::GovernanceProfile::parse(brokered_profile().as_bytes())
+            .expect("profile")
+            .credential_services
+    }
+
+    #[test]
+    fn brokered_secrets_are_masked_and_missing_secrets_fail_closed() {
+        let masker = CredentialMasker::default();
+        let secrets = BrokeredSecrets::resolve(&services(), &store(), &masker).expect("resolve");
+        assert!(!format!("{secrets:?}").contains(ANTHROPIC_KEY));
+        let masked = masker
+            .mask_complete(format!("leak {OPENAI_KEY}").as_bytes())
+            .expect("mask");
+        assert!(!String::from_utf8_lossy(&masked).contains(OPENAI_KEY));
+        let resolved = SecretResolver::retrieve(
+            &secrets,
+            &SecretName::new("SENDBOX_ANTHROPIC_API_KEY".to_owned()).expect("name"),
+        )
+        .expect("resolved");
+        assert_eq!(resolved.expose_secret(), ANTHROPIC_KEY.as_bytes());
+        assert!(
+            SecretResolver::retrieve(
+                &secrets,
+                &SecretName::new("SENDBOX_OTHER".to_owned()).expect("name")
+            )
+            .is_err()
+        );
+
+        let partial = FakeStore(BTreeMap::from([("SENDBOX_OPENAI_API_KEY", OPENAI_KEY)]));
+        let error =
+            BrokeredSecrets::resolve(&services(), &partial, &masker).expect_err("missing secret");
+        assert!(error.to_string().contains("SENDBOX_ANTHROPIC_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn relay_issues_and_revokes_audited_grants_without_secret_material() {
+        if !protected_test_tree() {
+            return;
+        }
+        let fixture = fixture(&brokered_profile(), 1);
+        let mut configuration = configuration(&["anthropic", "openai"]);
+        let run = admitted_run(&fixture, &mut configuration);
+        let services = run
+            .session
+            .brokered_services(&configuration)
+            .expect("services");
+        let secrets = BrokeredSecrets::resolve(&services, &store(), &CredentialMasker::default())
+            .expect("secrets");
+        let audit = AuditRecorder::new(SessionId::from_bytes([7; 16])).expect("audit");
+        let relay = HostCredentialRelay::start(&run, &services, secrets, audit.clone())
+            .await
+            .expect("relay");
+        relay
+            .finish(RevocationReason::SessionCompleted)
+            .await
+            .expect("finish");
+        relay
+            .finish(RevocationReason::SessionFailed)
+            .await
+            .expect("finish is idempotent");
+
+        let records = audit.records().expect("records");
+        let actions = records
+            .iter()
+            .map(|record| (record.event.action.as_str(), record.event.result))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            [
+                ("credential.grant.issued", AuditResult::Allowed),
+                ("credential.grant.issued", AuditResult::Allowed),
+                ("credential.grant.revoked", AuditResult::Success),
+                ("credential.grant.revoked", AuditResult::Success),
+            ]
+        );
+        for record in &records {
+            assert_eq!(
+                record.event.metadata["binding_sha256"],
+                run.binding_sha256.to_string()
+            );
+            let serialized = serde_json::to_string(&record.event).expect("json");
+            assert!(!serialized.contains(ANTHROPIC_KEY) && !serialized.contains(OPENAI_KEY));
+        }
+        assert_eq!(records[2].event.metadata["reason"], "session_completed");
+    }
+}

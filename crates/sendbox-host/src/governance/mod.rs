@@ -507,3 +507,208 @@ pub fn check(request: GovernanceCheckRequest) -> Result<GovernanceCheckReport, H
         brokered_services: configuration.credential_services.clone(),
     })
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use sendbox_config::{PolicyPreset, RuntimeProvider};
+    use sendbox_governance::profile::GovernanceProfile;
+
+    use super::operator::tests::{Fixture, fixture, private_directory, protected_test_tree};
+    use super::*;
+
+    pub(crate) fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs()
+    }
+
+    /// A profile valid now, brokering both supported providers.
+    pub(crate) fn brokered_profile() -> String {
+        let now = now_unix();
+        format!(
+            r#"format: sendbox.governance-profile
+version: 1
+id: acme
+revision: 4
+not_before_unix: {}
+expires_at_unix: {}
+ceiling:
+  runtimes: [apple, kata]
+  commands:
+    default_action: deny
+    allowlist: ["git *"]
+  network:
+    default_action: deny
+    allowed_domains: ["*.github.com"]
+    allow_dns: true
+credential_services:
+  - id: openai
+    provider: openai
+    secret: SENDBOX_OPENAI_API_KEY
+  - id: anthropic
+    provider: anthropic
+    secret: SENDBOX_ANTHROPIC_API_KEY
+"#,
+            now - 60,
+            now + 86_400
+        )
+    }
+
+    pub(crate) fn configuration(services: &[&str]) -> SandboxConfiguration {
+        let mut configuration = SandboxConfiguration::for_project(
+            PathBuf::from("/work/app"),
+            PolicyPreset::Strict,
+            RuntimeProvider::Apple,
+        );
+        configuration.github.forward_auth = false;
+        configuration.github.forward_copilot_auth = false;
+        configuration.policy.network.allowed_domains = vec!["*.github.com".to_owned()];
+        configuration.policy.commands.allowlist = vec!["git status".to_owned()];
+        configuration.credential_services = services.iter().map(|&s| s.to_owned()).collect();
+        configuration
+    }
+
+    fn bundle() -> BundleSelection<'static> {
+        BundleSelection {
+            trust_root: Path::new("/nonexistent/trust.json"),
+            trust_root_id: "test",
+            minimum_release_sequence: 0,
+        }
+    }
+
+    pub(crate) fn prepare(
+        fixture: &Fixture,
+        configuration: &mut SandboxConfiguration,
+    ) -> GovernedSession {
+        GovernedSession::prepare(
+            configuration,
+            &fixture.directory.path().join("absent-managed.yaml"),
+            Some(&fixture.source.path),
+            bundle(),
+            &fixture.directory.path().join("state"),
+            now_unix(),
+        )
+        .expect("prepare")
+        .expect("governed")
+    }
+
+    pub(crate) fn admitted_run(
+        fixture: &Fixture,
+        configuration: &mut SandboxConfiguration,
+    ) -> GovernedRun {
+        let session = prepare(fixture, configuration);
+        let facts = SessionFacts {
+            runtime: RuntimeKind::Apple,
+            image: None,
+            workspace_root: Path::new("/work/app"),
+        };
+        session.admit(configuration, &facts).expect("admit");
+        let binding = session
+            .binding(
+                ProjectId::github("acme", "app").expect("project"),
+                &"ab".repeat(32),
+                configuration,
+            )
+            .expect("binding");
+        GovernedRun::new(session, binding, SessionId::from_bytes([7; 16])).expect("run")
+    }
+
+    #[test]
+    fn standalone_sessions_cannot_request_brokered_credentials() {
+        let directory = private_directory();
+        let managed = directory.path().join("absent.yaml");
+        let state = directory.path().join("state");
+        let mut standalone = configuration(&[]);
+        assert!(
+            GovernedSession::prepare(&mut standalone, &managed, None, bundle(), &state, 0)
+                .expect("standalone")
+                .is_none()
+        );
+        let mut brokered = configuration(&["anthropic"]);
+        let error = GovernedSession::prepare(&mut brokered, &managed, None, bundle(), &state, 0)
+            .err()
+            .expect("brokered services without governance are rejected");
+        assert!(
+            matches!(error, HostError::Governance(message) if message.contains("credential_services"))
+        );
+    }
+
+    #[test]
+    fn relay_environment_points_agents_at_the_loopback_relay() {
+        let profile = GovernanceProfile::parse(brokered_profile().as_bytes()).expect("profile");
+        let environment = relay_environment(&profile.credential_services, 15_084)
+            .into_iter()
+            .map(|intent| {
+                assert!(!intent.sensitive);
+                (intent.name, intent.value)
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                (
+                    "ANTHROPIC_BASE_URL".to_owned(),
+                    "http://127.0.0.1:15084/anthropic".to_owned()
+                ),
+                (
+                    "ANTHROPIC_API_KEY".to_owned(),
+                    sendbox_governance::BROKERED_CREDENTIAL_PLACEHOLDER.to_owned()
+                ),
+                (
+                    "OPENAI_BASE_URL".to_owned(),
+                    "http://127.0.0.1:15084/openai/v1".to_owned()
+                ),
+                (
+                    "OPENAI_API_KEY".to_owned(),
+                    sendbox_governance::BROKERED_CREDENTIAL_PLACEHOLDER.to_owned()
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn governed_session_binds_admission_and_brokered_services() {
+        if !protected_test_tree() {
+            return;
+        }
+        let fixture = fixture(&brokered_profile(), 1);
+        let mut configuration = configuration(&["openai", "anthropic"]);
+        let run = admitted_run(&fixture, &mut configuration);
+        for host in ["api.anthropic.com", "api.openai.com"] {
+            assert!(
+                configuration
+                    .policy
+                    .network
+                    .blocked_domains
+                    .contains(&host.to_owned()),
+                "{host} must be denied to the workload"
+            );
+        }
+        let ids =
+            |services: &[ServiceId]| services.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(ids(&run.binding.brokered_services), ["anthropic", "openai"]);
+        assert_eq!(run.binding_sha256, run.binding.digest().expect("digest"));
+
+        let services = run
+            .session
+            .brokered_services(&configuration)
+            .expect("services");
+        let relay = run.session.relay_bootstrap(&services).expect("relay");
+        assert_eq!(relay.port, DEFAULT_CREDENTIAL_RELAY_PORT);
+        assert_eq!(relay.services, ["anthropic", "openai"]);
+        assert!(run.session.relay_bootstrap(&[]).is_none());
+
+        let audit = AuditRecorder::new(SessionId::from_bytes([7; 16])).expect("audit");
+        run.record_admission(&audit).expect("record");
+        let records = audit.records().expect("records");
+        let admission = &records.last().expect("admission record").event;
+        assert_eq!(admission.action, "governance.admission.accepted");
+        assert_eq!(admission.metadata["mode"], "opt_in");
+        assert_eq!(admission.metadata["brokered_services"], "anthropic,openai");
+        assert_eq!(
+            admission.metadata["binding_sha256"],
+            run.binding_sha256.to_string()
+        );
+    }
+}
