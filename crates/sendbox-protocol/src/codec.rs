@@ -353,6 +353,12 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, ProtocolErr
         7 => Ok(EventKind::StandardInputEof),
         8 => Ok(EventKind::TerminalResize),
         9 => Ok(EventKind::TerminalInputCredit),
+        10 => Ok(EventKind::CredentialRelayRequest),
+        11 => Ok(EventKind::CredentialRelayRequestBody),
+        12 => Ok(EventKind::CredentialRelayResponseHead),
+        13 => Ok(EventKind::CredentialRelayResponseBody),
+        14 => Ok(EventKind::CredentialRelayEnd),
+        15 => Ok(EventKind::CredentialRelayCredit),
         value => Err(ProtocolError::MalformedEncoding(format!(
             "unsupported event kind {value}"
         ))),
@@ -534,6 +540,12 @@ mod tests {
             (EventKind::StandardInputEof, 7),
             (EventKind::TerminalResize, 8),
             (EventKind::TerminalInputCredit, 9),
+            (EventKind::CredentialRelayRequest, 10),
+            (EventKind::CredentialRelayRequestBody, 11),
+            (EventKind::CredentialRelayResponseHead, 12),
+            (EventKind::CredentialRelayResponseBody, 13),
+            (EventKind::CredentialRelayEnd, 14),
+            (EventKind::CredentialRelayCredit, 15),
         ] {
             let encoded = [value];
             let mut decoder = Decoder::new(&encoded);
@@ -543,8 +555,8 @@ mod tests {
 
     #[test]
     fn unknown_event_kinds_are_still_rejected() {
-        let mut decoder = Decoder::new(&[10]);
-        let error = decode_event_kind(&mut decoder).expect_err("kind 10 is unassigned");
+        let mut decoder = Decoder::new(&[16]);
+        let error = decode_event_kind(&mut decoder).expect_err("kind 16 is unassigned");
         assert!(matches!(error, ProtocolError::MalformedEncoding(_)));
     }
 

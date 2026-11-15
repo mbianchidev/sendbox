@@ -12,14 +12,14 @@ const HEADER_END: &[u8] = b"\r\n\r\n";
 const READ_CHUNK_BYTES: usize = 1024;
 
 #[derive(Debug)]
-pub(crate) struct ParsedRequest {
+pub struct ParsedRequest {
     pub method: Method,
     pub target: String,
     pub headers: Vec<(HeaderName, HeaderValue)>,
     pub body: Vec<u8>,
 }
 
-pub(crate) async fn read_request(
+pub async fn read_request(
     reader: &mut (impl AsyncRead + Unpin),
     limits: &BrokerLimits,
     max_body_bytes: usize,
@@ -337,9 +337,7 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
         .position(|window| window == HEADER_END)
 }
 
-pub(crate) fn strip_hop_by_hop(
-    headers: &[(HeaderName, HeaderValue)],
-) -> Vec<(HeaderName, HeaderValue)> {
+pub fn strip_hop_by_hop(headers: &[(HeaderName, HeaderValue)]) -> Vec<(HeaderName, HeaderValue)> {
     let mut connection_named = Vec::new();
     for (name, value) in headers {
         if name == http::header::CONNECTION

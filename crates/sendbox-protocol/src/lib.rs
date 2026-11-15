@@ -7,6 +7,7 @@ mod frame;
 mod handshake;
 mod limits;
 mod operations;
+pub mod relay;
 mod types;
 
 pub use codec::{decode_message, encode_message};

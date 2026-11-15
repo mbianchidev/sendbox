@@ -2616,6 +2616,8 @@ dependencies = [
  "reqwest",
  "sendbox-config",
  "sendbox-egress",
+ "sendbox-governance",
+ "sendbox-protocol",
  "sendbox-runtime",
  "sendbox-secrets",
  "serde",

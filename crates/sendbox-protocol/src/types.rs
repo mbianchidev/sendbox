@@ -218,6 +218,20 @@ pub enum EventKind {
     TerminalResize = 8,
     /// Carries an encoded `TerminalInputCreditV1` after a V2 interactive launch.
     TerminalInputCredit = 9,
+    /// Guest to host: an encoded `CredentialRelayRequestV1` opening one
+    /// brokered credential stream.
+    CredentialRelayRequest = 10,
+    /// Guest to host: request body bytes for an open relay stream.
+    CredentialRelayRequestBody = 11,
+    /// Host to guest: an encoded `CredentialRelayResponseHeadV1`.
+    CredentialRelayResponseHead = 12,
+    /// Host to guest: response body bytes for a relay stream.
+    CredentialRelayResponseBody = 13,
+    /// Either direction: an encoded `CredentialRelayEndV1` closing a stream.
+    CredentialRelayEnd = 14,
+    /// Guest to host: an encoded `CredentialRelayCreditV1` permitting more
+    /// response body chunks.
+    CredentialRelayCredit = 15,
 }
 
 impl EventKind {
@@ -231,6 +245,20 @@ impl EventKind {
         matches!(
             self,
             Self::StandardInput | Self::StandardInputEof | Self::TerminalResize
+        )
+    }
+
+    /// Reports whether the kind belongs to the brokered credential relay.
+    #[must_use]
+    pub const fn is_credential_relay(self) -> bool {
+        matches!(
+            self,
+            Self::CredentialRelayRequest
+                | Self::CredentialRelayRequestBody
+                | Self::CredentialRelayResponseHead
+                | Self::CredentialRelayResponseBody
+                | Self::CredentialRelayEnd
+                | Self::CredentialRelayCredit
         )
     }
 }

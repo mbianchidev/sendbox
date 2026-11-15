@@ -4,7 +4,8 @@ mod broker;
 mod config;
 mod error;
 mod github;
-mod http1;
+pub mod http1;
+pub mod relay;
 mod session;
 mod upstream;
 
@@ -25,8 +26,8 @@ pub use session::{
     SessionCredentialConfiguration,
 };
 pub use upstream::{
-    PinnedHttpsTransport, SystemResolver, UpstreamRequest, UpstreamResolver, UpstreamResponse,
-    UpstreamTransport,
+    PinnedHttpsTransport, ResponseBody, StreamingLimits, StreamingResponse, StreamingTransport,
+    SystemResolver, UpstreamRequest, UpstreamResolver, UpstreamResponse, UpstreamTransport,
 };
 
 #[doc(hidden)]
