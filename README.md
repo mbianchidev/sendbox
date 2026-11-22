@@ -1,3 +1,5 @@
+<img src="docs/assets/logo.svg" width="96" height="96" alt="SendBox logo">
+
 # SendBox
 
 **Give your coding agent a workspace, not your whole machine.**
