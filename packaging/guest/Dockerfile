@@ -17,20 +17,20 @@ RUN apk add --no-cache \
         g++=15.2.0-r2 \
         gperf=3.3-r0 \
         libbpf-dev=1.6.2-r0 \
-        libcrypto3=3.5.9-r0 \
-        libssl3=3.5.9-r0 \
+        libcrypto3=3.5.9-r1 \
+        libssl3=3.5.9-r1 \
         linux-headers=6.16.12-r0 \
         llvm21=21.1.2-r1 \
         make=4.4.1-r3 \
         musl-dev=1.2.5-r24 \
-        openssl-dev=3.5.9-r0 \
+        openssl-dev=3.5.9-r1 \
         pkgconf=2.5.1-r0 \
         tar=1.35-r4 \
         zlib=1.4-r0 \
         zlib-dev=1.4-r0 \
         zlib-static=1.4-r0 \
-        zstd-dev=1.5.7-r2 \
-        zstd-static=1.5.7-r2
+        zstd-dev=1.6.0-r1 \
+        zstd-static=1.6.0-r1
 
 RUN ar d /usr/lib/libelf.a crc32.o \
     && ranlib /usr/lib/libelf.a \

@@ -14,20 +14,20 @@ RUN apk add --no-cache \
         elfutils-dev=0.194-r0 \
         file=5.46-r2 \
         libbpf-dev=1.6.2-r0 \
-        libcrypto3=3.5.9-r0 \
-        libssl3=3.5.9-r0 \
+        libcrypto3=3.5.9-r1 \
+        libssl3=3.5.9-r1 \
         linux-headers=6.16.12-r0 \
         llvm21=21.1.2-r1 \
         make=4.4.1-r3 \
         musl-dev=1.2.5-r24 \
-        openssl-dev=3.5.9-r0 \
+        openssl-dev=3.5.9-r1 \
         pkgconf=2.5.1-r0 \
         xz=5.8.4-r0 \
         zlib=1.4-r0 \
         zlib-dev=1.4-r0 \
         zlib-static=1.4-r0 \
-        zstd-dev=1.5.7-r2 \
-        zstd-static=1.5.7-r2
+        zstd-dev=1.6.0-r1 \
+        zstd-static=1.6.0-r1
 
 # Alpine libelf ships a fallback zlib-compatible crc32 object. Remove that
 # single-symbol fallback so the pinned libz archive is the sole provider.

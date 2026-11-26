@@ -20,8 +20,8 @@ RUN apk add --no-cache \
         zlib=1.4-r0 \
         zlib-dev=1.4-r0 \
         zlib-static=1.4-r0 \
-        zstd-dev=1.5.7-r2 \
-        zstd-static=1.5.7-r2
+        zstd-dev=1.6.0-r1 \
+        zstd-static=1.6.0-r1
 
 RUN ar d /usr/lib/libelf.a crc32.o \
     && ranlib /usr/lib/libelf.a \
