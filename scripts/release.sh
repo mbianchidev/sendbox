@@ -34,7 +34,8 @@ done
 python3 -c 'import tomllib' || fail "Python 3.11 or newer is required"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-REPOSITORY="mbianchidev/sendbox"
+# The repository moved from mbianchidev/sendbox; GitHub resolves an old-name origin to this name.
+REPOSITORY="sendbox-dev/sendbox"
 TAG="v$VERSION"
 BRANCH="release/$TAG"
 TEMP_DIR=""

@@ -19,7 +19,7 @@ case "$1 $2" in
         if [[ "$RELEASE_TEST_SCENARIO" == wrong_repo ]]; then
             printf 'example/another-repository\n'
         else
-            printf 'mbianchidev/sendbox\n'
+            printf 'sendbox-dev/sendbox\n'
         fi
         ;;
     "pr list")
@@ -41,13 +41,13 @@ case "$1 $2" in
             elif [[ "$RELEASE_TEST_SCENARIO" == foreign_pr ]]; then
                 cross_repository=true
             fi
-            printf 'https://github.com/mbianchidev/sendbox/pull/1\t%s\t%s\t%s\t%s\n' \
+            printf 'https://github.com/sendbox-dev/sendbox/pull/1\t%s\t%s\t%s\t%s\n' \
                 "$state" "$head" "$cross_repository" "$merge"
         fi
         ;;
     "pr create")
         touch "$RELEASE_TEST_STATE/pr"
-        printf 'https://github.com/mbianchidev/sendbox/pull/1\n'
+        printf 'https://github.com/sendbox-dev/sendbox/pull/1\n'
         ;;
     "pr view")
         if [[ "$*" == *statusCheckRollup* ]]; then
@@ -152,7 +152,7 @@ case "$1 $2" in
         printf 'success\n' >"$RELEASE_TEST_STATE/conclusion"
         ;;
     "release view")
-        url='https://github.com/mbianchidev/sendbox/releases/tag/v0.2.0'
+        url='https://github.com/sendbox-dev/sendbox/releases/tag/v0.2.0'
         pager="${GH_PAGER-${PAGER-}}"
         if [[ -t 1 && -n "$pager" && "$pager" != cat ]]; then
             printf '%s\n' "$url" | "$pager"
@@ -687,7 +687,7 @@ fn retries_failed_publication_without_recreating_the_tag_pr_or_version_bump() {
     assert_eq!(trace.matches("gh pr create").count(), 1);
     assert_eq!(trace.matches("gh pr merge").count(), 1);
     assert_eq!(trace.matches("gh run rerun").count(), 1);
-    assert!(trace.contains("gh run rerun 123 --repo mbianchidev/sendbox --failed"));
+    assert!(trace.contains("gh run rerun 123 --repo sendbox-dev/sendbox --failed"));
     assert_eq!(
         fs::read_to_string(repository.state.join("attempt")).unwrap(),
         "2\n"

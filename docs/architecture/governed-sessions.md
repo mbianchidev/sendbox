@@ -9,7 +9,7 @@ Two authorities are supported:
 
 - **Local** (single host): the host verifies the profile and runs the grant
   authority in process. The principal is the local OS account.
-- **Shared** ([`sendbox-fleet`](https://github.com/mbianchidev/sendbox-fleet)):
+- **Shared** ([`sendbox-fleet`](https://github.com/sendbox-dev/sendbox-fleet)):
   an authenticated, multi-user service enforces project-scoped roles, approves
   bounded, expiring exceptions, admits sessions, issues and checks grants, and
   keeps a central, hash-chained audit log. See
@@ -345,7 +345,7 @@ failure to record relay evidence fails the run.
 ## Shared governance service
 
 With `fleet` in the operator configuration, the host uses
-[`sendbox-fleet`](https://github.com/mbianchidev/sendbox-fleet) as its
+[`sendbox-fleet`](https://github.com/sendbox-dev/sendbox-fleet) as its
 authority. The profile is still read from `profile_path` and verified against
 the operator's `trust` signers on the host; the service separately verifies the
 same signed bytes when an operator publishes them, and only admits sessions
@@ -384,7 +384,7 @@ sequenceDiagram
   caller, so a host cannot claim another identity.
 - **Roles.** Admission needs the `member` role or higher in the project.
   Roles, exceptions, and audit are managed through the service; see its
-  [architecture](https://github.com/mbianchidev/sendbox-fleet/blob/main/docs/architecture.md).
+  [architecture](https://github.com/sendbox-dev/sendbox-fleet/blob/main/docs/architecture.md).
 - **Grants.** The service is the grant authority. Every brokered request is
   authorized by the service; any non-200 answer, timeout, or unreachable
   service denies with `authority_unavailable`. Nothing falls back to the
