@@ -97,7 +97,7 @@ bundle in a root-owned location before running a VM session. Homebrew does not
 provision or start a runtime.
 
 Alternatively, download a matching
-[release](https://github.com/mbianchidev/sendbox/releases), verify its attestation
+[release](https://github.com/sendbox-dev/sendbox/releases), verify its attestation
 and checksum, and follow the [installation guide](docs/installation.md).
 Host release artifacts include the matching signed guest bundle; source builds
 need that bundle separately.
@@ -134,7 +134,7 @@ Install the pinned Rust **1.93.1** toolchain and the
 [native build dependencies](docs/installation.md#requirements), then:
 
 ```bash
-git clone https://github.com/mbianchidev/sendbox.git
+git clone https://github.com/sendbox-dev/sendbox.git
 cd sendbox
 make install PREFIX="$HOME/.local"
 export PATH="$HOME/.local/bin:$PATH"

@@ -131,9 +131,15 @@ archive's provenance:
 ```bash
 brew fetch --formula mbianchidev/tap/sendbox
 gh attestation verify "$(brew --cache --formula mbianchidev/tap/sendbox)" \
-  --repo mbianchidev/sendbox \
-  --signer-workflow mbianchidev/sendbox/.github/workflows/release.yaml
+  --repo sendbox-dev/sendbox \
+  --signer-workflow sendbox-dev/sendbox/.github/workflows/release.yaml
 ```
+
+The repository moved from `mbianchidev/sendbox` to `sendbox-dev/sendbox`
+after v0.2.7. Releases up to v0.2.7 were attested by the original repository's
+workflow, and GitHub indexes those attestations under the `mbianchidev` owner.
+Verify them with `--owner mbianchidev --signer-workflow
+mbianchidev/sendbox/.github/workflows/release.yaml` instead of `--repo`.
 
 Copy the matching payload to a **new, versioned, root-owned location**. The
 following commands are an explicit administrator step, not a formula hook.
@@ -190,7 +196,7 @@ them. Do not mix a manual `/usr/local/bin/sendbox` install with Homebrew or use
 ## Release artifacts
 
 Download the matching artifact from
-[Releases](https://github.com/mbianchidev/sendbox/releases):
+[Releases](https://github.com/sendbox-dev/sendbox/releases):
 
 | Host | Artifacts |
 |---|---|
@@ -203,11 +209,12 @@ configuration examples, setup helper, and matching signed guest bundle. The
 release also publishes standalone guest-bundle archives.
 
 Verify GitHub provenance before trusting the embedded guest public key, then
-verify the adjacent checksum:
+verify the adjacent checksum (for v0.2.7 and earlier, use the owner-based check
+described above):
 
 ```bash
 gh attestation verify sendbox-<version>-<platform>.tar.gz \
-  -R mbianchidev/sendbox
+  -R sendbox-dev/sendbox
 shasum -a 256 -c sendbox-<version>-<platform>.tar.gz.sha256
 ```
 
@@ -240,7 +247,8 @@ for details.
 
 Releases are triggered by pushing a `vX.Y.Z` tag, not by `make release`, which
 only builds locally. From a clean checkout with `origin` pointing to
-`mbianchidev/sendbox`, run:
+`sendbox-dev/sendbox` (an origin that still uses the old `mbianchidev/sendbox`
+URL also works, because GitHub resolves it to the moved repository), run:
 
 ```bash
 ./scripts/release.sh 0.2.0
@@ -273,7 +281,7 @@ bypassing branch protections. An annotated tag is pushed at the PR's merged
 invoking checkout stays on `main` at its startup pull, while the original
 feature branch is unchanged and version edits remain in the isolated worktree.
 
-The script watches the [Release workflow](https://github.com/mbianchidev/sendbox/actions/workflows/release.yaml),
+The script watches the [Release workflow](https://github.com/sendbox-dev/sendbox/actions/workflows/release.yaml),
 which publishes GitHub assets and GHCR artifacts, including macOS installers,
 Linux archives, and signed guest bundles. The required release-signing secret
 is already configured; no local signing key is needed.
@@ -334,8 +342,9 @@ enabled, it checks included projects' stable releases hourly and downloads the
 existing SendBox archives for macOS arm64, Linux x86_64, and Linux aarch64, plus
 their checksum files. It recomputes SHA-256 against GitHub's asset digests and
 the adjacent published checksums, and verifies attestations from
-`mbianchidev/sendbox/.github/workflows/release.yaml` bound to `refs/tags/vX.Y.Z`
-on GitHub-hosted runners. It does not rebuild the CLI or guest bundles.
+`sendbox-dev/sendbox/.github/workflows/release.yaml` bound to `refs/tags/vX.Y.Z`
+on GitHub-hosted runners (`mbianchidev/sendbox/.github/workflows/release.yaml`
+for releases up to v0.2.7, before the repository moved). It does not rebuild the CLI or guest bundles.
 
 Only a published, non-draft, non-prerelease `vX.Y.Z` matching GitHub's latest
 stable release at or above the patched-release floor v0.2.3 is eligible.
@@ -364,7 +373,7 @@ move an existing tag, or republish artifacts just to retry a formula update.
 ## Build from source
 
 ```bash
-git clone https://github.com/mbianchidev/sendbox.git
+git clone https://github.com/sendbox-dev/sendbox.git
 cd sendbox
 make install
 ```

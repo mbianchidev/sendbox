@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Report suspected vulnerabilities privately through
-[GitHub private vulnerability reporting](https://github.com/mbianchidev/sendbox/security/advisories/new)
+[GitHub private vulnerability reporting](https://github.com/sendbox-dev/sendbox/security/advisories/new)
 (the repository's **Security** tab, then **Report a vulnerability**). Do not
 open public issues, pull requests, or discussions for vulnerabilities.
 
@@ -20,7 +20,7 @@ through a GitHub security advisory.
 
 ## Supported versions
 
-Only the [latest release](https://github.com/mbianchidev/sendbox/releases/latest)
+Only the [latest release](https://github.com/sendbox-dev/sendbox/releases/latest)
 receives security fixes. Upgrade to it before reporting, and confirm the issue
 still reproduces there.
 
